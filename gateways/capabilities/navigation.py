@@ -129,6 +129,9 @@ class _TargetSearch:
         self.map_name = args.get("map_name") or platform.geometry_state.snapshot().map_name
         self.threshold = args.get("verify_similarity_threshold", .55)
         self.rejected = set()
+        self.capability = capability
+        self.attempted = []
+        self.candidate_diagnostics = {}
 
     @contextmanager
     def acquired(self):
@@ -136,6 +139,13 @@ class _TargetSearch:
             camera_id=self.camera_id, detector_backend_name=self.backend, open_vocabulary_classes=(self.query,))
         try:
             yield
+        except GatewayError as error:
+            if self.capability in {"find_target", "explore_and_find_target"}:
+                error.details.update(map_name=self.map_name, query=self.query,
+                    attempted_candidate_ids=list(self.attempted),
+                    candidate_diagnostics=list(self.candidate_diagnostics.values()),
+                    rejected_candidate_ids=sorted(self.rejected))
+            raise
         finally:
             self.runtime.release(self.reason)
 
@@ -198,6 +208,7 @@ class _TargetSearch:
             self.query, camera_id=self.camera_id, map_name=self.map_name, limit=5, object_target=True)
             if candidate.record_id not in self.rejected)
         diagnostics = [self._build_target_candidate_diagnostic(candidate) for candidate in candidates]
+        self.candidate_diagnostics.update((item["record_id"], item) for item in diagnostics)
         allowed = [candidate for candidate, diagnostic in zip(candidates, diagnostics) if diagnostic["allowed_for_navigation"]]
         selected, clarification = self._select_low_ambiguity_target_candidates(
             query=self.query, candidates=allowed, candidate_diagnostics=diagnostics)
@@ -257,6 +268,7 @@ class _TargetSearch:
         attempted, last_error, last_verification = [], None, None
         for candidate in state["candidates"]:
             attempted.append(candidate.record_id)
+            self.attempted.append(candidate.record_id)
             diagnostic = next(item for item in diagnostics if item["record_id"] == candidate.record_id)
             diagnostic["navigation_attempted"] = True
             pose = candidate.inspection_pose

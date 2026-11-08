@@ -983,17 +983,28 @@ class NavigationMixin:
             return evidence
         return self.write(save)
 
-    def _resolve_inspection_pose(self, *, anchor_id, fallback_pose, override_poses=None):
-        if override_poses:
-            return override_poses[0]
+    def _resolve_inspection_pose(self, *, anchor_id, override_poses=None, object_record=None):
+        clearance = self._planner.object_clearance(object_record) if object_record is not None else None
+        poses = list(override_poses or ())
         if anchor_id:
             for anchor in self.get_navigation_semantic_context().anchors:
-                if anchor.anchor_id == anchor_id and anchor.inspection_poses:
-                    return anchor.inspection_poses[0]
+                if anchor.anchor_id == anchor_id:
+                    poses.extend(anchor.inspection_poses)
             for instance in self._record_map('instance').values():
-                if self._instance_is_confirmed(instance) and instance.anchor_id == anchor_id and instance.inspection_poses:
-                    return instance.inspection_poses[0]
-        return fallback_pose
+                if self._instance_is_confirmed(instance) and instance.anchor_id == anchor_id:
+                    poses.extend(instance.inspection_poses)
+        for pose in poses:
+            if self._planner.outside_target(pose, clearance):
+                return pose
+        if object_record is not None:
+            metadata = object_record.metadata
+            observer = getattr(object_record, 'attributes', metadata).get('observer_body_pose')
+            if (observer is not None and metadata.get('projection_method') != 'current_pose_fallback'
+                    and int(metadata.get('support_point_count') or 0) > 0):
+                pose = Pose.model_validate(observer)
+                if self._planner.outside_target(pose, clearance):
+                    return pose
+        return None
 
     def _record_arrival_trajectory_graph(self, result: MemoryArrivalVerification) -> None:
         metadata = dict(result.metadata or {})

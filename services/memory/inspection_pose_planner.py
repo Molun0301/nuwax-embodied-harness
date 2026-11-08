@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from math import atan2, cos, radians, sin
+import json
+from math import atan2, cos, hypot, radians, sin
+from types import SimpleNamespace
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.maps import CostMap, OccupancyGrid
+from core.config import runtime_config
+from services.memory.object_extent import object_extent_payload
 
 
 class InspectionPosePlanner:
@@ -37,24 +41,29 @@ class InspectionPosePlanner:
         cost_map: Optional[CostMap] = None,
         existing_poses: Optional[Iterable[Pose]] = None,
         max_candidates: int = 4,
+        target_clearance: Optional[Tuple[Pose, float]] = None,
     ) -> List[Pose]:
         """根据目标中心位姿生成一组巡检位姿。"""
 
         if observer_body_pose is not None and not frame_ids_semantically_equal(observer_body_pose.frame_id, target_pose.frame_id):
             raise ValueError("观察机体位姿与目标必须使用同一地图坐标系")
         if existing_poses and observer_body_pose is None:
-            deduplicated = self._deduplicate(existing_poses, max_candidates=max_candidates)
+            deduplicated = self._deduplicate(
+                (pose for pose in existing_poses if self.outside_target(pose, target_clearance)),
+                max_candidates=max_candidates)
             if deduplicated:
                 return deduplicated
 
         candidates: List[Tuple[float, Pose]] = []
-        if observer_body_pose is not None:
+        if observer_body_pose is not None and self.outside_target(observer_body_pose, target_clearance):
             # 先回到已实际观察目标的机体位姿；其它候选仍由导航验证地面与可达性。
             candidates.append((-1.0, observer_body_pose))
         for radius_m in self._candidate_radii_m:
             for angle_deg in self._candidate_angles_deg:
                 pose = self._build_candidate_pose(target_pose, radius_m=radius_m, angle_deg=angle_deg,
                                                   observer_body_pose=observer_body_pose)
+                if not self.outside_target(pose, target_clearance):
+                    continue
                 traversable, penalty = self._evaluate_pose(
                     pose,
                     occupancy_grid=occupancy_grid,
@@ -70,7 +79,27 @@ class InspectionPosePlanner:
         resolved = [pose for _, pose in candidates[: max(1, max_candidates)]]
         if resolved:
             return self._deduplicate(resolved, max_candidates=max_candidates)
-        return [target_pose]
+        return [] if target_clearance is not None else [target_pose]
+
+    def object_clearance(self, record) -> Tuple[Pose, float]:
+        """用现有物体支持外包与机体外包计算平面分离距离。"""
+        extent = object_extent_payload(SimpleNamespace(pose=record.pose, metadata=record.metadata,
+                                                       attributes=getattr(record, 'attributes', {})))
+        center = record.pose if extent is None else record.pose.model_copy(
+            update={'position': Vector3(**extent['center'])})
+        object_radius = max((hypot(point['x'] - center.position.x, point['y'] - center.position.y)
+                             for point in extent['footprint_xy']), default=0.0) if extent else 0.0
+        body = json.loads(runtime_config()['derived']['robot_geometry_json'])['footprint_xy_m']
+        body_radius = max(hypot(x, y) for x, y in body)
+        return center, object_radius + body_radius
+
+    @staticmethod
+    def outside_target(pose: Pose, clearance: Optional[Tuple[Pose, float]]) -> bool:
+        if clearance is None:
+            return True
+        center, radius = clearance
+        return (frame_ids_semantically_equal(pose.frame_id, center.frame_id)
+                and hypot(pose.position.x - center.position.x, pose.position.y - center.position.y) >= radius)
 
     def _build_candidate_pose(self, target_pose: Pose, *, radius_m: float, angle_deg: float,
                               observer_body_pose: Optional[Pose] = None) -> Pose:

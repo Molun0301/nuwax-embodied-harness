@@ -183,6 +183,8 @@ class TaskRunner:
             elif error is not None:
                 state, message = TaskState.FAILED, str(error)
                 code = error.error_code if isinstance(error, GatewayError) else "internal_error"
+                if isinstance(error, GatewayError) and cap.name in {"find_target", "explore_and_find_target"}:
+                    result = dict(error.details)
             else:
                 state, message, code = TaskState.SUCCEEDED, "任务已完成。", None
             status = replace(current, state=state, message=message, result=result, error_code=code,

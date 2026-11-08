@@ -642,7 +642,6 @@ class InstanceAssociationService:
             blended_pose = observation.pose
             evidence = self._accumulate_evidence(evidence if repeated else evidence.model_copy(update={'voxel_keys': []}), observation)
             evidence = evidence.model_copy(update={'position_weight': 1 / sigma ** 2, 'position_sigma_m': sigma})
-        inspection_poses = self._inspection_pose_planner.plan_for_target(target_pose=blended_pose, observer_body_pose=observation.observer_body_pose, occupancy_grid=occupancy_grid, cost_map=cost_map, existing_poses=current.inspection_poses)
         metadata = self._build_instance_metadata(observation, movability=current.movability, current_metadata=current.metadata)
         metadata['position_observation_count'] = reliable_pose_count + (0 if self._is_fallback_observation(observation) or replaces_reliable else 1)
         if self._is_fallback_observation(observation) and self._instance_pose_is_reliable(current):
@@ -670,15 +669,19 @@ class InstanceAssociationService:
         merged_lifecycle = InstanceLifecycleState.ACTIVE
         if was_pending and self._is_fallback_observation(observation):
             merged_lifecycle = InstanceLifecycleState.UNCERTAIN
-        updates = {'label': label, 'display_name': self._label_display(current, observation, label), 'support_evidence': evidence, 'pose': blended_pose, 'map_name': map_name or current.map_name, 'topo_node_id': observation.topo_node_id or current.topo_node_id, 'semantic_region_id': observation.semantic_region_id or current.semantic_region_id, 'confidence': max(float(current.confidence), float(observation.score)), 'observation_count': updated_count, 'last_seen_ts': current.last_seen_ts if repeated else now, 'artifact_ids': artifact_ids, 'semantic_labels': semantic_labels, 'visual_labels': visual_labels, 'vision_tags': self._merge_strings(current.vision_tags, observation.semantic_labels), 'inspection_poses': inspection_poses, 'dynamic_state': dynamic_state, 'observation_window': observation_window, 'deferred_projection_cache': deferred_cache, 'lifecycle_state': merged_lifecycle, 'metadata': metadata, 'attributes': {**current.attributes, **observation.attributes, **({'observer_body_pose': observation.observer_body_pose.model_dump(mode='json')} if observation.observer_body_pose is not None else {})}, 'supporting_observation_event_ids': supporting_event_ids}
+        updates = {'label': label, 'display_name': self._label_display(current, observation, label), 'support_evidence': evidence, 'pose': blended_pose, 'map_name': map_name or current.map_name, 'topo_node_id': observation.topo_node_id or current.topo_node_id, 'semantic_region_id': observation.semantic_region_id or current.semantic_region_id, 'confidence': max(float(current.confidence), float(observation.score)), 'observation_count': updated_count, 'last_seen_ts': current.last_seen_ts if repeated else now, 'artifact_ids': artifact_ids, 'semantic_labels': semantic_labels, 'visual_labels': visual_labels, 'vision_tags': self._merge_strings(current.vision_tags, observation.semantic_labels), 'dynamic_state': dynamic_state, 'observation_window': observation_window, 'deferred_projection_cache': deferred_cache, 'lifecycle_state': merged_lifecycle, 'metadata': metadata, 'attributes': self._observer_attributes(observation, previous=current.attributes), 'supporting_observation_event_ids': supporting_event_ids}
         isolated_updates = {key: copy.deepcopy(value) for key, value in updates.items()}
-        return current.model_copy(update=isolated_updates)
+        merged = current.model_copy(update=isolated_updates)
+        merged.inspection_poses = copy.deepcopy(self._inspection_pose_planner.plan_for_target(
+            target_pose=merged.pose, observer_body_pose=self._positive_observer_pose(observation),
+            occupancy_grid=occupancy_grid, cost_map=cost_map, existing_poses=current.inspection_poses,
+            target_clearance=self._inspection_pose_planner.object_clearance(merged)))
+        return merged
 
     def _create_instance(self, observation: ProjectedObservation, *, map_name: Optional[str], occupancy_grid, cost_map, now: datetime) -> SemanticInstance:
         id_kind = self._id_kind_from_label(observation.label)
         anchor_id = build_anchor_id(id_kind, timestamp=now)
         instance_id = build_instance_id(id_kind, timestamp=now)
-        inspection_poses = self._inspection_pose_planner.plan_for_target(target_pose=observation.pose, observer_body_pose=observation.observer_body_pose, occupancy_grid=occupancy_grid, cost_map=cost_map)
         movability = self._infer_movability(observation.label, observation.attributes)
         observation_window = self._build_observation_window((), observation, now=now, map_name=map_name)
         deferred_cache = self._build_deferred_projection_cache((), observation, now=now)
@@ -704,7 +707,27 @@ class InstanceAssociationService:
             extent = support_extent(evidence, pose=observation.pose) or extent
             if extent is not None:
                 metadata['object_extent'] = extent
-        return SemanticInstance(support_evidence=evidence, confirmation_state=InstanceConfirmationState.TENTATIVE, instance_id=instance_id, anchor_id=anchor_id, label=observation.label.strip().lower(), display_name=str(observation.attributes.get('display_name_zh') or observation.label), pose=observation.pose, map_name=map_name, topo_node_id=observation.topo_node_id, semantic_region_id=observation.semantic_region_id, instance_type=observation.instance_type, movability=movability, dynamic_state=dynamic_state, observation_window=observation_window, deferred_projection_cache=deferred_cache, lifecycle_state=created_lifecycle, confidence=float(observation.score), observation_count=1, first_seen_ts=now, last_seen_ts=now, artifact_ids=list(observation.source_artifact_ids), semantic_labels=list(observation.semantic_labels), visual_labels=list(observation.visual_labels), vision_tags=list(observation.semantic_labels), inspection_poses=inspection_poses, attributes=dict(observation.attributes), metadata=metadata)
+        instance = SemanticInstance(support_evidence=evidence, confirmation_state=InstanceConfirmationState.TENTATIVE, instance_id=instance_id, anchor_id=anchor_id, label=observation.label.strip().lower(), display_name=str(observation.attributes.get('display_name_zh') or observation.label), pose=observation.pose, map_name=map_name, topo_node_id=observation.topo_node_id, semantic_region_id=observation.semantic_region_id, instance_type=observation.instance_type, movability=movability, dynamic_state=dynamic_state, observation_window=observation_window, deferred_projection_cache=deferred_cache, lifecycle_state=created_lifecycle, confidence=float(observation.score), observation_count=1, first_seen_ts=now, last_seen_ts=now, artifact_ids=list(observation.source_artifact_ids), semantic_labels=list(observation.semantic_labels), visual_labels=list(observation.visual_labels), vision_tags=list(observation.semantic_labels), inspection_poses=[], attributes=self._observer_attributes(observation), metadata=metadata)
+        instance.inspection_poses = copy.deepcopy(self._inspection_pose_planner.plan_for_target(
+            target_pose=instance.pose, observer_body_pose=self._positive_observer_pose(observation),
+            occupancy_grid=occupancy_grid, cost_map=cost_map,
+            target_clearance=self._inspection_pose_planner.object_clearance(instance)))
+        return instance
+
+    @classmethod
+    def _positive_observer_pose(cls, observation):
+        if cls._is_fallback_observation(observation) or not observation.attributes.get('support_point_count'):
+            return None
+        return observation.observer_body_pose
+
+    @classmethod
+    def _observer_attributes(cls, observation, *, previous=None):
+        attributes = {**(previous or {}), **{key: value for key, value in observation.attributes.items()
+                                           if key != 'observer_body_pose'}}
+        observer = cls._positive_observer_pose(observation)
+        if observer is not None:
+            attributes['observer_body_pose'] = observer.model_dump(mode='json')
+        return attributes
 
     @classmethod
     def _id_kind_from_label(cls, label: str) -> str:

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/diagnostics"))
@@ -20,7 +21,10 @@ def doctor():
               "navigation_binary": str(binary), "navigation_binary_exists": binary.is_file(),
               "cargo": shutil.which("cargo"), "local_build_environment": (ROOT / ".nuwax-test-env/env.sh").is_file()}
     try:
-        checks["robot_geometry"] = bool(json.loads(worker_environment()["NUWAX_ROBOT_GEOMETRY_JSON"]))
+        with TemporaryDirectory(prefix="nuwax-dev-tools-doctor-") as data:
+            environment = worker_environment(Path(data))
+            from core.config import read_config
+            checks["robot_geometry"] = bool(json.loads(read_config(environment["NUWAX_INSTALL_HOME"])["derived"]["robot_geometry_json"]))
     except Exception as exc:
         checks["robot_geometry_error"] = str(exc)
     print(json.dumps(checks, ensure_ascii=False, indent=2))

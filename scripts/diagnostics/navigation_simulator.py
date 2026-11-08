@@ -467,8 +467,6 @@ def run_case(simulator: Simulator, args) -> int:
         if sample is None:
             raise ValueError("场景中没有指定用例；可用--request传入起点和目标")
         request = {**sample, "case_id": sample["id"], "scene_id": args.scene, "speed_mps": args.speed}
-    if args.no_local_planning:
-        request["local_planning"] = False
     run = simulator.start(request)
     deadline = time.monotonic() + args.timeout
     while run.thread.is_alive() and time.monotonic() < deadline:
@@ -499,8 +497,6 @@ def main(argv=None):
     parser.add_argument("--case", help="自动执行用例标识，默认该场景第一个用例")
     parser.add_argument("--request", type=Path, help="自动执行请求JSON，可自定义起点/目标/障碍")
     parser.add_argument("--speed", type=float, default=1.0)
-    parser.add_argument("--no-local-planning", action="store_true",
-                        help="仅保留旧版对照请求字段；作者 A 执行链不支持关闭局部规划，会明确拒绝")
     parser.add_argument("--timeout", type=float, default=120, help="自动执行的墙钟上限秒数，超时失败并保留结果")
     args = parser.parse_args(argv)
     try:

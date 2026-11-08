@@ -953,7 +953,6 @@ struct Simulation {
     successful_replan: SuccessfulReplanMemo<u64>,
     rejected_plan: Option<u64>,
     rejected_context: Option<Arc<ActualExecutionContext>>,
-    local_planning: bool,
 }
 impl Simulation {
     fn new(scene: &Scene, request: &Value) -> Result<Self, String> {
@@ -966,11 +965,6 @@ impl Simulation {
             config.scan.planning_horizon = value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
                 .ok_or("局部规划视距必须为正有限数值")?;
         }
-        // 局部规划开关只供实验台逐请求对照，缺省开启。
-        if let Some(value) = request.get("local_planning") {
-            config.local_planning = value.as_bool().ok_or("局部规划开关必须为布尔值")?;
-        }
-        let local_planning = config.local_planning;
         config.controller.speed = speed;
         config.controller.control_frequency = 1. / DT;
         config.controller.simulation = true;
@@ -1039,9 +1033,11 @@ impl Simulation {
             if q.iter().map(|v|v*v).sum::<f64>()<1e-12 {return Err("起点朝向不能为零四元数".into());}
             current.1=q;
         }
-        let mut follower = RouteFollower::new(config).map_err(|e| e.to_string())?;
-        // Explicit original-A static occupancy fixture, not synthetic LiDAR rays.
-        follower.enable_author_static_map_fixture(true);
+        // 离线测试台以场景中的原始实体和地面初始化现行生产碰撞地图。
+        let mut follower = RouteFollower::with_map_initializer(config, Some(|map, obstacles, ground, boundary, forbidden, body| {
+            map.seed_occupied(&obstacles.iter().chain(ground).copied().collect::<Vec<_>>(), body);
+            map.update_surface(&[], &[], boundary, forbidden)
+        })).map_err(|e| e.to_string())?;
         follower
             .update_execution_map(ExecutionMap::Surface(scene.map.clone()))
             .map_err(|e| e.to_string())?;
@@ -1089,7 +1085,6 @@ impl Simulation {
             successful_replan: SuccessfulReplanMemo::default(),
             rejected_plan: None,
             rejected_context: None,
-            local_planning,
         })
     }
     fn plan(&mut self, scene: &Scene) -> Result<(), String> {
@@ -1168,9 +1163,8 @@ impl Simulation {
             }
             PlannerStep::ReplanRequired(reason) => {
                 self.rejected_plan=Some(self.plans);
-                // Bind the original actual APPLIED value, not begin_braking's
-                // internally cleared command, to this synchronous step result.
-                self.rejected_context=self.follower.take_step_execution_context(as_twist(self.applied));
+                // 按当拍实际采用的速度刷新执行上下文，随后再进入制动。
+                self.rejected_context=self.follower.refresh_execution_context(as_twist(self.applied));
                 self.command = [0.; 3];
                 self.message = reason;
                 self.braking_for_replan = true;
@@ -1263,7 +1257,7 @@ impl Simulation {
     fn state(&mut self, scene: &Scene) -> Value {
         let local:Vec<_>=self.follower.local_path().map_or_else(Vec::new,|path|path.poses.iter()
             .map(|pose|[pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]).collect());
-        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_preferred_omnidirectional","local_planning":self.local_planning,"message":self.message})
+        json!({"status":self.status,"sim_time_sec":self.time,"pose":pose4(self.current),"orientation":self.current.1,"goal":pose4(self.goal),"goal_options":{"position_tolerance_m":self.options.position_tolerance_m,"yaw_tolerance_rad":self.options.yaw_tolerance_rad,"requires_orientation":self.options.requires_orientation()},"stopping_criteria":{"linear_speed_below_mps":STOP_LINEAR_MPS,"angular_speed_below_rps":STOP_ANGULAR_RPS,"comparison":"strictly_less"},"command":self.command,"velocity":self.applied,"global_path":self.path.iter().map(|p|p.0).collect::<Vec<_>>(),"path_revision":self.plans,"path_history":self.history,"local_path":local,"frames":std::mem::take(&mut self.pending_frames),"obstacles":scene.obstacles,"world_model":self.pose_mode,"terrain_response":scene.metadata["terrain_response"],"motion_failure":self.motion_failure,"metrics":{"speed_mps":self.applied[0].hypot(self.applied[1]),"configured_speed_mps":self.speed,"distance_remaining_m":distance(self.current,self.goal),"global_plans":self.plans,"local_plans":self.follower.local_plans(),"last_plan_ms":self.last_plan_ms,"last_control_ms":self.last_control_ms,"max_rss_mb":rss_mb(),"motion_validation_failures":self.motion_failures,"reverse_travel_m":self.reverse_travel_m,"lateral_travel_m":self.lateral_travel_m,"max_reverse_command_mps":self.max_reverse_command_mps,"max_lateral_command_mps":self.max_lateral_command_mps},"motion_policy":"forward_preferred_omnidirectional","message":self.message})
     }
 }
 fn synthetic(blocked: bool) -> Vec<(f32, f32, f32)> {

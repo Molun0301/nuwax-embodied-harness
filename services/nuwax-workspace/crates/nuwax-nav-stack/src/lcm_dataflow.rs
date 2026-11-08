@@ -9786,6 +9786,7 @@ mod tests {
         let mut robot_pose = PoseStamped::from_pose(
             Pose3 {
                 position: Point3::new(0.5, 0.5, 0.0),
+                orientation: nuwax_nav_types_messages::Quaternion::IDENTITY,
                 ..Pose3::default()
             },
             NavFrameId::Map,

@@ -90,8 +90,6 @@ nalgebra = { version = "0.33", features = ["serde-serialize"] }
 
 [dev-dependencies]
 nuwax-config = { path = "../../nuwax-workspace/crates/nuwax-config", features = ["test-support"] }
-# Tests transfer real captured objects through Receiver and Store before Reader build.
-nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["surface-source-qualification"] }
 
 # Phase 4 `[features]`(2026-07-07 codex rework lane-2):
 #   - `real-lcm-bridge`: runtime binary 的二次断言开关,

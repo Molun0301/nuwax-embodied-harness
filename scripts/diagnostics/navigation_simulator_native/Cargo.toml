@@ -9,7 +9,7 @@ nuwax-nav-pct-native = { path = "../../../services/nuwax-workspace/crates/nuwax-
 nuwax-core = { path = "../../../services/nuwax-workspace/crates/nuwax-core" }
 serde_json = "1"
 libc = "0.2"
-nuwax-nav-stack = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-stack", features = ["mls", "surface-source-qualification"] }
+nuwax-nav-stack = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-stack", features = ["mls"] }
 nuwax-nav-runtime = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-runtime" }
 nuwax-nav-mls-planner = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-mls-planner" }
 nuwax-nav-types-messages = { path = "../../../services/nuwax-workspace/crates/nuwax-nav-types-messages" }

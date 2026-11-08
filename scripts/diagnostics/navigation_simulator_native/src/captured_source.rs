@@ -83,9 +83,18 @@ impl CapturedSource {
         if fetched != expected || fetch_calls != expected.len() {
             return Err("missing-object fetch mismatch".into());
         }
-        let mut cache = SurfaceMapCache::configured_with_admitted_fine_source(config, receiver);
-        let map = cache.build(&message).map_err(|e| e.to_string())?;
-        let again = cache.build(&message).map_err(|e| e.to_string())?;
+        // 归档缺块已由原接收器准入；将完整对象交给现行生产缓存构建。
+        let mut complete = message.clone();
+        let included = &mut complete.fine.as_mut().unwrap().included;
+        for reference in &root.blocks {
+            if !included.contains_key(&reference.object) {
+                included.insert(reference.object, source.read_object(reference.object, MAX_BLOCK_BYTES)?);
+            }
+        }
+        drop(receiver);
+        let mut cache = SurfaceMapCache::configured(config);
+        let map = cache.build(&complete).map_err(|e| e.to_string())?;
+        let again = cache.build(&complete).map_err(|e| e.to_string())?;
         if !Arc::ptr_eq(&map, &again) {
             return Err("same publication lost the original Reader Arc".into());
         }

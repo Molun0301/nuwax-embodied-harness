@@ -356,9 +356,16 @@ fn pct_config(
         ..Config::default()
     };
     if let Some(body) = map.body_envelope() {
-        config.footprint = body.footprint_xy_m.clone();
-        config.footprint_radius = body
-            .footprint_xy_m
+        // 全局与SCAN执行端共用同一长宽矩形，凸包的窄前角不能成为不可执行的通路。
+        let bounds = body.footprint_xy_m.iter().fold(
+            [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
+                for i in 0..2 { bounds[0][i] = bounds[0][i].min(point[i]);
+                    bounds[1][i] = bounds[1][i].max(point[i]); }
+                bounds
+            });
+        config.footprint = vec![bounds[0], [bounds[1][0], bounds[0][1]],
+            bounds[1], [bounds[0][0], bounds[1][1]]];
+        config.footprint_radius = config.footprint
             .iter()
             .map(|p| p[0].hypot(p[1]))
             .fold(0., f64::max);
@@ -489,6 +496,28 @@ mod tests {
         SurfaceSnapshot::from_points(&points, base.config().clone(), quantum)
             .unwrap()
             .with_observations(Some(Arc::new(observations)))
+    }
+
+    #[test]
+    fn global_route_does_not_fit_a_narrow_nose_where_scan_rectangle_cannot_fit() {
+        let (_, base) = crate::native_test_helpers::fixture();
+        let mut body = base.body_envelope().unwrap().clone();
+        body.footprint_xy_m = vec![[-0.4,-0.2],[0.1,-0.2],[0.4,-0.05],
+            [0.4,0.05],[0.1,0.2],[-0.4,0.2]];
+        body.max_step_up_m=0.0; body.max_step_down_m=0.0;
+        let map = base.with_body_envelope(body).unwrap();
+        let config = pct_config(&map, 0.4, &[], 0.05);
+        let mut cells=Vec::new(); let mut bands=Vec::new();
+        for x in -12..45 { for y in -12..13 {
+            cells.push(Cell { x,y,ground:0.0,ceiling:f64::INFINITY });
+            let half = if x>=26 {0.15} else {0.25};
+            if ((f64::from(y)+0.5)*0.05).abs()>=half {
+                bands.push(Band { x,y,low:0.0,high:1.0 });
+            }
+        }}
+        let mut planner=nuwax_nav_pct_native::Planner::from_cells(config,&cells,&bands).unwrap();
+        assert!(planner.plan([0.025,0.025,0.4],[1.025,0.025,0.4]).is_err(),
+            "前端凸包虽能伸入窄口，执行端的完整矩形放不下，不能交付完整路线");
     }
 
     #[test]

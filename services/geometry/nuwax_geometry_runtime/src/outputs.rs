@@ -44,6 +44,10 @@ impl Outputs {
     pub fn start(session: SessionHandle) -> Result<Self, String> {
         let url = nuwax_config::transport()?.lcm_url.clone();
         let transport = LcmTransport::new_real(&url).map_err(|e| e.to_string())?;
+        let follow = nuwax_config::person_follow()?.autostart;
+        Ok(Self::start_with_transport(session, transport, follow))
+    }
+    fn start_with_transport(session: SessionHandle, transport: LcmTransport, follow: bool) -> Self {
         let (stop, mut stopped) = oneshot::channel();
         let recent_transport = transport.clone();
         let recent_session = session.clone();
@@ -71,27 +75,35 @@ impl Outputs {
                 }
             }
         });
-        let follow = nuwax_config::person_follow()?.autostart;
+        let pose_session = session.clone();
+        let pose_transport = transport.clone();
+        let pose_task = tokio::spawn(async move {
+            let mut poses = pose_session.pose_rx();
+            while poses.changed().await.is_ok() {
+                let id = pose_session.route_rx().borrow().as_ref().map_or(0, |route| route.id);
+                let tree = pose_session.frame_tree();
+                let message = schema::TfMessage { transforms: tree.transforms.iter().map(|edge| {
+                    let p = edge.translation.clone().unwrap_or_default();
+                    let q = edge.rotation.clone().unwrap_or_default();
+                    schema::TransformStamped { header: header(edge.timestamp_ns, &edge.parent_frame, 0),
+                        child_frame_id: edge.child_frame.clone(), transform: schema::Transform {
+                            translation: [p.x, p.y, p.z], rotation_xyzw: [q.x, q.y, q.z, q.w] } }
+                }).collect() };
+                let result = match schema::encode_tf_message_body(&message) {
+                    Ok(bytes) => publish(&pose_transport, "/tf", "tf2_msgs.TFMessage", bytes).await,
+                    Err(error) => Err(error.to_string()),
+                };
+                if let Err(reason) = result { pose_session.report_output_error(id, reason); }
+            }
+        });
         let task = tokio::spawn(async move {
             let routes = session.route_rx();
-            let mut poses = session.pose_rx();
             let mut maps = session.map_rx();
             let mut output = MapOutput::default();
             let mut follow_sent: Option<(u64, u64)> = None;
             loop {
                 let (id, result) = tokio::select! {
                     _=&mut stopped=>break,
-                    changed=poses.changed()=>{
-                        if changed.is_err(){break;}
-                        let id = routes.borrow().as_ref().map_or(0, |route| route.id);
-                        let tree=session.frame_tree();
-                        let message=schema::TfMessage{transforms:tree.transforms.iter().map(|edge|{
-                            let p=edge.translation.clone().unwrap_or_default();let q=edge.rotation.clone().unwrap_or_default();
-                            schema::TransformStamped{header:header(edge.timestamp_ns,&edge.parent_frame,0),child_frame_id:edge.child_frame.clone(),transform:schema::Transform{translation:[p.x,p.y,p.z],rotation_xyzw:[q.x,q.y,q.z,q.w]}}
-                        }).collect()};
-                        let result = match schema::encode_tf_message_body(&message){Ok(bytes)=>publish(&transport,"/tf","tf2_msgs.TFMessage",bytes).await,Err(e)=>Err(e.to_string())};
-                        (id, result)
-                    },
                     changed=maps.changed()=>{
                         if changed.is_err(){break;}
                         let id = routes.borrow().as_ref().map_or(0, |route| route.id);
@@ -115,10 +127,12 @@ impl Outputs {
                     session.report_output_error(id, reason);
                 }
             }
+            pose_task.abort();
+            let _ = pose_task.await;
             recent_task.abort();
             let _ = recent_task.await;
         });
-        Ok(Self { stop, task })
+        Self { stop, task }
     }
     pub async fn shutdown(self) {
         let _ = self.stop.send(());
@@ -340,3 +354,54 @@ async fn publish(
 #[cfg(test)]
 #[path = "outputs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod pose_output_tests {
+    use super::*;
+    use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
+
+    struct BlockMap {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        tf: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    }
+    #[async_trait::async_trait]
+    impl LcmBackend for BlockMap {
+        async fn publish(&self, frame: nuwax_protocol::RawLcmFrame) -> TransportResult<()> {
+            if frame.topic.channel() == "/map/occupancy" {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if frame.topic.channel() == "/tf" { self.tf.send(frame.payload).unwrap(); }
+            Ok(())
+        }
+        async fn subscribe(&self, _: LcmTopic, _: Option<LcmMessageType>) -> LcmFrameStream {
+            Box::pin(futures::stream::empty())
+        }
+        fn name(&self) -> &str { "地图阻塞时位姿仍发布" }
+    }
+    #[tokio::test]
+    async fn blocked_map_publication_does_not_delay_current_pose_tf() {
+        let mapper = crate::mapper::Mapper::start(812, Default::default()).unwrap();
+        mapper.feed(crate::mapper::tests::room_frame(812, 1_000_000_000));
+        mapper.snapshot().await.unwrap();
+        let map = mapper.map_rx().borrow().clone();
+        let (session, poses, maps) = crate::session::test_output_session(mapper.clone());
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(BlockMap { entered: Default::default(), release: Default::default(), tf: sender });
+        let output = Outputs::start_with_transport(session, LcmTransport::new(backend.clone()), false);
+        maps.send_replace(map);
+        tokio::time::timeout(std::time::Duration::from_secs(2), backend.entered.notified()).await.unwrap();
+        poses.send_replace(Some(crate::mapper::pose_from_isometry(
+            nalgebra::Isometry3::identity(), "map", 2_000_000_000)));
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv()).await
+            .expect("地图尚未解除阻塞时必须收到当前位姿TF").unwrap();
+        let mut packet = schema::TF_MESSAGE_FINGERPRINT.to_vec(); packet.extend(bytes);
+        let tf = schema::decode_tf_message(&packet).unwrap();
+        assert_eq!(tf.transforms.len(), 2);
+        assert!(tf.transforms.iter().all(|edge| edge.header.stamp_sec == 2));
+        backend.release.notify_one();
+        output.shutdown().await;
+        mapper.shutdown().await.unwrap();
+    }
+}

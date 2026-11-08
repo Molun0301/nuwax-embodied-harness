@@ -136,7 +136,7 @@ impl MissionProgress {
         }
         Ok(())
     }
-    /// 按源时间累加相邻位姿的距离，重复和倒序样本不增加行程。
+    /// 离上一个计入点超过0.1米才累加三维距离，重复和倒序样本不增加行程。
     pub fn observe(
         &mut self,
         pose: &MissionPose,
@@ -152,6 +152,10 @@ impl MissionProgress {
                 .map(|(a, b)| (a - b).powi(2))
                 .sum::<f64>()
                 .sqrt();
+            if distance <= 0.1 {
+                self.last_sample = Some((source_ns, previous));
+                return;
+            }
             self.travelled_m += distance;
         }
         self.last_sample = Some((source_ns, pose.position));
@@ -179,6 +183,24 @@ mod tests {
         assert!(!policy.can_visit(2.0, 2.0, f64::INFINITY));
         assert!(policy.should_return(5.0, 4.0).unwrap());
         assert!(policy.should_return(5.0, f64::INFINITY).is_err());
+    }
+    #[test]
+    fn distance_counts_from_last_counted_point_only_after_ten_centimeters() {
+        let mut state = MissionProgress::new(pose(0.0, 0.0)).unwrap();
+        state.observe(&pose(0.0, 0.0), 1);
+        for (stamp, x) in [(2, 0.04), (3, -0.04), (4, 0.1)] {
+            state.observe(&pose(x, 0.0), stamp);
+        }
+        assert_eq!(state.travelled_m, 0.0, "抖动和恰好0.1米都不累计");
+        state.observe(&pose(0.08, 0.08), 5);
+        let diagonal = (0.08_f64.powi(2) * 2.0).sqrt();
+        assert_eq!(state.travelled_m, diagonal, "三维距离跨过阈值即计入整段");
+        state.observe(&pose(0.12, 0.08), 6);
+        assert_eq!(state.travelled_m, diagonal, "计入点之后的小段保留到下次跨阈值");
+        state.observe(&pose(5.0, 5.0), 5);
+        assert_eq!(state.travelled_m, diagonal, "小幅样本之后的倒序数据仍不累计");
+        state.observe(&pose(0.20, 0.08), 7);
+        assert!((state.travelled_m - diagonal - 0.12).abs() < 1e-12);
     }
     #[test]
     fn adjacent_positions_count_height_and_jumps_but_not_replayed_samples() {

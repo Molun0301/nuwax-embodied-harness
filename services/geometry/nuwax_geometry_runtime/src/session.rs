@@ -1213,3 +1213,17 @@ pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
     let (faults, _) = mpsc::unbounded_channel();
     SessionHandle { commands, state, route, pose, maps, lio, faults }
 }
+
+#[cfg(test)]
+pub(crate) fn test_output_session(mapper: Arc<Mapper>) -> (SessionHandle,
+    watch::Sender<Option<Pose>>, watch::Sender<Option<MapUpdate>>) {
+    let mut session = test_block_session(mapper);
+    let (_, state) = watch::channel(GeometryState { info: Some(RuntimeInfo {
+        map_frame_id: "map".into(), odom_frame_id: "odom".into(),
+        base_frame_id: "base_link".into(), ..Default::default()
+    }), ..Default::default() });
+    let (poses, pose) = watch::channel(None);
+    let (maps, map) = watch::channel(None);
+    session.state = state; session.pose = pose; session.maps = map;
+    (session, poses, maps)
+}

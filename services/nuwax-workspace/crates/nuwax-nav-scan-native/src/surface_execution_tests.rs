@@ -70,13 +70,15 @@ fn registered_surface_overlap_escapes_across_updates_and_execution_retirement() 
 
 #[test]
 fn registered_surface_failed_initialization_does_not_poison_later_shallow_escape() {
-    let route = [[0.095, 0.025, 0.35], [0.6, 0.025, 0.35]];
+    let route = [[0.195, 0.025, 0.35], [0.6, 0.025, 0.35]];
     let contact = [[-0.025, 0.025, 0.35]];
     let mut req = shallow_surface_request(&route, &contact);
+    req.config.body_length = 0.4;
+    req.config.body_width = 0.4;
     let mut planner = registered_fixture(&req);
-    req.start_position[0] = 0.06;
+    req.start_position[0] = 0.04;
     let failure = planner.step(&req).unwrap_err();
-    assert!(failure.contains("half a voxel"));
+    assert!(failure.contains("localization and mapping allowance"));
     assert!(failure.contains("BODY_OVERLAP_RECOVERY_FAILED:"));
     planner.reset_execution();
     req.start_position = route[0];
@@ -160,11 +162,15 @@ fn registered_surface_escape_rejects_new_band_deep_overlap_and_inward_motion() {
     req.odometry_timestamp_ns += 100_000_000;
     assert!(planner.step(&req).unwrap_err().contains("no monotone"));
     req.obstacles = &contact;
-    req.start_position[0] = 0.06;
+    req.config.body_length = 0.4;
+    req.config.body_width = 0.4;
+    req.start_position[0] = 0.04;
     assert!(registered_fixture(&req)
         .step(&req)
         .unwrap_err()
-        .contains("half a voxel"));
+        .contains("localization and mapping allowance"));
+    req.config.body_length = 0.2;
+    req.config.body_width = 0.2;
     req.start_position = route[0];
     req.start_velocity = Some([-0.02, 0., 0.]);
     assert!(registered_fixture(&req)
@@ -206,6 +212,136 @@ fn registered_surface_escape_keeps_time_distance_and_geometry_generation_limits(
         .step(&req)
         .unwrap_err()
         .contains("registered source frame"));
+}
+
+#[test]
+fn registered_surface_localization_scale_overlap_exits_with_monotone_measured_depth() {
+    for penetration in [0.026, 0.04, 0.06, 0.08, 0.10] {
+        let route = [[0.3 - penetration, 0.025, 0.35], [1., 0.025, 0.35]];
+        let contact = [[-0.025, 0.025, 0.35]];
+        let mut req = shallow_surface_request(&route, &contact);
+        req.config.body_length = 0.6;
+        req.config.body_width = 0.6;
+        let mut planner = registered_fixture(&req);
+        let mut clear = false;
+        for tick in 0..100 {
+            req.odometry_timestamp_ns = tick * 50_000_000;
+            // 新目标不能重置初始接触和已发运动预算。
+            planner.reset_execution();
+            let before = req.start_position[0];
+            let out = planner.step(&req).expect("定位误差量级的接触应逐拍低速退出");
+            assert!(out.command_forward > 0. && out.command_forward <= 0.04);
+            assert_eq!(out.command_lateral, 0.);
+            assert_eq!(out.command_yaw_rate, 0.);
+            for sample in &out.samples {
+                // 独立矩形边界：原格右边为0，左机身边界持续右移。
+                assert!(sample.position[0] >= before);
+            }
+            let actual = &out.samples[1];
+            req.start_position = actual.position;
+            req.start_velocity = Some(actual.velocity);
+            assert!(req.start_position[0] > before);
+            if req.start_position[0] > 0.3 {
+                clear = true;
+                break;
+            }
+        }
+        assert!(clear, "穿透{penetration}米应完全退出初始占据");
+    }
+}
+
+#[test]
+fn registered_surface_measured_exit_progress_outlives_initial_escape_budget() {
+    let route = [[0.2, 0.025, 0.35], [1., 0.025, 0.35]];
+    let contact = [[-0.025, 0.025, 0.35]];
+    let mut req = shallow_surface_request(&route, &contact);
+    req.config.body_length = 0.6;
+    req.config.body_width = 0.6;
+    req.config.sample_dt = 0.05;
+    req.config.max_acceleration = 0.5;
+    let mut planner = registered_fixture(&req);
+    for tick in 0..200 {
+        // 每次实际执行整拍及其制动，再提供新的静止实测；行程和进展均来自已证样本。
+        req.odometry_timestamp_ns = tick * 100_000_000;
+        planner.reset_execution();
+        let before = req.start_position[0];
+        let out = planner.step(&req).expect("持续实测退出不能耗尽最初的总时间或总位移预算");
+        assert!(out.command_forward > 0. && out.command_forward <= 0.04);
+        assert_eq!(out.command_lateral, 0.);
+        assert_eq!(out.command_yaw_rate, 0.);
+        let actual = out.samples.last().unwrap();
+        req.start_position = actual.position;
+        req.start_velocity = Some(actual.velocity);
+        assert!(req.start_position[0] > before);
+        assert_eq!(actual.velocity, [0.; 3]);
+        if req.start_position[0] > 0.3 {
+            assert!(req.odometry_timestamp_ns > 5_050_000_000);
+            return;
+        }
+    }
+    panic!("实测穿透持续减小时应最终完全退出");
+}
+
+#[test]
+fn registered_surface_deeper_escape_stops_before_new_occupied_wall() {
+    let route = [[0.22, 0.025, 0.35], [1., 0.025, 0.35]];
+    let mut obstacles = vec![[-0.025, 0.025, 0.35]];
+    for row in -6..=6 {
+        obstacles.push([0.575, (row as f64 + 0.5) * 0.05, 0.35]);
+    }
+    let mut req = shallow_surface_request(&route, &obstacles);
+    req.config.body_length = 0.6;
+    req.config.body_width = 0.6;
+    let mut planner = registered_fixture(&req);
+    for tick in 0..100 {
+        req.odometry_timestamp_ns = tick * 50_000_000;
+        match planner.step(&req) {
+            Ok(out) => {
+                for sample in &out.samples {
+                    // 新墙左面为0.55米，整拍及制动样本均不能触墙。
+                    assert!(sample.position[0] + 0.3 < 0.55);
+                }
+                req.start_position = out.samples[1].position;
+                req.start_velocity = Some(out.samples[1].velocity);
+            }
+            Err(error) => {
+                assert!(error.contains("BODY_OVERLAP_RECOVERY_FAILED:"));
+                assert!(error.contains("no monotone"));
+                assert!(req.start_position[0] < 0.3, "退出通道受阻不能假报已脱困");
+                return;
+            }
+        }
+    }
+    panic!("退出方向被新占据截断时必须报原脱困失败");
+}
+
+#[test]
+fn registered_surface_overlap_above_three_voxels_is_rejected() {
+    let route = [[0.149, 0.025, 0.35], [1., 0.025, 0.35]];
+    let contact = [[-0.025, 0.025, 0.35]];
+    let mut req = shallow_surface_request(&route, &contact);
+    req.config.body_length = 0.6;
+    req.config.body_width = 0.6;
+    let error = registered_fixture(&req).step(&req).unwrap_err();
+    assert!(error.contains("BODY_OVERLAP_RECOVERY_FAILED:"));
+    assert!(error.contains("penetration exceeds localization and mapping allowance"));
+}
+
+#[test]
+fn registered_surface_deeper_escape_rejects_increased_measured_penetration() {
+    let route = [[0.22, 0.025, 0.35], [1., 0.025, 0.35]];
+    let contact = [[-0.025, 0.025, 0.35]];
+    let mut req = shallow_surface_request(&route, &contact);
+    req.config.body_length = 0.6;
+    req.config.body_width = 0.6;
+    let mut planner = registered_fixture(&req);
+    assert!(planner.step(&req).unwrap().command_forward > 0.);
+    req.odometry_timestamp_ns += 50_000_000;
+    req.start_position[0] -= 0.001;
+    let error = planner.step(&req).unwrap_err();
+    assert!(error.contains("measured escape penetration increased"));
+    planner.reset_execution();
+    assert_eq!(planner.step(&req).unwrap_err(), error);
 }
 
 #[test]

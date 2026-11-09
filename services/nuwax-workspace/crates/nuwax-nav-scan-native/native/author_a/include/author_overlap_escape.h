@@ -4,7 +4,7 @@
 
 namespace scan_planner {
 
-// 一次浅重叠事件跨任务退休保留；只允许离开初始实体的同一侧，不能清图或穿墙。
+// 一次重叠事件跨任务退休保留；只允许离开初始实体的同一侧，不能清图或穿墙。
 class AuthorOverlapEscape {
   struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; };
   bool active_=false,latched_=false;
@@ -12,6 +12,10 @@ class AuthorOverlapEscape {
   unsigned ticks_=0;
   double traveled_=0.;
   double admitted_=0.;
+  double distance_limit_=0.,time_limit_=0.;
+  static constexpr double escape_speed_=.04;
+  // 三格误差带覆盖定位偏差与占据量化；只用于恢复准入，不改变碰撞外包。
+  static double penetrationLimit(const ScanConfig& c) {return 3.*c.resolution;}
   std::string failure_;
   Eigen::Vector3d origin_=Eigen::Vector3d::Zero(),last_=Eigen::Vector3d::Zero();
   std::vector<Contact> contacts_;
@@ -41,7 +45,7 @@ class AuthorOverlapEscape {
     const double turn=std::max(std::abs(state.angular),std::abs(next_w));
     const double speed=std::max(state.linear.norm(),next.norm());
     path_bound+=(speed+radius(c)*turn)*c.sample_dt;
-    if(admitted_+path_bound>c.resolution)return false;
+    if(admitted_+path_bound>distance_limit_)return false;
     for(const auto& contact:contacts_) {
       const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
       const Eigen::Vector2d local=body(voxel-state.position.head<2>(),state.yaw)
@@ -65,7 +69,7 @@ class AuthorOverlapEscape {
     }
     if(!sweepFree(map,state,mean,mean_w,radius(c),0.,c.sample_dt,deadline,exhausted,&initial_))return false;
     auto end=motionAt(state,mean,mean_w,c.sample_dt);end.linear=next;end.angular=next_w;
-    if(traveled_+(end.position-last_).norm()>c.resolution)return false;
+    if(traveled_+(end.position-last_).norm()>distance_limit_)return false;
     state=end;return true;
   }
 
@@ -119,36 +123,47 @@ class AuthorOverlapEscape {
           const Contact candidate{cell,axis,0.};const double penetration=depth(candidate,c,p,yaw);
           if(penetration<selected.depth)selected={cell,axis,penetration};
         }
-        if(!(selected.depth>=0.&&selected.depth<=c.resolution/2.))
-          throw std::runtime_error("Current body pose is occupied; escape penetration exceeds half a voxel");
+        if(!(selected.depth>=0.&&selected.depth<=penetrationLimit(c)))
+          throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
         contacts_.push_back(selected);initial_.insert(cell);
       }
+      // 深重叠需要超过一格的退出行程；按初始最大穿透的两倍计入斜向退出，
+      // 时间由同一行程和既有低速推出。浅接触保留原一格、两秒未确认预算。
+      distance_limit_=c.resolution;
+      for(const auto& contact:contacts_)distance_limit_=std::max(distance_limit_,2.*contact.depth);
+      time_limit_=std::max(2.,distance_limit_/escape_speed_+c.sample_dt);
       active_=true;
     }
     if(stamp<last_stamp_){active_=false;throw std::runtime_error("Current body pose is occupied; escape source clock regressed");}
-    if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
-    if(stamp-began_>2'000'000'000LL||ticks_>static_cast<unsigned>(std::ceil(2./c.sample_dt))
-        ||traveled_>=c.resolution||admitted_>=c.resolution) {
-      active_=false;
-      throw std::runtime_error("Current body pose is occupied; escape time or distance budget exhausted");
-    }
+    bool progress_observed=false;
     for(const auto& contact:contacts_) {
       const double now=depth(contact,c,p,yaw);
       if(now>contact.depth+1e-10) {
         active_=false;
         throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
       }
+      if(now<contact.depth)progress_observed=true;
+    }
+    // 只有新的实测采样证实退出进展，才结清未确认运动预算；目标切换不结清。
+    if(stamp>last_stamp_&&progress_observed) {
+      began_=stamp;ticks_=0;traveled_=admitted_=0.;
+    }
+    if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
+    if(stamp-began_>time_limit_*1e9||ticks_>static_cast<unsigned>(std::ceil(time_limit_/c.sample_dt))
+        ||traveled_>=distance_limit_||admitted_>=distance_limit_) {
+      active_=false;
+      throw std::runtime_error("Current body pose is occupied; escape time or distance budget exhausted");
     }
     const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
     std::vector<Eigen::Vector2d> requests;Eigen::Vector2d sum=Eigen::Vector2d::Zero();
     for(const auto& contact:contacts_)sum+=contact.axis;
-    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*.04,yaw));
-    for(const auto& contact:contacts_)requests.push_back(body(contact.axis*.04,yaw));
+    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed_,yaw));
+    for(const auto& contact:contacts_)requests.push_back(body(contact.axis*escape_speed_,yaw));
     // 机体系精确轴候选避免坐标往返舍入使严格单调条件失去本可执行的零切向量。
     for(int axis=0;axis<2;++axis)for(double sign:{-1.,1.})
-      requests.emplace_back(axis==0?sign*.04:0.,axis==1?sign*.04:0.);
-    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*.04,yaw));
+      requests.emplace_back(axis==0?sign*escape_speed_:0.,axis==1?sign*escape_speed_:0.);
+    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed_,yaw));
     bool exhausted=false;
     for(const auto& requested:requests) {
       if(Clock::now()>=deadline)break;
@@ -182,7 +197,7 @@ class AuthorOverlapEscape {
           out.acceleration[j]=(out.velocity[j]-output.samples[i-1].velocity[j])/c.sample_dt;
       }
       output.motion_boundary_sources[0]=0;output.motion_boundary_sources[1]=2;output.motion_boundary_sources[2]=0;
-      // 每次发出的整拍最大运动量都计费，重复来源时间不能反复续发绕过总位移上限。
+      // 每次发出的整拍最大运动量都记入未确认窗口；重复来源时间不能绕过位移上限。
       admitted_+=issued_bound;
       for(auto& contact:contacts_)contact.depth=depth(contact,c,p,yaw);
       return;

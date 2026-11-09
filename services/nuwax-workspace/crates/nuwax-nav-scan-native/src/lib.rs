@@ -681,9 +681,11 @@ mod tests {
         let route = [[0.0, 0.0, 0.35], [4.0, 0.0, 0.35]];
         let obstacles = [[0.0, 0.55, 0.35]];
         let mut req = request(&route, &obstacles);
-        assert!(plan(&req).is_ok());
+        // 原地朝向入口直接核对机身碰撞，避免把允许的平移脱困误当成无碰撞。
+        req.goal_yaw = Some(0.);
+        assert!(fixture_planner().step(&req).is_ok());
         req.config.body_width = 1.4;
-        assert!(plan(&req).is_err());
+        assert!(fixture_planner().step(&req).is_err());
     }
     #[test]
     fn terminal_rotation_uses_real_body_sweep() {
@@ -949,9 +951,11 @@ mod tests {
         assert!(planner.step(&req).is_ok());
         let table = [[0.05, 0., 0.35]];
         req.obstacles = &table;
+        // 用原地朝向入口核对当前占据；平移脱困现在允许离开这类误差带内接触。
+        req.goal_yaw = Some(0.);
         req.odometry_timestamp_ns += 100_000_000;
         let failure = planner.step(&req).expect_err("当前已知深度实体必须阻止原雷达未知区域内的动作");
-        assert!(failure.contains("BODY_OVERLAP_RECOVERY_FAILED"), "{failure}");
+        assert!(failure.contains("Current body pose is occupied"), "{failure}");
         planner.reset_execution();
         req.obstacles = &[];
         req.ground = &table;

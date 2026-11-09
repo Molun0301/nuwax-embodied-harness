@@ -236,9 +236,13 @@ fn stop_retires_slow_plan_without_waiting_or_replaying_result() {
 fn overlap_recovery_failure_keeps_native_reason_in_execution_status() {
     let mut f = ready_follower();
     let source = f.map.as_ref().unwrap().clone();
+    let mut body = source.body_envelope().unwrap().clone();
+    let half = 4. * f.native_config(&source).resolution;
+    body.footprint_xy_m = vec![[-half, -half], [half, -half], [half, half], [-half, half]];
+    let source = Arc::new(source.as_ref().clone().with_body_envelope(body).unwrap());
     let config = f.native_config(&source);
     let mut owner = nuwax_nav_scan_native::MapOwner::new(&config).unwrap();
-    // 实体位于机身中心，穿透超过原半体素脱困边界。
+    // 实体位于机身中心，穿透超过定位与建图允许的三格误差带。
     owner.seed_occupied(&[[0.5, 1., 0.5]], [0.5, 1., 0.5]);
     owner.update_surface(&[], &[], &[], &[]).unwrap();
     f.epoch += 1;
@@ -251,7 +255,7 @@ fn overlap_recovery_failure_keeps_native_reason_in_execution_status() {
     let reason = f.execution_wait_reason().unwrap();
     assert!(reason.contains("机身与障碍重叠、脱困失败"), "{reason}");
     assert!(reason.contains("BODY_OVERLAP_RECOVERY_FAILED"), "{reason}");
-    assert!(reason.contains("escape penetration exceeds half a voxel"), "{reason}");
+    assert!(reason.contains("escape penetration exceeds localization and mapping allowance"), "{reason}");
 }
 
 #[test]

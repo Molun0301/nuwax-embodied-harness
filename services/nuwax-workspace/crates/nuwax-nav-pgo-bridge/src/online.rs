@@ -2848,9 +2848,22 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_exit_before_typed_ready_rolls_back_after_subscription_ack() {
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "nuwax-pgo-exit-before-ready-{}-{}",
+            std::process::id(),
+            timestamp_now_ns()
+        ));
+        std::fs::create_dir(&fixture_dir).unwrap();
+        std::fs::copy("/bin/true", fixture_dir.join("pgo")).unwrap();
+        std::fs::copy(
+            crate::discovery_group_guardian_executable(),
+            fixture_dir.join("nuwax-group-guardian"),
+        )
+        .unwrap();
         let mut config = test_config(20_002, 1);
-        config.executable = PathBuf::from("/bin/true");
+        config.executable = fixture_dir.join("pgo");
         let error = OnlinePgoOwner::start(config).await.unwrap_err();
+        std::fs::remove_dir_all(fixture_dir).unwrap();
         assert!(matches!(
             error,
             OnlinePgoStartError::Supervision { source, .. }

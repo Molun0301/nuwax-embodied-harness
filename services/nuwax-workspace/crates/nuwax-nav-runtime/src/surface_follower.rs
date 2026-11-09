@@ -393,6 +393,7 @@ impl SurfaceFollower {
             config: self.native_config(source),
             boundary: self.boundary.clone(),
             pose: Self::position(pose),
+            yaw: pose.pose.orientation.yaw(),
             frame: self.registered_frame.clone(),
             active: self.active.clone(),
             active_snapshot: self.active_snapshot.clone(),

@@ -32,7 +32,7 @@ pub struct NativeMap {
     pub resolution: f64,
     /// 真实地面代表点，缺测列不补高度。
     pub ground: Vec<[f64; 3]>,
-    /// SCAN 静态夹具的真实表面点；不重复注入实体 band 的人工暴露顶边界。
+    /// SCAN 持久层的真实表面点；不重复注入实体 band 的人工暴露顶边界。
     /// PCT 的 ground/cells/bands 保持原语义；真实注册雷达帧不经过此视图。
     pub static_collision_ground: Vec<[f64; 3]>,
     /// 非地面占据的体素中心。
@@ -271,6 +271,55 @@ pub fn from_surface_window(
         }
     }
     Ok(result)
+}
+
+/// 近期地面覆盖同列旧地面；当前机身覆盖内过高的持久地面不再作为碰撞输入。
+pub(crate) fn collision_ground(
+    persistent: Vec<[f64; 3]>,
+    recent: Vec<[f64; 3]>,
+    config: &nuwax_nav_scan_native::Config,
+    position: [f64; 3],
+    yaw: f64,
+) -> Vec<[f64; 3]> {
+    let r = config.resolution;
+    let column = |p: &[f64; 3]| [p[0], p[1]].map(|v| (v / r).floor() as i32);
+    let recent_columns: BTreeSet<_> = recent.iter().map(column).collect();
+    let (s, c) = yaw.sin_cos();
+    let (ac, as_) = (c.abs(), s.abs());
+    let center = [
+        position[0] + c * config.body_center_x - s * config.body_center_y,
+        position[1] + s * config.body_center_x + c * config.body_center_y,
+    ];
+    let (hx, hy) = (config.body_length * 0.5, config.body_width * 0.5);
+    let (ex, ey) = (ac * hx + as_ * hy, as_ * hx + ac * hy);
+    let support = position[2] - config.body_to_ground;
+    // 薄表面输入也可能含其它楼层或桌面；每列只关联离当前支撑最近的地面层。
+    let mut support_ground = BTreeMap::<[i32; 2], f64>::new();
+    for p in &persistent {
+        let height = support_ground.entry(column(p)).or_insert(p[2]);
+        if (p[2] - support).abs() < (*height - support).abs() {
+            *height = p[2];
+        }
+    }
+    persistent
+        .into_iter()
+        .filter(|p| {
+            let key = column(p);
+            if recent_columns.contains(&key) {
+                return false;
+            }
+            // 与原生碰撞层使用相同的四轴矩形/格子相交范围，包含机身边缘接触格。
+            let [dx, dy] = [0, 1].map(|i| (f64::from(key[i]) + 0.5) * r - center[i]);
+            let under_body = dx.abs() <= ex + r * 0.5
+                && dy.abs() <= ey + r * 0.5
+                && (c * dx + s * dy).abs() <= hx + r * 0.5 * (ac + as_)
+                && (-s * dx + c * dy).abs() <= hy + r * 0.5 * (ac + as_);
+            // 一格分辨率容纳地面量化差；只有当前实际覆盖提供的证据能剔除更高旧地面。
+            let same_ground = (p[2] - support_ground[&key]).abs() <= r;
+            !(under_body && same_ground && p[2] > support + r)
+        })
+        .chain(recent)
+        .collect()
 }
 
 /// 加入原感知来源已经区分的近期地面与障碍，不重新猜测标签。

@@ -22,6 +22,7 @@ pub(crate) struct MapInput {
     pub config: Config,
     pub boundary: Arc<Vec<[f64; 2]>>,
     pub pose: [f64; 3],
+    pub yaw: f64,
     pub frame: Option<Arc<RegisteredFrame>>,
     pub active: Option<Trajectory>,
     pub phase: f64,
@@ -140,12 +141,9 @@ impl MapWorker {
                     old.frame.as_ref().map(|f| &f.identity)
                         == input.frame.as_ref().map(|f| &f.identity)
                 });
-                let same_cell = previous.as_ref().is_some_and(|old| {
-                    (0..2).all(|i| {
-                        (old.pose[i] / old.config.resolution).floor()
-                            == (input.pose[i] / input.config.resolution).floor()
-                    })
-                });
+                let same_pose = previous
+                    .as_ref()
+                    .is_some_and(|old| old.pose == input.pose && old.yaw == input.yaw);
                 let same_domain = previous.as_ref().is_none_or(|old| {
                     old.frame.as_ref().map(|f| &f.identity.domain)
                         == input.frame.as_ref().map(|f| &f.identity.domain)
@@ -163,7 +161,7 @@ impl MapWorker {
                 if rebuilt {
                     owner = Some(MapOwner::new(&input.config)?);
                 }
-                let changed = !same_geometry || !same_frame || !same_cell || prepared.is_none();
+                let changed = !same_geometry || !same_frame || !same_pose || prepared.is_none();
                 if changed {
                     let c = input.config;
                     let radius = c.planning_horizon
@@ -180,11 +178,13 @@ impl MapWorker {
                         .into_iter()
                         .chain(recent_obstacles)
                         .collect();
-                    let ground: Vec<_> = native
-                        .static_collision_ground
-                        .into_iter()
-                        .chain(recent_ground)
-                        .collect();
+                    let ground = crate::native_map::collision_ground(
+                        native.static_collision_ground,
+                        recent_ground,
+                        &c,
+                        input.pose,
+                        input.yaw,
+                    );
                     let map = owner.as_mut().unwrap();
                     if let Some(initialize) = initializer {
                         initialize(
@@ -329,6 +329,10 @@ impl PlanWorker {
 }
 
 #[cfg(test)]
+#[path = "local_ground_tests.rs"]
+mod ground_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn publication(worker: &MapWorker, input: MapInput) -> PreparedMap {
@@ -373,6 +377,7 @@ mod tests {
             config: config.scan,
             boundary: Arc::new(Vec::new()),
             pose: [0.55, 1.05, 0.5],
+            yaw: 0.,
             frame: Some(Arc::new(frame.clone())),
             active: None,
             active_snapshot: None,

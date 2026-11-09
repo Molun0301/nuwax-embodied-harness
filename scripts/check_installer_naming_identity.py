@@ -695,7 +695,16 @@ class CacheIdentityChecks(unittest.TestCase):
         prefix = self.root / "generation"
         cargo = self.root / "fixture-cargo"
         environments = {}
+        outputs = {}
+        artifacts = []
         ambient = os.environ.get("NUWAX_SLAM2D_DEPENDENCY_PREFIX")
+        def check_output(argv, **kwargs):
+            if argv[-1] == "--print-release-artifacts":
+                self.assertEqual(argv, [str(outputs["nuwax-geometry-runtime"]), "--print-release-artifacts"])
+                self.assertEqual(kwargs, {"text": True})
+                return json.dumps({"artifacts": artifacts})
+            return self.fake_protoc_version(argv, **kwargs)
+        self.protoc_queries.side_effect = check_output
         def run(argv, **kwargs):
             if argv[0] == "cmake":
                 self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", kwargs.get("env", {}))
@@ -710,6 +719,13 @@ class CacheIdentityChecks(unittest.TestCase):
             binary = argv[argv.index("--bin") + 1]
             (target / "release").mkdir(exist_ok=True)
             (target / "release" / binary).write_bytes(b"\x7fELFfixture")
+            outputs[binary] = target / "release" / binary
+            if binary == "nuwax-geometry-runtime":
+                for name in ("pgo", "nuwax-group-guardian"):
+                    artifact = target / "release" / name
+                    artifact.write_bytes(b"\x7fELFfixture " + name.encode())
+                    artifact.chmod(0o644)
+                    artifacts.append({"path": str(artifact)})
             environments[binary] = dict(kwargs["env"])
         with patch.object(builds.os, "geteuid", return_value=1000), patch.object(
             builds, "_rust_toolchain", return_value=(cargo, {"FIXTURE_BASE_ENV": "retained"})
@@ -726,6 +742,10 @@ class CacheIdentityChecks(unittest.TestCase):
             if name != "nuwax-slam-2d-worker":
                 self.assertNotIn("NUWAX_SLAM2D_DEPENDENCY_PREFIX", environment)
         self.assertEqual(os.environ.get("NUWAX_SLAM2D_DEPENDENCY_PREFIX"), ambient)
+        for name in ("pgo", "nuwax-group-guardian"):
+            installed = prefix / "bin" / name
+            self.assertEqual(installed.read_bytes(), b"\x7fELFfixture " + name.encode())
+            self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
 
     def test_slam_dirty_source_fails_before_any_build_or_fetch(self):
         cache = self.build_slam_fixture(self.root / "generation-1")

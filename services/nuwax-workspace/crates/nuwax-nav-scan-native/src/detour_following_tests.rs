@@ -67,6 +67,70 @@ fn stationary_short_seed_uses_the_fitted_spline_dynamic_bound() {
 }
 
 #[test]
+fn reference_seed_flows_through_a_small_turn_and_stops_at_a_large_turn() {
+    let route = [[0., 0., 0.35], [1., 0., 0.35], [2., 0.25, 0.35], [2., 1.5, 0.35]];
+    let mut cfg = config();
+    cfg.planning_horizon = 5.;
+    cfg.max_velocity = 0.5;
+    cfg.max_acceleration = 0.5;
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.seed_occupied(&[], route[0]);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let state = MotionState { position: route[0], measured_velocity: 1,
+        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.).unwrap();
+    let samples = trajectory.samples(0., 0.001);
+    let nearest = |point: [f64; 3]| samples.iter().min_by(|a, b| {
+        let distance = |s: &TrajectorySample| (s.position[0] - point[0]).hypot(s.position[1] - point[1]);
+        distance(a).total_cmp(&distance(b))
+    }).unwrap();
+    let small = nearest(route[1]);
+    let large = nearest(route[2]);
+    eprintln!("小转角速度={}，大转角速度={}，总时长={}",
+        small.velocity[0].hypot(small.velocity[1]), large.velocity[0].hypot(large.velocity[1]), samples.last().unwrap().time);
+    assert!(small.velocity[0].hypot(small.velocity[1]) > 0.1, "小转角应连续通过：{small:?}");
+    assert!(large.velocity[0].hypot(large.velocity[1]) < 1e-5, "大转角应停车：{large:?}");
+    for sample in &samples {
+        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
+        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+    }
+}
+
+#[test]
+fn recorded_long_detour_uses_local_segment_times() {
+    let route = include!("归档长绕行.rs");
+    let mut cfg = config();
+    cfg.resolution = 0.05;
+    cfg.max_velocity = 0.5;
+    cfg.max_acceleration = 0.5;
+    cfg.planning_horizon = 5.;
+    cfg.sample_dt = 0.05;
+    // 复用同一归档禁行圆；完整办公室实体图不在此轨迹回放夹具内。
+    let forbidden: Vec<[i32; 2]> = (-20..100).flat_map(|x| (-30..50).map(move |y| [x, y]))
+        .filter(|p| ((p[0] as f64 + 0.5) * cfg.resolution - 2.8157907737910612)
+            .hypot((p[1] as f64 + 0.5) * cfg.resolution - 0.48732379702069534) <= 0.25)
+        .collect();
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.seed_occupied(&[], route[0]);
+    map.update_surface(&[], &[], &[], &forbidden).unwrap();
+    let state = MotionState { position: route[0], measured_velocity: 1,
+        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+        .expect("原归档长绕行应通过原规划接纳检查");
+    let samples = trajectory.samples(0., 0.001);
+    let duration = samples.last().unwrap().time;
+    let max_speed = samples.iter().map(|s| s.velocity.iter().map(|v| v*v).sum::<f64>().sqrt()).fold(0., f64::max);
+    eprintln!("归档长绕行：时长={duration:.9}，最大速度={max_speed:.9}");
+    // 同设备参数原版为37.883047444秒；还须保留长直段速度，防止分段初值未被采用。
+    assert!(duration < 37.883047444 * 0.9, "局部分段定时应缩短归档绕行：{duration}");
+    assert!(max_speed > cfg.max_velocity * 0.8, "长直段应采用局部时距：{max_speed}");
+    for sample in &samples {
+        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
+        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+    }
+}
+
+#[test]
 fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
     let route = [[0., 0., 0.35], [0.4, 0., 0.45], [0.4, -0.4, 0.45], [2.4, -0.4, 0.45], [2.4, -1.7, 0.45]];
     let mut cfg = config();

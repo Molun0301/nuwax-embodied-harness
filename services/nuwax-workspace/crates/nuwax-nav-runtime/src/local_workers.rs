@@ -134,6 +134,8 @@ impl MapWorker {
                     crate::native_map::same_source_geometry(&old.source, &input.source)
                         && old.source.same_body_query_view(&input.source)
                         && old.config.planning_horizon == input.config.planning_horizon
+                        && crate::native_map::collision_ground_padding(&old.config)
+                            == crate::native_map::collision_ground_padding(&input.config)
                         && old.boundary == input.boundary
                         && map_geometry(&old.config) == map_geometry(&input.config)
                 });

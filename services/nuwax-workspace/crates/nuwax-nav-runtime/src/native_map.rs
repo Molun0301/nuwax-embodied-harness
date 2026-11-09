@@ -273,7 +273,18 @@ pub fn from_surface_window(
     Ok(result)
 }
 
-/// 近期地面覆盖同列旧地面；当前机身覆盖内过高的持久地面不再作为碰撞输入。
+/// 一格余量及一个地图提交周期内机身角点的最大位移，复用现有运动与周期配置。
+pub(crate) fn collision_ground_padding(config: &nuwax_nav_scan_native::Config) -> f64 {
+    let radius = (config.body_length * 0.5 + config.body_center_x.abs())
+        .hypot(config.body_width * 0.5 + config.body_center_y.abs());
+    let translation = config
+        .max_velocity
+        .max(config.max_reverse_velocity)
+        .hypot(config.max_lateral_velocity);
+    config.resolution + config.sample_dt * (translation + radius * config.max_yaw_rate)
+}
+
+/// 近期地面覆盖同列旧地面；外扩机身内高于支撑且未超过可跨高度的持久地面过时。
 pub(crate) fn collision_ground(
     persistent: Vec<[f64; 3]>,
     recent: Vec<[f64; 3]>,
@@ -290,17 +301,13 @@ pub(crate) fn collision_ground(
         position[0] + c * config.body_center_x - s * config.body_center_y,
         position[1] + s * config.body_center_x + c * config.body_center_y,
     ];
-    let (hx, hy) = (config.body_length * 0.5, config.body_width * 0.5);
+    let padding = collision_ground_padding(config);
+    let (hx, hy) = (
+        config.body_length * 0.5 + padding,
+        config.body_width * 0.5 + padding,
+    );
     let (ex, ey) = (ac * hx + as_ * hy, as_ * hx + ac * hy);
     let support = position[2] - config.body_to_ground;
-    // 薄表面输入也可能含其它楼层或桌面；每列只关联离当前支撑最近的地面层。
-    let mut support_ground = BTreeMap::<[i32; 2], f64>::new();
-    for p in &persistent {
-        let height = support_ground.entry(column(p)).or_insert(p[2]);
-        if (p[2] - support).abs() < (*height - support).abs() {
-            *height = p[2];
-        }
-    }
     persistent
         .into_iter()
         .filter(|p| {
@@ -308,15 +315,15 @@ pub(crate) fn collision_ground(
             if recent_columns.contains(&key) {
                 return false;
             }
-            // 与原生碰撞层使用相同的四轴矩形/格子相交范围，包含机身边缘接触格。
+            // 四轴矩形/格子相交，机身外扩覆盖异步快照后一周期内平移和转向新触及的列。
             let [dx, dy] = [0, 1].map(|i| (f64::from(key[i]) + 0.5) * r - center[i]);
             let under_body = dx.abs() <= ex + r * 0.5
                 && dy.abs() <= ey + r * 0.5
                 && (c * dx + s * dy).abs() <= hx + r * 0.5 * (ac + as_)
                 && (-s * dx + c * dy).abs() <= hy + r * 0.5 * (ac + as_);
-            // 一格分辨率容纳地面量化差；只有当前实际覆盖提供的证据能剔除更高旧地面。
-            let same_ground = (p[2] - support_ground[&key]).abs() <= r;
-            !(under_body && same_ground && p[2] > support + r)
+            // 已覆盖区域若真有可跨的更高地面，当前支撑就应位于其上；超高表面仍阻挡。
+            let height_above_support = p[2] - support;
+            !(under_body && height_above_support > 0. && height_above_support <= config.max_step_up)
         })
         .chain(recent)
         .collect()

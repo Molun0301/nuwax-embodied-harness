@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         out.join("case.json"),
         serde_json::to_vec_pretty(
-            &json!({"case":case,"local_planning":true,"world":format!("{world:?}"),"start":start,"goal":goal,"source_voxel_m":q,"point_count":points.len(),"max_ticks":1200,"max_wall_seconds":90,"dt":DT,"speed_mps":0.5,"geometry":{"voxel_size":config.geometry.voxel_size,"step_threshold_m":config.geometry.step_threshold_m,"max_slope_deg":config.geometry.max_slope_deg,"wall_clearance_m":config.geometry.wall_clearance_m,"min_step_tread_depth_m":config.geometry.min_step_tread_depth_m},"scan":format!("{:?}",config.follower.scan),"body":format!("{body:?}"),"collision_scope":"plane nominal support constraint plus full calibrated convex envelope versus solid boxes; no leg/gait ground penetration claim","quantization":"ground nearest source top face <= half source voxel; solids conservative occupied cells"}),
+            &json!({"case":case,"world":format!("{world:?}"),"start":start,"goal":goal,"source_voxel_m":q,"point_count":points.len(),"max_ticks":1200,"max_wall_seconds":90,"dt":DT,"speed_mps":0.5,"geometry":{"voxel_size":config.geometry.voxel_size,"step_threshold_m":config.geometry.step_threshold_m,"max_slope_deg":config.geometry.max_slope_deg,"wall_clearance_m":config.geometry.wall_clearance_m,"min_step_tread_depth_m":config.geometry.min_step_tread_depth_m},"scan":format!("{:?}",config.follower.scan),"body":format!("{body:?}"),"collision_scope":"plane nominal support constraint plus full calibrated convex envelope versus solid boxes; no leg/gait ground penetration claim","quantization":"ground nearest source top face <= half source voxel; solids conservative occupied cells"}),
         )?,
     )?;
     let options = GoalOptions {
@@ -327,7 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let median = control_times.get(control_times.len() / 2);
     let p95 = control_times
         .get((control_times.len() * 95 / 100).min(control_times.len().saturating_sub(1)));
-    let summary = json!({"case":case,"local_planning":true,"outcome":outcome,"failure":failure,"ticks":ticks,"sim_seconds":time,"wall_seconds":began.elapsed().as_secs_f64(),"final_pose":current,"distance_remaining_m":distance(current,goal),"world_checks":world_checks,"world_failures":world_failures,"perception_updates":perception_updates,"unknown_departure":unknown_departure,"global_plans":plans,"local_planning_calls":follower.local_planning_calls(),"control_ms":{"median":median,"p95":p95,"max":control_times.last(),"over50ms":control_times.iter().filter(|v|**v>50.).count()},"global_plan_ms":plan_times});
+    let summary = json!({"case":case,"outcome":outcome,"failure":failure,"ticks":ticks,"sim_seconds":time,"wall_seconds":began.elapsed().as_secs_f64(),"final_pose":current,"distance_remaining_m":distance(current,goal),"world_checks":world_checks,"world_failures":world_failures,"perception_updates":perception_updates,"unknown_departure":unknown_departure,"global_plans":plans,"local_planning_calls":follower.local_planning_calls(),"control_ms":{"median":median,"p95":p95,"max":control_times.last(),"over50ms":control_times.iter().filter(|v|**v>50.).count()},"global_plan_ms":plan_times});
     fs::write(
         out.join("summary.json"),
         serde_json::to_vec_pretty(&summary)?,

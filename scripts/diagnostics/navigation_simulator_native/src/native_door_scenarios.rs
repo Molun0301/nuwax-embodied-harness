@@ -81,7 +81,7 @@ impl DoorFixture {
                 json!({"id": format!("{}-yaw-{:02}", self.id, degrees as u32),
                 "name": format!("{} · {}°原起终点", self.name, degrees),
                 "start": pose(-0.5), "goal": pose(0.5), "expected_reachable": true,
-                "requires_orientation": true, "local_planning": true,
+                "requires_orientation": true,
                 "fixture_id": self.id, "fixture_generation": "new_native_005m_door_v1",
                 "request_coordinates": "historical_aligned_door_request_unchanged",
                 "nominal_door_width_m": f64::from(self.width_cells) * 0.05,
@@ -253,7 +253,6 @@ mod tests {
                     heading.to_bits()
                 );
                 assert_eq!(request["requires_orientation"], true);
-                assert_eq!(request["local_planning"], true);
             }
         }
         assert_eq!(FIXTURES.iter().map(|f| f.cases().len()).sum::<usize>(), 6);
@@ -355,7 +354,6 @@ mod tests {
                 let simulation = crate::Simulation::new(scene, request).unwrap();
                 assert_eq!(simulation.options.position_tolerance_m, 0.35);
                 assert_eq!(simulation.options.yaw_tolerance_rad, 0.15);
-                assert!(simulation.local_planning);
                 assert_eq!(simulation.goal, crate::body4(&request["goal"]).unwrap());
                 let requested_start = crate::body4(&request["start"]).unwrap();
                 assert_eq!(simulation.current.0, requested_start.0);

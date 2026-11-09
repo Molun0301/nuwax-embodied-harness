@@ -344,13 +344,12 @@ fn transform_map_pose_odometry(
             Box::new(odometry),
             "odometry is waiting for a canonical map->odom transform".into(),
         )),
-        Err(
-            error @ (crate::map_pose::MapPoseError::StaleTransform { .. }
-            | crate::map_pose::MapPoseError::MisalignedTransform { .. }),
-        ) => Ok(MapPoseOdometryIngress::AwaitingTransform(
-            Box::new(odometry),
-            error.to_string(),
-        )),
+        Err(error @ crate::map_pose::MapPoseError::MisalignedTransform { .. }) => {
+            Ok(MapPoseOdometryIngress::AwaitingTransform(
+                Box::new(odometry),
+                error.to_string(),
+            ))
+        }
         Err(error @ crate::map_pose::MapPoseError::InvalidConfig(_)) => {
             Err(module_error("map_pose_adapter.odometry", error))
         }

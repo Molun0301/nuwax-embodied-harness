@@ -1,9 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nuwax_codec::lcm::schema;
 use thiserror::Error;
 
-const DEFAULT_TF_TTL: Duration = Duration::from_millis(250);
 const DEFAULT_TF_ALIGNMENT_TOLERANCE: Duration = Duration::from_millis(200);
 const BASE_FRAME_ALIASES: &[&str] = &[
     "base",
@@ -120,8 +119,6 @@ pub(crate) enum MapPoseError {
     InvalidTranslation(&'static str),
     #[error("invalid or missing source timestamp in {0}")]
     InvalidTimestamp(&'static str),
-    #[error("map->odom transform receipt age {age_ms}ms exceeds TTL {ttl_ms}ms")]
-    StaleTransform { age_ms: u128, ttl_ms: u128 },
     #[error("map->odom and odometry source timestamps differ by {skew_ms}ms (max {max_ms}ms)")]
     MisalignedTransform { skew_ms: u128, max_ms: u128 },
 }
@@ -131,7 +128,6 @@ struct RigidTransform {
     translation: [f64; 3],
     rotation_xyzw: [f64; 4],
     source_timestamp_ns: i64,
-    received_at: Instant,
 }
 
 /// Stateful adapter that never relabels raw odometry as map pose.
@@ -141,7 +137,6 @@ pub(crate) struct MapPoseAdapter {
     base_frame: String,
     strict_body_reference: bool,
     map_to_odom: Option<RigidTransform>,
-    tf_ttl: Duration,
     alignment_tolerance: Duration,
     generation: u64,
 }
@@ -156,7 +151,6 @@ impl MapPoseAdapter {
             map_frame,
             odom_frame,
             base_frame,
-            DEFAULT_TF_TTL,
             DEFAULT_TF_ALIGNMENT_TOLERANCE,
         )
     }
@@ -165,7 +159,6 @@ impl MapPoseAdapter {
         map_frame: impl Into<String>,
         odom_frame: impl Into<String>,
         base_frame: impl Into<String>,
-        tf_ttl: Duration,
         alignment_tolerance: Duration,
     ) -> Result<Self, MapPoseError> {
         let map_frame = map_frame.into().trim().to_string();
@@ -187,9 +180,9 @@ impl MapPoseAdapter {
                 "map, odom, and base frames must be distinct".into(),
             ));
         }
-        if tf_ttl.is_zero() || alignment_tolerance.is_zero() {
+        if alignment_tolerance.is_zero() {
             return Err(MapPoseError::InvalidConfig(
-                "TF TTL and source alignment tolerance must be positive".into(),
+                "source alignment tolerance must be positive".into(),
             ));
         }
         Ok(Self {
@@ -198,7 +191,6 @@ impl MapPoseAdapter {
             base_frame,
             strict_body_reference: false,
             map_to_odom: None,
-            tf_ttl,
             alignment_tolerance,
             generation: 0,
         })
@@ -221,7 +213,8 @@ impl MapPoseAdapter {
     /// Observe the latest real map->odom transform. Returns whether one was accepted.
     #[cfg(test)]
     pub(crate) fn observe_tf(&mut self, message: &schema::TfMessage) -> Result<bool, MapPoseError> {
-        self.observe_tf_at(message, Instant::now())
+        self.observe_tf_message(message)
+            .map(|observed| observed.accepted)
     }
 
     /// Observe canonical TF and return an atomic map pose when the same message
@@ -229,24 +222,6 @@ impl MapPoseAdapter {
     pub(crate) fn observe_tf_message(
         &mut self,
         message: &schema::TfMessage,
-    ) -> Result<MapPoseTfObservation, MapPoseError> {
-        self.observe_tf_message_at(message, Instant::now())
-    }
-
-    #[cfg(test)]
-    fn observe_tf_at(
-        &mut self,
-        message: &schema::TfMessage,
-        received_at: Instant,
-    ) -> Result<bool, MapPoseError> {
-        self.observe_tf_message_at(message, received_at)
-            .map(|observed| observed.accepted)
-    }
-
-    fn observe_tf_message_at(
-        &mut self,
-        message: &schema::TfMessage,
-        received_at: Instant,
     ) -> Result<MapPoseTfObservation, MapPoseError> {
         let Some(transform) = message.transforms.iter().rev().find(|transform| {
             frame_ids_semantically_equal(&transform.header.frame_id, &self.map_frame)
@@ -265,7 +240,6 @@ impl MapPoseAdapter {
             translation: transform.transform.translation,
             rotation_xyzw,
             source_timestamp_ns,
-            received_at,
         };
         let generation = self.generation.saturating_add(1).max(1);
         let map_pose = message
@@ -333,14 +307,6 @@ impl MapPoseAdapter {
         &self,
         odometry: &schema::Odometry,
     ) -> Result<Option<MapPoseObservation>, MapPoseError> {
-        self.transform_odometry_at(odometry, Instant::now())
-    }
-
-    fn transform_odometry_at(
-        &self,
-        odometry: &schema::Odometry,
-        now: Instant,
-    ) -> Result<Option<MapPoseObservation>, MapPoseError> {
         if !self.matches_base_frame(&odometry.child_frame_id) {
             return Err(MapPoseError::FrameMismatch {
                 field: "odometry.child_frame_id",
@@ -376,13 +342,6 @@ impl MapPoseAdapter {
         let Some(map_to_odom) = self.map_to_odom else {
             return Ok(None);
         };
-        let receipt_age = now.duration_since(map_to_odom.received_at);
-        if receipt_age > self.tf_ttl {
-            return Err(MapPoseError::StaleTransform {
-                age_ms: receipt_age.as_millis(),
-                ttl_ms: self.tf_ttl.as_millis(),
-            });
-        }
         let source_skew_ns = i128::from(odometry_timestamp_ns)
             .saturating_sub(i128::from(map_to_odom.source_timestamp_ns))
             .unsigned_abs();
@@ -732,49 +691,49 @@ mod tests {
     }
 
     #[test]
-    fn stale_tf_edge_is_rejected_instead_of_reused_forever() {
-        let ttl = Duration::from_millis(20);
-        let mut adapter = MapPoseAdapter::with_timing(
-            "map",
-            "odom",
-            "base_link",
-            ttl,
-            Duration::from_millis(200),
-        )
-        .expect("adapter");
-        let observed_at = Instant::now();
+    fn source_aligned_odometry_is_accepted_after_long_wall_clock_delay() {
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
         adapter
-            .observe_tf_at(&map_to_odom(0.0, 0.0), observed_at)
+            .observe_tf(&map_to_odom(10.0, -2.0))
             .expect("TF");
-        let error = adapter
-            .transform_odometry_at(
-                &odometry("odom", "base_link", 1.0, 2.0),
-                observed_at + ttl + Duration::from_millis(1),
-            )
-            .expect_err("expired TF must fail closed");
-        assert!(matches!(error, MapPoseError::StaleTransform { .. }));
+
+        // 实际等待超过原 250 毫秒期限，验证转换只依赖来源时间。
+        std::thread::sleep(Duration::from_secs(1));
+        for stamp_nsec in [0, 200_000_000] {
+            let mut aligned_odom = odometry("odom", "base_link", 1.5, 3.0);
+            aligned_odom.header.stamp_nsec = stamp_nsec;
+            let observed = adapter
+                .transform_odometry(&aligned_odom)
+                .expect("wall-clock delay must not reject source-aligned odometry")
+                .expect("map pose");
+            assert_eq!(observed.pose.header.frame_id, "map");
+            assert_eq!(observed.pose.pose.position, [11.5, 1.0, 0.0]);
+            assert_eq!(observed.pose.header.stamp_sec, 1);
+            assert_eq!(observed.pose.header.stamp_nsec, stamp_nsec);
+        }
     }
 
     #[test]
     fn tf_and_odometry_must_be_source_time_aligned() {
-        let mut adapter = MapPoseAdapter::with_timing(
-            "map",
-            "odom",
-            "base_link",
-            Duration::from_secs(1),
-            Duration::from_millis(100),
-        )
-        .expect("adapter");
-        let now = Instant::now();
-        adapter
-            .observe_tf_at(&map_to_odom(0.0, 0.0), now)
-            .expect("TF");
-        let mut delayed_odom = odometry("odom", "base_link", 1.0, 2.0);
-        delayed_odom.header.stamp_nsec = 101_000_000;
-        let error = adapter
-            .transform_odometry_at(&delayed_odom, now)
-            .expect_err("source-time skew must fail closed");
-        assert!(matches!(error, MapPoseError::MisalignedTransform { .. }));
+        let mut adapter = MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
+        let mut tf = map_to_odom(0.0, 0.0);
+        tf.transforms[0].header.stamp_nsec = 500_000_000;
+        adapter.observe_tf(&tf).expect("TF");
+
+        for stamp_nsec in [299_000_000, 701_000_000] {
+            let mut misaligned_odom = odometry("odom", "base_link", 1.0, 2.0);
+            misaligned_odom.header.stamp_nsec = stamp_nsec;
+            let error = adapter
+                .transform_odometry(&misaligned_odom)
+                .expect_err("source-time skew must fail closed");
+            assert_eq!(
+                error,
+                MapPoseError::MisalignedTransform {
+                    skew_ms: 201,
+                    max_ms: 200,
+                }
+            );
+        }
     }
 
     #[test]

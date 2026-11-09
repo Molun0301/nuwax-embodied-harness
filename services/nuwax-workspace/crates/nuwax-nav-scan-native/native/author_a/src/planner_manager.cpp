@@ -65,11 +65,12 @@ namespace scan_planner
         velocities.col(i) = from * velocity - to * target_velocity;
         accelerations.col(i) = from * acceleration / 3.;
       }
+      // 设备速度、加速度上限只约束水平运动；竖直导数仍参与三维边界重建。
       double lower = dt, upper = std::numeric_limits<double>::infinity();
       for (int i = 0; i + 1 < count; ++i) {
-        const Eigen::Vector3d p = positions.col(i + 1) - positions.col(i);
-        const Eigen::Vector3d v = velocities.col(i + 1) - velocities.col(i);
-        const Eigen::Vector3d a = accelerations.col(i + 1) - accelerations.col(i);
+        const Eigen::Vector2d p = (positions.col(i + 1) - positions.col(i)).head<2>();
+        const Eigen::Vector2d v = (velocities.col(i + 1) - velocities.col(i)).head<2>();
+        const Eigen::Vector2d a = (accelerations.col(i + 1) - accelerations.col(i)).head<2>();
         // 无加速度项时精确求速度范数；其余用三角不等式给出保守充分界。
         const bool feasible = a.isZero(0.)
             ? intersectTimeBound(v.squaredNorm() - max_velocity * max_velocity,
@@ -78,9 +79,9 @@ namespace scan_planner
         if (!feasible) return false;
       }
       for (int i = 0; i + 2 < count; ++i) {
-        const Eigen::Vector3d p = positions.col(i + 2) - 2. * positions.col(i + 1) + positions.col(i);
-        const Eigen::Vector3d v = velocities.col(i + 2) - 2. * velocities.col(i + 1) + velocities.col(i);
-        const Eigen::Vector3d a = accelerations.col(i + 2) - 2. * accelerations.col(i + 1) + accelerations.col(i);
+        const Eigen::Vector2d p = (positions.col(i + 2) - 2. * positions.col(i + 1) + positions.col(i)).head<2>();
+        const Eigen::Vector2d v = (velocities.col(i + 2) - 2. * velocities.col(i + 1) + velocities.col(i)).head<2>();
+        const Eigen::Vector2d a = (accelerations.col(i + 2) - 2. * accelerations.col(i + 1) + accelerations.col(i)).head<2>();
         if (!intersectTimeBound(a.norm() - max_acceleration, v.norm(), p.norm(), lower, upper)) return false;
       }
       // 导数分母要从累计结点时间相减；按累计时间/本段时距计入这四次差分的舍入量。
@@ -702,7 +703,7 @@ namespace scan_planner
       UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
       if (stationary_short_seed) {
         UniformBspline seed(ctrl_pts, 3, ts);
-        // 固定拟合后的控制点，以导数控制点三维范数求共同最小时距。
+        // 固定拟合后的控制点，以导数控制点水平范数求共同最小时距。
         // 一阶导数随时距反比、二阶导数随平方反比；覆盖连续时间及原逐轴/采样检查。
         ts *= strictDynamicScale(seed)
             * (1. + std::numeric_limits<double>::epsilon() * (ctrl_pts.cols() + 4));
@@ -1149,9 +1150,9 @@ namespace scan_planner
   {
     auto velocity = trajectory.getDerivative();
     auto acceleration = velocity.getDerivative();
-    // 导数样条位于其控制多边形凸包内，这些上界覆盖整个时间段。
-    return std::max(velocity.getControlPoint().colwise().norm().maxCoeff() / pp_.max_vel_,
-        std::sqrt(acceleration.getControlPoint().colwise().norm().maxCoeff() / pp_.max_acc_));
+    // 水平导数样条位于其控制多边形凸包内，上界覆盖整个时间段的平面运动。
+    return std::max(velocity.getControlPoint().topRows(2).colwise().norm().maxCoeff() / pp_.max_vel_,
+        std::sqrt(acceleration.getControlPoint().topRows(2).colwise().norm().maxCoeff() / pp_.max_acc_));
   }
 
   void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,

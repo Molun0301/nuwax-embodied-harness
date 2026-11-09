@@ -78,4 +78,35 @@ int main(int argc, char** argv) {
     assert(a.evaluateDeBoorT(t).norm() <= c.max_acceleration + 1e-10);
   }
   std::cout << "移动重规划：非零位置/速度/加速度边界保持，原采样与严格动力学检查通过\n";
+  // 地面高度起伏的竖直导数不消耗平面设备限额；三维边界仍须完整保持。
+  const Eigen::Vector3d terrain_acceleration(.3, 0., .8);
+  for (double vertical_velocity : {0., .6}) {
+    const Eigen::Vector3d terrain_velocity(.12, 0., vertical_velocity);
+    scan_planner::SCANPlannerManager terrain;
+    terrain.initPlanModules(params, std::make_shared<scan_planner::PlanningVisualization>(params), empty);
+    terrain.route_height_.set({start, Eigen::Vector3d(1., 0., .5), Eigen::Vector3d(1., 1., .5)});
+    terrain.route_height_.times = {0., 2., 4.};
+    terrain.route_height_.timed_arcs = terrain.route_height_.arcs;
+    terrain.route_height_.window(0., 4.);
+    assert(terrain.reboundReplan(start, terrain_velocity, terrain_acceleration, Eigen::Vector3d(1., 1., .5),
+        Eigen::Vector3d::Zero(), false, false, 0.));
+    auto& reference = terrain.local_data_.position_traj_;
+    auto terrain_v = reference.getDerivative(), terrain_a = terrain_v.getDerivative();
+    assert((reference.evaluateDeBoorT(0.) - start).norm() < 1e-10);
+    assert((terrain_v.evaluateDeBoorT(0.) - terrain_velocity).norm() < 1e-10);
+    assert((terrain_a.evaluateDeBoorT(0.) - terrain_acceleration).norm() < 1e-10);
+    assert(terrain.checkDynamicFeasibility(reference));
+    assert(terrain.strictDynamicScale(reference) <= 1.);
+    // 导数样条凸包给出连续时间证书；另按1毫秒采样复核全过程。
+    const double max_horizontal_v = terrain_v.getControlPoint().topRows(2).colwise().norm().maxCoeff();
+    const double max_horizontal_a = terrain_a.getControlPoint().topRows(2).colwise().norm().maxCoeff();
+    assert(max_horizontal_v <= c.max_velocity);
+    assert(max_horizontal_a <= c.max_acceleration);
+    for (double t = 0.; t <= reference.getTimeSum(); t += .001) {
+      assert(terrain_v.evaluateDeBoorT(t).head<2>().norm() <= c.max_velocity);
+      assert(terrain_a.evaluateDeBoorT(t).head<2>().norm() <= c.max_acceleration);
+    }
+    std::cout << "地面竖直导数：起点vz=" << vertical_velocity << "，az=0.8，水平加速度=0.3；时长="
+        << reference.getTimeSum() << "，水平速度/加速度连续上界=" << max_horizontal_v << "/" << max_horizontal_a << "\n";
+  }
 }

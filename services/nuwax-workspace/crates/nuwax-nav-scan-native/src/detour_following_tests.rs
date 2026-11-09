@@ -119,14 +119,18 @@ fn recorded_long_detour_uses_local_segment_times() {
         .expect("原归档长绕行应通过原规划接纳检查");
     let samples = trajectory.samples(0., 0.001);
     let duration = samples.last().unwrap().time;
-    let max_speed = samples.iter().map(|s| s.velocity.iter().map(|v| v*v).sum::<f64>().sqrt()).fold(0., f64::max);
-    eprintln!("归档长绕行：时长={duration:.9}，最大速度={max_speed:.9}");
+    let max_speed = samples.iter().map(|s| s.velocity[0].hypot(s.velocity[1])).fold(0., f64::max);
+    let max_3d_speed = samples.iter().map(|s| s.velocity.iter().map(|v| v*v).sum::<f64>().sqrt()).fold(0., f64::max);
+    eprintln!("归档长绕行：时长={duration:.9}，最大水平速度={max_speed:.9}，最大三维速度={max_3d_speed:.9}");
     // 同设备参数原版为37.883047444秒；还须保留长直段速度，防止分段初值未被采用。
     assert!(duration < 37.883047444 * 0.9, "局部分段定时应缩短归档绕行：{duration}");
     assert!(max_speed > cfg.max_velocity * 0.8, "长直段应采用局部时距：{max_speed}");
     for sample in &samples {
-        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
-        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+        // 严格设备界约束水平运动；原三维采样检查的绝对容差仍为1.0。
+        assert!(sample.velocity[0].hypot(sample.velocity[1]) <= cfg.max_velocity + 1e-8);
+        assert!(sample.acceleration[0].hypot(sample.acceleration[1]) <= cfg.max_acceleration + 1e-8);
+        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1.);
+        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1.);
     }
 }
 

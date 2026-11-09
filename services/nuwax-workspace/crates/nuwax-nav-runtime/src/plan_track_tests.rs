@@ -233,6 +233,28 @@ fn stop_retires_slow_plan_without_waiting_or_replaying_result() {
 }
 
 #[test]
+fn overlap_recovery_failure_keeps_native_reason_in_execution_status() {
+    let mut f = ready_follower();
+    let source = f.map.as_ref().unwrap().clone();
+    let config = f.native_config(&source);
+    let mut owner = nuwax_nav_scan_native::MapOwner::new(&config).unwrap();
+    // 实体位于机身中心，穿透超过原半体素脱困边界。
+    owner.seed_occupied(&[[0.5, 1., 0.5]], [0.5, 1., 0.5]);
+    owner.update_surface(&[], &[], &[], &[]).unwrap();
+    f.epoch += 1;
+    f.map_worker.retire(f.epoch, false);
+    f.prepared = Some(PreparedMap {
+        epoch: f.epoch, source, snapshot: owner.snapshot(), config,
+        changed: false, checked_curve: None,
+    });
+    assert_eq!(f.step(), PlannerStep::Command(Twist2::ZERO));
+    let reason = f.execution_wait_reason().unwrap();
+    assert!(reason.contains("机身与障碍重叠、脱困失败"), "{reason}");
+    assert!(reason.contains("BODY_OVERLAP_RECOVERY_FAILED"), "{reason}");
+    assert!(reason.contains("escape penetration exceeds half a voxel"), "{reason}");
+}
+
+#[test]
 fn distant_new_curve_keeps_valid_old_curve_and_requests_again() {
     let mut f = ready_follower();
     let old = f.active.clone().unwrap();

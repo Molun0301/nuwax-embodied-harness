@@ -503,6 +503,7 @@ impl SurfaceFollower {
         let config = self.native_config(&map.source);
         let terminal_yaw = (self.position_reached() && self.options.requires_orientation())
             .then(|| self.goal.as_ref().unwrap().pose.orientation.yaw());
+        let mut tracking_failure = None;
         let checked = match self.tracker.track_and_check(
             &config,
             &map.snapshot,
@@ -515,10 +516,10 @@ impl SurfaceFollower {
             terminal_yaw,
         ) {
             Ok(checked) => checked,
-            Err(reason) => {
-                self.wait_reason = Some(reason);
+            Err(failure) => {
+                tracking_failure = Some(failure.message);
                 nuwax_nav_scan_native::TrackResult {
-                    reason: nuwax_nav_scan_native::track_reason::NO_CANDIDATE,
+                    reason: failure.reason,
                     ..Default::default()
                 }
             }
@@ -581,16 +582,17 @@ impl SurfaceFollower {
         }
         self.wait_reason = if checked.invalid() {
             Some(
-                if checked.no_candidate() {
-                    "命令检查没有合法候选，等待重规划"
+                if checked.reason & nuwax_nav_scan_native::track_reason::RECOVERY_FAILED != 0 {
+                    format!("机身与障碍重叠、脱困失败：{}", tracking_failure.as_deref().unwrap())
+                } else if checked.no_candidate() {
+                    "命令检查没有合法候选，等待重规划".into()
                 } else if checked.deviated() {
-                    "机身偏离轨迹，等待重规划"
+                    "机身偏离轨迹，等待重规划".into()
                 } else if checked.finished() {
-                    "局部轨迹结束，等待重规划"
+                    "局部轨迹结束，等待重规划".into()
                 } else {
-                    "等待局部轨迹"
-                }
-                .into(),
+                    "等待局部轨迹".into()
+                },
             )
         } else {
             None

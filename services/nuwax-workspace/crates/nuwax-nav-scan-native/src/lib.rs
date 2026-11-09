@@ -105,6 +105,17 @@ pub struct TrackResult {
     pub installed: bool,
     pub recovery_samples: Vec<TrajectorySample>,
 }
+/// 原生跟踪失败的原因位及原始文本。
+#[derive(Debug)]
+pub struct TrackFailure {
+    pub reason: u32,
+    pub message: String,
+}
+impl From<TrackFailure> for String {
+    fn from(failure: TrackFailure) -> Self {
+        failure.message
+    }
+}
 /// 跟踪原因位，与 scan_native.h 的 ScanTrackReason 对应。
 pub mod track_reason {
     pub const NO_TRAJECTORY:u32=1<<0;
@@ -450,7 +461,7 @@ impl ScanTracker {
         state: &MotionState,
         previous: [f64; 3],
         terminal_yaw: Option<f64>,
-    ) -> Result<TrackResult, String> {
+    ) -> Result<TrackResult, TrackFailure> {
         let mut result = TrackRaw::default();
         let mut recovery = SamplesRaw::default();
         let mut error = [0 as c_char; 1024];
@@ -486,7 +497,7 @@ impl ScanTracker {
                 recovery_samples: samples,
             })
         } else {
-            Err(error_message(&error))
+            Err(TrackFailure { reason: result.reason, message: error_message(&error) })
         }
     }
 }

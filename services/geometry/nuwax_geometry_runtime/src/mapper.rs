@@ -774,11 +774,13 @@ impl Worker {
             dynamic_frame: Some(dynamic),
             registered_points_map: points,
         };
-        if let Some(candidate) = mapping_backend::compute_candidate_in_place(
+        let candidate = mapping_backend::compute_candidate_in_place(
             self.kernel.as_mut().unwrap(),
             &input,
             self.config.compute,
-        )? {
+        )?;
+        let committed_this_frame = candidate.is_some();
+        if let Some(candidate) = candidate {
             self.grid = Some(PersistentOccupancyGrid::stage_observation(
                 self.grid.as_ref(),
                 &candidate.latest_frame_occupancy,
@@ -791,7 +793,7 @@ impl Worker {
             }
         }
         self.last_input = Some(input);
-        if !frame.mapping_only {
+        if committed_this_frame && !frame.mapping_only {
             if let Some(update) = self.corrector.process_frame(
                 &frame,
                 &pgo,

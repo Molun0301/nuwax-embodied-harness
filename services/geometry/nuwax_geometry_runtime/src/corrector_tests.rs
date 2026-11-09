@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn native_pgo_request_preserves_committed_nanoseconds_and_rejects_other_frames() {
+fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_frames() {
     use crate::{
         mapper::MapperConfig,
         mapping_backend::{self, MappingBackendInput, MappingBackendSpec},
@@ -35,20 +35,6 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_rejects_other_frames()
         let committed_stamp = candidate.source_timestamp_ns;
         assert_eq!(committed_stamp, stamp);
         assert_eq!((grid.grid.ts * 1e9) as u64, stamp - 124);
-
-        let mut next_frame = frame.clone();
-        next_frame.odom_pose.timestamp_ns += 1_000_000;
-        let next_input = MappingBackendInput {
-            source_timestamp_ns: next_frame.odom_pose.timestamp_ns,
-            received_at_ns: next_frame.odom_pose.timestamp_ns,
-            ..input.clone()
-        };
-        assert!(
-            mapping_backend::compute_candidate_in_place(&mut kernel, &next_input, compute)
-                .unwrap()
-                .is_none(),
-            "未到构图节拍时，已提交地图仍属于前一帧"
-        );
 
         for (lio_backend, backend_id) in [("fastlio2", 2), ("pointlio", 3)] {
             let mut geometry: nuwax_config::sections::Geometry =
@@ -86,17 +72,14 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_rejects_other_frames()
             assert_eq!(decoded.identity.source_timestamp_ns, stamp as i64);
             assert_eq!(decoded.identity.registered_cloud.backend, backend_id);
 
-            let mut mismatched =
-                owner.request(&next_frame, &points, (&grid.grid, committed_stamp), 2);
-            mismatched.identity.request_sequence = 2;
-            assert_eq!(
-                mismatched.identity.committed_map.source_timestamp_ns,
-                stamp as i64
+            let corrector = crate::mapper::tests::frames_without_candidate_keep_session_healthy(
+                backend, corrector, &frame,
             );
-            let error = wire::encode_native_pgo_request_wire(&mismatched).unwrap_err();
-            assert!(error.to_string().contains(
-                "committed map, registered cloud, and request source timestamps must agree"
-            ));
+            assert_eq!(corrector.sequence, 0, "后继帧不能进入校正器或分配请求序号");
+            assert!(corrector.first_stamp.is_none());
+            let Mode::Native(owner) = &corrector.mode else { unreachable!() };
+            assert!(owner.runtime.is_none() && owner.owner.is_none() && owner.ingress.is_none(),
+                "未提交本帧地图时不能启动原生校正请求");
         }
     }
 }

@@ -29,6 +29,51 @@ fn config() -> MapperConfig {
     }
 }
 
+pub(crate) fn frames_without_candidate_keep_session_healthy(
+    backend: MappingBackendSpec,
+    corrector: Corrector,
+    frame: &MappingFrame,
+) -> Corrector {
+    let mut worker = Worker::new(
+        frame.session_id, MapperConfig { backend, ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    worker.corrector = corrector;
+    // 辅助帧先真实提交地图，但不调用校正器；后继主帧必须跳过旧地图。
+    let mut seed = frame.clone();
+    seed.mapping_only = true;
+    worker.frame(seed).unwrap();
+    assert!(worker.grid.is_some());
+    assert_eq!(worker.grid_stamp, frame.odom_pose.timestamp_ns);
+    let mut next = frame.clone();
+    next.odom_pose.timestamp_ns += 1_000_000;
+    worker.frame(next).expect("未到候选节拍的主帧不能使会话故障");
+    assert_eq!(worker.grid_stamp, frame.odom_pose.timestamp_ns);
+    assert!(worker.failure.is_none());
+    assert!(worker.snapshot().unwrap().occupancy.is_some(), "会话仍可保存地图");
+    worker.corrector
+}
+
+#[tokio::test]
+async fn native_pgo_session_survives_frames_without_candidates() {
+    for backend in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
+        let mapper = Mapper::start(205, MapperConfig {
+            backend, correction_backend: "native_pgo".into(), ..config()
+        }).unwrap();
+        let stamp = 1_794_200_973_126_363_516;
+        let mut seed = room_frame(205, stamp);
+        seed.mapping_only = true;
+        mapper.feed(seed);
+        assert!(mapper.snapshot().await.unwrap().occupancy.is_some());
+        mapper.feed(room_frame(205, stamp + 1_000_000));
+        mapper.snapshot().await.expect("节拍内后继帧后会话仍可保存");
+        assert!(mapper.error_rx().borrow().is_none());
+        mapper.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn session_switch_discards_old_frames_and_save_flushes_the_latest_real_frame() {
     let mapper = Mapper::start(21, config()).unwrap();

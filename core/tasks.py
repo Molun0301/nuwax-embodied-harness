@@ -54,6 +54,7 @@ class TaskContext:
         self.cancelled = cancelled
         self.deadline = deadline
         self._runner = runner
+        self._last_progress: Optional[str] = None
 
     def check(self) -> None:
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -72,6 +73,7 @@ class TaskContext:
 
     def progress(self, value: float, stage: str, message: str, **data: Any) -> None:
         self.check()
+        self._last_progress = message or stage
         self._runner._update(self.task_id, progress=value, stage=stage, message=message, data=dict(data))
 
 
@@ -178,6 +180,8 @@ class TaskRunner:
             if ctx.cancelled.is_set():
                 state = TaskState.TIMED_OUT if timed_out else TaskState.CANCELLED
                 message = "任务已超时。" if timed_out else current.cancel_reason or "任务已取消。"
+                if timed_out and ctx._last_progress:
+                    message += f"最后进度：{ctx._last_progress}"
                 code = None
                 result = None
             elif error is not None:

@@ -37,6 +37,7 @@ PROGRAMS = {
     "nuwax-mapping-cli": {"module": "geometry", "manifest": WORKSPACE + "/Cargo.toml", "package": "nuwax-mapping-cli", "features": []},
 }
 ALL_PROGRAMS = {**LOCAL_PROGRAMS, **PROGRAMS}
+PROGRAM_AUXILIARIES = {"nuwax-geometry-runtime": ("pgo", "nuwax-group-guardian")}
 PLATFORMS = {"focal-arm64", "noble-x86_64"}
 _HEX = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
@@ -369,6 +370,8 @@ def _local_runtime_files(prefix: Path, program: str) -> set:
         raise ValueError("本机回退回执只接受可预编译程序")
     prefix = prefix.resolve(strict=True)
     pending = [_ordinary_file(prefix, "bin/" + program)]
+    pending.extend(_ordinary_file(prefix, "bin/" + name)
+                   for name in PROGRAM_AUXILIARIES.get(program, ()))
     if program == "nuwax-slam-2d-worker":
         pending.append(prefix / "lib/libnuwax_slamtec.so.1")
     files, seen = set(), set()
@@ -540,7 +543,8 @@ def _extract(archive: Path, destination: Path, program: str, fingerprint_value: 
     if _receipt_files(destination, files) != files:
         raise ValueError("预编译归档内部文件摘要不符")
     for relative in files:
-        if not (relative == "bin/" + program or relative.startswith(("lib/", "lib64/", program_share(program) + "/"))):
+        if not (relative in {"bin/" + name for name in (program, *PROGRAM_AUXILIARIES.get(program, ()))}
+                or relative.startswith(("lib/", "lib64/", program_share(program) + "/"))):
             raise ValueError("预编译归档写入非程序目录")
     binary = destination / "bin" / program
     with binary.open("rb") as handle:

@@ -584,6 +584,17 @@ def _executable(path: Path) -> None:
             raise RuntimeError(f"构建输出不是 Linux 本机二进制程序：{path}")
 
 
+def _install_geometry_artifacts(binary: Path, prefix: Path) -> None:
+    """收集同次构建的原生校正及进程组守护程序。"""
+    artifacts = json.loads(subprocess.check_output(
+        [str(binary), "--print-release-artifacts"], text=True))["artifacts"]
+    for artifact in artifacts:
+        source = Path(artifact["path"])
+        destination = prefix / "bin" / source.name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o755)
+
+
 def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
                   jobs: int, run: Callable, *, prebuilt: Optional[Mapping] = None,
                   local_build: bool = False, programs: Optional[Iterable[str]] = None,
@@ -655,6 +666,8 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
             shutil.copyfile(built, installed)
             installed.chmod(0o755)
             binaries[binary_name] = str(installed)
+            if binary_name == "nuwax-geometry-runtime":
+                _install_geometry_artifacts(built, prefix)
             if binary_name == "nuwax-slam-2d-worker":
                 from scripts.package_slam2d import elf_info
                 _machine, _needed, search = elf_info(built)

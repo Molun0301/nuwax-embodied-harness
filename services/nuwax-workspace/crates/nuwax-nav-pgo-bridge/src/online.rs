@@ -551,6 +551,7 @@ impl OnlinePgoOwner {
         };
 
         let mut command = SupervisedNativeCommand::new(&config.executable);
+        command.guardian_executable(config.executable.with_file_name("nuwax-group-guardian"));
         if config.clear_environment {
             command.env_clear();
         }
@@ -1525,7 +1526,12 @@ mod tests {
     fn test_config(runtime_generation: i64, backend_generation: i64) -> OnlinePgoConfig {
         let mut config =
             OnlinePgoConfig::new(test_provider(), runtime_generation, backend_generation);
-        config.executable = crate::native_executable();
+        config.executable = crate::discovery_native_executable();
+        static GUARDIAN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        GUARDIAN.get_or_init(|| {
+            std::fs::copy(crate::discovery_group_guardian_executable(),
+                config.executable.with_file_name("nuwax-group-guardian")).unwrap();
+        });
         config.ready_timeout = Duration::from_secs(5);
         config.result_timeout = Duration::from_secs(5);
         config.cancel_timeout = Duration::from_secs(2);

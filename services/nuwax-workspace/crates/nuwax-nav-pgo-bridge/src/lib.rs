@@ -24,10 +24,11 @@ use nuwax_nav_base::error::NavResult;
 use nuwax_nav_base::native::NativeProcessDiagnostics;
 
 
-/// 返回本次构建的原生位姿图优化程序。
+/// 返回与当前程序一起安装的原生位姿图优化程序。
 #[must_use]
 pub fn native_executable() -> std::path::PathBuf {
-    discovery_native_executable()
+    std::env::current_exe().expect("当前可执行文件位置")
+        .with_file_name("pgo")
 }
 
 /// Return the build-time native PGO artifact for side-effect-free discovery only.

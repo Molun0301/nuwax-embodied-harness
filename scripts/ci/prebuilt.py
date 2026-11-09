@@ -202,6 +202,8 @@ def asset_entry(asset):
 def private_libraries(program, prefix, cache):
     """只封装私有动态库；目标系统ABI由平台系统包与候选验证负责。"""
     result, pending = {}, [prefix / "bin" / program]
+    pending.extend(prefix / "bin" / name for name in common.PROGRAM_AUXILIARIES.get(program, ()))
+    executables = {program, *common.PROGRAM_AUXILIARIES.get(program, ())}
     if program == "nuwax-slam-2d-worker":
         pending.append(prefix / "lib/libnuwax_slamtec.so.1")
     seen = set()
@@ -211,7 +213,7 @@ def private_libraries(program, prefix, cache):
         if resolved in seen:
             continue
         seen.add(resolved)
-        if binary.name != program:
+        if binary.name not in executables:
             result[binary.name] = resolved
         listing = capture(["ldd", str(resolved)])
         if "not found" in listing:
@@ -318,6 +320,11 @@ def package(root, prefix, cache, output, program, fingerprint_value, spec, audit
         binary = staging / "bin" / program
         shutil.copyfile(prefix / "bin" / program, binary)
         binary.chmod(0o755)
+        for name in common.PROGRAM_AUXILIARIES.get(program, ()):
+            destination = staging / "bin" / name
+            shutil.copyfile(prefix / "bin" / name, destination)
+            destination.chmod(0o755)
+            run(["patchelf", "--set-rpath", "$ORIGIN/../lib:$ORIGIN/../lib64", str(destination)])
         libraries = private_libraries(program, prefix, cache)
         for name, source in libraries.items():
             destination = staging / "lib" / name
@@ -524,7 +531,8 @@ def classify_native_usage(program, cache, spec, linked, records, private):
             if matched:
                 record.update(usage="linked-native", map_member_names=matched, package_id=package)
                 runtime.add(str(path))
-        if path.name in {value.name for value in private.values()}:
+        if path.name in {*common.PROGRAM_AUXILIARIES.get(program, ()),
+                         *(value.name for value in private.values())}:
             runtime.add(str(path))
         elif path.is_file() and path.suffix not in (".a", ".so") and ".so." not in path.name and os.access(path, os.X_OK):
             data = path.read_bytes()

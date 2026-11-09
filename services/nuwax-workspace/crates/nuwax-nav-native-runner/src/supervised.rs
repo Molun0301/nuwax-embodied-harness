@@ -58,6 +58,7 @@ pub fn discovery_group_guardian_executable() -> &'static Path {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupervisedNativeCommand {
     program: OsString,
+    guardian_program: PathBuf,
     args: Vec<OsString>,
     current_dir: Option<PathBuf>,
     clear_environment: bool,
@@ -90,6 +91,7 @@ impl SupervisedNativeCommand {
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
             program: program.as_ref().to_os_string(),
+            guardian_program: discovery_group_guardian_executable().to_path_buf(),
             args: Vec::new(),
             current_dir: None,
             clear_environment: false,
@@ -99,6 +101,12 @@ impl SupervisedNativeCommand {
             #[cfg(test)]
             guardian_test_exit: None,
         }
+    }
+
+    /// 指定随载荷一起安装的进程组守护程序。
+    pub fn guardian_executable(&mut self, program: impl AsRef<Path>) -> &mut Self {
+        self.guardian_program = program.as_ref().to_path_buf();
+        self
     }
 
     /// Append one argument without shell interpretation.
@@ -186,10 +194,10 @@ impl SupervisedNativeCommand {
             if self.guardian_test_checkpoint.is_some() || self.guardian_test_exit.is_some() {
                 PathBuf::from(TEST_GROUP_GUARDIAN_PATH)
             } else {
-                discovery_group_guardian_executable().to_path_buf()
+                self.guardian_program.clone()
             };
         #[cfg(not(test))]
-        let guardian_path = discovery_group_guardian_executable().to_path_buf();
+        let guardian_path = self.guardian_program;
         let mut command = Command::new(guardian_path);
         command
             .arg("--parent-pid")

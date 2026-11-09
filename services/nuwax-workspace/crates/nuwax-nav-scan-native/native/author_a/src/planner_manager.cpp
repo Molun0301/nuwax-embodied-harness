@@ -723,15 +723,17 @@ namespace scan_planner
     }
     // 原参考本身已经可行时先交付其严格证书，避免优化器不断切掉必要拐角后
     // 才回退到同一参考，导致计算超过原命令交付窗。实测边界和所有门禁仍相同。
-    const bool history_executable = local_data_.traj_id_ > 0
-        && (ros::Time::now() - local_data_.start_time_).toSec() < local_data_.duration_;
-    const bool retain_boundary = !history_executable
-        || (start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.));
-    if (reference_free && retain_boundary) {
+    // 执行中的非零边界同样需要定时；历史曲线存在不能证明新初值的首段可行。
+    if (reference_free) {
       Eigen::MatrixXd retained_controls = reference_controls;
       Eigen::VectorXd retained_knots;
-      if (retimeReferenceControls(retained_controls, seed_control_arcs, retained_knots, start_pt, start_vel, start_acc,
+      if (!retimeReferenceControls(retained_controls, seed_control_arcs, retained_knots, start_pt, start_vel, start_acc,
           local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_)) {
+        ROS_WARN("真实运动边界与参考初值不存在满足设备上限的时距。");
+        ++continuous_failures_count_;
+        return false;
+      }
+      {
         UniformBspline retained(retained_controls, 3, reference_dt);
         retained.setKnot(retained_knots);
         if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
@@ -836,7 +838,16 @@ namespace scan_planner
         if(start_vel.isZero(0.)&&start_acc.isZero(0.)&&local_target_vel.isZero(0.))
           pos.setKnot((pos.getKnot()*scale).eval());
         else
-          pos.lengthenTime(scale);
+        {
+          Eigen::MatrixXd timed_controls = pos.getControlPoint();
+          Eigen::VectorXd timed_knots;
+          flag_step_2_success = retimeReferenceControls(timed_controls, seed_control_arcs, timed_knots,
+              start_pt, start_vel, start_acc, local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_);
+          if (flag_step_2_success) {
+            pos = UniformBspline(timed_controls, 3, ts);
+            pos.setKnot(timed_knots);
+          }
+        }
       } else {
         Eigen::MatrixXd optimal_control_points;
         flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);

@@ -50,4 +50,32 @@ int main(int argc, char** argv) {
     assert(short_plan.reboundReplan(start, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
         start + Eigen::Vector3d(distance, 0., 0.), Eigen::Vector3d::Zero(), true, false, 0.));
   }
+  // 执行中带真实非零速度、加速度重新锚定；不能因存在历史而跳过初值定时。
+  auto empty = std::make_shared<GridMap>(); empty->initMap(params);
+  const Eigen::Vector3d start(0., 0., .5), velocity(.12, 0., 0.), acceleration(.1, 0., .05);
+  empty->importStaticOccupied({}, start);
+  scan_planner::SCANPlannerManager moving;
+  moving.initPlanModules(params, std::make_shared<scan_planner::PlanningVisualization>(params), empty);
+  moving.route_height_.set({start, Eigen::Vector3d(1., 0., .5), Eigen::Vector3d(1., 1., .5)});
+  moving.route_height_.times = {0., 2., 4.};
+  moving.route_height_.timed_arcs = moving.route_height_.arcs;
+  moving.route_height_.window(0., 4.);
+  moving.local_data_.traj_id_ = 1;
+  moving.local_data_.start_time_ = ros::Time::now();
+  moving.local_data_.duration_ = 100.;
+  moving.local_data_.position_traj_ = scan_planner::UniformBspline(Eigen::MatrixXd::Constant(3, 7, .5), 3, .1);
+  assert(moving.reboundReplan(start, velocity, acceleration, Eigen::Vector3d(1., 1., .5),
+      Eigen::Vector3d::Zero(), false, false, 0.));
+  auto& curve = moving.local_data_.position_traj_;
+  auto v = curve.getDerivative(), a = v.getDerivative();
+  assert((curve.evaluateDeBoorT(0.) - start).norm() < 1e-10);
+  assert((v.evaluateDeBoorT(0.) - velocity).norm() < 1e-10);
+  assert((a.evaluateDeBoorT(0.) - acceleration).norm() < 1e-10);
+  assert(moving.checkDynamicFeasibility(curve));
+  assert(moving.strictDynamicScale(curve) <= 1.);
+  for (double t = 0.; t <= curve.getTimeSum(); t += .001) {
+    assert(v.evaluateDeBoorT(t).norm() <= c.max_velocity + 1e-10);
+    assert(a.evaluateDeBoorT(t).norm() <= c.max_acceleration + 1e-10);
+  }
+  std::cout << "移动重规划：非零位置/速度/加速度边界保持，原采样与严格动力学检查通过\n";
 }

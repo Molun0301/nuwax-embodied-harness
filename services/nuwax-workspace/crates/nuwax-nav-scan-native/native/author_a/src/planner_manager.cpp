@@ -384,6 +384,7 @@ namespace scan_planner
     std::vector<double> seed_control_arcs;
     // Initialization flags are members of this persistent manager.
     bool flag_regenerate = false;
+    bool stationary_short_seed = false;
     if (route_time_seed)
     {
       flag_first_call = false;
@@ -430,7 +431,10 @@ namespace scan_planner
         PolynomialTraj gl_traj;
 
         double dist = (start_pt - local_target_pt).norm();
-        // 静止五次种子的导数控制多边形给出速度5d/T、加速度20d/T²的充分界。
+        stationary_short_seed = dist < pp_.max_vel_ * pp_.max_vel_ / pp_.max_acc_
+            && start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.)
+            && !flag_randomPolyTraj;
+        // 先生成原五次曲线的几何采样；静止短程在拟合后按实际三次样条重新定时。
         const double short_time = std::max(5. * dist / pp_.max_vel_, sqrt(20. * dist / pp_.max_acc_));
         double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? short_time : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
 
@@ -628,6 +632,13 @@ namespace scan_planner
       ctrl_pts.col(size - 1) = local_target_pt + local_target_vel * ts;
     } else {
       UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+      if (stationary_short_seed) {
+        UniformBspline seed(ctrl_pts, 3, ts);
+        // 固定拟合后的控制点，以导数控制点三维范数求共同最小时距。
+        // 一阶导数随时距反比、二阶导数随平方反比；覆盖连续时间及原逐轴/采样检查。
+        ts *= strictDynamicScale(seed)
+            * (1. + std::numeric_limits<double>::epsilon() * (ctrl_pts.cols() + 4));
+      }
     }
     if(!height_sample_arcs.empty()) {
       // Cubic Greville index j corresponds to sample j-1; boundary extensions

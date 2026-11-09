@@ -1,3 +1,5 @@
+include!("short_seed_checks.rs");
+
 // 全局图已知墙体、局部概率图暂未观测墙体时，完整参考仍必须决定绕行方向。
 #[test]
 fn global_detour_is_not_replaced_by_a_straight_local_curve() {
@@ -34,6 +36,33 @@ fn stationary_centimeter_approach_produces_a_dynamically_feasible_curve() {
         }
         assert!(samples.last().unwrap().position[0] > distance * 0.9,
             "短程曲线必须实际覆盖剩余接近距离：{samples:?}");
+    }
+}
+
+#[test]
+fn stationary_short_seed_uses_the_fitted_spline_dynamic_bound() {
+    let mut cfg = config();
+    cfg.max_velocity = 0.5;
+    cfg.max_acceleration = 0.5;
+    for distance in [0.03_f64, 0.4] {
+        let route = [[0., 0., 0.4], [distance, 0., 0.4]];
+        let mut map = MapOwner::new(&cfg).unwrap();
+        map.seed_occupied(&[], route[0]);
+        map.update_surface(&[], &[], &[], &[]).unwrap();
+        let state = MotionState { position: route[0], measured_velocity: 1,
+            measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+            .expect("紧化短程初值必须通过原规划接纳检查");
+        let samples = curve.samples(0., 0.001);
+        let before = (5. * distance / cfg.max_velocity).max((20. * distance / cfg.max_acceleration).sqrt());
+        let after = samples.last().unwrap().time;
+        eprintln!("短程 {distance} 米：原五次初值={before:.9} 秒，现轨迹={after:.9} 秒");
+        assert!(after < before * 0.75, "拟合后的紧界应明显缩短短程：{after}/{before}");
+        for sample in &samples {
+            assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
+            assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+        }
+        assert!(samples.last().unwrap().position[0] > distance * 0.9);
     }
 }
 

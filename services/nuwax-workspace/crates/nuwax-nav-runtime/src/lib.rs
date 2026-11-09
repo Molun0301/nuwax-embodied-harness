@@ -527,6 +527,8 @@ pub trait NavPlanner: Send + 'static {
     fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
     /// Produce one controller step without waiting for a background computation.
     fn step(&mut self) -> PlannerStep;
+    /// 没有路线时，只在已满足原目标位置容差后执行到达或原地朝向阶段。
+    fn step_at_goal(&mut self) -> Option<PlannerStep> { None }
     /// Clear planner state after a terminal fence.
     fn stop(&mut self);
 }
@@ -1252,7 +1254,31 @@ where
             if self.status.phase == SchedulerPhase::Controlling {
                 self.control_tick(status_tx).await?;
             } else {
-                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                match self.planner.step_at_goal() {
+                    Some(PlannerStep::Succeeded) => {
+                        self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle).await?;
+                    }
+                    Some(PlannerStep::Command(twist)) => {
+                        self.apply_controller_twist(status_tx, twist).await?;
+                        self.status.message = self.planner.execution_wait_reason().unwrap_or_else(|| {
+                            if twist == Twist2::ZERO { "位置已达，等待朝向控制".into() }
+                            else { "位置已达，正在调整朝向".into() }
+                        });
+                        self.publish_status(status_tx);
+                    }
+                    Some(PlannerStep::Failed(reason)) => {
+                        self.status.message = reason;
+                        self.finish_terminal(status_tx, TerminalOutcome::PlannerFailed, SchedulerPhase::Failed).await?;
+                    }
+                    Some(PlannerStep::ReplanRequired(reason)) => {
+                        self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                        self.status.message = reason;
+                        self.publish_status(status_tx);
+                    }
+                    Some(PlannerStep::Pending(_)) | None => {
+                        self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                    }
+                }
             }
         }
         if self.session.is_some() {
@@ -2213,6 +2239,98 @@ mod tests {
         assert!(scheduler.status.message.contains("新目标无可行路径"));
         assert!(scheduler.session.is_none());
         assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn n6_goal_without_path_uses_original_tolerances_and_finishes() {
+        for tolerance in [0.15, 0.08, 0.02] {
+            let (config, source) = crate::native_test_helpers::fixture();
+            let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+            let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()),
+                crate::native_test_helpers::author_static_map_follower(config),
+                SchedulerConfig::default()).unwrap();
+            let (status, _) = watch::channel(scheduler.status.clone());
+            let mut pose = map_pose();
+            pose.pose.position = nuwax_nav_types_messages::Point3::new(0.5, 1., 0.5);
+            scheduler.observe_odometry(&status, pose.clone(), None).unwrap();
+            scheduler.observe_costmap(&status, CostmapObservation {
+                costmap: ExecutionMap::Surface(source), source_timestamp_ns: 1,
+            }, Instant::now()).unwrap();
+            let mut target = session();
+            let mut goal = pose.clone();
+            goal.pose.position.x += 0.0336;
+            goal.pose.orientation = nuwax_nav_types_messages::Quaternion::from_yaw(0.0203);
+            target.goal = ExecutionGoal::Body(goal);
+            target.options = nuwax_nav_types_messages::GoalOptions {
+                position_tolerance_m: tolerance, yaw_tolerance_rad: 0.3,
+                ..Default::default()
+            };
+            scheduler.start_session(&status, target).await.unwrap();
+            scheduler.session_tick(&status).await.unwrap();
+            if tolerance > 0.0336 {
+                assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
+            } else {
+                assert_eq!(scheduler.status.last_terminal, None, "选点位置超出原容差时不能判到达");
+                assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+                scheduler.cancel(&status, "goal-1").await.unwrap();
+            }
+            assert_eq!(scheduler.current_path_revision, 0);
+            assert!(scheduler.current_path.is_none());
+            assert!(motion.lock().unwrap().calls.iter().any(|call| call == "release:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn n6_goal_without_path_turns_only_and_keeps_collision_checks() {
+        for blocked in [false, true] {
+            let (config, source) = crate::native_test_helpers::fixture();
+            let source = if blocked {
+                Arc::new(source.with_recent_obstacle_points(1, 1, 0, &[],
+                    [(0, [0.5, 1., 0.5])]).unwrap())
+            } else { source };
+            let mut scheduler = NavScheduler::new(
+                FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+                crate::native_test_helpers::author_static_map_follower(config),
+                SchedulerConfig::default()).unwrap();
+            let (status, _) = watch::channel(scheduler.status.clone());
+            let mut pose = map_pose();
+            pose.pose.position = nuwax_nav_types_messages::Point3::new(0.5, 1., 0.5);
+            scheduler.observe_odometry(&status, pose.clone(), None).unwrap();
+            scheduler.observe_costmap(&status, CostmapObservation {
+                costmap: ExecutionMap::Surface(source), source_timestamp_ns: 1,
+            }, Instant::now()).unwrap();
+            let mut goal = session();
+            let mut target = pose.clone();
+            target.pose.orientation = nuwax_nav_types_messages::Quaternion::from_yaw(0.6);
+            goal.goal = ExecutionGoal::Body(target.clone());
+            goal.options = nuwax_nav_types_messages::GoalOptions {
+                position_tolerance_m: 0.15, yaw_tolerance_rad: 0.1,
+                ..Default::default()
+            };
+            scheduler.start_session(&status, goal).await.unwrap();
+            let until = Instant::now() + Duration::from_secs(1);
+            let mut turned = false;
+            loop {
+                scheduler.session_tick(&status).await.unwrap();
+                let command = scheduler.status.last_applied_twist.unwrap_or(Twist2::ZERO);
+                assert_eq!(command.linear, Point2::new(0., 0.));
+                assert_eq!(scheduler.status.last_terminal, None);
+                assert!(scheduler.current_path.is_none());
+                if command.angular_z != 0. { turned = true; break; }
+                if blocked && scheduler.planner.execution_wait_reason().is_some() { break; }
+                assert!(Instant::now() < until, "等待原地朝向控制超时");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert_eq!(turned, !blocked, "机身碰撞时不能通过无路线转向绕过检查");
+            if !blocked {
+                target.stamp.nanos += 50_000_000;
+                scheduler.observe_odometry(&status, target, None).unwrap();
+                scheduler.session_tick(&status).await.unwrap();
+                assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
+            } else {
+                scheduler.cancel(&status, "goal-1").await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

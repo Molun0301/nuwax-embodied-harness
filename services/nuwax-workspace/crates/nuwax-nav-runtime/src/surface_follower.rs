@@ -735,12 +735,16 @@ impl NavPlanner for SurfaceFollower {
     fn execution_cycle_complete(&self) -> bool {
         self.execution_cycle_complete
     }
+    fn step_at_goal(&mut self) -> Option<PlannerStep> {
+        self.position_reached().then(|| self.step())
+    }
     fn step(&mut self) -> PlannerStep {
         self.execution_cycle_complete = false;
         if self.reached() {
             return PlannerStep::Succeeded;
         }
-        if self.map.is_none() || self.odometry.is_none() || self.reference.is_empty() {
+        if self.map.is_none() || self.odometry.is_none()
+            || (self.reference.is_empty() && !self.position_reached()) {
             return PlannerStep::Pending(Vec::new());
         }
         match self.compute() {

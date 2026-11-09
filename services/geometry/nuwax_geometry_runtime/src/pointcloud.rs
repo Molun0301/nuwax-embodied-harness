@@ -475,11 +475,14 @@ impl CloudMap {
         Ok(result)
     }
     pub fn adopt_publication(&mut self, previous: &mut Self) -> Result<(), String> {
+        // 重建地图首次封存就接续会话版本，根几何与全部块版本一起推进。
         self.revision = previous.revision + 1;
         self.surface = Some(
             self.fine
                 .seal(domain(self.session_id), self.revision, self.stamp)?,
         );
+        self.dirty = false;
+        self.fine.retain_committed(self.surface.as_ref().unwrap());
         self.dense_snapshot =
             self.dense
                 .snapshot(self.stamp, self.revision, &self.session_id.to_string());

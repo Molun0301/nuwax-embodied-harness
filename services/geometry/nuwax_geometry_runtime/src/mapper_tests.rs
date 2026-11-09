@@ -74,6 +74,76 @@ async fn native_pgo_session_survives_frames_without_candidates() {
     }
 }
 
+#[test]
+fn pgo_rebuild_keeps_root_and_block_versions_accepted_by_navigation() {
+    use nuwax_map_chunks::{Receiver, Repository, Transfer, MAX_BLOCK_BYTES};
+
+    for backend in [MappingBackendSpec::Voxel, MappingBackendSpec::raytracing_defaults()] {
+        let session = 206;
+        let first_stamp = 1_000_000_000;
+        let mut worker = Worker::new(
+            session, MapperConfig { backend, ..config() }, None, false,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        ).unwrap();
+        let mut receiver = Receiver::new(Repository::temporary().unwrap());
+        let receive = |receiver: &mut Receiver, worker: &Worker| {
+            let fine = worker.fine_root.borrow().clone().unwrap();
+            let transfer = Transfer {
+                root: fine.manifest().encode().unwrap(),
+                included: Default::default(),
+            };
+            receiver.receive(&transfer, &fine.manifest().domain, |_, block| {
+                fine.repository.read_object(block.object, MAX_BLOCK_BYTES)
+            }).expect("导航接收器必须接纳同会话的根与块")
+        };
+        // 多次真实发布使校正前的版本超过私有重放的首次封存版本。
+        for index in 0..4 {
+            let mut frame = room_frame(session, first_stamp + index * 1_000_000_000);
+            frame.odom_pose.position.as_mut().unwrap().x = index as f64 * 0.1;
+            worker.frame(frame).unwrap();
+            receive(&mut receiver, &worker);
+        }
+        let mut previous = receiver.current().unwrap();
+        assert!(previous.revision > 1);
+        assert!(!previous.blocks.is_empty());
+
+        for offset in [0.01, 0.02] {
+            worker.apply_pgo(PgoUpdate::constant_for_test(
+                first_stamp, Isometry3::translation(offset, 0., 0.),
+            )).unwrap();
+            let rebuilt = receive(&mut receiver, &worker);
+            assert_eq!(rebuilt.domain, previous.domain);
+            assert_eq!(rebuilt.revision, previous.revision + 1);
+            assert!(rebuilt.geometry_revision > previous.geometry_revision);
+            assert!(!rebuilt.blocks.is_empty());
+            let mut retained = 0;
+            for block in &rebuilt.blocks {
+                assert_eq!(block.block_revision, rebuilt.revision);
+                assert_eq!(block.geometry_revision, rebuilt.revision);
+                if let Ok(index) = previous.blocks.binary_search_by_key(&block.key, |old| old.key) {
+                    retained += 1;
+                    assert!(block.block_revision > previous.blocks[index].block_revision);
+                    assert!(block.geometry_revision > previous.blocks[index].geometry_revision);
+                }
+            }
+            assert!(retained > 0, "必须覆盖校正前后同一空间块的版本推进");
+            eprintln!("PGO {}: root {} -> {}, geometry {} -> {}, blocks={}, retained={}",
+                backend.stable_name(), previous.revision, rebuilt.revision,
+                previous.geometry_revision, rebuilt.geometry_revision, rebuilt.blocks.len(), retained);
+            let saved = worker.snapshot().unwrap();
+            assert_eq!(saved.cloud.revision, rebuilt.revision, "保存不能重复提交已发布的重建地图");
+            previous = rebuilt;
+        }
+
+        worker.frame(room_frame(session, first_stamp + 4_000_000_000)).unwrap();
+        let next = receive(&mut receiver, &worker);
+        assert_eq!(next.revision, previous.revision + 1);
+        assert!(next.geometry_revision >= previous.geometry_revision);
+    }
+}
+
 #[tokio::test]
 async fn session_switch_discards_old_frames_and_save_flushes_the_latest_real_frame() {
     let mapper = Mapper::start(21, config()).unwrap();

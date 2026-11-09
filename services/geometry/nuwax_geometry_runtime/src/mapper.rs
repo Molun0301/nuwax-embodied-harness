@@ -851,7 +851,6 @@ impl Worker {
                 )?);
             }
         }
-        rebuilt.commit(frames.last().map_or(0, |f| f.odom_pose.timestamp_ns))?;
         rebuilt.adopt_publication(&mut self.cloud)?;
         self.cloud = rebuilt;
         self.fine_root.send_replace(self.cloud.surface());

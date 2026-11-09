@@ -1,5 +1,20 @@
 use super::*;
 
+impl PgoUpdate {
+    pub(crate) fn constant_for_test(first_stamp: u64, correction: Isometry3<f64>) -> Self {
+        Self {
+            latest: correction,
+            timeline: CorrectionTimeline::new(vec![CorrectionKeyframe {
+                timestamp: 0.,
+                local_pose: Isometry3::identity(),
+                optimized_pose: correction,
+            }])
+            .unwrap(),
+            first_stamp,
+        }
+    }
+}
+
 #[test]
 fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_frames() {
     use crate::{

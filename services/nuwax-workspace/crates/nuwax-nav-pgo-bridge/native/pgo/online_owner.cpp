@@ -24,11 +24,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -175,10 +177,15 @@ bool parseNonnegativeInt(const std::string& text, int& value) {
     return true;
 }
 
-std::string expectedTypedChannel(int64_t runtime_generation, int64_t backend_generation,
+std::string expectedTypedChannel(uint64_t runtime_generation, uint64_t backend_generation,
                                  const std::string& leaf, const std::string& type) {
-    return "/c/n/" + std::to_string(runtime_generation) + "/b/" +
-           std::to_string(backend_generation) + "/" + leaf + "#" + type;
+    // 与 Rust 保持相同的定长无损编码；取消与状态同类型，需要独立后缀。
+    std::ostringstream channel;
+    channel << "/p" << std::hex << std::setfill('0') << std::setw(16)
+            << runtime_generation << std::setw(16) << backend_generation;
+    if (leaf == "cancel") channel << "/c";
+    channel << "#" << type;
+    return channel.str();
 }
 
 int64_t timestampNowNs() {

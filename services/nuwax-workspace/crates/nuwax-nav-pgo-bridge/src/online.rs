@@ -61,13 +61,22 @@ impl OnlinePgoTopics {
                 "backend_generation must be positive".into(),
             ));
         }
-        let prefix = format!("/c/n/{runtime_generation}/b/{backend_generation}");
-        Ok(Self {
-            request: format!("{prefix}/request#{REQUEST_TYPE}"),
-            result: format!("{prefix}/result#{RESULT_TYPE}"),
-            status: format!("{prefix}/status#{STATUS_TYPE}"),
-            cancel: format!("{prefix}/cancel#{STATUS_TYPE}"),
-        })
+        Ok(Self::for_generation_bits(
+            runtime_generation as u64,
+            backend_generation as u64,
+        ))
+    }
+
+    fn for_generation_bits(runtime_generation: u64, backend_generation: u64) -> Self {
+        // 每个代次无损编码为 16 位十六进制；类型区分请求、结果和状态。
+        // 取消与状态同类型，单独增加 /c，四个通道均不超过 LCM 的 63 字节上限。
+        let prefix = format!("/p{runtime_generation:016x}{backend_generation:016x}");
+        Self {
+            request: format!("{prefix}#{REQUEST_TYPE}"),
+            result: format!("{prefix}#{RESULT_TYPE}"),
+            status: format!("{prefix}#{STATUS_TYPE}"),
+            cancel: format!("{prefix}/c#{STATUS_TYPE}"),
+        }
     }
 }
 
@@ -1824,24 +1833,42 @@ mod tests {
     }
 
     #[test]
+    fn topics_fit_lcm_channel_limit_at_maximum_generations() {
+        for topics in [
+            OnlinePgoTopics::for_runtime(i64::MAX, 1).unwrap(),
+            OnlinePgoTopics::for_runtime(1, i64::MAX).unwrap(),
+            OnlinePgoTopics::for_runtime(i64::MAX, i64::MAX).unwrap(),
+            OnlinePgoTopics::for_generation_bits(u64::MAX, 1),
+            OnlinePgoTopics::for_generation_bits(1, u64::MAX),
+            OnlinePgoTopics::for_generation_bits(u64::MAX, u64::MAX),
+        ] {
+            let channels = [topics.request, topics.result, topics.status, topics.cancel];
+            assert_eq!(channels.iter().collect::<std::collections::BTreeSet<_>>().len(), 4);
+            for channel in channels {
+                assert!(channel.len() <= 63, "通道超过 LCM 的 63 字节上限：{channel}");
+            }
+        }
+    }
+
+    #[test]
     fn topics_and_frozen_argv_are_generation_private_and_noncanonical() {
         let config = test_config(41, 7);
         let topics = config.validate().unwrap();
         assert_eq!(
             topics.request,
-            "/c/n/41/b/7/request#nuwax_msgs.NativePgoRequest"
+            "/p00000000000000290000000000000007#nuwax_msgs.NativePgoRequest"
         );
         assert_eq!(
             topics.result,
-            "/c/n/41/b/7/result#nuwax_msgs.NativePgoResult"
+            "/p00000000000000290000000000000007#nuwax_msgs.NativePgoResult"
         );
         assert_eq!(
             topics.status,
-            "/c/n/41/b/7/status#nuwax_msgs.NativePgoStatus"
+            "/p00000000000000290000000000000007#nuwax_msgs.NativePgoStatus"
         );
         assert_eq!(
             topics.cancel,
-            "/c/n/41/b/7/cancel#nuwax_msgs.NativePgoStatus"
+            "/p00000000000000290000000000000007/c#nuwax_msgs.NativePgoStatus"
         );
         let restarted_topics = OnlinePgoTopics::for_runtime(41, 8).unwrap();
         assert_ne!(topics, restarted_topics);
@@ -2422,11 +2449,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_lcm_subscriptions_precede_spawn_ready_and_no_candidate_terminal() {
-        let config = test_config(20_001, 1);
+        let config = test_config(i64::MAX, i64::MAX);
         let (owner, mut ingress) = OnlinePgoOwner::start(config).await.unwrap();
         assert!(owner.topics().request.ends_with(REQUEST_TYPE));
         let result = ingress
-            .submit(complete_request(20_001, 1, 1, 6_000_000_000))
+            .submit(complete_request(i64::MAX, i64::MAX, 1, 6_000_000_000))
             .await
             .unwrap();
         assert_eq!(
@@ -2435,7 +2462,7 @@ mod tests {
         );
         assert_eq!(result.accepted_keyframe(), Some(true));
         let stationary = ingress
-            .submit(complete_request(20_001, 1, 2, 7_000_000_000))
+            .submit(complete_request(i64::MAX, i64::MAX, 2, 7_000_000_000))
             .await
             .unwrap();
         assert_eq!(

@@ -645,24 +645,17 @@ async fn run_surface_planner_with_computer(
                         if is_approach {
                             let end=plan.path.poses.last().expect("原生非空路线").pose.position;
                             let target=Point3::new(planned_goal.goal.pose.position[0],planned_goal.goal.pose.position[1],planned_goal.goal.pose.position[2]);
-                            let start=input.start.pose.position;
                             // 两格避免量化抖动；0.25米使一次逼近超过普通格心偏移。
                             let threshold=0.25_f64.max(2.0*plan.resolution);
                             let state=approach.get_or_insert(ApproachProgress {endpoint:end,best_distance:f64::INFINITY,stagnant:0});
                             let improvement=state.best_distance-end.distance(target);
-                            let can_advance=start.distance(target)-end.distance(target)>=threshold;
-                            if !can_advance || improvement<threshold {
+                            if state.best_distance.is_finite() && improvement<threshold {
                                 // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
-                                let stopped=execution_feedback.as_ref().is_some_and(|feedback|
-                                    feedback.zero_sent_rejection
-                                        && feedback.path_identity.session_id==planned_goal.session_id
-                                        && feedback.path_identity.goal_key==planned_goal.goal_key()
-                                        && feedback.path_identity.planner_runtime_generation==generation
-                                        && feedback.path_identity.path_revision==path_revision as u64);
-                                let at_end=start.distance(state.endpoint)<=0.15;
-                                if !state.best_distance.is_finite() || at_end || stopped {
+                                let at_end=pose.as_ref().is_some_and(|current|
+                                    current.pose.position.distance(state.endpoint)<=0.15);
+                                if at_end {
                                     state.stagnant+=1;
-                                    if !state.best_distance.is_finite() || state.stagnant>=3 {
+                                    if state.stagnant>=3 {
                                         let reason=approach_failure(end,target,state.stagnant);
                                         hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.goal_key(),reason,true,false)));
                                         needs_plan=false;approach_failure_pending=true;
@@ -2301,14 +2294,48 @@ goal: schema::PoseStamped {
     }
 
     #[tokio::test]
+    async fn n6_first_short_approach_is_published_and_executes_before_stagnation() {
+        let computer: SurfacePathComputer = Arc::new(|map, pose, goal, config| {
+            let mut endpoint = goal.clone();
+            endpoint.goal.pose.position[0] = 0.75;
+            Ok(SurfacePlan {
+                path: body_path(map, pose, &endpoint, config)?,
+                kind: nuwax_nav_runtime::RouteKind::Approach,
+                resolution: 0.1,
+            })
+        });
+        let mut harness = Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [3.2, 1.55, 2.45]);
+        harness.goal(&goal).await;
+        let route = harness.path_for(&goal).await;
+        assert_eq!(route.route_kind, 1);
+        let start = route.path.poses.first().unwrap().pose.position;
+        let endpoint = route.path.poses.last().unwrap().pose.position;
+        let target = Point3::new(3.2, 1.55, 2.45);
+        let improvement = Point3::new(start[0], start[1], start[2]).distance(target)
+            - Point3::new(endpoint[0], endpoint[1], endpoint[2]).distance(target);
+        assert!(improvement > 0. && improvement < 0.25, "首段改善={improvement}");
+        harness.wait_controlling().await;
+        // 位姿尚未到旧端点，不得把提前搜索的无改善计成已执行停滞。
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(harness.scheduler.status().last_terminal, None);
+        harness.cancel(&goal).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn progressive_no_initial_advance_fails_and_cancellation_still_fences() {
         let mut harness=progressive_harness().await;
         harness.feed.lock().unwrap().position=[1.75,1.55,2.45];
         tokio::time::sleep(Duration::from_millis(100)).await;
         let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.45]);
         harness.goal(&goal).await;
+        assert_eq!(harness.path_for(&goal).await.route_kind,1,"首次逼近必须先交付");
         harness.terminal(TerminalOutcome::PlannerFailed).await;
         assert!(harness.scheduler.status().message.contains("最近可达点="));
+        assert!(harness.scheduler.status().message.contains("无进展重规划3次"));
         let changed_after=current_unix_timestamp_ns().unwrap();
         harness.feed.lock().unwrap().position=[0.55,1.55,2.5];
         tokio::time::timeout(Duration::from_secs(1),async {

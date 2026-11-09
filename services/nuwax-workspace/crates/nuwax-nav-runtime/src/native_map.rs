@@ -284,7 +284,7 @@ pub(crate) fn collision_ground_padding(config: &nuwax_nav_scan_native::Config) -
     config.resolution + config.sample_dt * (translation + radius * config.max_yaw_rate)
 }
 
-/// 近期地面覆盖同列旧地面；外扩机身内高于支撑且未超过可跨高度的持久地面过时。
+/// 近期地面覆盖同列旧地面；外扩机身内，相对支撑或同列最低层可跨的高地面过时。
 pub(crate) fn collision_ground(
     persistent: Vec<[f64; 3]>,
     recent: Vec<[f64; 3]>,
@@ -295,6 +295,11 @@ pub(crate) fn collision_ground(
     let r = config.resolution;
     let column = |p: &[f64; 3]| [p[0], p[1]].map(|v| (v / r).floor() as i32);
     let recent_columns: BTreeSet<_> = recent.iter().map(column).collect();
+    let mut lowest_ground = BTreeMap::<[i32; 2], f64>::new();
+    for p in &persistent {
+        let height = lowest_ground.entry(column(p)).or_insert(p[2]);
+        *height = height.min(p[2]);
+    }
     let (s, c) = yaw.sin_cos();
     let (ac, as_) = (c.abs(), s.abs());
     let center = [
@@ -321,9 +326,13 @@ pub(crate) fn collision_ground(
                 && dy.abs() <= ey + r * 0.5
                 && (c * dx + s * dy).abs() <= hx + r * 0.5 * (ac + as_)
                 && (-s * dx + c * dy).abs() <= hy + r * 0.5 * (ac + as_);
-            // 已覆盖区域若真有可跨的更高地面，当前支撑就应位于其上；超高表面仍阻挡。
+            // 当前支撑或同列最低地面提供高度基准，避免叠加机身高度估计误差。
             let height_above_support = p[2] - support;
-            !(under_body && height_above_support > 0. && height_above_support <= config.max_step_up)
+            let height_above_lowest = p[2] - lowest_ground[&key];
+            let stale_ground = (height_above_support > 0.
+                && height_above_support <= config.max_step_up)
+                || (height_above_lowest > 0. && height_above_lowest <= config.max_step_up);
+            !(under_body && stale_ground)
         })
         .chain(recent)
         .collect()

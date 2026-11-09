@@ -230,14 +230,17 @@ fn n6_persistent_solid_under_body_keeps_overlap_reason_32() {
 
 #[test]
 fn n6_real_step_above_max_step_up_still_blocks() {
-    for x in [0.025, 0.625] {
-        let input = input(source(&[[x, 0.025, 0.18]], &[]));
-        let map = prepare(&MapWorker::new(None).unwrap(), &input);
-        if x > 0.5 {
-            check(&map, input.pose).expect("台阶在当前机身外");
+    for step in [0.1, f64::from(0.15_f32)] {
+        for x in [0.025, 0.625] {
+            let mut input = input(source(&[[x, 0.025, 0.18]], &[]));
+            input.config.max_step_up = step;
+            let map = prepare(&MapWorker::new(None).unwrap(), &input);
+            if x > 0.5 {
+                check(&map, input.pose).expect("台阶在当前机身外");
+            }
+            let error = check(&map, [x, 0., 0.4]).expect_err("机身下与前方超高台阶均须阻挡");
+            assert_eq!(error.reason, 32);
         }
-        let error = check(&map, [x, 0., 0.4]).expect_err("机身下与前方超高台阶均须阻挡");
-        assert_eq!(error.reason, 32);
     }
 }
 
@@ -350,18 +353,13 @@ fn n6_multilayer_ground_eight_cm_apart_produces_trajectory() {
 }
 
 #[test]
-fn n6_archived_column_keeps_surface_above_strict_max_step_up() {
-    // N6-10 冻结输入的原值；高层比可跨高度上界高约 0.820 毫米，按新规则保留。
-    let mut input = input(source(&[], &[]));
-    input.pose = [
+fn n6_archived_column_ground_is_removed_and_produces_trajectory() {
+    // N6-10 历史位姿持久层重算.json 与原生表面复算.cpp 的原值，不改高度或可跨上界。
+    let position = [
         3.0432525477509524,
         -0.3996377514741919,
         0.006867227014326419,
     ];
-    input.yaw = 0.6344043223712519;
-    let support = -0.3976949366046674;
-    input.config.body_to_ground = input.pose[2] - support;
-    input.config.max_step_up = f64::from(0.15_f32);
     let xy = [2.8750000428408384, -0.7250000108033419];
     let ground = [
         -0.3281250048894435,
@@ -369,19 +367,83 @@ fn n6_archived_column_keeps_surface_above_strict_max_step_up() {
         -0.24687500367872417,
     ]
     .map(|z| [xy[0], xy[1], z]);
-    let retained = crate::native_map::collision_ground(
-        ground.to_vec(),
-        vec![],
-        &input.config,
-        input.pose,
-        input.yaw,
-    );
-    assert_eq!(retained, vec![ground[2]], "不以量化容差放宽可跨高度上界");
+    // 同时覆盖归档完整三层及用户指定的最低层/高层两条真实记录。
+    for ground in [ground.to_vec(), vec![ground[0], ground[2]]] {
+        let mut input = input(source(&ground, &[]));
+        input.pose = position;
+        input.yaw = 0.6344043223712519;
+        input.config.body_length = 0.6789949835614777;
+        input.config.body_width = 0.32800000000271845;
+        input.config.body_center_x = 0.026072508220619156;
+        input.config.body_center_y = 1.2490009027033011e-15;
+        input.config.body_to_ground = 0.40456216361899383;
+        input.config.max_step_up = 0.15000000596046448;
+        input.config.body_z_max = 0.01467999999999997;
+        assert_eq!(
+            position[2] - input.config.body_to_ground,
+            -0.3976949366046674
+        );
+        let native = crate::native_map::from_surface(&input.source).unwrap();
+        assert_eq!(
+            native.static_collision_ground, ground,
+            "高度场须保留真实归档数值"
+        );
+        assert!(native.obstacles.is_empty());
+        assert!(native.ground.iter().all(|p| {
+            [p[0], p[1]].map(|v| (v / input.config.resolution).floor() as i32) == [57, -15]
+        }));
+        let mut frame = (**input.frame.as_ref().unwrap()).clone();
+        frame.sensor_origin_world = position;
+        frame.body_position_world = position;
+        frame.points_world = Arc::from([[position[0] - 2., position[1] - 2., position[2] - 1.4]]);
+        input.frame = Some(Arc::new(frame));
+        let map = prepare(&MapWorker::new(None).unwrap(), &input);
+        let state = MotionState {
+            position,
+            yaw: input.yaw,
+            measured_velocity: 1,
+            measured_yaw_rate: 1,
+            ..Default::default()
+        };
+        let tracked = ScanTracker::default()
+            .track_and_check(&map.config, &map.snapshot, &state, [0.; 3], None)
+            .expect("真实格[57,-15]不能再触发原因32");
+        assert!(
+            tracked.recovery_samples.is_empty(),
+            "真实高层应被剔除，无需浅脱困"
+        );
+        assert!(crate::native_map::collision_ground(
+            native.static_collision_ground,
+            vec![],
+            &input.config,
+            input.pose,
+            input.yaw,
+        )
+        .is_empty());
+        let goal = [
+            position[0] + 2. * input.yaw.cos(),
+            position[1] + 2. * input.yaw.sin(),
+            position[2],
+        ];
+        let curve = ScanPlanner::default()
+            .plan(
+                &map.config,
+                &map.snapshot,
+                &[position, goal],
+                &state,
+                None,
+                0.,
+            )
+            .expect("真实归档地面过滤后必须产出原生轨迹");
+        assert!(!curve.samples(0., input.config.sample_dt).is_empty());
+    }
+}
 
-    // 低于或等于支撑的地面保留；一格分辨率内的正高差也按新规则剔除。
-    input.pose = [0., 0., 0.4];
-    input.yaw = 0.;
-    input.config.body_to_ground = 0.4;
+#[test]
+fn n6_ground_filter_support_and_column_minimum_bounds() {
+    let mut input = input(source(&[], &[]));
+    input.config.max_step_up = f64::from(0.15_f32);
+    // 最低层无更低地面且低于支撑，保留；等于支撑的非最低层由条件二剔除。
     let heights = [
         -0.01,
         0.,
@@ -398,8 +460,30 @@ fn n6_archived_column_keeps_surface_above_strict_max_step_up() {
             input.pose,
             input.yaw,
         ),
-        vec![ground[0], ground[1], ground[4]]
+        vec![ground[0], ground[4]]
     );
+}
+
+#[test]
+fn n6_column_minimum_filter_is_limited_to_expanded_body() {
+    let q = f64::from(0.05_f32);
+    let ground = [[0.625, 0.025, q * 11.5 / 8.], [0.625, 0.025, q * 24.5 / 8.]];
+    let mut input = input(source(&ground, &[]));
+    input.config.max_step_up = f64::from(0.15_f32);
+    let native = crate::native_map::from_surface(&input.source).unwrap();
+    assert_eq!(
+        crate::native_map::collision_ground(
+            native.static_collision_ground.clone(),
+            vec![],
+            &input.config,
+            input.pose,
+            input.yaw,
+        ),
+        native.static_collision_ground,
+        "外扩机身之外，同列多层地面仍保留"
+    );
+    let map = prepare(&MapWorker::new(None).unwrap(), &input);
+    assert_eq!(check(&map, [0.625, 0., 0.4]).unwrap_err().reason, 32);
 }
 
 #[test]

@@ -4,7 +4,6 @@
   const $ = id => document.getElementById(id);
   let snapshot = null;
   let pending = false;
-  let polling = false;
   let settingsDirty = false;
   let trackedJob = null;
   const short = value => value ? value.slice(0, 12) : '未知';
@@ -87,13 +86,6 @@
       $('updateInterval').value = data.settings.check_interval_minutes;
     }
   }
-  async function refresh() {
-    if (polling || pending) return;
-    polling = true;
-    try { render(await managerSnapshot()); }
-    catch (error) { $('updateMessage').textContent = error.message; }
-    finally { polling = false; }
-  }
   async function act(path, body = {}) {
     if (pending) return;
     pending = true;
@@ -133,7 +125,4 @@
     $('updatePanel').scrollIntoView({behavior: 'smooth', block: 'center'});
     $('updateCheck').focus();
   });
-  document.addEventListener('visibilitychange', () => {if (!document.hidden) refresh();});
-  refresh();
-  setInterval(() => {if (!document.hidden) refresh();}, 5000);
 })();

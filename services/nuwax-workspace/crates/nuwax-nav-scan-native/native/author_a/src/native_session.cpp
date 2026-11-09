@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 using Eigen::Vector3d;
 namespace {
@@ -96,7 +97,8 @@ struct TrackerSession {
   scan_planner::AuthorOverlapEscape escape;
   Curve curve,pending;
   geometry_msgs::Twist raw;
-  double phase=0.;
+  double phase=0.,reference_time=0.;
+  std::optional<int64_t> reference_stamp;
   bool install_pending=false;
   TrackerSession() {controller.cmd_vel_pub.sink=[this](const std::any& v){raw=std::any_cast<geometry_msgs::Twist>(v);};}
 };
@@ -188,7 +190,7 @@ extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double d
 }
 extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
-extern "C" void nuwax_scan_tracker_clear(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;}
+extern "C" void nuwax_scan_tracker_clear(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
     const double previous[3],double terminal_yaw,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
@@ -226,11 +228,23 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=SCAN_TRACK_DEVIATED;s.curve.reset();return;}
       out->remaining=std::max(0.,s.curve->duration()-s.phase);out->phase=s.phase;
       if(out->remaining<=0.){out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();return;}
-      if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.install_pending=false;}
+      if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.reference_time=s.phase;s.reference_stamp.reset();s.install_pending=false;}
+      // 实际投影用于进度；期望参考按控制周期推进，超出原偏离距离时停表。
+      const double next_reference=std::min(s.curve->duration(),std::max(s.phase,s.reference_time+c->sample_dt));
+      s.reference_time=std::max(s.reference_time,s.phase);
+      // 同一来源采样的重复计算仍只算一拍，保留既有控制时钟语义。
+      if(s.reference_stamp!=state->timestamp_ns) {
+        if((s.curve->position.evaluateDeBoorT(next_reference)-position).norm()<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution))
+          s.reference_time=next_reference;
+        s.reference_stamp=state->timestamp_ns;
+      }
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
-      s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.phase;s.controller.last_update_time=ros::Time(ros::Time::now().toSec()-c->sample_dt);
-      const auto before=s.curve->position.evaluateDeBoorT(s.phase);desired_yaw=s.controller.estimateDesiredYaw(s.phase,before);
-      target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.phase+s.controller.time_forward));s.controller.cmdCallback({});
+      // 完整参考末段继续位置反馈；局部窗口仍保留原末端减速，不把期望走完当作实际到达。
+      if(s.curve->reference_progress>=s.curve->reference_duration)s.controller.finish_dist=0.;
+      // 本拍已推进并检查参考，回调不再额外推进一拍。
+      s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
+      const auto before=s.curve->position.evaluateDeBoorT(s.reference_time);desired_yaw=s.controller.estimateDesiredYaw(s.reference_time,before);
+      target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }

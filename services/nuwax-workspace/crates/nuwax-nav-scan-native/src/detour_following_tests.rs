@@ -9,6 +9,160 @@ fn local_detour_window_keeps_the_global_corner() {
     check_detour_curve(3.);
 }
 
+#[test]
+fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
+    let route = [[0., 0., 0.35], [0.4, 0., 0.45], [0.4, -0.4, 0.45], [2.4, -0.4, 0.45], [2.4, -1.7, 0.45]];
+    let mut cfg = config();
+    cfg.planning_horizon = 5.;
+    cfg.sample_dt = 0.05;
+    cfg.max_velocity = 0.5;
+    cfg.max_acceleration = 0.5;
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.seed_occupied(&[], route[0]);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let snapshot = map.snapshot();
+    let mut state = MotionState {
+        position: route[0], timestamp_ns: 1_000_000_000,
+        measured_velocity: 1, measured_yaw_rate: 1, ..MotionState::default()
+    };
+    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0.).unwrap();
+    let samples = curve.samples(0., cfg.sample_dt);
+    let speed = |s: &TrajectorySample| s.velocity[0].hypot(s.velocity[1]);
+    let normal_speed = samples.iter().map(speed).fold(0., f64::max);
+    eprintln!("轨迹时长={}，起步速度={}，正常速度={normal_speed}", samples.last().unwrap().time, speed(&samples[1]));
+    assert!(samples.last().unwrap().time > 10., "覆盖重定时后的长绕行");
+    assert!(speed(&samples[1]) < 0.005 && normal_speed > 0.2,
+        "覆盖慢起步和后续正常速度：起步={}，正常={normal_speed}", speed(&samples[1]));
+    let mut tracker = ScanTracker::default();
+    tracker.install(&curve);
+    // 机体高度相对参考低2厘米，仍在原偏离阈值内；平面底盘不积分竖直速度。
+    state.position[2] -= 0.02;
+    let mut previous = [0.; 3];
+    let mut max_speed: f64 = 0.;
+    let mut phase = 0.;
+    // 不重规划、不移动轨迹；实际位置仅由下发命令进行平面运动学积分。
+    for tick in 0..160 {
+        state.timestamp_ns = 1_000_000_000 + tick * 50_000_000;
+        let tracked = tracker.track_and_check(&cfg, &snapshot, &state, previous, None).unwrap();
+        assert!(!tracked.invalid() && tracked.deviation <= 0.2, "第{tick}拍：{tracked:?}");
+        if tick == 0 {
+            let expected = samples[1].velocity[0] + 0.8 * (samples[1].position[0] - state.position[0]);
+            assert!(tracked.installed && tracked.phase == 0. && (tracked.command[0] - expected).abs() < 1e-10,
+                "新轨应从投影初始化后执行首个控制周期：{tracked:?}");
+        }
+        let [vx, vy, w] = tracked.command;
+        max_speed = max_speed.max(vx.hypot(vy));
+        let (cs, sn) = (state.yaw.cos(), state.yaw.sin());
+        state.velocity = [cs * vx - sn * vy, sn * vx + cs * vy, 0.];
+        state.position[0] += state.velocity[0] * cfg.sample_dt;
+        state.position[1] += state.velocity[1] * cfg.sample_dt;
+        state.yaw += w * cfg.sample_dt;
+        state.yaw_rate = w;
+        let mut arc = 0.;
+        let mut nearest = (f64::INFINITY, 0.);
+        for pair in route.windows(2) {
+            let delta: [f64; 3] = std::array::from_fn(|i| pair[1][i] - pair[0][i]);
+            let length2: f64 = delta.iter().map(|v| v * v).sum();
+            let fraction = ((0..3).map(|i| (state.position[i] - pair[0][i]) * delta[i]).sum::<f64>() / length2).clamp(0., 1.);
+            let distance: f64 = (0..3).map(|i| (state.position[i] - pair[0][i] - fraction * delta[i]).powi(2)).sum();
+            if distance < nearest.0 { nearest = (distance, arc + fraction * length2.sqrt()); }
+            arc += length2.sqrt();
+        }
+        state.route_progress = nearest.1;
+        previous = tracked.command;
+        phase = tracked.phase;
+    }
+    eprintln!("慢起步160拍：最大速度={max_speed:.6}，正常速度={normal_speed:.6}，位置={:?}，实际投影={phase:.6}", state.position);
+    assert!(max_speed >= normal_speed * 0.7, "应在160拍内升到轨迹正常速度：{max_speed}/{normal_speed}");
+    assert!(state.position[0] > 0.8 && phase > 3., "实际运动必须沿路线前进：{:?}，投影={phase}", state.position);
+}
+
+#[test]
+fn reference_time_waits_at_deviation_bound_and_restarts_at_installed_projection() {
+    let route = [[0., 0., 0.35], [4., 0., 0.35]];
+    let mut cfg = config();
+    cfg.sample_dt = 0.05;
+    cfg.planning_horizon = 5.;
+    // 慢参考曲线配合原设备限速，使控制量未饱和，能独立核对实际取样点。
+    let mut planning = cfg;
+    planning.max_velocity = 0.1;
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.seed_occupied(&[], route[0]);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let snapshot = map.snapshot();
+    let mut state = MotionState { position: route[0], measured_velocity: 1,
+        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+    let curve = ScanPlanner::default().plan(&planning, &snapshot, &route, &state, None, 0.).unwrap();
+    let samples = curve.samples(0., cfg.sample_dt);
+    let bound = samples.iter().take_while(|s| s.position[0] <= 0.2).last().unwrap();
+    let expected = bound.velocity[0] + 0.8 * bound.position[0];
+    let mut tracker = ScanTracker::default();
+    tracker.install(&curve);
+    let mut previous = [0.; 3];
+    for tick in 0..400 {
+        state.timestamp_ns = 1_000_000_000 + tick * 50_000_000;
+        let tracked = tracker.track_and_check(&cfg, &snapshot, &state, previous, None).unwrap();
+        assert!(!tracked.invalid() && !tracked.replan_early());
+        assert_eq!(tracked.phase, 0., "静止反馈不能被期望时钟记成实际行程");
+        assert!((tracked.remaining - samples.last().unwrap().time).abs() < 1e-10);
+        if tick >= 300 {
+            assert!((tracked.command[0] - expected).abs() < 1e-8,
+                "候选参考点超出20厘米后必须停表：{}，期望={expected}", tracked.command[0]);
+        }
+        previous = tracked.command;
+    }
+    // 实际位置前移后，参考不能落在实际投影之后；重装原轨也不能继承旧期望时间。
+    state.position = samples.iter().find(|s| s.position[0] > 0.8).unwrap().position;
+    state.route_progress = state.position[0];
+    state.timestamp_ns += 50_000_000;
+    let advanced = tracker.track_and_check(&cfg, &snapshot, &state, [0.1, 0., 0.], None).unwrap();
+    assert!(advanced.phase > bound.time && advanced.command[0] > 0.);
+    let actual = curve.samples(advanced.phase, cfg.sample_dt)[0];
+    let at_projection = actual.velocity[0] + 0.8 * (actual.position[0] - state.position[0]);
+    assert!((advanced.command[0] - at_projection).abs() < 1e-8,
+        "追平实际投影时不能再多前探一拍：{advanced:?}，投影处期望={at_projection}");
+    tracker.install(&curve);
+    let mut fresh = ScanTracker::default();
+    fresh.install(&curve);
+    let installed = tracker.track_and_check(&cfg, &snapshot, &state, [0.; 3], None).unwrap();
+    let original = fresh.track_and_check(&cfg, &snapshot, &state, [0.; 3], None).unwrap();
+    assert!(installed.installed && original.installed);
+    assert_eq!(installed.phase, original.phase);
+    assert_eq!(installed.command, original.command);
+}
+
+#[test]
+fn reference_end_does_not_stop_before_actual_projection_finishes() {
+    let route = [[0., 0., 0.35], [1., 0., 0.35]];
+    let mut cfg = config();
+    cfg.sample_dt = 0.05;
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.seed_occupied(&[], route[0]);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let snapshot = map.snapshot();
+    let mut state = MotionState { position: route[0], measured_velocity: 1,
+        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0.).unwrap();
+    let endpoint = *curve.samples(0., cfg.sample_dt).last().unwrap();
+    let expected = endpoint.velocity[0] + 0.8 * (endpoint.position[0] - 0.9);
+    eprintln!("实际样条末端={endpoint:?}，末端追踪期望={expected}");
+    let mut tracker = ScanTracker::default();
+    tracker.install(&curve);
+    state.position[0] = 0.9;
+    state.route_progress = 0.9;
+    let mut previous = [0.; 3];
+    for tick in 0..120 {
+        state.timestamp_ns += 50_000_000;
+        let tracked = tracker.track_and_check(&cfg, &snapshot, &state, previous, None).unwrap();
+        assert!(!tracked.invalid() && tracked.remaining > 0.);
+        if tick >= 100 {
+            assert!((tracked.command[0] - expected).abs() < 1e-8 && tracked.command[0] > 0.05,
+                "期望到末端后仍须追踪剩余实际位置，不能提前置零：{tracked:?}");
+        }
+        previous = tracked.command;
+    }
+}
+
 fn check_detour_curve(horizon: f64) {
     let route = [[0., 0., 0.35], [2.4, 0., 0.35], [2.4, -1.7, 0.35]];
     let mut req = request(&route, &[]);

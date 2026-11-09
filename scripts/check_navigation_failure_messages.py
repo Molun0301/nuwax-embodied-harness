@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 import time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -28,8 +29,11 @@ class NavigationFailureMessageTests(unittest.TestCase):
     def test_failures_keep_cause_and_native_success_stays_success(self):
         with tempfile.TemporaryDirectory(prefix="a2d-nav-message-") as directory,task_platform() as p,FailureGeometry(MapStore(directory)) as backend:
             client=GeometryClient(backend.target);view=GeometryStateView(client,p.events);p.geometry=client;p.geometry_state=view
+            ready=threading.Event()
+            unsubscribe=view.subscribe(lambda state:ready.set() if state.map_name=="map" else None)
             try:
                 view.start();client.start_mapping("map")
+                self.assertTrue(ready.wait(3),"未收到测试地图状态订阅")
                 for cap in CAPABILITIES:p.capabilities.register(cap)
                 for cause in ("BudgetExhausted: 256 visits; clearance unknown","planner path timeout; previous=MissingSupport","InsufficientClearance: candidate rejected",""):
                     backend.failure=cause
@@ -38,6 +42,6 @@ class NavigationFailureMessageTests(unittest.TestCase):
                     self.assertEqual(status.state,TaskState.FAILED if cause else TaskState.SUCCEEDED)
                     if cause:self.assertEqual(status.message,cause);self.assertEqual(status.error_code,"navigation_failed")
                     else:self.assertEqual(status.result["arrival"],"target")
-            finally:view.stop();client.close()
+            finally:unsubscribe();view.stop();client.close()
 
 if __name__=="__main__":unittest.main(verbosity=2)

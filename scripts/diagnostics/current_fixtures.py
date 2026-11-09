@@ -26,7 +26,7 @@ def finished(platform, task_id, timeout=3):
 def task_platform(*, history_limit=200):
     events = EventBus()
     platform = SimpleNamespace(events=events, capabilities=CapabilityTable(),
-        ensure=lambda names, timeout: None, motion=SimpleNamespace(begin=lambda: 7),
+        ensure=lambda names, timeout, *, ctx=None: None, motion=SimpleNamespace(begin=lambda: 7),
         robot=SimpleNamespace(manifest=SimpleNamespace(robot_name="go2")))
     platform.tasks = TaskRunner(platform, history_limit=history_limit)
     try:

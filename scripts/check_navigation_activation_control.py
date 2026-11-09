@@ -14,7 +14,7 @@ class PreparationChecks(unittest.TestCase):
         for timeout in (False,True):
             with self.subTest(timeout=timeout),task_platform() as p:
                 entered,release,dispatched=threading.Event(),threading.Event(),threading.Event()
-                def ensure(names,budget):entered.set();release.wait(2)
+                def ensure(names,budget,*,ctx=None):entered.set();release.wait(2)
                 p.ensure=ensure
                 p.capabilities.register(Capability("prepare","准备",{"type":"object"},"task",
                     lambda *a:dispatched.set(),needs=("geometry",),timeout_sec=.03 if timeout else 2))

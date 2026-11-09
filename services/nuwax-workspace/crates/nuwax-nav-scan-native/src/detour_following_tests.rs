@@ -217,3 +217,45 @@ fn check_recorded_start(route: &[[f64; 3]], velocity: [f64; 3], registered: bool
     }
     panic!("静止或微动且输入有效时，原局部求解预算内仍未产生轨迹与平移命令：{velocity:?}");
 }
+
+
+#[test]
+fn obstacle_adjacent_zigzag_over_capacity_shortens_local_target() {
+    // 2米窗口最多32个控制点；每个5厘米转折都超过简化阈值，需保留的锚点超过10个。
+    // 第8段含30厘米直段，可在末端参考速度下完成原动力学检查。
+    let mut route = vec![[0., 0., 0.35], [0.1, 0., 0.35]];
+    for i in 1..=60 {
+        route.push([0.1 + i as f64 * 0.05 + if i >= 8 { 0.3 } else { 0. }, if i % 2 == 1 { 0.04 } else { 0. }, 0.35]);
+    }
+    // 绕行末段回到前段附近；缩短后的目标进入原全局目标制动区。
+    route.push([0.625, 0.02, 0.35]);
+    let obstacles: Vec<_> = (0..=320).flat_map(|x| {
+        [-0.025, 0.065].map(move |y| [x as f64 * 0.01, y, 0.35])
+    }).collect();
+    let mut cfg = config();
+    cfg.resolution = 0.01;
+    cfg.body_length = 0.015;
+    cfg.body_width = 0.015;
+    cfg.max_velocity = 0.2;
+    let mut map = MapOwner::new(&cfg).unwrap();
+    map.update_surface(&obstacles, &[], &[], &[]).unwrap();
+    let state = MotionState {
+        position: route[0], timestamp_ns: 1_000_000_000,
+        measured_velocity: 1, measured_yaw_rate: 1, ..MotionState::default()
+    };
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+        .expect("贴障参考锚点超过容量时应缩短本次目标并产出轨迹");
+    let view = trajectory.inspect(0., 0.01);
+    assert!(view.local_target[0] > 0.1 && view.local_target[0] < 1., "应交付窗口前段：{view:?}");
+    let end = view.samples.last().unwrap();
+    assert!((end.position[0] - view.local_target[0]).hypot(end.position[1] - view.local_target[1]) < 1e-6);
+    // 原窗口末端远离全局目标、参考速度非零；缩短后必须采用原制动区的零速边界。
+    assert!(end.velocity[0].hypot(end.velocity[1]) < 1e-8, "末端速度应按缩短位置的制动距离获取");
+    for sample in &view.samples {
+        let speed = sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt();
+        let acceleration = sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt();
+        assert!(speed <= cfg.max_velocity + 1e-8);
+        assert!(acceleration <= cfg.max_acceleration + 1e-8);
+        assert!(sample.position[1] > -0.015 && sample.position[1] < 0.055);
+    }
+}

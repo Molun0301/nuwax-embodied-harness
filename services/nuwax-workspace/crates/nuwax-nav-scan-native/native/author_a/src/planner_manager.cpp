@@ -95,8 +95,8 @@ namespace scan_planner
       return controls.allFinite();
     }
 
-    bool buildReferenceControls(const RouteHeightReference& route, const Eigen::Vector3d& start,
-        const Eigen::Vector3d& target, int count, double resolution, double max_velocity, double max_acceleration,
+    void buildReferenceControls(RouteHeightReference& route, const Eigen::Vector3d& start,
+        Eigen::Vector3d& target, int count, double resolution, double max_velocity, double max_acceleration,
         GridMap& map, Eigen::MatrixXd& controls, std::vector<double>& control_arcs)
     {
       struct Anchor { Eigen::Vector3d point; double arc; };
@@ -165,7 +165,22 @@ namespace scan_planner
       }
       std::vector<Anchor> anchors;
       for (std::size_t i = 0; i < input.size(); ++i) if (keep[i]) anchors.push_back(input[i]);
-      if (3 * anchors.size() > static_cast<std::size_t>(count)) return false;
+      if (3 * anchors.size() > static_cast<std::size_t>(count)) {
+        // 容量只覆盖本次连续参考前缀；保留必要转折，不跨障碍删点。
+        anchors.resize(count / 3);
+        // 末端落在最后一段内部，避免拐角处的出段速度成为入段边界。
+        anchors.back().arc = (anchors[anchors.size() - 2].arc + anchors.back().arc) / 2.;
+        anchors.back().point = route.positionAtArc(anchors.back().arc);
+        target = anchors.back().point;
+        route.end_arc = anchors.back().arc;
+        for (std::size_t i = 1; i < route.timed_arcs.size(); ++i) {
+          if (route.end_arc > route.timed_arcs[i]) continue;
+          const double fraction = (route.end_arc - route.timed_arcs[i - 1])
+              / (route.timed_arcs[i] - route.timed_arcs[i - 1]);
+          route.end_time = route.times[i - 1] + fraction * (route.times[i] - route.times[i - 1]);
+          break;
+        }
+      }
       std::vector<int> interior(anchors.size() - 1, 0);
       std::vector<double> lengths(interior.size()), times(interior.size()), peaks(interior.size());
       for (std::size_t i = 0; i < lengths.size(); ++i) {
@@ -204,7 +219,6 @@ namespace scan_planner
           controls.col(column++) = point; control_arcs.push_back(arc);
         }
       }
-      return true;
     }
 
     void applyLinearZReference(std::vector<Eigen::Vector3d> &points, const double start_z, const double target_z)
@@ -366,6 +380,8 @@ namespace scan_planner
     double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     std::vector<double> timed_seed_arcs;
+    Eigen::MatrixXd ctrl_pts;
+    std::vector<double> seed_control_arcs;
     // Initialization flags are members of this persistent manager.
     bool flag_regenerate = false;
     if (route_time_seed)
@@ -373,10 +389,23 @@ namespace scan_planner
       flag_first_call = false;
       flag_force_polynomial = false;
       // 使用既有完整参考的时标，不把拐角重试再次压成起终点直线。
-      const double span = route_height_.end_time - route_height_.begin_time;
+      double span = route_height_.end_time - route_height_.begin_time;
       const int capacity = std::max(7, static_cast<int>(std::floor(pp_.planning_horizon_ / pp_.ctrl_pt_dist * 3)));
       const double detail_dt = std::min(ts, grid_map_->getResolution() / pp_.max_vel_);
       const int intervals = std::clamp(static_cast<int>(std::ceil(span / detail_dt)), 6, capacity - 1);
+      const double original_end_arc = route_height_.end_arc;
+      buildReferenceControls(route_height_, start_pt, local_target_pt, intervals + 3,
+          resolution, pp_.max_vel_, pp_.max_acc_, *grid_map_, ctrl_pts, seed_control_arcs);
+      if (route_height_.end_arc < original_end_arc) {
+        span = route_height_.end_time - route_height_.begin_time;
+        global_data_.last_progress_time_ = route_height_.end_time;
+        // 与原局部目标相同的制动距离及速度边界，位置和时标取缩短后的参考。
+        local_target_vel = (route_height_.points.back() - local_target_pt).norm()
+                < pp_.max_vel_ * pp_.max_vel_ / (2. * pp_.max_acc_)
+            ? Eigen::Vector3d::Zero().eval() : route_height_.velocityAtTime(route_height_.end_time);
+        if (local_target_vel.norm() > pp_.max_vel_)
+          local_target_vel = local_target_vel.normalized() * pp_.max_vel_;
+      }
       ts = span / intervals;
       for (int i = 0; i <= intervals; ++i) {
         const double arc = route_height_.arcAtTime(route_height_.begin_time + i * ts);
@@ -584,17 +613,9 @@ namespace scan_planner
       ++continuous_failures_count_;
       return false;
     }
-    Eigen::MatrixXd ctrl_pts;
-    std::vector<double> seed_control_arcs;
     if (route_time_seed) {
       // 控制多边形保持原折线的单调段，避免插值在窄通道拐角产生反向摆动。
       const int size = static_cast<int>(point_set.size()) + 2;
-      if (!buildReferenceControls(route_height_, start_pt, local_target_pt, size,
-          grid_map_->getResolution(), pp_.max_vel_, pp_.max_acc_, *grid_map_, ctrl_pts, seed_control_arcs)) {
-        ROS_WARN("Reference corners exceed the existing control-point capacity.");
-        ++continuous_failures_count_;
-        return false;
-      }
       const double square_dt = ts * ts;
       // 三次样条端点的解析位置/速度/加速度约束，使用原实际运动边界。
       ctrl_pts.col(0) = start_pt - start_vel * ts + start_acc * (square_dt / 3.);

@@ -828,6 +828,7 @@ namespace scan_planner
   {
 
     getLocalTarget();
+    const double requested_end_arc = planner_manager_->route_height_.end_arc;
 
     bool plan_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj,getOdomYaw());
@@ -839,6 +840,9 @@ namespace scan_planner
     {
 
       auto info = &planner_manager_->local_data_;
+      // 仅同步因容量缩短的目标，保留原参考端点，不能用样条的数值偏差改写它。
+      if (planner_manager_->route_height_.end_arc < requested_end_arc)
+        local_target_pt_ = planner_manager_->route_height_.positionAtArc(planner_manager_->route_height_.end_arc);
 
       /* publish traj */
       scan_planner::Bspline bspline;

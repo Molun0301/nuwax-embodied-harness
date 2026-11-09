@@ -795,7 +795,7 @@ impl Worker {
             if let Some(update) = self.corrector.process_frame(
                 &frame,
                 &pgo,
-                self.grid.as_ref().map(|g| &g.grid),
+                self.grid.as_ref().map(|g| (&g.grid, self.grid_stamp)),
                 self.base_anchor,
             )? {
                 self.apply_pgo(update)?;

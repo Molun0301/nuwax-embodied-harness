@@ -99,7 +99,7 @@ impl Corrector {
         &mut self,
         frame: &MappingFrame,
         indices: &[u32],
-        grid: Option<&nuwax_mapping::OccupancyGrid>,
+        grid: Option<(&nuwax_mapping::OccupancyGrid, u64)>,
         anchor: Isometry3<f64>,
     ) -> Result<Option<PgoUpdate>, String> {
         if matches!(self.mode, Mode::Relocalization) {
@@ -302,12 +302,11 @@ impl Native {
         &mut self,
         frame: &MappingFrame,
         points: &[Point3<f64>],
-        grid: &nuwax_mapping::OccupancyGrid,
+        grid: (&nuwax_mapping::OccupancyGrid, u64),
         sequence: u64,
         anchor: Isometry3<f64>,
         first: u64,
     ) -> Result<Option<PgoUpdate>, String> {
-        use nuwax_codec::lcm::native_pgo as wire;
         if self.runtime.is_none() {
             self.runtime = Some(
                 tokio::runtime::Builder::new_multi_thread()
@@ -330,69 +329,11 @@ impl Native {
             self.owner = Some(owner);
             self.ingress = Some(ingress);
         }
-        let pose = pose_isometry(&frame.odom_pose);
-        self.local_poses.insert(frame.odom_pose.timestamp_ns, pose);
-        let p = pose.translation.vector;
-        let q = pose.rotation.quaternion();
-        let nonce = u128::from(frame.session_id).to_be_bytes();
-        let identity = wire::NativePgoRequestIdentity {
-            backend: wire::NATIVE_PGO_BACKEND,
-            runtime_generation: frame.session_id as i64,
-            backend_generation: 1,
-            request_sequence: 0,
-            mapping_session_id: frame.session_id.to_string(),
-            mapping_session_generation: 1,
-            mapping_backend_kind: self.mapping_backend.clone(),
-            mapping_backend_generation: 1,
-            map_frame_generation: 1,
-            mapping_commit_id: wire::NativePgoMappingCommitId {
-                boot_nonce: nonce,
-                sequence: sequence as i64,
-            },
-            occupancy_revision: sequence as i64,
-            cloud_revision: sequence as i64,
-            registered_cloud: wire::NativePgoRegisteredCloudProof {
-                backend: match self.lio_backend.as_str() {
-                    "pointlio" => 3,
-                    "fastlio2" => 2,
-                    _ => 1,
-                },
-                runtime_generation: frame.session_id as i64,
-                source_sequence: sequence as i64,
-                source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-                source_point_count: frame.points_body.len() as i64,
-                point_count: points.len() as i64,
-            },
-            correlated_odom: wire::NativePgoCorrelatedOdomProof {
-                source_sequence: sequence as i64,
-                source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-                translation_m: [p.x, p.y, p.z],
-                rotation_xyzw: [q.i, q.j, q.k, q.w],
-            },
-            committed_map: wire::NativePgoCommittedMapProof {
-                source_timestamp_ns: (grid.ts * 1e9) as i64,
-                width: grid.width as i64,
-                height: grid.height as i64,
-                resolution_m: grid.resolution,
-                origin_x_m: grid.origin[0],
-                origin_y_m: grid.origin[1],
-            },
-            source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-            map_frame_id: grid.frame_id.clone(),
-            odom_frame_id: frame.odom_pose.frame_id.clone(),
-            body_frame_id: self.base_frame.clone(),
-            points_frame_id: self.base_frame.clone(),
-            correction_lease: wire::NativePgoCorrectionLeaseId {
-                boot_nonce: nonce,
-                generation: 1,
-            },
-        };
-        let request = wire::NativePgoRequest {
-            schema_version: wire::NATIVE_PGO_SCHEMA_VERSION_V3,
-            identity,
-            registered_body_coordinate_count: (points.len() * 3) as i32,
-            registered_body_points_xyz: points.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
-        };
+        self.local_poses.insert(
+            frame.odom_pose.timestamp_ns,
+            pose_isometry(&frame.odom_pose),
+        );
+        let request = self.request(frame, points, grid, sequence);
         let response = self
             .runtime
             .as_ref()
@@ -439,6 +380,80 @@ impl Native {
                 "原生PGO拒绝本帧：{}",
                 response.result().rejection_reason
             )),
+        }
+    }
+
+    fn request(
+        &self,
+        frame: &MappingFrame,
+        points: &[Point3<f64>],
+        grid: (&nuwax_mapping::OccupancyGrid, u64),
+        sequence: u64,
+    ) -> nuwax_codec::lcm::native_pgo::NativePgoRequest {
+        use nuwax_codec::lcm::native_pgo as wire;
+        let (grid, source_timestamp_ns) = grid;
+        let pose = pose_isometry(&frame.odom_pose);
+        let p = pose.translation.vector;
+        let q = pose.rotation.quaternion();
+        let nonce = u128::from(frame.session_id).to_be_bytes();
+        let identity = wire::NativePgoRequestIdentity {
+            backend: wire::NATIVE_PGO_BACKEND,
+            runtime_generation: frame.session_id as i64,
+            backend_generation: 1,
+            request_sequence: 0,
+            mapping_session_id: frame.session_id.to_string(),
+            mapping_session_generation: 1,
+            mapping_backend_kind: self.mapping_backend.clone(),
+            mapping_backend_generation: 1,
+            map_frame_generation: 1,
+            mapping_commit_id: wire::NativePgoMappingCommitId {
+                boot_nonce: nonce,
+                sequence: sequence as i64,
+            },
+            occupancy_revision: sequence as i64,
+            cloud_revision: sequence as i64,
+            registered_cloud: wire::NativePgoRegisteredCloudProof {
+                backend: match self.lio_backend.as_str() {
+                    "pointlio" => 3,
+                    "fastlio2" => 2,
+                    _ => 1,
+                },
+                runtime_generation: frame.session_id as i64,
+                source_sequence: sequence as i64,
+                source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
+                source_point_count: frame.points_body.len() as i64,
+                point_count: points.len() as i64,
+            },
+            correlated_odom: wire::NativePgoCorrelatedOdomProof {
+                source_sequence: sequence as i64,
+                source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
+                translation_m: [p.x, p.y, p.z],
+                rotation_xyzw: [q.i, q.j, q.k, q.w],
+            },
+            committed_map: wire::NativePgoCommittedMapProof {
+                // 来源属于已提交地图，不能经浮点秒恢复，也不能替换为当前帧时间。
+                source_timestamp_ns: source_timestamp_ns as i64,
+                width: grid.width as i64,
+                height: grid.height as i64,
+                resolution_m: grid.resolution,
+                origin_x_m: grid.origin[0],
+                origin_y_m: grid.origin[1],
+            },
+            source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
+            map_frame_id: grid.frame_id.clone(),
+            odom_frame_id: frame.odom_pose.frame_id.clone(),
+            body_frame_id: self.base_frame.clone(),
+            points_frame_id: self.base_frame.clone(),
+            correction_lease: wire::NativePgoCorrectionLeaseId {
+                boot_nonce: nonce,
+                generation: 1,
+            },
+        };
+        wire::NativePgoRequest {
+            schema_version: wire::NATIVE_PGO_SCHEMA_VERSION_V3,
+            identity,
+            registered_body_coordinate_count: (points.len() * 3) as i32,
+            registered_body_points_xyz: points.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
         }
     }
 }

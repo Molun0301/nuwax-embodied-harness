@@ -1,5 +1,106 @@
 use super::*;
 
+#[test]
+fn native_pgo_request_preserves_committed_nanoseconds_and_rejects_other_frames() {
+    use crate::{
+        mapper::MapperConfig,
+        mapping_backend::{self, MappingBackendInput, MappingBackendSpec},
+        persistent_occupancy::PersistentOccupancyGrid,
+    };
+    use nuwax_codec::lcm::native_pgo as wire;
+
+    let stamp = 1_794_200_973_126_363_516;
+    let frame = crate::mapper::tests::room_frame(204, stamp);
+    let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
+    let input = MappingBackendInput {
+        source_timestamp_ns: stamp,
+        received_at_ns: stamp,
+        registered_frame_id: "map".into(),
+        sensor_origin_map: frame.ray_origin_body,
+        dynamic_frame: None,
+        registered_points_map: points.clone(),
+    };
+    let compute = MapperConfig::default().compute;
+    for backend in [
+        MappingBackendSpec::Voxel,
+        MappingBackendSpec::raytracing_defaults(),
+    ] {
+        let mut kernel = backend.into_kernel(compute.window_capacity);
+        let candidate = mapping_backend::compute_candidate_in_place(&mut kernel, &input, compute)
+            .unwrap()
+            .unwrap();
+        let grid =
+            PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy)
+                .unwrap();
+        let committed_stamp = candidate.source_timestamp_ns;
+        assert_eq!(committed_stamp, stamp);
+        assert_eq!((grid.grid.ts * 1e9) as u64, stamp - 124);
+
+        let mut next_frame = frame.clone();
+        next_frame.odom_pose.timestamp_ns += 1_000_000;
+        let next_input = MappingBackendInput {
+            source_timestamp_ns: next_frame.odom_pose.timestamp_ns,
+            received_at_ns: next_frame.odom_pose.timestamp_ns,
+            ..input.clone()
+        };
+        assert!(
+            mapping_backend::compute_candidate_in_place(&mut kernel, &next_input, compute)
+                .unwrap()
+                .is_none(),
+            "未到构图节拍时，已提交地图仍属于前一帧"
+        );
+
+        for (lio_backend, backend_id) in [("fastlio2", 2), ("pointlio", 3)] {
+            let mut geometry: nuwax_config::sections::Geometry =
+                nuwax_config::test_support::section("geometry");
+            geometry.mapping_backend = backend.stable_name().into();
+            geometry.lio_backend = lio_backend.into();
+            let corrector = Corrector::from_config(
+                "native_pgo",
+                &geometry,
+                &nuwax_config::test_support::section("robot"),
+                &nuwax_config::test_support::section("transport"),
+            )
+            .unwrap();
+            let Mode::Native(owner) = &corrector.mode else {
+                unreachable!()
+            };
+            let mut request = owner.request(&frame, &points, (&grid.grid, committed_stamp), 1);
+            // 在线拥有方在封装请求前分配请求序号；这里只验证构造与编码，不启动通信。
+            request.identity.request_sequence = 1;
+            let encoded = wire::encode_native_pgo_request_wire(&request).unwrap();
+            let decoded = wire::decode_native_pgo_request_wire(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert_eq!(
+                decoded.identity.committed_map.source_timestamp_ns,
+                stamp as i64
+            );
+            assert_eq!(
+                decoded.identity.registered_cloud.source_timestamp_ns,
+                stamp as i64
+            );
+            assert_eq!(
+                decoded.identity.correlated_odom.source_timestamp_ns,
+                stamp as i64
+            );
+            assert_eq!(decoded.identity.source_timestamp_ns, stamp as i64);
+            assert_eq!(decoded.identity.registered_cloud.backend, backend_id);
+
+            let mut mismatched =
+                owner.request(&next_frame, &points, (&grid.grid, committed_stamp), 2);
+            mismatched.identity.request_sequence = 2;
+            assert_eq!(
+                mismatched.identity.committed_map.source_timestamp_ns,
+                stamp as i64
+            );
+            let error = wire::encode_native_pgo_request_wire(&mismatched).unwrap_err();
+            assert!(error.to_string().contains(
+                "committed map, registered cloud, and request source timestamps must agree"
+            ));
+        }
+    }
+}
+
 fn local_consensus_source() -> Vec<Point3<f64>> {
     let mut source = Vec::new();
     for index in 0..8 {

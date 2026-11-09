@@ -430,7 +430,9 @@ namespace scan_planner
         PolynomialTraj gl_traj;
 
         double dist = (start_pt - local_target_pt).norm();
-        double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? sqrt(dist / pp_.max_acc_) : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
+        // 静止五次种子的导数控制多边形给出速度5d/T、加速度20d/T²的充分界。
+        const double short_time = std::max(5. * dist / pp_.max_vel_, sqrt(20. * dist / pp_.max_acc_));
+        double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? short_time : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
 
         if (!flag_randomPolyTraj)
         {

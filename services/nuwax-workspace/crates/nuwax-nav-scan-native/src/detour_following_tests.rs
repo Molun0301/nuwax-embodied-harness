@@ -10,6 +10,34 @@ fn local_detour_window_keeps_the_global_corner() {
 }
 
 #[test]
+fn stationary_centimeter_approach_produces_a_dynamically_feasible_curve() {
+    let mut cfg = config();
+    cfg.max_velocity = 0.3;
+    cfg.max_acceleration = 1.;
+    cfg.sample_dt = 0.05;
+    // 窄门走完后的剩余距离量级，包含平面短程和原机体与地面参考的高度差。
+    for distance in [0.02, 0.0325, 0.05] {
+        let route = [[0., 0., 0.4], [distance, 0., 0.395]];
+        let mut map = MapOwner::new(&cfg).unwrap();
+        map.seed_occupied(&[], route[0]);
+        map.update_surface(&[], &[], &[], &[]).unwrap();
+        let state = MotionState { position: route[0], measured_velocity: 1,
+            measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
+        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+            .expect("静止几厘米接近必须在原求解调用中产出可执行轨迹");
+        let samples = curve.samples(0., 0.001);
+        for sample in &samples {
+            let speed = sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt();
+            let acceleration = sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt();
+            assert!(speed <= cfg.max_velocity + 1e-8, "短程速度越界：{sample:?}");
+            assert!(acceleration <= cfg.max_acceleration + 1e-8, "短程加速度越界：{sample:?}");
+        }
+        assert!(samples.last().unwrap().position[0] > distance * 0.9,
+            "短程曲线必须实际覆盖剩余接近距离：{samples:?}");
+    }
+}
+
+#[test]
 fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
     let route = [[0., 0., 0.35], [0.4, 0., 0.45], [0.4, -0.4, 0.45], [2.4, -0.4, 0.45], [2.4, -1.7, 0.45]];
     let mut cfg = config();

@@ -424,6 +424,33 @@ class _TargetSearch:
         candidates: List[NavigationCandidate],
         candidate_diagnostics: List[Dict[str, Any]],
     ) -> Tuple[List[NavigationCandidate], Optional[Dict[str, Any]]]:
+        # 先保留汇总多次观测的实例，再合并本次查询中指向同一物体的记录。
+        merged = []
+        for candidate in sorted(candidates, key=lambda item: (
+            item.metadata["record_kind"] != "object_instance", -item.metadata["candidate_score"],
+        )):
+            instance_ids = set(candidate.metadata["linked_object_instance_ids"])
+            if candidate.metadata["record_kind"] == "object_instance":
+                instance_ids.add(candidate.record_id)
+            labels = {normalize_query(label) for label in candidate.metadata["visual_labels"]}
+            position = (candidate.anchor_pose or candidate.inspection_pose).position
+            for retained in merged:
+                retained_ids = set(retained.metadata["linked_object_instance_ids"])
+                if retained.metadata["record_kind"] == "object_instance":
+                    retained_ids.add(retained.record_id)
+                if instance_ids.intersection(retained_ids):
+                    break
+                retained_labels = {normalize_query(label) for label in retained.metadata["visual_labels"]}
+                retained_position = (retained.anchor_pose or retained.inspection_pose).position
+                if labels.intersection(retained_labels) and math.sqrt(
+                    (position.x - retained_position.x) ** 2
+                    + (position.y - retained_position.y) ** 2
+                    + (position.z - retained_position.z) ** 2
+                ) <= 0.5:
+                    break
+            else:
+                merged.append(candidate)
+        candidates = sorted(merged, key=lambda item: item.metadata["candidate_score"], reverse=True)
         if len(candidates) <= 1:
             return candidates, None
         top_candidate, second_candidate = candidates[:2]
@@ -433,7 +460,8 @@ class _TargetSearch:
             clarification = self._build_target_clarification(
                 query=query,
                 reason="ambiguous_navigation_candidates",
-                candidate_diagnostics=candidate_diagnostics,
+                candidate_diagnostics=[item for item in candidate_diagnostics
+                    if item["record_id"] in {candidate.record_id for candidate in candidates}],
             )
             return [], clarification
         return [top_candidate], None

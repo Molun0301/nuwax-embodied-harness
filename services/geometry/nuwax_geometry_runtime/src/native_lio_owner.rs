@@ -454,10 +454,7 @@ impl NativeProcessOwner {
         command.process_group(0);
         let mut command = Command::from(command);
         command.stdin(Stdio::null());
-        #[cfg(test)]
         command.stdout(Stdio::piped());
-        #[cfg(not(test))]
-        command.stdout(Stdio::null());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
@@ -469,20 +466,15 @@ impl NativeProcessOwner {
         let pid = child.id().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED spawned child did not expose a pid".to_owned()
         })?;
-        #[cfg(test)]
         let stdout = child.stdout.take().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED child stdout pipe was not created".to_owned()
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED child stderr pipe was not created".to_owned()
         })?;
-        #[cfg(test)]
         let stdout_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
         let stderr_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
-        #[cfg(test)]
         let stdout_drain = Some(spawn_output_drain("stdout", stdout, stdout_tail.clone()));
-        #[cfg(not(test))]
-        let stdout_drain = None;
         let stderr_drain = spawn_output_drain("stderr", stderr, stderr_tail.clone());
 
         Ok(Self {
@@ -834,6 +826,8 @@ where
             if read == 0 {
                 return Ok(());
             }
+            tracing::info!(component = "native_lio", stream = label,
+                output = %String::from_utf8_lossy(&buffer[..read]), "原生LIO子进程输出");
             tail.lock().extend(&buffer[..read]);
         }
     })

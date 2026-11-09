@@ -1205,7 +1205,8 @@ where
         if let Some(feedback)=&mut self.status.surface_replan_feedback{
             if feedback.current_context.as_ref().is_some_and(|c|c.applied!=twist){feedback.current_context=None;}
         }
-        self.status.message="速度请求已接受".into();self.publish_status(status_tx);Ok(())
+        if twist!=Twist2::ZERO{self.status.message="速度请求已接受".into();}
+        self.publish_status(status_tx);Ok(())
     }
 
     fn wrap_local_intent(
@@ -2212,6 +2213,42 @@ mod tests {
         assert!(scheduler.status.message.contains("新目标无可行路径"));
         assert!(scheduler.session.is_none());
         assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn n6_zero_receipts_preserve_current_planning_reason_through_timeout() {
+        let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+        let mut scheduler = NavScheduler::new(
+            FakeMotion(motion.clone()), FakePlanner::commanding(), SchedulerConfig::default(),
+        ).unwrap();
+        let (status, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_odometry(&status, map_pose(), None).unwrap();
+        scheduler.observe_costmap(&status, costmap_at(1), Instant::now()).unwrap();
+        scheduler.start_session(&status, session()).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        let reason = "PCT原生全局规划：起点机身与占据相交，无合法逼近节点";
+        let (reply, received) = oneshot::channel();
+        scheduler.handle_input(&status, InputCommand {
+            kind: InputKind::PlanningDiagnostic("goal-1".into(),
+                execution_identity_for("goal-1", 0).goal_key(), reason.into(), false, true), reply,
+        }).await;
+        received.await.unwrap().unwrap();
+        let wait_started = scheduler.path_wait_started_at;
+        for _ in 0..4 {
+            scheduler.session_tick(&status).await.unwrap();
+            assert_eq!(scheduler.status.message, reason);
+            assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+            assert_eq!(scheduler.path_wait_started_at, wait_started);
+        }
+        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+        assert!(scheduler.status.message.contains(reason), "{}", scheduler.status.message);
+        assert!(!scheduler.status.message.contains("速度请求已接受"));
+        scheduler.start_session(&status, session_for("goal-2")).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(!scheduler.status.message.contains(reason));
+        scheduler.cancel(&status, "goal-2").await.unwrap();
     }
 
     #[tokio::test]

@@ -564,5 +564,32 @@ fn n6_ground_filter_keeps_other_surface_above_current_floor() {
     assert_eq!(retained.len(), 1, "下层旧地面剔除，只保留超高薄表面");
     assert!(retained[0][2] > input.config.max_step_up);
     let map = prepare(&MapWorker::new(None).unwrap(), &input);
-    assert_eq!(check(&map, input.pose).unwrap_err().reason, 32);
+    // 仅朝向入口不启动脱困，直接证明原输入中的上层表面仍被原生碰撞查询拒绝。
+    let occupied = ScanTracker::default()
+        .track_and_check(
+            &map.config,
+            &map.snapshot,
+            &MotionState {
+                position: input.pose,
+                measured_velocity: 1,
+                measured_yaw_rate: 1,
+                ..Default::default()
+            },
+            [0.; 3],
+            Some(input.yaw),
+        )
+        .unwrap_err();
+    assert_eq!(
+        occupied.reason,
+        nuwax_nav_scan_native::track_reason::NO_CANDIDATE
+    );
+    assert!(occupied.message.contains("Current body pose is occupied"));
+    // 同一占据输入现在可证明原地转向脱困；有恢复样本才能与地面被过滤掉区分。
+    let escaped = check(&map, input.pose).expect("保留的薄顶面允许通过证明后的转向脱困");
+    assert!(!escaped.recovery_samples.is_empty());
+    assert_eq!(&escaped.command[..2], &[0.; 2]);
+    assert_ne!(escaped.command[2], 0.);
+    let stopped = escaped.recovery_samples.last().unwrap();
+    assert_eq!(stopped.velocity, [0.; 3]);
+    assert_eq!(stopped.yaw_rate, 0.);
 }

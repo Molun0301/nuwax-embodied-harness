@@ -515,6 +515,7 @@ mod tests {
     include!("detour_following_tests.rs");
     include!("command_limit_tests.rs");
     include!("surface_execution_tests.rs");
+    include!("overlap_escape_tests.rs");
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.

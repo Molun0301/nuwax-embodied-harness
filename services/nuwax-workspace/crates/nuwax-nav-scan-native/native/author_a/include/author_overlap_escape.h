@@ -6,7 +6,7 @@ namespace scan_planner {
 
 // 一次重叠事件跨任务退休保留；只允许离开初始实体的同一侧，不能清图或穿墙。
 class AuthorOverlapEscape {
-  struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; };
+  struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; double remaining=0.; bool body_axis=false; };
   bool active_=false,latched_=false;
   int64_t began_=0,last_stamp_=0;
   unsigned ticks_=0;
@@ -29,8 +29,133 @@ class AuthorOverlapEscape {
     const Eigen::Vector2d x=world(Eigen::Vector2d::UnitX(),yaw),y=world(Eigen::Vector2d::UnitY(),yaw);
     const Eigen::Vector2d center=p.head<2>()+world({c.body_center_x,c.body_center_y},yaw);
     const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
-    return c.body_length/2.*std::abs(contact.axis.dot(x))+c.body_width/2.*std::abs(contact.axis.dot(y))
-        +c.resolution/2.*contact.axis.cwiseAbs().sum()+contact.axis.dot(voxel-center);
+    const Eigen::Vector2d axis=contact.body_axis?world(contact.axis,yaw):contact.axis;
+    return c.body_length/2.*std::abs(axis.dot(x))+c.body_width/2.*std::abs(axis.dot(y))
+        +c.resolution/2.*axis.cwiseAbs().sum()+axis.dot(voxel-center);
+  }
+
+  // 四条分离轴、两个有向侧面共同给出真实平面穿透；已分离时取零。
+  static std::array<Eigen::Vector2d,4> axes(double yaw) {
+    using namespace command_check_detail;
+    return {Eigen::Vector2d::UnitX(),Eigen::Vector2d::UnitY(),
+        world(Eigen::Vector2d::UnitX(),yaw),world(Eigen::Vector2d::UnitY(),yaw)};
+  }
+  static double penetration(const Contact& contact,const ScanConfig& c,const Eigen::Vector3d& p,double yaw) {
+    double result=std::numeric_limits<double>::infinity();
+    for(const auto& axis:axes(yaw))for(double sign:{-1.,1.})
+      result=std::min(result,depth({contact.cell,sign*axis,0.},c,p,yaw));
+    return std::max(0.,result);
+  }
+
+  // 每段运动沿用执行器的恒定平均机体系速度。象限内各有向分离量为
+  // d(t)=d(0)+a*sin(wt)/w+b*(1-cos(wt))/w；其导数为 a*cos(wt)+b*sin(wt)。
+  // 按分离量交点、零点和导数零点分段，逐段检查下包络，证明整段穿透非增。
+  static bool monotone(const Contact& contact,const ScanConfig& c,
+      const command_check_detail::State& start,const Eigen::Vector2d& mean,double w,double duration) {
+    using namespace command_check_detail;
+    const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
+    const double tolerance=64.*std::numeric_limits<double>::epsilon()*
+        (1.+mean.norm()+std::abs(w)*(radius(c)+(voxel-start.position.head<2>()).norm()));
+    if(w==0.) {
+      double best=std::numeric_limits<double>::infinity(),rate=0.;
+      for(const auto& axis:axes(start.yaw))for(double sign:{-1.,1.}) {
+        const double d=depth({contact.cell,sign*axis,0.},c,start.position,start.yaw);
+        const double r=-sign*axis.dot(world(mean,start.yaw));
+        if(d<best){best=d;rate=r;}else if(d==best)rate=std::min(rate,r);
+      }
+      // 固定朝向下穿透是仿射函数的下包络，导数只会下降；允许切向平台段。
+      return rate<=tolerance||best+rate*duration<0.;
+    }
+    std::vector<double> cuts{0.,duration};
+    const double finish=start.yaw+w*duration;
+    for(int k=static_cast<int>(std::floor(std::min(start.yaw,finish)/(M_PI/2.)))+1;
+        k*M_PI/2.<std::max(start.yaw,finish);++k)cuts.push_back((k*M_PI/2.-start.yaw)/w);
+    std::sort(cuts.begin(),cuts.end());
+    for(size_t part=1;part<cuts.size();++part) {
+      const auto state=motionAt(start,mean,w,cuts[part-1]);
+      const double span=cuts[part]-cuts[part-1],theta=state.yaw;
+      const double co=std::cos(theta),si=std::sin(theta),mid=theta+w*span/2.;
+      const double sc=std::cos(mid)>=0.?1.:-1.,ss=std::sin(mid)>=0.?1.:-1.;
+      const Eigen::Vector2d offset(c.body_center_x,c.body_center_y);
+      const Eigen::Vector2d center_velocity=mean+w*Eigen::Vector2d(-offset.y(),offset.x());
+      const Eigen::Vector2d local=body(state.position.head<2>()-voxel,theta);
+      const Eigen::Vector2d local_rate=mean-w*Eigen::Vector2d(-local.y(),local.x());
+      struct Curve {double d,a,b;};std::array<Curve,8> curves;size_t index=0;
+      for(int axis=0;axis<4;++axis)for(double sign:{-1.,1.}) {
+        const auto direction=axes(theta)[axis];
+        double a,b;
+        if(axis<2) {
+          const double hx=(axis==0?c.body_length:c.body_width)/2.;
+          const double hy=(axis==0?c.body_width:c.body_length)/2.;
+          a=w*(-hx*sc*si+hy*ss*co);b=w*(-hx*sc*co-hy*ss*si);
+          a-=sign*world(center_velocity,theta)[axis];
+          b-=sign*world(Eigen::Vector2d(-center_velocity.y(),center_velocity.x()),theta)[axis];
+        } else {
+          const int j=axis-2;
+          a=c.resolution/2.*w*(-sc*si+ss*co)-sign*local_rate[j];
+          b=c.resolution/2.*w*(-sc*co-ss*si)
+              +sign*Eigen::Vector2d(-local_rate.y(),local_rate.x())[j];
+        }
+        curves[index++]={depth({contact.cell,sign*direction,0.},c,state.position,theta),a,b};
+      }
+      std::vector<double> events{0.,span};
+      const auto roots=[&](double A,double B,double C) {
+        const double amplitude=std::hypot(A,B);if(amplitude==0.||std::abs(C)>amplitude)return;
+        const double phase=std::atan2(B,A),angle=std::acos(std::clamp(-C/amplitude,-1.,1.));
+        for(double root:{phase-angle,phase+angle}) {
+          const double low=std::min(0.,w*span),high=std::max(0.,w*span);
+          for(int k=static_cast<int>(std::ceil((low-root)/(2.*M_PI)));root+k*2.*M_PI<high;++k) {
+            const double t=(root+k*2.*M_PI)/w;if(t>0.&&t<span)events.push_back(t);
+          }
+        }
+      };
+      for(size_t i=0;i<curves.size();++i) {
+        const auto& v=curves[i];roots(v.a,v.b,0.);
+        roots(-v.b,v.a,w*v.d+v.b);
+        for(size_t j=0;j<i;++j) {
+          const auto& u=curves[j];roots(u.b-v.b,v.a-u.a,w*(v.d-u.d)+v.b-u.b);
+        }
+      }
+      std::sort(events.begin(),events.end());
+      for(size_t i=1;i<events.size();++i) {
+        const double t=(events[i-1]+events[i])/2.,angle=w*t;
+        double best=std::numeric_limits<double>::infinity(),rate=0.;
+        for(const auto& v:curves) {
+          const double d=v.d+v.a*std::sin(angle)/w+v.b*2.*std::pow(std::sin(angle/2.),2)/w;
+          const double r=v.a*std::cos(angle)+v.b*std::sin(angle);
+          if(d<best){best=d;rate=r;}else if(d==best)rate=std::min(rate,r);
+        }
+        if(best>0.&&rate>tolerance)return false;
+      }
+    }
+    return true;
+  }
+
+  // 实测瞬时速度不能先向内再靠本拍平均位移抵消；在切向平台处允许数值零。
+  static bool startsOutward(const Contact& contact,const ScanConfig& c,
+      const command_check_detail::State& state) {
+    using namespace command_check_detail;
+    const double co=std::cos(state.yaw),si=std::sin(state.yaw),w=state.angular;
+    const auto abs_rate=[](double value,double rate) {
+      return std::abs(value)<64.*std::numeric_limits<double>::epsilon()?std::abs(rate):std::copysign(1.,value)*rate;
+    };
+    const double cell_rate=c.resolution/2.*(abs_rate(co,-w*si)+abs_rate(si,w*co));
+    const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
+    const Eigen::Vector2d local=body(state.position.head<2>()-voxel,state.yaw);
+    const Eigen::Vector2d local_rate=state.linear-w*Eigen::Vector2d(-local.y(),local.x());
+    const Eigen::Vector2d center_velocity=world(state.linear+w*Eigen::Vector2d(-c.body_center_y,c.body_center_x),state.yaw);
+    double best=std::numeric_limits<double>::infinity(),rate=0.;
+    const auto directions=axes(state.yaw);
+    for(int i=0;i<4;++i)for(double sign:{-1.,1.}) {
+      const double d=depth({contact.cell,sign*directions[i],0.},c,state.position,state.yaw);
+      const double r=i<2?(i==0
+          ?c.body_length/2.*abs_rate(co,-w*si)+c.body_width/2.*abs_rate(si,w*co)
+          :c.body_length/2.*abs_rate(si,w*co)+c.body_width/2.*abs_rate(co,-w*si))-sign*center_velocity[i]
+          :cell_rate-sign*local_rate[i-2];
+      if(d<best){best=d;rate=r;}else if(d==best)rate=std::min(rate,r);
+    }
+    return best<0.||rate<=64.*std::numeric_limits<double>::epsilon()*
+        (1.+state.linear.norm()+std::abs(w)*(radius(c)+local.norm()));
   }
 
   bool advance(GridMap& map,const ScanConfig& c,command_check_detail::State& state,
@@ -47,25 +172,7 @@ class AuthorOverlapEscape {
     path_bound+=(speed+radius(c)*turn)*c.sample_dt;
     if(admitted_+path_bound>distance_limit_)return false;
     for(const auto& contact:contacts_) {
-      const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
-      const Eigen::Vector2d local=body(voxel-state.position.head<2>(),state.yaw)
-          -Eigen::Vector2d(c.body_center_x,c.body_center_y);
-      const double distance=(voxel-state.position.head<2>()).norm()+c.resolution/std::sqrt(2.)+speed*c.sample_dt;
-      const double cell_projection=c.resolution/2.*(std::abs(std::cos(state.yaw))+std::abs(std::sin(state.yaw)));
-      const double movement=(speed+distance*turn)*c.sample_dt;
-      for(int axis=0;axis<2;++axis)for(double sign:{-1.,1.}) {
-        const double half=(axis==0?c.body_length:c.body_width)/2.;
-        // 格内可能切割实体的机体半平面只可向内收缩：对格内每一点，
-        // gap=sign*R(-yaw)*(point-reference)-offset-half 的导数下界非负。
-        // 原来位于机体外的格内点因此始终在外，禁止同格内侧向新增扫掠。
-        if(sign*local[axis]+cell_projection-half>=-movement
-            &&std::min(-sign*state.linear[axis],-sign*next[axis])-distance*turn<0.)return false;
-      }
-      // 固定轴上的有向分离量导数下界；包含平移转轴和机体全部角点的转动。
-      // 连续下界非负保证穿透不会先增后减，也不能从原实体另一侧退出。
-      const double outward=std::min(contact.axis.dot(world(state.linear,state.yaw)),
-          contact.axis.dot(world(next,state.yaw)))-speed*turn*c.sample_dt-radius(c)*turn;
-      if(outward < 0.)return false;
+      if(!startsOutward(contact,c,state)||!monotone(contact,c,state,mean,mean_w,c.sample_dt))return false;
     }
     if(!sweepFree(map,state,mean,mean_w,radius(c),0.,c.sample_dt,deadline,exhausted,&initial_))return false;
     auto end=motionAt(state,mean,mean_w,c.sample_dt);end.linear=next;end.angular=next_w;
@@ -125,7 +232,7 @@ class AuthorOverlapEscape {
         }
         if(!(selected.depth>=0.&&selected.depth<=penetrationLimit(c)))
           throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
-        contacts_.push_back(selected);initial_.insert(cell);
+        selected.remaining=selected.depth;contacts_.push_back(selected);initial_.insert(cell);
       }
       // 深重叠需要超过一格的退出行程；按初始最大穿透的两倍计入斜向退出，
       // 时间由同一行程和既有低速推出。浅接触保留原一格、两秒未确认预算。
@@ -137,12 +244,15 @@ class AuthorOverlapEscape {
     if(stamp<last_stamp_){active_=false;throw std::runtime_error("Current body pose is occupied; escape source clock regressed");}
     bool progress_observed=false;
     for(const auto& contact:contacts_) {
-      const double now=depth(contact,c,p,yaw);
+      const double now=penetration(contact,c,p,yaw);
       if(now>contact.depth+1e-10) {
         active_=false;
         throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
       }
-      if(now<contact.depth)progress_observed=true;
+      const double remaining=depth(contact,c,p,yaw);
+      if(latched_&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10)
+        throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
+      if(now<contact.depth-1e-10||remaining<contact.remaining-1e-10)progress_observed=true;
     }
     // 只有新的实测采样证实退出进展，才结清未确认运动预算；目标切换不结清。
     if(stamp>last_stamp_&&progress_observed) {
@@ -157,17 +267,24 @@ class AuthorOverlapEscape {
     const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
     std::vector<Eigen::Vector2d> requests;Eigen::Vector2d sum=Eigen::Vector2d::Zero();
-    for(const auto& contact:contacts_)sum+=contact.axis;
+    for(const auto& contact:contacts_)sum+=contact.body_axis?world(contact.axis,yaw):contact.axis;
     if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed_,yaw));
-    for(const auto& contact:contacts_)requests.push_back(body(contact.axis*escape_speed_,yaw));
+    for(const auto& contact:contacts_)requests.push_back(body((contact.body_axis?world(contact.axis,yaw):contact.axis)*escape_speed_,yaw));
     // 机体系精确轴候选避免坐标往返舍入使严格单调条件失去本可执行的零切向量。
     for(int axis=0;axis<2;++axis)for(double sign:{-1.,1.})
       requests.emplace_back(axis==0?sign*escape_speed_:0.,axis==1?sign*escape_speed_:0.);
     for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed_,yaw));
+    // 先平移，再原地正反转向，最后小幅平移转向组合；请求仍按平台命令盒和实测加速度限幅。
+    std::vector<std::pair<Eigen::Vector2d,double>> candidates;
+    for(const auto& request:requests)candidates.emplace_back(request,0.);
+    const double turn_speed=escape_speed_/radius(c);
+    for(double sign:{-1.,1.})candidates.emplace_back(Eigen::Vector2d::Zero(),sign*turn_speed);
+    for(double fraction:{.5,1.})for(double sign:{-1.,1.})for(const auto& request:requests)
+      candidates.emplace_back(request*.5,sign*fraction*turn_speed);
     bool exhausted=false;
-    for(const auto& requested:requests) {
-      if(Clock::now()>=deadline)break;
-      const auto command=bounded(requested,0.,actual,c,false);
+    for(const auto& requested:candidates) {
+      if(Clock::now()>=deadline){exhausted=true;break;}
+      const auto command=bounded(requested.first,requested.second,actual,c,false);
       State state=actual;
       double path_bound=0.;
       std::vector<State> samples{actual};
@@ -180,10 +297,32 @@ class AuthorOverlapEscape {
         samples.push_back(state);
       }
       if(!safe)continue;
-      bool progress=true;
-      for(const auto& contact:contacts_)
-        if(depth(contact,c,state.position,state.yaw)>=depth(contact,c,p,yaw))progress=false;
-      if(!progress)continue;
+      bool progress=false,same_side=true;
+      auto exits=contacts_;
+      for(auto& contact:exits) {
+        double after=depth(contact,c,state.position,state.yaw);
+        if(!latched_) {
+          // 法向不可执行时，选取同侧可达的侧面；最小穿透可先保持不变，退出距离必须下降。
+          double best=std::numeric_limits<double>::infinity();
+          const auto directions=axes(yaw);
+          for(int i=0;i<4;++i)for(double sign:{-1.,1.}) {
+            const auto& axis=directions[i];
+            const Eigen::Vector2d delta=p.head<2>()+world({c.body_center_x,c.body_center_y},yaw)
+                -Eigen::Vector2d((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
+            if(sign*axis.dot(delta)<0.)continue;
+            const Eigen::Vector2d local=i==2?Eigen::Vector2d::UnitX():Eigen::Vector2d::UnitY();
+            const Contact option{contact.cell,sign*(i>=2?local:axis),0.,0.,i>=2};
+            const double from=depth(option,c,p,yaw),to=depth(option,c,state.position,state.yaw);
+            if(from-to>1e-10&&from/(from-to)<best) {
+              best=from/(from-to);contact.axis=option.axis;contact.body_axis=option.body_axis;after=to;
+            }
+          }
+        }
+        const double from=depth(contact,c,p,yaw);
+        if(std::max(0.,after)>std::max(0.,from)+1e-10)same_side=false;
+        if(after<from-1e-10)progress=true;
+      }
+      if(!progress||!same_side)continue;
       output.command_forward=command.linear.x();output.command_lateral=command.linear.y();
       output.command_yaw_rate=command.angular;output.command_duration=c.sample_dt;
       output.duration=(samples.size()-1)*c.sample_dt;output.sample_count=samples.size();
@@ -199,7 +338,11 @@ class AuthorOverlapEscape {
       output.motion_boundary_sources[0]=0;output.motion_boundary_sources[1]=2;output.motion_boundary_sources[2]=0;
       // 每次发出的整拍最大运动量都记入未确认窗口；重复来源时间不能绕过位移上限。
       admitted_+=issued_bound;
-      for(auto& contact:contacts_)contact.depth=depth(contact,c,p,yaw);
+      contacts_=std::move(exits);
+      for(auto& contact:contacts_) {
+        contact.depth=penetration(contact,c,p,yaw);
+        contact.remaining=depth(contact,c,p,yaw);
+      }
       return;
     }
     throw std::runtime_error(exhausted?"Current body pose is occupied; escape proof computation exhausted"

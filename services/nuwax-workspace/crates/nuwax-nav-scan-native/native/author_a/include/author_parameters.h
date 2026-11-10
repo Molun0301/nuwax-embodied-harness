@@ -11,7 +11,7 @@ inline ros::NodeHandle authorParameters(const ScanConfig& c) {
  n.setParam("fsm/planning_horizon",c.planning_horizon);
  n.setParam("fsm/emergency_time_",1.0); n.setParam("fsm/fail_safe",true);
  n.setParam("fsm/max_replan_fail_count",1000);
- n.setParam("manager/max_vel",c.max_velocity);n.setParam("manager/max_acc",c.max_acceleration);
+ n.setParam("manager/max_vel",c.max_velocity);n.setParam("manager/max_acc",c.max_acceleration);n.setParam("manager/max_yaw_rate",c.max_yaw_rate);
  n.setParam("manager/max_jerk",4.0);n.setParam("manager/control_points_distance",.2);
  n.setParam("manager/feasibility_tolerance",.5);n.setParam("manager/planning_horizon",c.planning_horizon);
  n.setParam("optimization/lambda_smooth",1.0);n.setParam("optimization/lambda_collision",1.0);

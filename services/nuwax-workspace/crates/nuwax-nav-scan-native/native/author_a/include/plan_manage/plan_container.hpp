@@ -191,7 +191,7 @@ namespace scan_planner
   struct PlanParameters
   {
     /* planning algorithm parameters */
-    double max_vel_, max_acc_, max_jerk_; // physical limits
+    double max_vel_, max_acc_, max_jerk_, max_yaw_rate_; // physical limits
     double vel_tolerance_, acc_tolerance_;
     double ctrl_pt_dist;                  // distance between adjacient B-spline control points
     double feasibility_tolerance_;        // permitted ratio of vel/acc exceeding limits

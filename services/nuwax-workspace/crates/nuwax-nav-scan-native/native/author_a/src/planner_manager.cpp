@@ -9,138 +9,247 @@ namespace scan_planner
 {
   namespace
   {
-    // 与正时距域求交：常数项非负，负二次项只有一个非负出口。
-    bool intersectTimeBound(double a, double b, double c, double& lower, double& upper)
-    {
-      if (a == 0.) {
-        if (b < 0.) lower = std::max(lower, -c / b);
-        else if (b > 0.) upper = std::min(upper, -c / b);
-        else if (c > 0.) return false;
-      } else {
-        const double discriminant = b * b - 4. * a * c;
-        if (discriminant < 0.) return false;
-        const double root = std::sqrt(discriminant);
-        if (a < 0.) lower = std::max(lower, b < 0. ? 2. * c / (root - b) : (b + root) / (-2. * a));
-        else {
-          const double right = (-b + root) / (2. * a);
-          if (!(right > 0.)) return false;
-          lower = std::max(lower, c / (a * right));
-          upper = std::min(upper, right);
-        }
-      }
-      return upper > 0. && lower <= upper;
-    }
-
-    bool retimeReferenceSegment(Eigen::MatrixXd& controls, const std::vector<double>& arcs, double& dt,
+    // 非均匀三次样条：局部延长、端部线性重拟合、逐间隔收紧；其余几何固定。
+    bool retimeLocalKnots(Eigen::MatrixXd& controls, Eigen::VectorXd& knots, double seed_dt,
         const Eigen::Vector3d& start, const Eigen::Vector3d& velocity, const Eigen::Vector3d& acceleration,
-        const Eigen::Vector3d& target, const Eigen::Vector3d& target_velocity,
-        double max_velocity, double max_acceleration, double time_origin)
+        double max_velocity, double max_acceleration, double sample_velocity, double sample_acceleration, const std::vector<int>& transition_points, std::string& reason)
     {
-      const int count = controls.cols();
-      Eigen::MatrixXd positions = controls;
-      Eigen::MatrixXd velocities = Eigen::MatrixXd::Zero(3, count);
-      Eigen::MatrixXd accelerations = Eigen::MatrixXd::Zero(3, count);
-      // 时距变化时重建真实边界；直接整体放慢会篡改非零实测导数。
-      for (int i = 0; i < 3; ++i) {
-        positions.col(i) = start;
-        positions.col(count - 3 + i) = target;
+      const int count=controls.cols(), spans=count-3;
+      const Eigen::MatrixXd original_controls=controls;
+      if(authorTraceEnabled()) {
+        auto out=authorTraceStream();out<<"{\"event\":\"local_timing_input\",\"points\":";
+        traceMatrix(out,controls);out<<",\"transition_indices\":[";
+        for(std::size_t j=0;j<transition_points.size();++j){if(j)out<<',';out<<transition_points[j];}
+        out<<"]}\n";
       }
-      velocities.col(0) = -velocity; velocities.col(2) = velocity;
-      velocities.col(count - 3) = -target_velocity; velocities.col(count - 1) = target_velocity;
-      accelerations.col(0) = accelerations.col(2) = acceleration / 3.;
-      accelerations.col(1) = -acceleration / 6.;
-      double first_corner = arcs.back(), last_corner = arcs.front();
-      for (int i = 3; i + 2 < count - 3; ++i) {
-        if (arcs[i] == arcs[i + 1] && arcs[i] == arcs[i + 2]) {
-          first_corner = std::min(first_corner, arcs[i]);
-          last_corner = std::max(last_corner, arcs[i]);
+      if(velocity.head<2>().norm()>max_velocity||acceleration.head<2>().norm()>max_acceleration) {
+        reason="真实起点水平速度或加速度超过设备上限";return false;
+      }
+      std::vector<double> lengths(count-1),speeds(count,max_velocity),travel(count-1);
+      for(int i=0;i<count-1;++i)lengths[i]=(controls.col(i+1)-controls.col(i)).head<2>().norm();
+      // 初始化时间由内部几何决定；旧拟合端点的微小差分不作为新的时间尺度。
+      lengths[0]=lengths[1]=0.;
+      lengths[2]=(controls.col(3)-start).head<2>().norm();
+      speeds[0]=speeds[1]=speeds[2]=velocity.head<2>().norm();
+      const double terminal=(controls.col(count-1)-controls.col(count-3)).head<2>().norm()/(2.*seed_dt);
+      speeds[count-1]=speeds[count-2]=speeds[count-3]=std::min(max_velocity,terminal);
+      for(int i=1;i<count;++i)speeds[i]=std::min(speeds[i],std::sqrt(speeds[i-1]*speeds[i-1]+2.*max_acceleration*lengths[i-1]));
+      for(int i=count-2;i>=0;--i)speeds[i]=std::min(speeds[i],std::sqrt(speeds[i+1]*speeds[i+1]+2.*max_acceleration*lengths[i]));
+      for(int i=0;i<count-1;++i)travel[i]=lengths[i]>0.
+          ?(speeds[i]+speeds[i+1]>0.?2.*lengths[i]/(speeds[i]+speeds[i+1]):2.*std::sqrt(lengths[i]/max_acceleration))
+          :std::numeric_limits<double>::infinity();
+      travel[0]=travel[1]=std::numeric_limits<double>::infinity();
+      travel[count-3]=travel[count-2]=std::numeric_limits<double>::infinity();
+      Eigen::VectorXd intervals(spans);
+      for(int i=0;i<spans;++i) {
+        double candidate=0.;int available=0;
+        for(int j=i;j<=i+2;++j)if(std::isfinite(travel[j])){candidate+=travel[j];++available;}
+        candidate=available?candidate/available:seed_dt;
+        intervals[i]=std::isfinite(candidate)?candidate:seed_dt;
+      }
+      // 非零真实起点的控制点依赖时距，从原工作时距起步；零导数不改变位置。
+      if(!velocity.isZero(0.)||!acceleration.isZero(0.))intervals[0]=intervals[1]=seed_dt;
+      intervals[spans-2]=intervals[spans-1]=std::max(intervals[spans-2],intervals[spans-1]);
+      const double inward=1.-1e-8;
+      // V0、V1为真实起点速度加减a*h/2，直接解两侧范数的二次不等式。
+      auto boundary_span=[&](const Eigen::VectorXd& v,const Eigen::VectorXd& a,double limit) {
+        const double slack=limit*limit-v.squaredNorm();
+        if(slack<0.)return 0.;
+        if(a.squaredNorm()==0.)return std::numeric_limits<double>::infinity();
+        const double projection=std::abs(v.dot(a));
+        return slack>0.?2.*slack/(projection+std::sqrt(projection*projection+a.squaredNorm()*slack)):0.;
+      };
+      const double boundary_max=std::min(boundary_span(velocity.head<2>(),acceleration.head<2>(),max_velocity),
+          boundary_span(velocity,acceleration,sample_velocity));
+      if(boundary_max==0.){reason="真实起点导数与严格速度控制点证书不存在正首间隔";return false;}
+      intervals[0]=std::min(intervals[0],boundary_max/2.);
+      auto boundary_speed_ok=[&](double h){return h<boundary_max;};
+      auto rebuild=[&]() {
+        // 首两个物理间隔可独立变化；外延结点沿首间隔延伸。
+        knots.resize(count+4);knots[3]=0.;
+        for(int i=2;i>=0;--i)knots[i]=knots[i+1]-intervals[0];
+        for(int i=0;i<spans;++i)knots[i+4]=knots[i+3]+intervals[i];
+        for(int i=count+1;i<count+4;++i)knots[i]=knots[i-1]+intervals[spans-1];
+        controls=original_controls;
+        const double a=intervals[0],b=intervals[1];
+        controls.col(0)=start-velocity*a+acceleration*(a*a/3.);
+        controls.col(1)=start-acceleration*(a*a/6.);
+        controls.col(2)=controls.col(1)+(velocity+acceleration*(a/2.))*((2.*a+b)/3.);
+        // 首边界贴上限时，绝对坐标舍入可能使二阶差分向外跨一个浮点间隔。
+        // 只把该舍入差向可行侧构造；最终仍由原严格证书检查，真实边界误差另行记录。
+        const Eigen::Vector3d boundary_v0=3.*(controls.col(1)-controls.col(0))/(knots[4]-knots[1]);
+        const Eigen::Vector3d boundary_v1=3.*(controls.col(2)-controls.col(1))/(knots[5]-knots[2]);
+        const Eigen::Vector3d boundary_a=2.*(boundary_v1-boundary_v0)/(knots[4]-knots[2]);
+        const double boundary_scale=std::max(boundary_a.head<2>().norm()/max_acceleration,boundary_a.norm()/sample_acceleration);
+        if(boundary_scale>1.) {
+          const Eigen::Vector3d difference=boundary_a*(1.-1./boundary_scale)*(a*a);
+          controls.col(0)-=difference;
+          Eigen::Index axis;boundary_a.cwiseAbs().maxCoeff(&axis);
+          controls(axis,0)=std::nextafter(controls(axis,0),boundary_a[axis]>0.?
+              -std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity());
+        }
+        // 与原参数化相同的线性最小二乘，仅解端部过渡列；固定列移至右端。
+        // 拟合真实二阶导数的连续变化，消除旧均匀时距留下的端部导数突变。
+        if(!transition_points.empty()) {
+          const int unknowns=transition_points.size();
+          Eigen::MatrixXd weights=Eigen::MatrixXd::Zero(count-3,unknowns);
+          Eigen::MatrixXd values=Eigen::MatrixXd::Zero(count-3,3);
+          int row=0;
+          for(int i=0;i<count-3;++i) {
+            Eigen::Vector4d coefficient=Eigen::Vector4d::Zero();
+            for(int side=0;side<2;++side) {
+              const int j=i+side;
+              const double factor=(side?1.:-1.)*2./(knots[j+4]-knots[j+2]);
+              coefficient[side]+=factor*3./(knots[j+4]-knots[j+1]);
+              coefficient[side+1]-=factor*(3./(knots[j+4]-knots[j+1])+3./(knots[j+5]-knots[j+2]));
+              coefficient[side+2]+=factor*3./(knots[j+5]-knots[j+2]);
+            }
+            bool active=false;
+            for(int j=0;j<unknowns;++j)if(transition_points[j]>=i&&transition_points[j]<=i+3)active=true;
+            if(!active)continue;
+            const double scale=1./std::sqrt(knots[i+4]-knots[i+3]);
+            for(int j=0;j<4;++j) {
+              auto found=std::find(transition_points.begin(),transition_points.end(),i+j);
+              if(found==transition_points.end())values.row(row)-=scale*coefficient[j]*controls.col(i+j).transpose();
+              else weights(row,found-transition_points.begin())=scale*coefficient[j];
+            }
+            ++row;
+          }
+          const Eigen::MatrixXd fitted=weights.topRows(row).colPivHouseholderQr().solve(values.topRows(row));
+          for(int j=0;j<unknowns;++j)controls.col(transition_points[j])=fitted.row(j).transpose();
+        }
+      };
+      auto derivatives=[&](Eigen::MatrixXd& velocities,Eigen::MatrixXd& accelerations) {
+        velocities.resize(3,count-1);accelerations.resize(3,count-2);
+        for(int i=0;i<count-1;++i)
+          velocities.col(i)=3.*(controls.col(i+1)-controls.col(i))/(knots[i+4]-knots[i+1]);
+        for(int i=0;i<count-2;++i)
+          accelerations.col(i)=2.*(velocities.col(i+1)-velocities.col(i))/(knots[i+4]-knots[i+2]);
+      };
+      auto extend=[&](int interval,double addition) {
+        const double rounding=std::numeric_limits<double>::epsilon()*(count+4)*std::max(1.,knots[count]);
+        intervals[interval]=std::nextafter(intervals[interval]+std::max(addition,rounding),std::numeric_limits<double>::infinity());
+        // 末端的两个间隔相等，保留固定末三点原有的终点位置。
+        if(interval>=spans-2)intervals[spans-2]=intervals[spans-1]=std::max(intervals[spans-2],intervals[spans-1]);
+      };
+      Eigen::MatrixXd velocities,accelerations;
+      for(int pass=0;pass<64;++pass) {
+        rebuild();derivatives(velocities,accelerations);
+        bool changed=false;
+        for(int i=0;i<count-1;++i) {
+          rebuild();derivatives(velocities,accelerations);
+          const double limit=i<2?max_velocity:max_velocity*inward;
+          const double magnitude=std::max(velocities.col(i).head<2>().norm(),velocities.col(i).norm()*limit/(sample_velocity*inward));
+          if(magnitude<=limit)continue;
+          if(i<2) {reason="真实起点导数在当前首间隔下不能满足严格速度界";return false;}
+          const double denominator=knots[i+4]-knots[i+1];
+          const double addition=denominator*(magnitude/(limit*inward)-1.);
+          const int first=std::max(2,i-2),last=std::min(spans-1,i);
+          for(int j=first;j<=last;++j)extend(j,addition/(last-first+1));
+          changed=true;
+        }
+        for(int offset=1;offset<count-2;++offset) {
+          const int i=pass%2?count-2-offset:offset;
+          rebuild();derivatives(velocities,accelerations);
+          const bool spatial=accelerations.col(i).norm()/sample_acceleration
+              >accelerations.col(i).head<2>().norm()/max_acceleration;
+          const double local_limit=(spatial?sample_acceleration:max_acceleration)*inward;
+          const double magnitude=spatial?accelerations.col(i).norm():accelerations.col(i).head<2>().norm();
+          if(magnitude<=local_limit)continue;
+          // 在该真实二阶导数的支撑内选择最有效的局部增时方向。
+          int selected=-1;double slope=0.,best_gain=0.;
+          const Eigen::VectorXd saved=intervals;
+          for(int j=std::max(0,i-2);j<=std::min(spans-1,i+1);++j) {
+            const double delta=intervals[j]*1e-4;
+            if(j==0&&!boundary_speed_ok(intervals[0]+delta))continue;
+            extend(j,delta);rebuild();Eigen::MatrixXd v,a;derivatives(v,a);
+            const double gradient=((spatial?a.col(i).norm():a.col(i).head<2>().norm())-magnitude)/delta;
+            intervals=saved;
+            const double gain=gradient/(j>=spans-2?2.:1.);
+            if(gain<best_gain){best_gain=gain;slope=gradient;selected=j;}
+          }
+          rebuild();
+          if(selected<0) {reason="真实起点衔接没有可局部延长的可行方向";return false;}
+          const double maximum=intervals[selected]*.15;
+          const double addition=std::min(maximum,(magnitude-local_limit*inward)/(-slope));
+          if(selected==0&&!boundary_speed_ok(intervals[0]+addition)) {
+            reason="真实起点速度与加速度限制首间隔，无法延长衔接";return false;
+          }
+          extend(selected,addition);changed=true;
+        }
+        if(!changed) {
+          // 延长得到可行解后，逐个间隔收紧；只保留仍满足原导数约束的缩短。
+          auto feasible=[&]() {
+            rebuild();derivatives(velocities,accelerations);
+            return velocities.topRows(2).colwise().norm().maxCoeff()<=max_velocity*inward
+                && accelerations.rightCols(count-3).topRows(2).colwise().norm().maxCoeff()<=max_acceleration*inward
+                && velocities.colwise().norm().maxCoeff()<=sample_velocity*inward
+                && accelerations.rightCols(count-3).colwise().norm().maxCoeff()<=sample_acceleration*inward;
+          };
+          for(int sweep=0;sweep<3;++sweep)for(int offset=0;offset<spans-1;++offset) {
+            const int j=sweep%2?spans-2-offset:offset;
+            const Eigen::VectorXd saved=intervals;
+            double low=.5,high=1.;
+            for(int step=0;step<14;++step) {
+              const double fraction=(low+high)/2.;intervals=saved;
+              intervals[j]*=fraction;
+              if(j==spans-2)intervals[spans-1]=intervals[j];
+              if(feasible())high=fraction;else low=fraction;
+            }
+            intervals=saved;intervals[j]*=high;
+            if(j==spans-2)intervals[spans-1]=intervals[j];
+          }
+          rebuild();
+          if(authorTraceEnabled()) {
+            auto out=authorTraceStream();out<<"{\"event\":\"timing_transition_points\",\"indices\":[";
+            for(std::size_t j=0;j<transition_points.size();++j){if(j)out<<',';out<<transition_points[j];}
+            out<<"],\"max_displacement\":";
+            double maximum=0.;for(int i:transition_points)maximum=std::max(maximum,(controls.col(i)-original_controls.col(i)).norm());
+            out<<maximum<<"}\n";
+          }
+          int first_fixed=3;
+          while(std::find(transition_points.begin(),transition_points.end(),first_fixed)!=transition_points.end())++first_fixed;
+          const Eigen::Vector2d original=(original_controls.col(first_fixed)-start).head<2>();
+          UniformBspline curve(controls,3,seed_dt);curve.setKnot(knots);
+          auto v=curve.getDerivative(),a=v.getDerivative();
+          // 控制多边形回折不等于真实曲线回头；逐段求二次速度投影的真实最小值。
+          if((controls.col(3)-controls.col(2)).head<2>().dot(original)<0.)
+          for(int j=0;j<std::min(first_fixed,spans);++j) {
+            const double left=knots[j+3],right=knots[j+4],middle=(left+right)/2.;
+            auto projection=[&](double t){return v.evaluateDeBoorT(t).head<2>().dot(original);};
+            const double p=projection(left),q=projection(right),m=projection(middle);
+            const double quadratic=2.*(p+q-2.*m),linear=q-p-quadratic;
+            double minimum=std::min(p,q);
+            if(quadratic>0.) {
+              const double fraction=-linear/(2.*quadratic);
+              if(fraction>0.&&fraction<1.)minimum=std::min(minimum,projection(left+fraction*(right-left)));
+            }
+            if(minimum<0.){reason="真实起点与固定控制多边形的衔接曲线会回头";return false;}
+          }
+          if(v.getControlPoint().topRows(2).colwise().norm().maxCoeff()>max_velocity
+              ||a.getControlPoint().topRows(2).colwise().norm().maxCoeff()>max_acceleration) {
+            if(authorTraceEnabled()) {
+              auto out=authorTraceStream();out<<"{\"event\":\"local_timing_certificate_failed\",\"velocities\":";
+              traceMatrix(out,v.getControlPoint());out<<",\"accelerations\":";traceMatrix(out,a.getControlPoint());out<<"}\n";
+            }
+            reason="局部时距的最终严格控制点证书未通过";return false;
+          }
+          return true;
         }
       }
-      // 非零边界沿首末原直段衰减；不能把前进中的端点骤接到静止初值而产生回头。
-      for (int i = 3; i < count - 3; ++i) {
-        const double from = first_corner > arcs.front()
-            ? std::clamp((first_corner - arcs[i]) / (first_corner - arcs.front()), 0., 1.) : 0.;
-        const double to = arcs.back() > last_corner
-            ? std::clamp((arcs[i] - last_corner) / (arcs.back() - last_corner), 0., 1.) : 0.;
-        velocities.col(i) = from * velocity - to * target_velocity;
-        accelerations.col(i) = from * acceleration / 3.;
+      if(authorTraceEnabled()) {
+        rebuild();derivatives(velocities,accelerations);
+        auto out=authorTraceStream();out<<"{\"event\":\"local_timing_unconverged\",\"intervals\":";
+        traceMatrix(out,intervals);out<<",\"velocities\":";traceMatrix(out,velocities);
+        out<<",\"accelerations\":";traceMatrix(out,accelerations);out<<"}\n";
       }
-      // 设备速度、加速度上限只约束水平运动；竖直导数仍参与三维边界重建。
-      double lower = dt, upper = std::numeric_limits<double>::infinity();
-      for (int i = 0; i + 1 < count; ++i) {
-        const Eigen::Vector2d p = (positions.col(i + 1) - positions.col(i)).head<2>();
-        const Eigen::Vector2d v = (velocities.col(i + 1) - velocities.col(i)).head<2>();
-        const Eigen::Vector2d a = (accelerations.col(i + 1) - accelerations.col(i)).head<2>();
-        // 无加速度项时精确求速度范数；其余用三角不等式给出保守充分界。
-        const bool feasible = a.isZero(0.)
-            ? intersectTimeBound(v.squaredNorm() - max_velocity * max_velocity,
-                2. * p.dot(v), p.squaredNorm(), lower, upper)
-            : intersectTimeBound(a.norm(), v.norm() - max_velocity, p.norm(), lower, upper);
-        if (!feasible) return false;
-      }
-      for (int i = 0; i + 2 < count; ++i) {
-        const Eigen::Vector2d p = (positions.col(i + 2) - 2. * positions.col(i + 1) + positions.col(i)).head<2>();
-        const Eigen::Vector2d v = (velocities.col(i + 2) - 2. * velocities.col(i + 1) + velocities.col(i)).head<2>();
-        const Eigen::Vector2d a = (accelerations.col(i + 2) - 2. * accelerations.col(i + 1) + accelerations.col(i)).head<2>();
-        if (!intersectTimeBound(a.norm() - max_acceleration, v.norm(), p.norm(), lower, upper)) return false;
-      }
-      // 导数分母要从累计结点时间相减；按累计时间/本段时距计入这四次差分的舍入量。
-      // 最终仍按原严格上限核验，不放宽检查，也不增加求解重试。
-      dt = std::nextafter(lower * (1. + std::numeric_limits<double>::epsilon()
-          * (count + 4 + 4. * time_origin / lower)),
-          std::numeric_limits<double>::infinity());
-      if (!std::isfinite(dt) || dt > upper) return false;
-      controls = positions + velocities * dt + accelerations * (dt * dt);
-      for (int i = 0; i + 1 < count; ++i) {
-        const Eigen::Vector3d direction = positions.col(i + 1) - positions.col(i);
-        if ((controls.col(i + 1) - controls.col(i)).dot(direction) < 0.) return false;
-      }
-      return controls.allFinite();
-    }
-
-    bool retimeReferenceControls(Eigen::MatrixXd& controls, const std::vector<double>& arcs,
-        Eigen::VectorXd& knots, const Eigen::Vector3d& start, const Eigen::Vector3d& velocity, const Eigen::Vector3d& acceleration,
-        const Eigen::Vector3d& target,
-        const Eigen::Vector3d& target_velocity, double max_velocity, double max_acceleration)
-    {
-      const int count = controls.cols();
-      std::vector<int> stops{0};
-      for (int i = 3; i < count - 3; ++i)
-        if (arcs[i] == arcs[i + 1] && arcs[i] == arcs[i + 2]) stops.push_back(i);
-      stops.push_back(count - 3);
-      knots = Eigen::VectorXd::Zero(count + 4);
-      double first_dt = 0., last_dt = 0.;
-      for (std::size_t segment = 1; segment < stops.size(); ++segment) {
-        const int first = stops[segment - 1], last = stops[segment];
-        Eigen::MatrixXd part = controls.middleCols(first, last - first + 3);
-        std::vector<double> part_arcs(arcs.begin() + first, arcs.begin() + last + 3);
-        double dt = 0.;
-        if (!retimeReferenceSegment(part, part_arcs, dt,
-            segment == 1 ? start : Eigen::Vector3d(part.col(1)),
-            segment == 1 ? velocity : Eigen::Vector3d::Zero().eval(),
-            segment == 1 ? acceleration : Eigen::Vector3d::Zero().eval(),
-            segment + 1 == stops.size() ? target : Eigen::Vector3d(part.col(part.cols() - 2)),
-            segment + 1 == stops.size() ? target_velocity : Eigen::Vector3d::Zero().eval(),
-            max_velocity, max_acceleration, knots[first + 3])) return false;
-        controls.middleCols(first, part.cols()) = part;
-        for (int i = first + 3; i < last + 3; ++i) knots[i + 1] = knots[i] + dt;
-        if (segment == 1) first_dt = dt;
-        last_dt = dt;
-        if (authorTraceEnabled()) {
-          auto out = authorTraceStream();
-          out << "{\"event\":\"reference_segment_timing\",\"first\":" << first
-              << ",\"last\":" << last << ",\"dt\":" << dt
-              << ",\"duration\":" << (last - first) * dt << "}\n";
-        }
-      }
-      for (int i = 0; i < 3; ++i) knots[i] = (i - 3) * first_dt;
-      for (int i = count + 1; i < count + 4; ++i) knots[i] = knots[count] + (i - count) * last_dt;
-      return true;
+      reason="真实起点与固定控制多边形的局部定时未收敛";
+      return false;
     }
 
     void buildReferenceControls(RouteHeightReference& route, const Eigen::Vector3d& start,
         Eigen::Vector3d& target, int count, double resolution, double max_velocity, double max_acceleration,
-        GridMap& map, Eigen::MatrixXd& controls, std::vector<double>& control_arcs)
+        GridMap& map, Eigen::MatrixXd& controls, std::vector<double>& control_arcs, double max_yaw_rate, std::vector<bool>& anchor_points)
     {
       struct Anchor { Eigen::Vector3d point; double arc; };
       std::vector<Anchor> input{{start, route.begin_arc}};
@@ -229,18 +338,18 @@ namespace scan_planner
       for (std::size_t i = 0; i < lengths.size(); ++i)
         lengths[i] = (anchors[i + 1].point - anchors[i].point).norm();
       for (std::size_t i = 1; i + 1 < anchors.size(); ++i) {
-        const Eigen::Vector3d incoming = (anchors[i].point - anchors[i - 1].point).normalized();
-        const Eigen::Vector3d outgoing = (anchors[i + 1].point - anchors[i].point).normalized();
-        // 在半个相邻段、且不超过制动距离的邻域内完成速度转向：
-        // |Δv|=2v sin(θ/2)，可用时间=邻域长度/v，要求 |Δv|/Δt≤a。
-        const double blend = std::min({lengths[i - 1] / 2., lengths[i] / 2.,
-            max_velocity * max_velocity / (2. * max_acceleration)});
-        const double sine_limit = max_acceleration * blend / (2. * max_velocity * max_velocity);
-        if ((incoming - outgoing).norm() / 2. < sine_limit) {
-          repeats[i] = 1;
-          speeds[i] = max_velocity;
+        const Eigen::Vector2d incoming = (anchors[i].point - anchors[i - 1].point).head<2>();
+        const Eigen::Vector2d outgoing = (anchors[i + 1].point - anchors[i].point).head<2>();
+        const double planar_length=incoming.norm()*outgoing.norm();
+        const double angle=planar_length>0.?std::acos(std::clamp(incoming.dot(outgoing)/planar_length,-1.,1.)):0.;
+        if(angle<=M_PI/2.) {
+          const double blend=std::min({lengths[i-1]/2.,lengths[i]/2.,max_velocity*max_velocity/(2.*max_acceleration)});
+          const double radius=angle>0.?blend/std::tan(angle/2.):std::numeric_limits<double>::infinity();
+          repeats[i]=1;
+          speeds[i]=std::min({max_velocity,max_yaw_rate*radius,std::sqrt(max_acceleration*radius)});
         }
       }
+
       // 连续通过点的速度同时受前后停车距离约束。
       for (std::size_t i = 1; i < speeds.size(); ++i)
         speeds[i] = std::min(speeds[i], std::sqrt(speeds[i - 1] * speeds[i - 1] + 2. * max_acceleration * lengths[i - 1]));
@@ -263,10 +372,11 @@ namespace scan_planner
           if (times[i] / (interior[i] + 1) > times[selected] / (interior[selected] + 1)) selected = i;
         ++interior[selected];
       }
-      controls.resize(3, count); control_arcs.clear();
+      controls.resize(3, count); control_arcs.clear(); anchor_points.assign(count,false);
       int column = 0;
       for (std::size_t i = 0; i < anchors.size(); ++i) {
         for (int repeat = 0; repeat < repeats[i]; ++repeat) {
+          anchor_points[column]=true;
           controls.col(column++) = anchors[i].point; control_arcs.push_back(anchors[i].arc);
         }
         if (i + 1 == anchors.size()) break;
@@ -352,6 +462,7 @@ namespace scan_planner
     nh.param("manager/max_vel", pp_.max_vel_, -1.0);
     nh.param("manager/max_acc", pp_.max_acc_, -1.0);
     nh.param("manager/max_jerk", pp_.max_jerk_, -1.0);
+    nh.param("manager/max_yaw_rate", pp_.max_yaw_rate_, -1.0);
     nh.param("optimization/vel_tolerance", pp_.vel_tolerance_, 1.0);
     nh.param("optimization/acc_tolerance", pp_.acc_tolerance_, 1.0);
     nh.param("manager/feasibility_tolerance", pp_.feasibility_tolerance_, 0.0);
@@ -451,9 +562,9 @@ namespace scan_planner
     std::vector<double> timed_seed_arcs;
     Eigen::MatrixXd ctrl_pts;
     std::vector<double> seed_control_arcs;
+    std::vector<bool> seed_anchor_points;
     // Initialization flags are members of this persistent manager.
     bool flag_regenerate = false;
-    bool stationary_short_seed = false;
     if (route_time_seed)
     {
       flag_first_call = false;
@@ -465,7 +576,7 @@ namespace scan_planner
       const int intervals = std::clamp(static_cast<int>(std::ceil(span / detail_dt)), 6, capacity - 1);
       const double original_end_arc = route_height_.end_arc;
       buildReferenceControls(route_height_, start_pt, local_target_pt, intervals + 3,
-          resolution, pp_.max_vel_, pp_.max_acc_, *grid_map_, ctrl_pts, seed_control_arcs);
+          resolution, pp_.max_vel_, pp_.max_acc_, *grid_map_, ctrl_pts, seed_control_arcs, pp_.max_yaw_rate_, seed_anchor_points);
       if (route_height_.end_arc < original_end_arc) {
         span = route_height_.end_time - route_height_.begin_time;
         global_data_.last_progress_time_ = route_height_.end_time;
@@ -500,11 +611,8 @@ namespace scan_planner
         PolynomialTraj gl_traj;
 
         double dist = (start_pt - local_target_pt).norm();
-        stationary_short_seed = dist < pp_.max_vel_ * pp_.max_vel_ / pp_.max_acc_
-            && start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.)
-            && !flag_randomPolyTraj;
         // 先生成原五次曲线的几何采样；静止短程在拟合后按实际三次样条重新定时。
-        const double short_time = std::max(5. * dist / pp_.max_vel_, sqrt(20. * dist / pp_.max_acc_));
+        const double short_time = std::max(3. * dist / pp_.max_vel_, sqrt(8. * dist / pp_.max_acc_));
         double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? short_time : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
 
         if (!flag_randomPolyTraj)
@@ -548,7 +656,11 @@ namespace scan_planner
             point_set.push_back(pt);
           }
         } while (flag_too_far || point_set.size() < 7); // To make sure the initial path has enough points.
-        t -= ts;
+        // 等间隔覆盖真实末端，不能把截断采样位置与目标的零速度混在同一拟合边界。
+        const int sample_intervals=static_cast<int>(std::ceil(time/ts));
+        ts=time/sample_intervals;point_set.clear();
+        for(int i=0;i<=sample_intervals;++i)point_set.push_back(gl_traj.evaluate(i*ts));
+        t=time;
         start_end_derivatives.push_back(gl_traj.evaluateVel(0));
         start_end_derivatives.push_back(local_target_vel);
         start_end_derivatives.push_back(gl_traj.evaluateAcc(0));
@@ -701,70 +813,26 @@ namespace scan_planner
       ctrl_pts.col(size - 1) = local_target_pt + local_target_vel * ts;
     } else {
       UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
-      if (stationary_short_seed) {
-        UniformBspline seed(ctrl_pts, 3, ts);
-        // 固定拟合后的控制点，以导数控制点水平范数求共同最小时距。
-        // 一阶导数随时距反比、二阶导数随平方反比；覆盖连续时间及原逐轴/采样检查。
-        ts *= strictDynamicScale(seed)
-            * (1. + std::numeric_limits<double>::epsilon() * (ctrl_pts.cols() + 4));
-      }
+
     }
 
     if(authorTraceEnabled()) {
       auto out=authorTraceStream();out<<"{\"event\":\"initial_control_points\",\"attempt\":"<<count-1<<",\"ts\":"<<ts<<",\"points\":";traceMatrix(out,ctrl_pts);out<<"}\n";
     }
     vector<vector<Eigen::Vector3d>> a_star_paths;
-    Eigen::MatrixXd reference_controls = route_time_seed ? ctrl_pts : Eigen::MatrixXd{};
-    const double reference_dt = ts;
-    Eigen::VectorXd reference_knots;
-    bool reference_free = false;
-    if (route_time_seed) {
-      UniformBspline reference_curve(reference_controls, 3, reference_dt);
-      reference_free = trajectoryCollisionFree(reference_curve);
+    // 路线锚点和重复停车点固定；每端最多三个相邻的导数过渡点参与拟合。
+    std::vector<int> transition_points;
+    for(int side=0;side<2;++side)for(int offset=0;offset<3;++offset) {
+      const int i=side?ctrl_pts.cols()-4-offset:3+offset;
+      if(i<3||i>=ctrl_pts.cols()-3)break;
+      if(route_time_seed&&seed_anchor_points[i])break;
+      if(std::find(transition_points.begin(),transition_points.end(),i)==transition_points.end())transition_points.push_back(i);
     }
-    // 原参考本身已经可行时先交付其严格证书，避免优化器不断切掉必要拐角后
-    // 才回退到同一参考，导致计算超过原命令交付窗。实测边界和所有门禁仍相同。
-    // 执行中的非零边界同样需要定时；历史曲线存在不能证明新初值的首段可行。
-    if (reference_free) {
-      Eigen::MatrixXd retained_controls = reference_controls;
-      Eigen::VectorXd retained_knots;
-      if (!retimeReferenceControls(retained_controls, seed_control_arcs, retained_knots, start_pt, start_vel, start_acc,
-          local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_)) {
-        ROS_WARN("真实运动边界与参考初值不存在满足设备上限的时距。");
-        ++continuous_failures_count_;
-        return false;
-      }
-      {
-        UniformBspline retained(retained_controls, 3, reference_dt);
-        retained.setKnot(retained_knots);
-        if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
-            && strictDynamicScale(retained) <= 1.) {
-          if (trajectoryHasPreferredClearance(retained)) {
-            if (authorTraceEnabled()) {
-              auto out = authorTraceStream();
-              out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained.getTimeSum() / ((retained_controls.cols() - 3) * reference_dt)
-                  << ",\"duration\":" << retained.getTimeSum() << "}\n";
-            }
-            updateTrajInfo(retained, ros::Time::now());
-            continuous_failures_count_ = 0;
-            return true;
-          }
-          // 优化器仍沿用原均匀工作时距；初值的分段结点随几何一同保留到接纳阶段。
-          // 工作时距只用于原优化器的代价计算，不作为发布轨迹的时间表。
-          ctrl_pts = retained_controls;
-          reference_controls = retained_controls;
-          reference_knots = retained_knots;
-          ts = std::max(reference_dt, (retained_knots.tail(retained_knots.size() - 1)
-              - retained_knots.head(retained_knots.size() - 1)).maxCoeff());
-          ctrl_pts.col(0) = start_pt - start_vel * ts + start_acc * (ts * ts / 3.);
-          ctrl_pts.col(1) = start_pt - start_acc * (ts * ts / 6.);
-          ctrl_pts.col(2) = start_pt + start_vel * ts + start_acc * (ts * ts / 3.);
-          ctrl_pts.col(ctrl_pts.cols() - 3) = local_target_pt - local_target_vel * ts;
-          ctrl_pts.col(ctrl_pts.cols() - 2) = local_target_pt;
-          ctrl_pts.col(ctrl_pts.cols() - 1) = local_target_pt + local_target_vel * ts;
-        }
-      }
-    }
+    const Eigen::MatrixXd reference_controls=ctrl_pts;
+    UniformBspline reference_curve(reference_controls,3,ts);
+    const bool reference_free=route_time_seed&&trajectoryCollisionFree(reference_curve);
+    // 初值和优化结果统一在优化后定时，避免端部定时成功使曲折初值跳过几何优化。
+    std::string timing_reason;
     if(!height_sample_arcs.empty()) {
       // Cubic Greville index j corresponds to sample j-1; boundary extensions
       // keep the endpoint arc. This mapping stays fixed throughout the solve.
@@ -780,6 +848,14 @@ namespace scan_planner
           return route_height_.heightAtArc(a+ratio*(b-a));
         };
       };
+    }
+    bspline_optimizer_rebound_->fixed_stop_points_.clear();
+    if(route_time_seed)for(int i=3;i+2<ctrl_pts.cols()-3;++i) {
+      if(seed_anchor_points[i]&&seed_anchor_points[i+1]&&seed_anchor_points[i+2]
+          &&ctrl_pts.col(i)==ctrl_pts.col(i+1)&&ctrl_pts.col(i)==ctrl_pts.col(i+2)) {
+        for(int j=0;j<3;++j)bspline_optimizer_rebound_->fixed_stop_points_.push_back(i+j);
+        i+=2;
+      }
     }
     a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
 
@@ -798,67 +874,25 @@ namespace scan_planner
       for(size_t i=0;i<a_star_paths.size();++i){if(i)out<<',';out<<'[';for(size_t j=0;j<a_star_paths[i].size();++j){if(j)out<<',';traceMatrix(out,a_star_paths[i][j]);}out<<']';}out<<"]}\n";
     }
     std::cerr << "first_optimize_step_success=" << flag_step_1_success << endl;
-    if (!flag_step_1_success && !reference_free)
-    {
-      // visualization_->displayOptimalList( ctrl_pts, vis_id );
-      continuous_failures_count_++;
-      return false;
+    // 保留原有无碰撞参考回退；数值状态失败但几何已无碰撞时保留排斥后的结果。
+    if(!flag_step_1_success&&reference_free) {
+      UniformBspline optimized_geometry(ctrl_pts,3,ts);
+      if(!trajectoryCollisionFree(optimized_geometry))ctrl_pts=reference_controls;
     }
-    if (!flag_step_1_success) ctrl_pts = reference_controls;
-    //visualization_->displayOptimalList( ctrl_pts, vis_id );
-
     t_opt = ros::WallTime::now() - t_start;
     t_start = ros::WallTime::now();
 
-    /*** STEP 3: REFINE(RE-ALLOCATE TIME) IF NECESSARY ***/
-    if (reference_knots.size()) {
-      const double first_dt = reference_knots[4] - reference_knots[3];
-      const double last_dt = reference_knots[ctrl_pts.cols()] - reference_knots[ctrl_pts.cols() - 1];
-      // 同一真实运动边界换回分段时间表，不能因优化器的工作时距改变实测导数。
-      ctrl_pts.col(0) = start_pt - start_vel * first_dt + start_acc * (first_dt * first_dt / 3.);
-      ctrl_pts.col(1) = start_pt - start_acc * (first_dt * first_dt / 6.);
-      ctrl_pts.col(2) = start_pt + start_vel * first_dt + start_acc * (first_dt * first_dt / 3.);
-      ctrl_pts.col(ctrl_pts.cols() - 3) = local_target_pt - local_target_vel * last_dt;
-      ctrl_pts.col(ctrl_pts.cols() - 2) = local_target_pt;
-      ctrl_pts.col(ctrl_pts.cols() - 1) = local_target_pt + local_target_vel * last_dt;
-    }
-    UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);
-    if (reference_knots.size()) pos.setKnot(reference_knots);
-    pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
-
-    double ratio;
-    const bool needs_reallocation=route_time_seed
-        ? ((ratio=strictDynamicScale(pos))>1.) : !pos.checkFeasibility(ratio,false);
-    bool flag_step_2_success = true;
-    if (needs_reallocation)
-    {
-      std::cerr << "Need to reallocate time." << endl;
-      if(route_time_seed) {
-        // 已优化轨迹只调整时标；静止边界整体缩放，移动边界沿原节点保留首末导数。
-        const double scale=ratio*(1.+std::numeric_limits<double>::epsilon()*(ctrl_pts.cols()+4));
-        if(start_vel.isZero(0.)&&start_acc.isZero(0.)&&local_target_vel.isZero(0.))
-          pos.setKnot((pos.getKnot()*scale).eval());
-        else
-        {
-          Eigen::MatrixXd timed_controls = pos.getControlPoint();
-          Eigen::VectorXd timed_knots;
-          flag_step_2_success = retimeReferenceControls(timed_controls, seed_control_arcs, timed_knots,
-              start_pt, start_vel, start_acc, local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_);
-          if (flag_step_2_success) {
-            pos = UniformBspline(timed_controls, 3, ts);
-            pos.setKnot(timed_knots);
-          }
-        }
-      } else {
-        Eigen::MatrixXd optimal_control_points;
-        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
-        if (flag_step_2_success)
-          pos = UniformBspline(optimal_control_points, 3, ts);
-      }
-    }
+    // 所有来源和优化结果共用局部结点定时；只重拟合明确允许的端部过渡点。
+    Eigen::MatrixXd final_controls=ctrl_pts;
+    Eigen::VectorXd final_knots;
+    bool flag_step_2_success=retimeLocalKnots(final_controls,final_knots,ts,start_pt,start_vel,start_acc,
+        pp_.max_vel_,pp_.max_acc_,pp_.max_vel_+pp_.vel_tolerance_,pp_.max_acc_+pp_.acc_tolerance_,transition_points,timing_reason);
+    UniformBspline pos(final_controls,3,ts);
+    if(flag_step_2_success)pos.setKnot(final_knots);
+    else ROS_WARN_STREAM("局部结点定时失败："<<timing_reason);
 
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
-        && (!route_time_seed || (trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.));
+        && trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.;
     if (!accepted)
     {
       std::fprintf(stderr,"\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
@@ -1048,27 +1082,6 @@ namespace scan_planner
     return true;
   }
 
-  bool SCANPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points)
-  {
-    double t_inc;
-
-    Eigen::MatrixXd ctrl_pts; // = traj.getControlPoint()
-
-    // std::cerr << "ratio: " << ratio << std::endl;
-    reparamBspline(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
-
-    traj = UniformBspline(ctrl_pts, 3, ts);
-
-    double t_step = traj.getTimeSum() / (ctrl_pts.cols() - 3);
-    bspline_optimizer_rebound_->ref_pts_.clear();
-    for (double t = 0; t < traj.getTimeSum() + 1e-4; t += t_step)
-      bspline_optimizer_rebound_->ref_pts_.push_back(traj.evaluateDeBoorT(t));
-
-    bool success = bspline_optimizer_rebound_->BsplineOptimizeTrajRefine(ctrl_pts, ts, optimal_control_points);
-
-    return success;
-  }
-
   void SCANPlannerManager::updateTrajInfo(const UniformBspline &position_traj, const ros::Time time_now)
   {
     local_data_.start_time_ = time_now;
@@ -1155,26 +1168,4 @@ namespace scan_planner
         std::sqrt(acceleration.getControlPoint().topRows(2).colwise().norm().maxCoeff() / pp_.max_acc_));
   }
 
-  void SCANPlannerManager::reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio,
-                                         Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc)
-  {
-    double time_origin = bspline.getTimeSum();
-    int seg_num = bspline.getControlPoint().cols() - 3;
-    // double length = bspline.getLength(0.1);
-    // int seg_num = ceil(length / pp_.ctrl_pt_dist);
-
-    bspline.lengthenTime(ratio);
-    double duration = bspline.getTimeSum();
-    dt = duration / double(seg_num);
-    time_inc = duration - time_origin;
-
-    vector<Eigen::Vector3d> point_set;
-    for (double time = 0.0; time <= duration + 1e-4; time += dt)
-    {
-      point_set.push_back(bspline.evaluateDeBoorT(time));
-    }
-    UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
-  }
-
 } // namespace scan_planner
-

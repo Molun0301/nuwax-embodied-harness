@@ -78,6 +78,8 @@ namespace scan_planner
     AStar::Ptr a_star_;
     std::function<void(int,int)> bind_route_segment_;
     std::vector<Eigen::Vector3d> ref_pts_;
+    // 大于90度转角的三重停车锚点不参与几何优化。
+    std::vector<int> fixed_stop_points_;
 
     std::vector<std::vector<Eigen::Vector3d>> initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init = true);
     bool BsplineOptimizeTrajRebound(Eigen::MatrixXd &optimal_points, double ts); // must be called after initControlPoints()

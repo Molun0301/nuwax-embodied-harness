@@ -1212,6 +1212,7 @@ namespace scan_planner
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance +
                               lambda3_ * g_feasibility;
     grad_3D.row(2).setZero();
+    for(int i:fixed_stop_points_)grad_3D.col(i).setZero();
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 

@@ -204,7 +204,7 @@ class AuthorOverlapEscape {
       planImpl(map,c,p,yaw,velocity,angular,stamp,recontact_,output);
       recontact_=false;
       // 只有通过整拍和制动证明并输出动作，才将后续无安全候选记为真实失败。
-      latched_=true;
+      latched_|=output.command_forward!=0.||output.command_lateral!=0.||output.command_yaw_rate!=0.;
     } catch(const std::runtime_error& error) {
       throw std::runtime_error("BODY_OVERLAP_RECOVERY_FAILED: "+std::string(error.what()));
     }
@@ -251,17 +251,18 @@ class AuthorOverlapEscape {
     }
     if(stamp<last_stamp_)throw std::runtime_error("Current body pose is occupied; escape source clock regressed");
     bool progress_observed=false;
-    for(const auto& contact:contacts_) {
+    for(auto& contact:contacts_) {
       const double now=penetration(contact,c,p,yaw);
-      if(now>contact.depth+1e-10) {
-        failure_="Current body pose is occupied; measured escape penetration increased";
-        throw std::runtime_error(failure_);
-      }
       const double remaining=depth(contact,c,p,yaw);
-      if(contact.directed&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10) {
+      if(latched_&&(now>contact.depth+1e-10
+          ||(contact.directed&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10))) {
         failure_="Current body pose is occupied; measured escape penetration increased";
         throw std::runtime_error(failure_);
       }
+      if(now>penetrationLimit(c))
+        throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
+      // 动作前的静止测量变化只更新基准，不结算或重发未确认运动预算。
+      if(!latched_){contact.depth=now;contact.remaining=remaining;continue;}
       if(now<contact.depth-1e-10||remaining<contact.remaining-1e-10)progress_observed=true;
     }
     // 只有新的实测采样证实退出进展，才结清未确认运动预算。

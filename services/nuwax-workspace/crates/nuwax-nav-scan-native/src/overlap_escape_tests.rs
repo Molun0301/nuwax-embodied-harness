@@ -130,6 +130,58 @@ fn shallow_escape_covers_forward_reverse_and_side_wall() {
 }
 
 #[test]
+fn unissued_escape_updates_stationary_depth_without_renewing_budget() {
+    let route=[[0.295,0.025,0.35],[1.,0.025,0.35]];
+    let obstacles=[[-0.025,0.025,0.35]];
+    let mut req=shallow_surface_request(&route,&obstacles);
+    req.config.body_length=0.6;
+    req.config.body_width=0.32;
+    req.config.sample_dt=0.05;
+    req.start_velocity=Some([-0.001,0.,0.]);
+    req.odometry_timestamp_ns=1_000_000_000;
+    let mut planner=registered_fixture(&req);
+    let first=planner.step(&req).unwrap_err();
+    assert!(first.contains("no monotone"),"起步实测向内仍须拒绝：{first}");
+    req.start_position[0]-=0.003336350098702423;
+    req.odometry_timestamp_ns+=100_000_000;
+    let changed=planner.step(&req).unwrap_err();
+    assert!(!changed.contains("penetration increased"),"未输出动作的测量增深不能故障锁：{changed}");
+    req.odometry_timestamp_ns=3_100_000_000;
+    let expired=planner.step(&req).unwrap_err();
+    assert!(expired.contains("budget exhausted"),"更新基准不能续领预算：{expired}");
+}
+
+#[test]
+fn unissued_depth_updates_still_reject_more_than_three_voxels() {
+    let route=[[0.295,0.025,0.35],[1.,0.025,0.35]];
+    let obstacles=[[-0.025,0.025,0.35]];
+    let mut req=shallow_surface_request(&route,&obstacles);
+    req.config.body_length=0.6;
+    req.config.body_width=0.6;
+    req.start_velocity=Some([-0.001,0.,0.]);
+    let mut planner=registered_fixture(&req);
+    assert!(planner.step(&req).is_err());
+    req.start_position[0]-=0.16;
+    req.odometry_timestamp_ns+=50_000_000;
+    assert!(planner.step(&req).unwrap_err().contains("exceeds localization and mapping allowance"));
+}
+
+#[test]
+fn issued_escape_increase_beyond_three_voxels_keeps_the_fault_lock() {
+    let route=[[0.295,0.025,0.35],[1.,0.025,0.35]];
+    let obstacles=[[-0.025,0.025,0.35]];
+    let mut req=shallow_surface_request(&route,&obstacles);
+    req.config.body_length=0.6;req.config.body_width=0.6;
+    let mut planner=registered_fixture(&req);
+    let first=planner.step(&req).unwrap();
+    assert!(first.command_forward!=0.||first.command_lateral!=0.||first.command_yaw_rate!=0.);
+    req.start_position[0]-=0.16;req.odometry_timestamp_ns+=50_000_000;
+    assert!(planner.step(&req).unwrap_err().contains("penetration increased"));
+    req.start_position=route[0];req.odometry_timestamp_ns+=50_000_000;
+    assert!(planner.step(&req).unwrap_err().contains("penetration increased"),"动作后真实增深的故障不能因退回浅处而解锁");
+}
+
+#[test]
 fn shallow_escape_uses_tangent_plateau_when_reverse_is_disabled() {
     let route = [[-0.29, 0.025, 0.35], [1., 0.025, 0.35]];
     let obstacles = [[0.025, 0.025, 0.35]];

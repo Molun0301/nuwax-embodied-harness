@@ -1182,9 +1182,10 @@ mod tests {
                 let original=planner.original_samples(req.config.sample_dt);
                 let low=original.iter().map(|p|p.position[2]).fold(f64::INFINITY,f64::min);
                 let high=original.iter().map(|p|p.position[2]).fold(f64::NEG_INFINITY,f64::max);
-                // 同一102点输入在63b43ed0原局部求解器的已有拟合范围；参考修复不改变该样条行为。
-                assert!((low-0.39416981200047052).abs()<1e-8 && (high-0.39798499736324322).abs()<1e-8,
-                    "原局部样条高度行为发生变化：{low}至{high}");
+                // 真实起点为0.4米，首样本必须精确锚定；端部重拟合后检查原5毫米高度过渡。
+                assert!((original[0].position[2]-route[0][2]).abs()<1e-10);
+                assert!((low-0.39499283208279196).abs()<1e-8 && (high-0.4).abs()<1e-8,
+                    "端部重拟合必须保留实测高度过渡和真实起点：{low}至{high}");
                 assert!(result.command_forward>0.);
                 produced=true;break;
             }

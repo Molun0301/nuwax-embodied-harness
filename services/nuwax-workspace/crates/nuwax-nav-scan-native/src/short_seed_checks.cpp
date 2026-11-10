@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
   assert(moving.checkDynamicFeasibility(curve));
   assert(moving.strictDynamicScale(curve) <= 1.);
   for (double t = 0.; t <= curve.getTimeSum(); t += .001) {
-    assert(v.evaluateDeBoorT(t).norm() <= c.max_velocity + 1e-10);
-    assert(a.evaluateDeBoorT(t).norm() <= c.max_acceleration + 1e-10);
+    assert(v.evaluateDeBoorT(t).head<2>().norm() <= c.max_velocity + 1e-10);
+    assert(a.evaluateDeBoorT(t).head<2>().norm() <= c.max_acceleration + 1e-10);
   }
   std::cout << "移动重规划：非零位置/速度/加速度边界保持，原采样与严格动力学检查通过\n";
   // 地面高度起伏的竖直导数不消耗平面设备限额；三维边界仍须完整保持。

@@ -29,8 +29,8 @@ fn stationary_centimeter_approach_produces_a_dynamically_feasible_curve() {
             .expect("静止几厘米接近必须在原求解调用中产出可执行轨迹");
         let samples = curve.samples(0., 0.001);
         for sample in &samples {
-            let speed = sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt();
-            let acceleration = sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt();
+            let speed = sample.velocity[0].hypot(sample.velocity[1]);
+            let acceleration = sample.acceleration[0].hypot(sample.acceleration[1]);
             assert!(speed <= cfg.max_velocity + 1e-8, "短程速度越界：{sample:?}");
             assert!(acceleration <= cfg.max_acceleration + 1e-8, "短程加速度越界：{sample:?}");
         }
@@ -59,8 +59,8 @@ fn stationary_short_seed_uses_the_fitted_spline_dynamic_bound() {
         eprintln!("短程 {distance} 米：原五次初值={before:.9} 秒，现轨迹={after:.9} 秒");
         assert!(after < before * 0.75, "拟合后的紧界应明显缩短短程：{after}/{before}");
         for sample in &samples {
-            assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
-            assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+            assert!(sample.velocity[0].hypot(sample.velocity[1]) <= cfg.max_velocity + 1e-8);
+            assert!(sample.acceleration[0].hypot(sample.acceleration[1]) <= cfg.max_acceleration + 1e-8);
         }
         assert!(samples.last().unwrap().position[0] > distance * 0.9);
     }
@@ -89,10 +89,20 @@ fn reference_seed_flows_through_a_small_turn_and_stops_at_a_large_turn() {
     eprintln!("小转角速度={}，大转角速度={}，总时长={}",
         small.velocity[0].hypot(small.velocity[1]), large.velocity[0].hypot(large.velocity[1]), samples.last().unwrap().time);
     assert!(small.velocity[0].hypot(small.velocity[1]) > 0.1, "小转角应连续通过：{small:?}");
-    assert!(large.velocity[0].hypot(large.velocity[1]) < 1e-5, "大转角应停车：{large:?}");
+    // 此角为75.964度，与14.036度的首角均属于不超过90度的连续通过范围。
+    assert!(large.velocity[0].hypot(large.velocity[1]) > 1e-5, "不超过90度的拐角应连续通过：{large:?}");
+    let stop_route = [[0., 0., 0.35], [1., 0., 0.35], [0.5, 1., 0.35]];
+    let stopped = ScanPlanner::default().plan(&cfg, &map.snapshot(), &stop_route, &state, None, 0.).unwrap();
+    let stopped_samples = stopped.samples(0., 0.0001);
+    let corner = stopped_samples.iter().min_by(|a,b| {
+        let distance=|s:&TrajectorySample| (s.position[0]-1.).hypot(s.position[1]);
+        distance(a).total_cmp(&distance(b))
+    }).unwrap();
+    // 新角为116.565度，三个重复控制点须给出原地停车。
+    assert!(corner.velocity[0].hypot(corner.velocity[1]) < 1e-5, "超过90度的拐角应停车：{corner:?}");
     for sample in &samples {
-        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1e-8);
-        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1e-8);
+        assert!(sample.velocity[0].hypot(sample.velocity[1]) <= cfg.max_velocity + 1e-8);
+        assert!(sample.acceleration[0].hypot(sample.acceleration[1]) <= cfg.max_acceleration + 1e-8);
     }
 }
 
@@ -486,8 +496,8 @@ fn check_recorded_start(route: &[[f64; 3]], velocity: [f64; 3], registered: bool
             assert!(delta <= req.config.max_acceleration * req.config.sample_dt + 1e-8,
                 "首个执行采样必须兑现实测速度边界：{velocity:?} -> {first:?}");
             for sample in &result.samples {
-                let speed = sample.velocity.iter().map(|v|v*v).sum::<f64>().sqrt();
-                let acc = sample.acceleration.iter().map(|v|v*v).sum::<f64>().sqrt();
+                let speed = sample.velocity[0].hypot(sample.velocity[1]);
+                let acc = sample.acceleration[0].hypot(sample.acceleration[1]);
                 assert!(speed <= req.config.max_velocity + 1e-8);
                 assert!(acc <= req.config.max_acceleration + 1e-8);
             }
@@ -531,8 +541,8 @@ fn obstacle_adjacent_zigzag_over_capacity_shortens_local_target() {
     // 原窗口末端远离全局目标、参考速度非零；缩短后必须采用原制动区的零速边界。
     assert!(end.velocity[0].hypot(end.velocity[1]) < 1e-8, "末端速度应按缩短位置的制动距离获取");
     for sample in &view.samples {
-        let speed = sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt();
-        let acceleration = sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt();
+        let speed = sample.velocity[0].hypot(sample.velocity[1]);
+        let acceleration = sample.acceleration[0].hypot(sample.acceleration[1]);
         assert!(speed <= cfg.max_velocity + 1e-8);
         assert!(acceleration <= cfg.max_acceleration + 1e-8);
         assert!(sample.position[1] > -0.015 && sample.position[1] < 0.055);

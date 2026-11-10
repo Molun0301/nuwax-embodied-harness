@@ -379,14 +379,9 @@ fn registered_surface_keeps_subvoxel_reference_turn_before_planning() {
         }
         let mut heading = 0.;
         for sample in &out.samples {
-            assert!(sample.velocity.iter().map(|v| v * v).sum::<f64>().sqrt() <= 0.2 + 1e-8);
+            assert!(sample.velocity[0].hypot(sample.velocity[1]) <= 0.2 + 1e-8);
             assert!(
-                sample
-                    .acceleration
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-                    .sqrt()
+                sample.acceleration[0].hypot(sample.acceleration[1])
                     <= 0.5 + 1e-8
             );
             if sample.velocity[0].hypot(sample.velocity[1]) > 1e-8 {

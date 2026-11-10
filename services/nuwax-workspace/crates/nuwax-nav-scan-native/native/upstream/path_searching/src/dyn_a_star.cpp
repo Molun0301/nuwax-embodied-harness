@@ -97,7 +97,16 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
         return false;
     start_to_end.normalize();
 
-    int occ = checkOccupancy(Index2Coord(start_idx), start_yaw);
+    // 业务拒绝在占据查询里返回1；端点调整须先识别允许域之外的-1。
+    const auto endpoint_occupancy = [&](const Vector3i& index, double yaw) {
+        const Vector3d point = Index2Coord(index);
+        if (!grid_map_->isInMap(point) || grid_map_->bodyContacts(point, yaw, 0.) == -1)
+            return -1;
+        return checkOccupancy(point, yaw);
+    };
+    int occ = endpoint_occupancy(start_idx, start_yaw);
+    if (occ == -1)
+        return false;
     if (occ)
     {
         //ROS_WARN("Start point is insdide an obstacle.");
@@ -106,7 +115,7 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
             start_pt -= start_to_end * step_size_;
             start_idx = Coord2Index(start_pt);
 
-            occ = checkOccupancy(Index2Coord(start_idx), start_yaw);
+            occ = endpoint_occupancy(start_idx, start_yaw);
             if (occ == -1)
             {
                 ROS_WARN("[Astar] Start point outside the map region.");
@@ -115,7 +124,9 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
         } while (occ);
     }
 
-    occ = checkOccupancy(Index2Coord(end_idx), end_yaw);
+    occ = endpoint_occupancy(end_idx, end_yaw);
+    if (occ == -1)
+        return false;
     if (occ)
     {
         //ROS_WARN("End point is insdide an obstacle.");
@@ -124,7 +135,7 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
             end_pt += start_to_end * step_size_;
             end_idx = Coord2Index(end_pt);
 
-            occ = checkOccupancy(Index2Coord(end_idx), end_yaw);
+            occ = endpoint_occupancy(end_idx, end_yaw);
             if (occ == -1)
             {
                 ROS_WARN("[Astar] End point outside the map region.");

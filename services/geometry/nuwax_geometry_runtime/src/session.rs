@@ -674,6 +674,8 @@ impl Session {
         let id = self.next_session + 1;
         let mut config = self.config.clone();
         config.map_name = request.map_name.clone();
+        // 已保存地图只在本次加载会话使用重定位，不创建回环校正器。
+        config.correction_backend = "relocalization".into();
         let mapper = Mapper::prepare_load(id, config, snapshot, true)?;
         let view_only = mapper.planar_view_only();
         if !view_only {
@@ -768,12 +770,6 @@ impl Session {
         let mapper = self.mapper()?;
         if mapper.planar_view_only() {
             return Err(Status::failed_precondition(PLANAR_VIEW_ONLY));
-        }
-        if matches!(
-            self.config.correction_backend.as_str(),
-            "library_pgo" | "native_pgo"
-        ) {
-            return Err(Status::failed_precondition("PGO 配置下不能重定位"));
         }
         let planar = self.state.info.as_ref().unwrap().pipeline == "slam_2d";
         let result = if planar {

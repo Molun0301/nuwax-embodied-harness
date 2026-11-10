@@ -641,23 +641,33 @@ async fn native_child_kill_faults_session_without_exiting_process() {
 }
 
 #[tokio::test]
-async fn pgo_relocalization_is_explicitly_rejected() {
+async fn pgo_saved_map_relocalizes_after_load() {
     let mut f = Fixture::start(false, true).await;
-    f.mapping("回环图").await;
-    f.client.save_map(SaveMapRequest::default()).await.unwrap();
-    f.client
+    f.saved_map("回环图").await;
+    f.client.stop_session(Empty {}).await.unwrap();
+    let loaded = f.client
         .load_map(LoadMapRequest {
             map_name: "回环图".into(),
         })
         .await
-        .unwrap();
-    let error = f
+        .unwrap()
+        .into_inner();
+    assert_eq!(loaded.phase, SessionPhase::Loaded as i32);
+    let stamp = now();
+    f.frame(stamp).await;
+    f.frame(stamp + 100_000_000).await;
+    // 输入仍经生产队列进入帧路由，与已有重定位进程用例保持相同等待。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let matched = f
         .client
         .relocalize(RelocalizeRequest::default())
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(error.message().contains("PGO"));
+        .unwrap()
+        .into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert!(matched.frames_used > 0 && matched.frames_used <= 8);
+    assert_eq!(matched.pose.unwrap().frame_id, "map");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
 }
 
 #[tokio::test]

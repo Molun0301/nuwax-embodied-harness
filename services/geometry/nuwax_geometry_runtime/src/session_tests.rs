@@ -1,6 +1,56 @@
 use super::*;
 
 #[tokio::test]
+async fn saved_pgo_map_load_uses_relocalization_and_new_mapping_keeps_pgo() {
+    let root = std::env::temp_dir().join(format!("nuwax-loaded-pgo-{}", uuid::Uuid::new_v4()));
+    let mapper = Mapper::start(713, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper, root.clone()).await;
+    // 使用生产 LIO 启动链；本测试的匹配帧直接进入生产帧路由。
+    for backend in ["native_pgo", "library_pgo"] {
+        session.config.correction_backend = backend.into();
+        session.start_mapping(StartMappingRequest {
+            map_name: backend.into(), ..Default::default()
+        }).await.unwrap();
+        let mapping = session.mapper().unwrap();
+        assert_eq!(mapping.correction_backend(), backend);
+        let stamp = now_ns();
+        let frame = crate::mapper::tests::room_frame(mapping.session_id(), stamp);
+        session.router.publish_frame(frame.clone());
+        let saved = mapping.snapshot().await.unwrap();
+        assert_eq!(saved.occupancy.as_ref().unwrap().meta.as_ref().unwrap().timestamp_ns, stamp);
+        let error = mapping.error_rx().borrow().clone();
+        assert!(error.is_none(), "{backend} 新图校正失败：{error:?}");
+        session.save(SaveMapRequest::default()).await.unwrap();
+        session.end_current().await.unwrap();
+        session.load(LoadMapRequest { map_name: backend.into() }).await.unwrap();
+        assert_eq!(session.phase(), SessionPhase::Loaded);
+        assert_eq!(session.config.correction_backend, backend);
+        let loaded = session.mapper().unwrap();
+        assert_eq!(loaded.correction_backend(), "relocalization");
+        assert_eq!(loaded.snapshot().await.unwrap().occupancy.unwrap().data, saved.occupancy.unwrap().data);
+        let mut current_frame = frame;
+        current_frame.session_id = loaded.session_id();
+        current_frame.odom_pose.timestamp_ns = now_ns();
+        session.router.publish_frame(current_frame);
+        loaded.snapshot().await.unwrap();
+        // 加载会话接收当前帧后进入已定位态；无需修改全局配置。
+        let result = session.relocalize(RelocalizeRequest::default()).await.unwrap();
+        assert!(result.succeeded, "{backend}: {}", result.message);
+        assert_eq!(session.phase(), SessionPhase::Localized);
+        session.end_current().await.unwrap();
+    }
+    // 加载会话结束后再建新图，仍按原配置创建校正器。
+    session.start_mapping(StartMappingRequest {
+        map_name: "再次新建".into(), ..Default::default()
+    }).await.unwrap();
+    assert_eq!(session.mapper().unwrap().correction_backend(), "library_pgo");
+    session.end_current().await.unwrap();
+    session.lio().unwrap().shutdown().await;
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn recent_input_survives_end_and_load_for_immediate_relocalization() {
     let mapper = Mapper::start(711, MapperConfig::default()).unwrap();
     let mut session = actor(mapper.clone(), PathBuf::new()).await;

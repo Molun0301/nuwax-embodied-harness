@@ -521,6 +521,9 @@ impl Drop for ScanTracker {
 }
 
 #[cfg(test)]
+mod astar_endpoint_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     mod fixture {include!("numerical_fixture.rs");}

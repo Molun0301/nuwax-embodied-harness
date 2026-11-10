@@ -27,6 +27,10 @@ def configure(values, root, home):
                    'robot.actuator_max_yaw_rps': float(limits['wz_rps']),
                    'robot.actuator_motion_model': 'omnidirectional',
                    'perception.stream_camera_id': sensors['image']['camera_ids'][0]})
+    if not values['geometry.pointlio_options']:
+        values['geometry.pointlio_options'] = json.dumps(
+            {'ivox_grid_resolution': 0.2, 'ivox_nearby_type': 'nearby18', 'match_s': 900.0},
+            separators=(',', ':'))
     if model == 'go2':
         values['robot.model_base_link'] = 'imu'
         origin = calibration['imu']['translation_m']

@@ -77,6 +77,27 @@ struct Trajectory {
     }
     return {tau,(position.evaluateDeBoorT(tau)-p).norm()};
   }
+  std::pair<double,double> projectStart(const Vector3d& p,double maximum_deviation) {
+    const double total=duration();const int count=std::max(1,int(std::ceil(total/.01)));
+    double best=std::numeric_limits<double>::infinity(),tau=0.;
+    // 新曲线由实测状态起步；沿时间从起点寻找首个匹配的局部最近点。
+    // 安装不能用只增不减的全局路线进度跳过曲线开头。
+    for(int i=0;i<=count;++i) {
+      const double t=total*i/count,distance=(position.evaluateDeBoorT(t)-p).squaredNorm();
+      if(distance>best && best<=maximum_deviation*maximum_deviation)break;
+      if(distance<best){best=distance;tau=t;}
+    }
+    const double left=std::max(0.,tau-total/count),right=std::min(total,tau+total/count);
+    for(int i=0;i<16;++i) {
+      const Vector3d delta=position.evaluateDeBoorT(tau)-p,v=velocity.evaluateDeBoorT(tau),a=acceleration.evaluateDeBoorT(tau);
+      const double denominator=v.squaredNorm()+delta.dot(a);
+      if(denominator<=0.)break;
+      const double next=std::clamp(tau-delta.dot(v)/denominator,left,right);
+      if(next==tau)break;
+      tau=next;
+    }
+    return {tau,(position.evaluateDeBoorT(tau)-p).norm()};
+  }
 };
 using Curve=std::shared_ptr<Trajectory>;
 struct PlannerSession {
@@ -204,7 +225,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Vector3d position=Eigen::Map<const Vector3d>(state->position);const double yaw=state->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
     std::pair<double,double> installed_projection;
     if(s.pending){
-      const auto projected=s.pending->project(position,state->route_progress);
+      const auto projected=s.pending->projectStart(position,std::max(MINIMUM_DEVIATION_M,2.*c->resolution));
       if(projected.second<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){
         s.curve=std::move(s.pending);s.install_pending=true;out->installed=1;installed_projection=projected;
       }else{s.pending.reset();out->reason=SCAN_TRACK_REJECTED_TRAJECTORY;}

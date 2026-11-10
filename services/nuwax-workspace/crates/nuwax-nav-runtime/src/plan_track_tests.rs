@@ -68,7 +68,7 @@ fn business_tolerance_keeps_the_current_curve_running() {
     let mut f=ready_follower();
     f.options.position_tolerance_m=0.15;
     next_pose(&mut f,[4.88,1.,0.5]);
-    f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+    f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.2,0.,0.],[0.;3])));
     assert!(f.position_reached());
     let step=f.step();
     assert_ne!(step,PlannerStep::Succeeded,"进入业务容差不得跳过仍可执行的曲线");
@@ -76,17 +76,20 @@ fn business_tolerance_keeps_the_current_curve_running() {
 }
 
 #[test]
-fn eighth_round_saved_arrivals_wait_for_the_active_curve() {
+fn eighth_round_saved_arrivals_wait_for_measured_stop() {
     // 第八轮保存图点1—3宣告成功所用的原位姿与原目标；原公开距离约0.11—0.13米。
     let cases=[
         ([3.425000377371905,-0.9749997835606372,-0.006618790235110528],-0.7809150981891009,
-         [3.4771255350043146,-0.8731128163688107,8.114317428093484e-05],-0.5346897590916752),
+         [3.4771255350043146,-0.8731128163688107,8.114317428093484e-05],-0.5346897590916752,
+         [-0.004132412374019623,-0.04417669400572777,0.06583206355571747],-0.7613534927368164),
         ([3.425000377371905,-3.174999816343192,-0.006618790235110528],0.7898812286057957,
-         [3.4336594147392905,-3.291656103125382,-0.01040755859722894],0.4983556442836828),
+         [3.4336594147392905,-3.291656103125382,-0.01040755859722894],0.4983556442836828,
+         [-0.09225789457559586,0.16836026310920715,0.027424369007349014],0.8790434002876282),
         ([1.1750003438442924,-3.174999816343192,-0.006618790235110528],-1.4809150981891008,
-         [1.0491310112959802,-3.153941722377487,-0.009084951989200413],-1.7496794895831096),
+         [1.0491310112959802,-3.153941722377487,-0.009084951989200413],-1.7496794895831096,
+         [0.06596540659666061,-0.041104670614004135,-0.04151221737265587],0.8583846688270569),
     ];
-    for (target,yaw,actual,actual_yaw) in cases {
+    for (target,yaw,actual,actual_yaw,velocity,yaw_rate) in cases {
         let mut f=ready_follower();
         let mut goal=pose(target[0],target[1],target[2]);
         goal.pose.orientation=Quaternion::from_yaw(yaw);
@@ -94,12 +97,32 @@ fn eighth_round_saved_arrivals_wait_for_the_active_curve() {
         odometry.pose.orientation=Quaternion::from_yaw(actual_yaw);
         f.goal=Some(goal);f.odometry=Some(odometry);
         f.options.position_tolerance_m=0.15;f.options.yaw_tolerance_rad=0.3;
-        f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+        // 原来源时刻的平台实测运动；配对误差分别为77、172、77纳秒。
+        f.observe_measured_motion(Some(crate::motion_feedback::tests::measured(velocity,[0.,0.,yaw_rate])));
         assert!(f.position_reached());
-        assert!(!f.reached(),"真实到达位姿仍有执行曲线时不能提前成功");
-        f.active=None;f.pending_curve=None;
-        assert!(f.reached(),"无执行曲线且位置朝向合格、实测停稳才可完成");
+        assert!(!f.reached(),"进入容差时仍在运动，不能提前成功");
+        assert!(f.active.is_some());
+        f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+        assert!(f.reached(),"位置朝向合格、实测停稳即可完成");
     }
+}
+
+#[test]
+fn ninth_round_stopped_arrival_succeeds_with_unfinished_curve() {
+    // 第九轮保存图连续目标末拍：活动曲线余0.290413秒、公开误差0.024826米。
+    let mut f=ready_follower();
+    let mut goal=pose(0.3750002723187187,-4.024999827519059,-0.023521249252740795);
+    let mut actual=pose(0.38996061247955716,-4.044744294055069,-0.02515822120913558);
+    goal.pose.orientation=Quaternion::from_yaw(-1.006363320716952);
+    actual.pose.orientation=Quaternion::from_yaw(-1.072751879536303);
+    f.goal=Some(goal);f.odometry=Some(actual);
+    f.options.position_tolerance_m=0.15;f.options.yaw_tolerance_rad=0.3;
+    f.observe_measured_motion(Some(crate::motion_feedback::tests::measured(
+        [6.771426847813366e-05,-0.0002417263976858355,-0.00018311811803040358],
+        [0.,0.,-5.7431892283567847e-05])));
+    assert!(f.active.is_some());
+    assert_eq!(f.step_at_goal(),Some(PlannerStep::Succeeded));
+    assert_eq!(f.step(),PlannerStep::Succeeded);
 }
 fn delayed_planner(
     f: &mut SurfaceFollower,

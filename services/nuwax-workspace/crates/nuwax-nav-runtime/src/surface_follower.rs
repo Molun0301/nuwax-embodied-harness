@@ -323,8 +323,7 @@ impl SurfaceFollower {
             measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
             ..Default::default()
         };
-        self.active.is_none() && self.pending_curve.is_none()
-            && self.position_reached() && yaw && state.stopped()
+        self.position_reached() && yaw && state.stopped()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
         let mut config = self.config.scan;
@@ -745,8 +744,7 @@ impl NavPlanner for SurfaceFollower {
         self.execution_cycle_complete
     }
     fn step_at_goal(&mut self) -> Option<PlannerStep> {
-        (self.active.is_none() && self.pending_curve.is_none() && self.position_reached())
-            .then(|| self.step())
+        self.position_reached().then(|| self.step())
     }
     fn step(&mut self) -> PlannerStep {
         self.execution_cycle_complete = false;
@@ -754,8 +752,10 @@ impl NavPlanner for SurfaceFollower {
             || (self.reference.is_empty() && !self.position_reached()) {
             return PlannerStep::Pending(Vec::new());
         }
+        if self.reached() {
+            return PlannerStep::Succeeded;
+        }
         match self.compute() {
-            Ok(_) if self.reached() => PlannerStep::Succeeded,
             Ok(command) => PlannerStep::Command(command),
             Err(reason) => {
                 self.wait_reason = Some(reason.clone());

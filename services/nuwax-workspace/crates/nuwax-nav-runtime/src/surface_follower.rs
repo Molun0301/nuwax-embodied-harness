@@ -315,7 +315,16 @@ impl SurfaceFollower {
             .abs()
                 < self.options.yaw_tolerance_rad
         };
-        self.position_reached() && yaw
+        let boundary = crate::motion_feedback::boundary_for_pose(pose, self.measured_motion.as_ref());
+        let state = MotionState {
+            velocity: boundary.velocity.unwrap_or([0.; 3]),
+            yaw_rate: boundary.yaw_rate.unwrap_or(0.),
+            measured_velocity: u32::from(boundary.velocity.is_some()),
+            measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
+            ..Default::default()
+        };
+        self.active.is_none() && self.pending_curve.is_none()
+            && self.position_reached() && yaw && state.stopped()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
         let mut config = self.config.scan;
@@ -502,7 +511,8 @@ impl SurfaceFollower {
             return Ok(Twist2::ZERO);
         };
         let config = self.native_config(&map.source);
-        let terminal_yaw = (self.position_reached() && self.options.requires_orientation())
+        let terminal_yaw = (self.active.is_none() && self.pending_curve.is_none()
+            && self.position_reached() && self.options.requires_orientation())
             .then(|| self.goal.as_ref().unwrap().pose.orientation.yaw());
         let mut tracking_failure = None;
         let checked = match self.tracker.track_and_check(
@@ -555,7 +565,7 @@ impl SurfaceFollower {
             self.needs_plan = true;
         }
         self.phase = checked.phase;
-        if checked.replan_early() && !self.early_requested {
+        if checked.replan_early() && !self.early_requested && !self.position_reached() {
             self.needs_plan = true;
             self.early_requested = true;
         }
@@ -566,7 +576,7 @@ impl SurfaceFollower {
         }
         // 已有计算时合并请求；这次计算交付后只由后续新事件再次请求。
         if self.needs_plan {
-            if !self.planning && terminal_yaw.is_none() {
+            if !self.planning && terminal_yaw.is_none() && !self.position_reached() {
                 self.plan_snapshot = Some(map.snapshot.clone());
                 self.plan_worker.submit(PlanInput {
                     epoch: self.epoch,
@@ -735,18 +745,17 @@ impl NavPlanner for SurfaceFollower {
         self.execution_cycle_complete
     }
     fn step_at_goal(&mut self) -> Option<PlannerStep> {
-        self.position_reached().then(|| self.step())
+        (self.active.is_none() && self.pending_curve.is_none() && self.position_reached())
+            .then(|| self.step())
     }
     fn step(&mut self) -> PlannerStep {
         self.execution_cycle_complete = false;
-        if self.reached() {
-            return PlannerStep::Succeeded;
-        }
         if self.map.is_none() || self.odometry.is_none()
             || (self.reference.is_empty() && !self.position_reached()) {
             return PlannerStep::Pending(Vec::new());
         }
         match self.compute() {
+            Ok(_) if self.reached() => PlannerStep::Succeeded,
             Ok(command) => PlannerStep::Command(command),
             Err(reason) => {
                 self.wait_reason = Some(reason.clone());

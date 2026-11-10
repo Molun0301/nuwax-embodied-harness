@@ -1,4 +1,4 @@
-// 零容差到达使用当拍实际位姿；FakeMotion 仅记录租约请求，不证明实测停稳。
+// 零容差到达使用当拍实际位姿；停稳由明确的实测输入证明。
 fn yaw_zero_pi_goal() -> nuwax_nav_types_messages::Quaternion {
     nuwax_nav_types_messages::Quaternion { x: 0.0, y: 0.0, z: 1.0, w: 0.0 }
 }
@@ -35,7 +35,10 @@ async fn yaw_zero_surface_scheduler(
         let q = pose.pose.orientation;
         map.validate_body_pose([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]).unwrap();
     }
-    let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+    let motion = Arc::new(Mutex::new(FakeMotionState {
+        measured: Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])),
+        ..Default::default()
+    }));
     let follower = crate::native_test_helpers::author_static_map_follower(config);
     let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()), follower,
         SchedulerConfig::default()).unwrap();

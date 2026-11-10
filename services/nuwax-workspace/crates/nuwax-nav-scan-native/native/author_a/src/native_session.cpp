@@ -189,6 +189,10 @@ extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double d
   double yaw=0.;for(size_t i=0;i<out->sample_count;++i){auto& x=out->samples[i];x.time=std::min(out->duration,i*dt);const double t=std::min(curve->duration(),from+x.time);const auto pos=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t),a=curve->acceleration.evaluateDeBoorT(t);if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);for(int j=0;j<3;++j){x.position[j]=pos[j];x.velocity[j]=v[j];x.acceleration[j]=a[j];}x.yaw=yaw;}
 }
 extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
+extern "C" int nuwax_scan_motion_stopped(const ScanState* state) {
+  return state->measured_velocity&&state->measured_yaw_rate
+      &&std::hypot(state->velocity[0],state->velocity[1])<.02&&std::abs(state->yaw_rate)<.02;
+}
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
 extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
 extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
@@ -229,7 +233,17 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       const auto projection=out->installed?installed_projection:s.curve->project(position,state->route_progress);s.phase=projection.first;out->deviation=projection.second;
       if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=SCAN_TRACK_DEVIATED;s.curve.reset();return;}
       out->remaining=std::max(0.,s.curve->duration()-s.phase);out->phase=s.phase;
-      if(out->remaining<=0.){out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();return;}
+      if(out->remaining<=0.) {
+        out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();
+        // FINISHED只表示几何曲线走完；仍在运动时按实测边界制动，由运行时统一确认停稳。
+        if(!nuwax_scan_motion_stopped(state)) {
+          const auto brake=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,
+              command_world,Eigen::Vector2d::Zero(),0.,position,yaw,false);
+          if(!brake.found){out->reason|=SCAN_TRACK_NO_CANDIDATE;return;}
+          out->command[0]=brake.linear.x();out->command[1]=brake.linear.y();out->command[2]=brake.angular;
+        }
+        return;
+      }
       if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.reference_time=s.phase;s.reference_stamp.reset();s.install_pending=false;}
       // 实际投影用于进度；期望参考按控制周期推进，超出原偏离距离时停表。
       const double next_reference=std::min(s.curve->duration(),std::max(s.phase,s.reference_time+c->sample_dt));
@@ -242,7 +256,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       }
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       // 完整参考末段继续位置反馈；局部窗口仍保留原末端减速，不把期望走完当作实际到达。
-      if(s.curve->reference_progress>=s.curve->reference_duration)s.controller.finish_dist=0.;
+      s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
       s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       const auto before=s.curve->position.evaluateDeBoorT(s.reference_time);desired_yaw=s.controller.estimateDesiredYaw(s.reference_time,before);

@@ -62,6 +62,45 @@ fn next_pose(f: &mut SurfaceFollower, position: [f64; 3]) {
     current.pose.position = Point3::new(position[0], position[1], position[2]);
     f.update_odometry(current);
 }
+
+#[test]
+fn business_tolerance_keeps_the_current_curve_running() {
+    let mut f=ready_follower();
+    f.options.position_tolerance_m=0.15;
+    next_pose(&mut f,[4.88,1.,0.5]);
+    f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+    assert!(f.position_reached());
+    let step=f.step();
+    assert_ne!(step,PlannerStep::Succeeded,"进入业务容差不得跳过仍可执行的曲线");
+    assert!(f.active.is_some(),"应继续当前曲线而非切到原地朝向分支");
+}
+
+#[test]
+fn eighth_round_saved_arrivals_wait_for_the_active_curve() {
+    // 第八轮保存图点1—3宣告成功所用的原位姿与原目标；原公开距离约0.11—0.13米。
+    let cases=[
+        ([3.425000377371905,-0.9749997835606372,-0.006618790235110528],-0.7809150981891009,
+         [3.4771255350043146,-0.8731128163688107,8.114317428093484e-05],-0.5346897590916752),
+        ([3.425000377371905,-3.174999816343192,-0.006618790235110528],0.7898812286057957,
+         [3.4336594147392905,-3.291656103125382,-0.01040755859722894],0.4983556442836828),
+        ([1.1750003438442924,-3.174999816343192,-0.006618790235110528],-1.4809150981891008,
+         [1.0491310112959802,-3.153941722377487,-0.009084951989200413],-1.7496794895831096),
+    ];
+    for (target,yaw,actual,actual_yaw) in cases {
+        let mut f=ready_follower();
+        let mut goal=pose(target[0],target[1],target[2]);
+        goal.pose.orientation=Quaternion::from_yaw(yaw);
+        let mut odometry=pose(actual[0],actual[1],actual[2]);
+        odometry.pose.orientation=Quaternion::from_yaw(actual_yaw);
+        f.goal=Some(goal);f.odometry=Some(odometry);
+        f.options.position_tolerance_m=0.15;f.options.yaw_tolerance_rad=0.3;
+        f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+        assert!(f.position_reached());
+        assert!(!f.reached(),"真实到达位姿仍有执行曲线时不能提前成功");
+        f.active=None;f.pending_curve=None;
+        assert!(f.reached(),"无执行曲线且位置朝向合格、实测停稳才可完成");
+    }
+}
 fn delayed_planner(
     f: &mut SurfaceFollower,
     delay: Duration,

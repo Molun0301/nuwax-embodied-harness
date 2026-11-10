@@ -40,8 +40,14 @@ async fn zero_position_surface_scheduler() -> (
     (scheduler, status, motion, goal)
 }
 #[tokio::test]
-async fn zero_position_real_surface_arrival_releases_without_stopped_confirmation() {
+async fn zero_position_real_surface_arrival_requires_measured_stop_before_release() {
     let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.status.last_terminal.is_none(),"缺少测速不能宣告停稳");
+    motion.lock().unwrap().measured = Some(crate::motion_feedback::tests::measured([0.1,0.,0.],[0.;3]));
+    scheduler.session_tick(&status).await.unwrap();
+    assert!(scheduler.status.last_terminal.is_none(),"仍在移动不能提前成功");
+    motion.lock().unwrap().measured = Some(crate::motion_feedback::tests::measured([0.;3],[0.;3]));
     scheduler.session_tick(&status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert!(!scheduler.lease_active);

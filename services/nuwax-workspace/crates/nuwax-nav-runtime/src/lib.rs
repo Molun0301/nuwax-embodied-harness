@@ -1251,6 +1251,8 @@ where
             if !self.lease_active {
                 self.acquire_session(status_tx).await?;
             }
+            // 控制态与等待路线态都在当拍读取测速，不能用上一拍的停稳结论收尾。
+            self.planner.observe_measured_motion(self.motion.measured_motion());
             if self.status.phase == SchedulerPhase::Controlling {
                 self.control_tick(status_tx).await?;
             } else {
@@ -1953,6 +1955,8 @@ mod tests {
         rejected_generation: Option<u64>,
         // Enabled only by phase-sensitive protocol tests; ordinary fixtures do not allocate it.
         twist_probe: Option<Vec<(usize, String, Twist2)>>,
+        // 只有明确声明测速的夹具才提供停稳证据。
+        measured: Option<MeasuredMotion>,
     }
 
     #[derive(Clone)]
@@ -1960,6 +1964,9 @@ mod tests {
 
     #[async_trait]
     impl NavMotionPort for FakeMotion {
+        fn measured_motion(&self) -> Option<MeasuredMotion> {
+            self.0.lock().unwrap().measured.clone()
+        }
         async fn acquire(&mut self, generation: u64) -> Result<u64, MotionPortError> {
             let mut state = self.0.lock().unwrap();
             state.calls.push("acquire:".into());
@@ -2245,7 +2252,10 @@ mod tests {
     async fn n6_goal_without_path_uses_original_tolerances_and_finishes() {
         for tolerance in [0.15, 0.08, 0.02] {
             let (config, source) = crate::native_test_helpers::fixture();
-            let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+            let motion = Arc::new(Mutex::new(FakeMotionState {
+                measured: Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])),
+                ..Default::default()
+            }));
             let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()),
                 crate::native_test_helpers::author_static_map_follower(config),
                 SchedulerConfig::default()).unwrap();
@@ -2289,7 +2299,10 @@ mod tests {
                     [(0, [0.5, 1., 0.5])]).unwrap())
             } else { source };
             let mut scheduler = NavScheduler::new(
-                FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+                FakeMotion(Arc::new(Mutex::new(FakeMotionState {
+                    measured: Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])),
+                    ..Default::default()
+                }))),
                 crate::native_test_helpers::author_static_map_follower(config),
                 SchedulerConfig::default()).unwrap();
             let (status, _) = watch::channel(scheduler.status.clone());

@@ -64,6 +64,12 @@ pub struct MotionState {
     pub measured_velocity: u32,
     pub measured_yaw_rate: u32,
 }
+impl MotionState {
+    /// 与原生曲线末端共用实测停稳条件；缺少测速不充当静止。
+    pub fn stopped(&self) -> bool {
+        unsafe { nuwax_scan_motion_stopped(self) != 0 }
+    }
+}
 #[repr(C)]
 #[derive(Default)]
 struct SamplesRaw {
@@ -150,6 +156,7 @@ impl TrackResult {
     }
 }
 extern "C" {
+    fn nuwax_scan_motion_stopped(state: *const MotionState) -> i32;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
     fn nuwax_scan_map_destroy(map: *mut c_void);
     fn nuwax_scan_map_surface(

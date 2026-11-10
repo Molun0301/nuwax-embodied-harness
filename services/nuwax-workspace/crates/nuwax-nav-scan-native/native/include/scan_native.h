@@ -25,6 +25,8 @@ typedef struct {
     int64_t timestamp_ns;
     uint32_t measured_velocity, measured_yaw_rate;
 } ScanState;
+/* 实测停稳口径由原生末端和运行时共同使用。 */
+int nuwax_scan_motion_stopped(const ScanState *state);
 /* 跟踪原因位；与 Rust track_reason 一一对应。 */
 typedef enum {
     SCAN_TRACK_NO_TRAJECTORY = 1u << 0,

@@ -31,6 +31,8 @@ if os.environ.get("NEH_INSTALLER_SOURCE_ROOT"):
         setattr(installer_package, module_name, module)
         spec.loader.exec_module(module)
 from scripts.module_installer import lifecycle, manager
+from scripts.device_manager import runtime as device_runtime
+from core.config import ConfigStore
 
 LEGACY_NAME = "neh-0123456789abcdef.service"
 ASSIGNED_NAME = "neh-install-01234567-89ab-4cde-8fab-0123456789ab.service"
@@ -65,12 +67,18 @@ class OfflineFixture(unittest.TestCase):
         (driver / 'manifest.py').write_text('')
         (driver / 'assembly.py').write_text('')
         self.hardware = SimpleNamespace(is_jetson=False)
+        # 配置探针在进程内执行真实方案操作，外部命令仍全部禁止。
+        def probe(prefix, operation, **parameters):
+            store = ConfigStore(Path(prefix).parent.parent, ROOT, port=9876)
+            return store.request(operation, **parameters)
+
+        self.stack.enter_context(patch.object(device_runtime, "probe", side_effect=probe))
 
     def generation(self, label="one", *, name=LEGACY_NAME, mode="systemd-user", modules=None,
                    deployment=True):
         prefix = self.home / "generations" / label
         prefix.mkdir(parents=True)
-        (prefix / "settings.env").write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
+        ConfigStore(self.home, ROOT, port=9876).install("测试", {"gateway.host": "127.0.0.7"})
         (prefix / "start.sh").write_text("#!/bin/sh\nexit 0\n")
         state = {"schema": 1, "complete": True, "source_root": str(self.root),
                  "robot": "customrobot", "modules": modules or ["core"], "installation_inputs": {"version": 1, "fixture": "same-inputs"}}
@@ -99,18 +107,13 @@ class OfflineFixture(unittest.TestCase):
             self.counter += 1
             return uuid.UUID(hex=f"{self.counter:08x}" + "0" * 24)
 
-        def write_runtime(root, prefix, modules, robot, existing):
-            (prefix / "settings.env").write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
-            (prefix / "start.sh").write_text("#!/bin/sh\nexit 0\n")
-
         patches = {
             "check_prerequisites": Mock(return_value="/fixture/python"),
             "installation_inputs": Mock(return_value={"version": 1, "fixture": "same-inputs"}),
-            "CommandRunner": Mock(return_value=Mock(side_effect=forbidden)),
+            "CommandRunner": Mock(side_effect=lambda log, root: Mock(side_effect=forbidden, log=log)),
             "_system_dependencies": Mock(), "_python_environment": Mock(),
             "build_modules": Mock(return_value={}), "_prepare_models": Mock(),
             "_verify_prefix": Mock(), "prune_build_cache": Mock(),
-            "existing_config": Mock(return_value={}), "write_runtime": Mock(side_effect=write_runtime),
         }
         for name, value in patches.items():
             self.stack.enter_context(patch.object(manager, name, value))
@@ -129,7 +132,10 @@ class OfflineFixture(unittest.TestCase):
 
 class RegistrationIdentityTests(OfflineFixture):
     def test_pure_descriptor_does_not_assign_or_require_installation(self):
-        with patch.object(uuid, "uuid4", side_effect=forbidden):
+        # 描述对象只需已解析的配置，不要求实际创建安装或运行配置探针。
+        with patch.object(uuid, "uuid4", side_effect=forbidden), \
+                patch.object(lifecycle, "effective_settings", return_value=(
+                    {"gateway.host": "127.0.0.7", "gateway.port": 9876}, self.home / "run/config.toml")):
             descriptor = lifecycle.deployment_descriptor(self.root, self.home, self.home / "generations/missing",
                                                           ["core"], "customrobot")
         self.assertEqual(descriptor["lifecycle"], {"mode": "foreground", "service_name": None})
@@ -218,27 +224,27 @@ class RegistrationIdentityTests(OfflineFixture):
                     lifecycle.start_current(queued)
 
 
-    def test_unnamed_foreground_stop_retains_exact_settings_owner(self):
+    def test_foreground_stop_uses_installation_supervisor_owner(self):
         prefix, _ = self.generation(mode="foreground", name=ASSIGNED_NAME)
         descriptor = lifecycle.inspect_installation(self.home)
-        pid_file = Path(descriptor["pid_file"])
-        pid_file.parent.mkdir(parents=True)
-        pid_file.write_text("12345")
-        exact = ("NUWAX_INSTALL_HOME=" + str(self.home)).encode()
-        with patch.object(lifecycle, "_exited", side_effect=[False, True]), \
-                patch.object(Path, "read_bytes", return_value=exact + b"\0"), patch.object(os, "kill") as kill:
+        pid_file = self.home / "config/runtime.json"
+        pid_file.write_text(json.dumps({"pid": 99999}))
+        read_text = Path.read_text
+
+        def process_or_config(path, *args, **kwargs):
+            if path == Path("/proc/12345/stat"):
+                return "12345 (检查子进程) Z"
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(device_runtime.Runtime, "_components", return_value={"pid": 12345}), \
+                patch.object(Path, "read_text", process_or_config), patch.object(os, "kill") as kill:
             self.assertEqual(lifecycle.stop_current(descriptor), 0)
-            kill.assert_called_once()
-        with patch.object(lifecycle, "_exited", return_value=False), \
-                patch.object(Path, "read_bytes", return_value=b"NUWAX_INSTALL_HOME=/foreign\0"), \
-                patch.object(os, "kill") as kill:
-            self.assertEqual(lifecycle.stop_current(descriptor), 0)
-            self.assertFalse(pid_file.exists())
-            kill.assert_not_called()
+            kill.assert_called_once_with(12345, device_runtime.signal.SIGTERM)
+        # 过时的状态文件不能替代本安装的监督者身份；套接字不可用时不发信号。
         for error in (PermissionError(), FileNotFoundError(), OSError()):
-            with self.subTest(error=type(error).__name__), patch.object(lifecycle, "_exited", return_value=False), \
-                    patch.object(Path, "read_bytes", side_effect=error), patch.object(os, "kill") as kill:
-                pid_file.write_text("12345")
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(device_runtime.Runtime, "_components", side_effect=error), patch.object(os, "kill") as kill:
+                pid_file.write_text(json.dumps({"pid": 99999}))
                 self.assertEqual(lifecycle.stop_current(descriptor), 0)
                 self.assertFalse(pid_file.exists())
                 kill.assert_not_called()

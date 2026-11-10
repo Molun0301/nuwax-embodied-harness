@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.module_installer.lifecycle import deployment_descriptor, inspect_installation, stop_current
+from core.config import ConfigStore
 
 
 def wait_until(predicate, timeout=5):
@@ -38,6 +39,7 @@ def process_state(pid):
 class ProcessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="neh-update-processes-")
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.prefix = self.root / "installation/generations/test"
         self.prefix.mkdir(parents=True)
@@ -45,7 +47,10 @@ class ProcessTests(unittest.TestCase):
         self.lock_file = self.prefix.parent.parent / "run/business.lock"
         self.pid_file.parent.mkdir(parents=True)
         self.lock_file.parent.mkdir(parents=True)
-        (self.prefix / "settings.env").write_text("")
+        (self.prefix / "source").symlink_to(ROOT, target_is_directory=True)
+        (self.prefix / "venv").symlink_to(sys.prefix, target_is_directory=True)
+        store = ConfigStore(self.prefix.parent.parent)
+        store.install("测试", {})
         (self.prefix / "manifest.json").write_text(json.dumps({
             "deployment": deployment_descriptor(self.root, self.prefix.parent.parent, self.prefix, ["core"], "customrobot", service_name="neh-fixture.service"),
             "schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
@@ -65,11 +70,19 @@ class ProcessTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def supervisor(self, *, identity=True):
-        code = f"""import fcntl, os, pathlib, time
+        code = f"""import fcntl, json, os, pathlib, socket
 lock = open({str(self.lock_file)!r}, 'a')
 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-pathlib.Path({str(self.pid_file)!r}).write_text(__import__("json").dumps({{"pid":os.getpid()}}))
-time.sleep(60)
+# 通过本安装的监督者套接字声明拥有方，状态文件仅作为夹具就绪标志。
+server = socket.socket(socket.AF_UNIX)
+server.bind({str(self.lock_file.parent / 'supervisor.sock')!r})
+server.listen()
+pathlib.Path({str(self.pid_file)!r}).write_text(json.dumps({{"pid":os.getpid()}}))
+while True:
+    connection, _ = server.accept()
+    with connection, connection.makefile('rb') as request:
+        assert json.loads(request.readline()) == {{"op": "status"}}
+        connection.sendall(json.dumps({{"pid": os.getpid()}}).encode() + b'\\n')
 """
         environment = dict(os.environ)
         environment["NUWAX_INSTALL_HOME"] = str(self.prefix.parent.parent if identity else self.root / "unrelated")

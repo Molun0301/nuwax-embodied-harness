@@ -9,20 +9,23 @@ from __future__ import annotations
 from contextlib import ExitStack
 from pathlib import Path
 import sys
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from scripts.module_installer import runtime
+from core.config import ConfigStore, flatten, read_config
 from services.model_providers import resolve_text_embedding_provider_spec
 
 
-TEXT_MODEL = "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL"
-TEXT_DIM = "NUWAX_MEMORY_TEXT_EMBEDDING_DIM"
-IMAGE_MODEL = "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL"
-IMAGE_DIM = "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM"
+TEXT_MODEL = "memory.text_embedding_model"
+TEXT_DIM = "memory.text_embedding_dim"
+IMAGE_MODEL = "memory.image_embedding_model"
+IMAGE_DIM = "memory.image_embedding_dim"
 SAVED = "_NUWAX_INSTALLER_SAVED_"
 ONLINE = "tongyi-embedding-vision-flash-2026-03-06"
 
@@ -104,73 +107,98 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="neh-provider-config-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        self.home = self.root / "install"
+        self.prefix = self.home / "generations/one"
+        self.prefix.mkdir(parents=True)
+        (self.prefix / "venv").symlink_to(sys.prefix, target_is_directory=True)
+        (self.prefix / "source").symlink_to(ROOT, target_is_directory=True)
+        (self.home / "current").symlink_to("generations/one")
+        self.store = ConfigStore(self.home)
 
-    def settings(self, existing, enabled=True):
-        values = dict(existing)
-        result = runtime._memory_settings(self.root, values, enabled)
-        values.update(result)
-        return values
+    def settings(self, existing=None, enabled=True):
+        if existing is not None:
+            self.store.install("测试", existing)
+        # 停用只影响合成配置；再次安装必须从用户方案读取，不能回存停用后的运行快照。
+        configured = self.store.request("existing")["values"]
+        modules = ["core", "memory"] if enabled else ["core"]
+        values = runtime.write_runtime(ROOT, self.prefix, modules, "customrobot", configured)
+        self.store.install("测试", values)
+        (self.prefix / "installed.json").write_text(json.dumps({"robot": "customrobot", "modules": modules}))
+        self.store.compose()
+        return flatten(read_config(self.home))
+
+    def legacy_settings(self, values):
+        # 旧键只作为升级导入输入，恢复规则由现行导入器验证。
+        directory = self.home / "config/profiles/customrobot"
+        directory.mkdir(parents=True)
+        (directory / "测试.env").write_text("".join(key + "=" + str(value) + "\n" for key, value in values.items()))
+        (directory / ".active").write_text("测试")
+        (self.prefix / "installed.json").write_text(json.dumps({"robot": "customrobot", "modules": ["core"]}))
+        return self.settings(enabled=False)
 
     def test_disabled_module_uses_lexical_only(self):
         result = self.settings({}, enabled=False)
         self.assertEqual(result[TEXT_MODEL], "lexical-only")
-        self.assertEqual(result[TEXT_DIM], "256")
+        self.assertEqual(result[TEXT_DIM], 256)
         self.assertEqual(result[IMAGE_MODEL], "disabled")
-        self.assertEqual(result[IMAGE_DIM], "512")
+        self.assertEqual(result[IMAGE_DIM], 512)
 
     def test_enabled_fresh_module_keeps_existing_local_model_defaults(self):
         result = self.settings({})
-        self.assertEqual(result[TEXT_MODEL], str(self.root / "runtime_data/models/BAAI__bge-small-zh-v1.5"))
-        self.assertEqual(result[IMAGE_MODEL], str(self.root / "runtime_data/models/openai__clip-vit-base-patch32"))
-        self.assertEqual(result[TEXT_DIM], "512")
-        self.assertEqual(result[IMAGE_DIM], "512")
+        self.assertEqual(result[TEXT_MODEL], str(self.home / "data/models/BAAI__bge-small-zh-v1.5"))
+        self.assertEqual(result[IMAGE_MODEL], str(self.home / "data/models/openai__clip-vit-base-patch32"))
+        self.assertEqual(result[TEXT_DIM], 512)
+        self.assertEqual(result[IMAGE_DIM], 512)
 
     def test_real_cloud_models_are_not_replaced_by_local_defaults(self):
-        existing = {TEXT_MODEL: ONLINE, TEXT_DIM: "768", IMAGE_MODEL: ONLINE, IMAGE_DIM: "768"}
+        existing = {TEXT_MODEL: ONLINE, TEXT_DIM: 768, IMAGE_MODEL: ONLINE, IMAGE_DIM: 768}
         result = self.settings(existing)
         for key, value in existing.items():
             self.assertEqual(result[key], value)
 
     def test_custom_models_and_dimensions_survive_disable_and_reenable(self):
-        original = {TEXT_MODEL: "/models/my-bge", TEXT_DIM: "384", IMAGE_MODEL: "/models/my-clip", IMAGE_DIM: "768"}
+        original = {TEXT_MODEL: "/models/my-bge", TEXT_DIM: 384, IMAGE_MODEL: "/models/my-clip", IMAGE_DIM: 768}
         disabled = self.settings(original, enabled=False)
         self.assertEqual(disabled[TEXT_MODEL], "lexical-only")
-        disabled_again = self.settings(disabled, enabled=False)
-        restored = self.settings(disabled_again)
+        disabled_again = self.settings(enabled=False)
+        self.assertEqual(disabled_again, disabled)
+        restored = self.settings()
         for key, value in original.items():
             self.assertEqual(restored[key], value)
 
     def test_changed_real_model_replaces_saved_dimension_even_when_equal_to_disabled_default(self):
         current = {
-            TEXT_MODEL: "sentence-transformers:new-model", TEXT_DIM: "256",
-            IMAGE_MODEL: "/models/new-clip", IMAGE_DIM: "512",
-            SAVED + TEXT_MODEL: ONLINE, SAVED + TEXT_DIM: "768",
-            SAVED + IMAGE_MODEL: ONLINE, SAVED + IMAGE_DIM: "768",
+            "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "sentence-transformers:new-model", "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "256",
+            "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL": "/models/new-clip", "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM": "512",
+            SAVED + "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": ONLINE, SAVED + "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "768",
+            SAVED + "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL": ONLINE, SAVED + "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM": "768",
         }
-        restored = self.settings(self.settings(current, enabled=False))
-        self.assertEqual(restored[TEXT_MODEL], current[TEXT_MODEL])
-        self.assertEqual(restored[TEXT_DIM], "256")
-        self.assertEqual(restored[IMAGE_MODEL], current[IMAGE_MODEL])
-        self.assertEqual(restored[IMAGE_DIM], "512")
+        self.legacy_settings(current)
+        restored = self.settings()
+        self.assertEqual(restored[TEXT_MODEL], current["NUWAX_MEMORY_TEXT_EMBEDDING_MODEL"])
+        self.assertEqual(restored[TEXT_DIM], 256)
+        self.assertEqual(restored[IMAGE_MODEL], current["NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL"])
+        self.assertEqual(restored[IMAGE_DIM], 512)
 
     def test_legacy_no_model_does_not_overwrite_saved_real_provider_dimension(self):
-        prior = {TEXT_MODEL: "hashing-old", TEXT_DIM: "32",
-                 SAVED + TEXT_MODEL: ONLINE, SAVED + TEXT_DIM: "768"}
-        restored = self.settings(self.settings(prior, enabled=False))
+        prior = {"NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": "hashing-old", "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "32",
+                 SAVED + "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL": ONLINE, SAVED + "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "768"}
+        self.legacy_settings(prior)
+        restored = self.settings()
         self.assertEqual(restored[TEXT_MODEL], ONLINE)
-        self.assertEqual(restored[TEXT_DIM], "768")
+        self.assertEqual(restored[TEXT_DIM], 768)
 
 
 
 
     def test_generated_disabled_file_preserves_saved_real_model(self):
-        prefix = self.root / "install/generations/one"
-        runtime.write_runtime(self.root, prefix, ["core"], "customrobot", {TEXT_MODEL: ONLINE, TEXT_DIM: "768"})
-        result = runtime.read_settings(prefix / "settings.env")
+        self.settings({TEXT_MODEL: ONLINE, TEXT_DIM: 768}, enabled=False)
+        result = runtime.read_settings(self.home / "run/config.toml")
+        saved = self.store.profile_values(self.store.active())
         self.assertEqual(result[TEXT_MODEL], "lexical-only")
-        self.assertEqual(result[SAVED + TEXT_MODEL], ONLINE)
-        self.assertEqual(result[SAVED + TEXT_DIM], "768")
-        self.assertEqual(self.settings(result)[TEXT_MODEL], ONLINE)
+        self.assertEqual(saved[TEXT_MODEL], ONLINE)
+        self.assertEqual(saved[TEXT_DIM], 768)
+        self.assertEqual(self.settings()[TEXT_MODEL], ONLINE)
 
 
 

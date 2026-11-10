@@ -182,3 +182,183 @@ fn shallow_escape_combines_translation_and_turn_for_opposing_contacts() {
     );
     assert_eq!(command[1], 0.);
 }
+
+// 第七轮实际配置和控制状态，见N6-19b归档；仅重放两成员冻结几何，不代替现场回放。
+fn n6_20_r7_chain() -> (Config, Vec<MotionState>) {
+    let config = Config {
+        resolution: 0.05000000074505806,
+        body_length: 0.6789949835614777,
+        body_width: 0.32800000000271845,
+        body_height: 0.4192421636189938,
+        body_to_ground: 0.40456216361899383,
+        max_velocity: 0.999999999999993,
+        max_acceleration: 0.5,
+        max_yaw_rate: 0.9999999999999929,
+        planning_horizon: 5.0,
+        sample_dt: 0.05,
+        body_center_x: 0.026072508220619156,
+        body_center_y: 1.2490009027033011e-15,
+        body_z_min: -0.40456216361899383,
+        body_z_max: 0.01467999999999997,
+        max_step_up: 0.15000000596046448,
+        max_step_down: 0.15000000596046448,
+        max_slope: 0.3141592653589793,
+        max_yaw_acceleration: 20.0,
+        max_reverse_velocity: 0.0,
+        max_lateral_velocity: 0.1744299999999988,
+    };
+    let states = vec![
+        MotionState { position: [4.72722390133869, 0.42264081558236116, 0.01171238755107227], velocity: [0.06811423959850842, 0.008768917491102436, 0.008467873319189185], yaw: -0.03328296349112102, yaw_rate: 0.010022572526697686, timestamp_ns: 1794298148785357237, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.72722390133869, 0.42264081558236116, 0.01171238755107227], velocity: [0.035887512554491144, 0.0016603284179003222, 0.003158228531914008], yaw: -0.03328296349112102, yaw_rate: 0.006510557240651799, timestamp_ns: 1794298148785357237, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.72722390133869, 0.42264081558236116, 0.01171238755107227], velocity: [0.020013526008807115, 7.993200711820137e-05, 0.001013686975710591], yaw: -0.03328296349112102, yaw_rate: 0.004919954283740841, timestamp_ns: 1794298148785357237, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.722007082196579, 0.4382828527061481, 0.011661074650343618], velocity: [0.0057499880503056695, -1.305471447636869e-05, 0.000681039640515301], yaw: -0.03076372481142398, yaw_rate: 0.011582977103143663, timestamp_ns: 1794298148885357380, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.722007082196579, 0.4382828527061481, 0.011661074650343618], velocity: [-0.003290523345176596, -1.058517319030769e-05, -0.0010164079900234345], yaw: -0.03076372481142398, yaw_rate: 0.006363378504906166, timestamp_ns: 1794298148885357380, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.722007082196579, 0.4382828527061481, 0.011661074650343618], velocity: [-0.009266453706292895, -0.0006108299925772378, -0.002244369902946832], yaw: -0.03076372481142398, yaw_rate: 0.008138715621088815, timestamp_ns: 1794298148885357380, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.722007082196579, 0.4382828527061481, 0.011661074650343618], velocity: [-0.01712719854156793, -0.0009175525514785795, -0.0022842615443546283], yaw: -0.03076372481142398, yaw_rate: 0.007402043367983856, timestamp_ns: 1794298148885357380, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+        MotionState { position: [4.733302210106727, 0.459441763074898, 0.007176286139628278], velocity: [-0.02166703597346221, -0.0009381550518706292, -0.0026977672346478704], yaw: -0.025614626253419256, yaw_rate: 0.00794038421763137, timestamp_ns: 1794298149085357189, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },
+    ];
+    (config, states)
+}
+
+#[test]
+fn n6_20_r7_transient_clear_admits_new_member_with_safe_braking() {
+    let (config, states) = n6_20_r7_chain();
+    let r = config.resolution;
+    let old = [101.5 * r, 4.5 * r, 0.5 * r];
+    let new = [102.5 * r, 9.5 * r, -3.5 * r];
+    let mut map = MapOwner::new(&config).unwrap();
+    map.seed_occupied(&[], states[0].position);
+    let mut tracker = ScanTracker::default();
+    for (i, state) in states.iter().enumerate() {
+        let obstacles = if i < 3 { vec![old] } else { vec![old, new] };
+        map.update_surface(&obstacles, &[], &[], &[]).unwrap();
+        let out = tracker.track_and_check(&config, &map.snapshot(), state, [0.; 3], None).unwrap();
+        if i < 3 || i == states.len() - 1 {
+            assert!(!out.recovery_samples.is_empty(), "第{i}个真实状态应产出有界恢复动作");
+            check_escape_sweep(&config, &obstacles, &out.recovery_samples);
+        } else {
+            assert!(out.recovery_samples.is_empty(), "真实短暂清除帧没有重叠");
+        }
+    }
+    let depth = escape_cell_depth(&config, new, states[7].position, states[7].yaw);
+    assert!((depth - 0.00003119510568594386).abs() < 1e-12);
+}
+
+#[test]
+fn n6_20_transient_clear_does_not_reissue_budget_and_half_second_ends_event() {
+    let route = [[0.095, 0.025, 0.35], [1., 0.025, 0.35]];
+    let obstacle = [-0.025, 0.025, 0.35];
+    let req = shallow_surface_request(&route, &[]);
+    let mut map = MapOwner::new(&req.config).unwrap();
+    map.seed_occupied(&[], req.start_position);
+    let mut tracker = ScanTracker::default();
+    let mut state = MotionState { position: req.start_position, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() };
+    let mut issued = 0;
+    let failure = loop {
+        tracker.clear_trajectory();
+        map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+        match tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None) {
+            Ok(out) => { assert!(!out.recovery_samples.is_empty()); issued += 1; }
+            Err(error) => break error,
+        }
+        assert!(issued < 40, "清除抖动不能反复获得未确认行程预算");
+        map.update_surface(&[], &[], &[], &[]).unwrap();
+        tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+        // 每拍有新来源时间，但没有实测退出进展；单拍清除不能重复发预算。
+        state.timestamp_ns += 50_000_000;
+    };
+    assert!(failure.message.contains("budget exhausted") || failure.message.contains("no monotone"));
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let clear_start = state.timestamp_ns + 100_000_000;
+    state.timestamp_ns = clear_start;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    state.timestamp_ns = clear_start + 499_999_999;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    assert_eq!(tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap_err().message, failure.message);
+    // 仅朝向入口遇到重叠也要打断连续清除，不能跨过这些占据拍累计半秒。
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    state.timestamp_ns = clear_start + 600_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    state.timestamp_ns = clear_start + 700_000_000;
+    assert!(tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], Some(0.)).is_err());
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    state.timestamp_ns = clear_start + 1_100_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    state.timestamp_ns = clear_start + 1_200_000_000;
+    assert_eq!(tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap_err().message, failure.message);
+    // 连续半秒无重叠后，原地也可以建立新事件。
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    state.timestamp_ns = clear_start + 1_300_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    state.timestamp_ns = clear_start + 1_800_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    let out = tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    assert!(!out.recovery_samples.is_empty());
+    check_escape_sweep(&req.config, &[obstacle], &out.recovery_samples);
+}
+
+#[test]
+fn n6_20_no_safe_candidate_latches_only_after_an_issued_action() {
+    let route = [[0.095, 0.025, 0.35], [1., 0.025, 0.35]];
+    let obstacle = [-0.025, 0.025, 0.35];
+    let req = shallow_surface_request(&route, &[]);
+    let mut map = MapOwner::new(&req.config).unwrap();
+    map.seed_occupied(&[], req.start_position);
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    let snapshot = map.snapshot();
+    let mut tracker = ScanTracker::default();
+    let mut state = MotionState {
+        position: req.start_position, velocity: [-0.02, 0., 0.],
+        measured_velocity: 1, measured_yaw_rate: 1, ..Default::default()
+    };
+    let first = tracker.track_and_check(&req.config, &snapshot, &state, [0.; 3], None).unwrap_err();
+    assert!(first.message.contains("no safe escape candidate"));
+    state.velocity = [0.; 3];
+    state.timestamp_ns += 50_000_000;
+    let safe = tracker.track_and_check(&req.config, &snapshot, &state, [0.; 3], None).unwrap();
+    check_escape_sweep(&req.config, &[obstacle], &safe.recovery_samples);
+    state.velocity = [-0.02, 0., 0.];
+    state.timestamp_ns += 50_000_000;
+    let fault = tracker.track_and_check(&req.config, &snapshot, &state, [0.; 3], None).unwrap_err();
+    assert!(fault.message.contains("no safe escape candidate"));
+    state.velocity = [0.; 3];
+    state.timestamp_ns += 50_000_000;
+    tracker.clear_trajectory();
+    assert_eq!(tracker.track_and_check(&req.config, &snapshot, &state, [0.; 3], None).unwrap_err().message,
+        fault.message, "发出过动作后的真实证明失败，不能借速度恢复或清理轨迹解锁");
+    tracker.clear();
+    let safe = tracker.track_and_check(&req.config, &snapshot, &state, [0.; 3], None).unwrap();
+    check_escape_sweep(&req.config, &[obstacle], &safe.recovery_samples);
+}
+
+#[test]
+fn n6_20_healthy_event_ends_after_half_second_of_source_clear() {
+    let route = [[0.095, 0.025, 0.35], [1., 0.025, 0.35]];
+    let obstacle = [-0.025, 0.025, 0.35];
+    let req = shallow_surface_request(&route, &[]);
+    let mut map = MapOwner::new(&req.config).unwrap();
+    map.seed_occupied(&[], req.start_position);
+    let mut tracker = ScanTracker::default();
+    let mut state = MotionState {
+        position: req.start_position, measured_velocity: 1, measured_yaw_rate: 1,
+        ..Default::default()
+    };
+    map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+    let safe = tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    check_escape_sweep(&req.config, &[obstacle], &safe.recovery_samples);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    state.timestamp_ns = 100_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    state.timestamp_ns = 600_000_000;
+    tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    // 原地结束事件后，另一侧的接触须重新选择方向，不能继承旧方向或距离解锁条件。
+    let opposite = [0.175, 0.025, 0.35];
+    map.update_surface(&[opposite], &[], &[], &[]).unwrap();
+    let safe = tracker.track_and_check(&req.config, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    assert!(safe.command[0] < 0.);
+    check_escape_sweep(&req.config, &[opposite], &safe.recovery_samples);
+}

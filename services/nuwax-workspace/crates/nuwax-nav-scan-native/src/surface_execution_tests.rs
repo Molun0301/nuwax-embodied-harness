@@ -125,20 +125,20 @@ fn registered_surface_failed_first_proof_can_retry_without_rearming_issued_budge
     req.start_yaw_rate = Some(0.);
     req.start_velocity = Some([-0.02, 0., 0.]);
     assert!(planner.step(&req).unwrap_err().contains("no monotone"));
-    planner.reset_execution();
     req.start_velocity = Some([0.; 3]);
     req.odometry_timestamp_ns = 50_000_000;
     assert!(planner.step(&req).unwrap().command_forward > 0.);
     req.odometry_timestamp_ns = 2_050_000_001;
     let exhausted = planner.step(&req).unwrap_err();
     assert!(exhausted.contains("budget exhausted"));
-    planner.reset_execution();
     req.odometry_timestamp_ns += 50_000_000;
     assert_eq!(planner.step(&req).unwrap_err(), exhausted,
-        "发出动作后的耗尽首因必须跨目标保留，不能重置额度或被泛化");
-    // 满足旧的两格净离开条件后才是新事件；新失败不能继承旧事件首因。
-    req.start_position[0] = 0.3;
-    planner.step(&req).unwrap();
+        "同一事件必须保留预算耗尽首因");
+    let replan = [route[0], [0.6, 0.025, 0.35], route[1]];
+    req.reference = &replan;
+    assert_eq!(planner.step(&req).unwrap_err(), exhausted,
+        "同目标参考路线变化不能解除预算故障锁");
+    // 新目标可以结束故障锁；重新准入仍过原安全证明。
     planner.reset_execution();
     req.start_position = route[0];
     req.odometry_timestamp_ns += 50_000_000;
@@ -186,14 +186,12 @@ fn registered_surface_escape_keeps_time_distance_and_geometry_generation_limits(
     let mut req = shallow_surface_request(&route, &contact);
     let mut planner = registered_fixture(&req);
     assert!(planner.step(&req).is_ok());
-    planner.reset_execution();
     req.odometry_timestamp_ns = 2_000_000_001;
     assert!(planner.step(&req).unwrap_err().contains("budget exhausted"));
     req.odometry_timestamp_ns = 0;
     let mut planner = registered_fixture(&req);
     let mut exhausted = false;
     for _ in 0..20 {
-        planner.reset_execution();
         match planner.step(&req) {
             Ok(out) => assert!(out.command_forward > 0.),
             Err(_) => {
@@ -202,7 +200,7 @@ fn registered_surface_escape_keeps_time_distance_and_geometry_generation_limits(
             }
         }
     }
-    assert!(exhausted, "重复来源时间和新目标不能反复续发逃逸命令");
+    assert!(exhausted, "重复来源时间不能反复续发逃逸命令");
     let mut planner = registered_fixture(&req);
     assert!(planner.step(&req).is_ok());
     planner.reset_execution();
@@ -340,8 +338,10 @@ fn registered_surface_deeper_escape_rejects_increased_measured_penetration() {
     req.start_position[0] -= 0.001;
     let error = planner.step(&req).unwrap_err();
     assert!(error.contains("measured escape penetration increased"));
+    req.start_position = route[0];
+    assert_eq!(planner.step(&req).unwrap_err(), error, "同事件回到浅接触仍保留真实增深故障");
     planner.reset_execution();
-    assert_eq!(planner.step(&req).unwrap_err(), error);
+    assert!(planner.step(&req).unwrap().command_forward > 0., "新目标解除故障后仍须取得安全动作");
 }
 
 #[test]

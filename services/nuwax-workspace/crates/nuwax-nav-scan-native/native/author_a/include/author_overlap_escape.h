@@ -1,13 +1,15 @@
 #pragma once
 #include <author_command_check.h>
 #include <stdexcept>
+#include <optional>
 
 namespace scan_planner {
 
-// 一次重叠事件跨任务退休保留；只允许离开初始实体的同一侧，不能清图或穿墙。
+// 同一事件保留退出方向和运动记账；连续半秒来源时间无重叠或新目标才结束事件。
 class AuthorOverlapEscape {
-  struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; double remaining=0.; bool body_axis=false; };
-  bool active_=false,latched_=false;
+  struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; double remaining=0.; bool body_axis=false; bool directed=false; };
+  bool active_=false,latched_=false,recontact_=false;
+  std::optional<int64_t> clear_since_;
   int64_t began_=0,last_stamp_=0;
   unsigned ticks_=0;
   double traveled_=0.;
@@ -17,7 +19,7 @@ class AuthorOverlapEscape {
   // 三格误差带覆盖定位偏差与占据量化；只用于恢复准入，不改变碰撞外包。
   static double penetrationLimit(const ScanConfig& c) {return 3.*c.resolution;}
   std::string failure_;
-  Eigen::Vector3d origin_=Eigen::Vector3d::Zero(),last_=Eigen::Vector3d::Zero();
+  Eigen::Vector3d last_=Eigen::Vector3d::Zero();
   std::vector<Contact> contacts_;
   std::set<GridMap::BodyCell> initial_;
 
@@ -182,10 +184,15 @@ class AuthorOverlapEscape {
 
  public:
   bool active() const { return active_; }
-  void observeClear(const Eigen::Vector3d& p,double resolution) {
-    active_=false;
-    // 离开至少两格才允许另一事件；新目标不能重置仍在原处的预算或故障锁。
-    if(latched_&&(p-origin_).head<2>().norm()>2.*resolution)latched_=false;
+  void observeOverlap() {
+    if(clear_since_){recontact_=true;clear_since_.reset();}
+  }
+  void observeClear(const Eigen::Vector3d& p,int64_t stamp) {
+    if(!active_)return;
+    if(!clear_since_||stamp<last_stamp_)clear_since_=stamp;
+    if(stamp-*clear_since_>=500000000){*this=AuthorOverlapEscape{};return;}
+    // 暂时清除仍属于原事件；保留预算并记入这期间的实测行程。
+    if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
   }
 
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
@@ -193,29 +200,28 @@ class AuthorOverlapEscape {
     // 缺测尚不能开始恢复证明，保留原输入等待语义，不宣告几何恢复失败。
     if(!velocity||!std::isfinite(angular))
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
-    const bool issued=latched_;
     try {
-      planImpl(map,c,p,yaw,velocity,angular,stamp,output);
-      // 只有通过整拍和制动证明并输出动作，才消耗跨目标事件。
+      planImpl(map,c,p,yaw,velocity,angular,stamp,recontact_,output);
+      recontact_=false;
+      // 只有通过整拍和制动证明并输出动作，才将后续无安全候选记为真实失败。
       latched_=true;
     } catch(const std::runtime_error& error) {
-      const std::string reason=error.what();
-      if(!issued) *this=AuthorOverlapEscape{};
-      else {active_=false;if(failure_.empty())failure_=reason;}
-      throw std::runtime_error("BODY_OVERLAP_RECOVERY_FAILED: "+reason);
+      throw std::runtime_error("BODY_OVERLAP_RECOVERY_FAILED: "+std::string(error.what()));
     }
   }
 
  private:
   void planImpl(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
-      const double* velocity,double angular,int64_t stamp,ScanOutput& output) {
+      const double* velocity,double angular,int64_t stamp,bool recontact,ScanOutput& output) {
     using namespace command_check_detail;
-    if(!active_) {
-      if(latched_)throw std::runtime_error(failure_.empty()
-          ? "Current body pose is occupied; escape episode is already exhausted or completed"
-          : failure_);
-      origin_=last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;failure_.clear();
+    if(!failure_.empty())throw std::runtime_error(failure_);
+    const bool starting=!active_;
+    if(starting) {
+      last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;failure_.clear();
       contacts_.clear();initial_.clear();
+    }
+    if(starting||recontact) {
+      // 短暂清除后新出现的当前接触重新过三格准入；原方向和原预算不重置。
       std::vector<GridMap::BodyCell> cells;
       if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())
         throw std::runtime_error("Current body pose is occupied or outside the local map; no eligible contacts");
@@ -234,6 +240,8 @@ class AuthorOverlapEscape {
           throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
         selected.remaining=selected.depth;contacts_.push_back(selected);initial_.insert(cell);
       }
+    }
+    if(starting) {
       // 深重叠需要超过一格的退出行程；按初始最大穿透的两倍计入斜向退出，
       // 时间由同一行程和既有低速推出。浅接触保留原一格、两秒未确认预算。
       distance_limit_=c.resolution;
@@ -241,28 +249,30 @@ class AuthorOverlapEscape {
       time_limit_=std::max(2.,distance_limit_/escape_speed_+c.sample_dt);
       active_=true;
     }
-    if(stamp<last_stamp_){active_=false;throw std::runtime_error("Current body pose is occupied; escape source clock regressed");}
+    if(stamp<last_stamp_)throw std::runtime_error("Current body pose is occupied; escape source clock regressed");
     bool progress_observed=false;
     for(const auto& contact:contacts_) {
       const double now=penetration(contact,c,p,yaw);
       if(now>contact.depth+1e-10) {
-        active_=false;
-        throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
+        failure_="Current body pose is occupied; measured escape penetration increased";
+        throw std::runtime_error(failure_);
       }
       const double remaining=depth(contact,c,p,yaw);
-      if(latched_&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10)
-        throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
+      if(contact.directed&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10) {
+        failure_="Current body pose is occupied; measured escape penetration increased";
+        throw std::runtime_error(failure_);
+      }
       if(now<contact.depth-1e-10||remaining<contact.remaining-1e-10)progress_observed=true;
     }
-    // 只有新的实测采样证实退出进展，才结清未确认运动预算；目标切换不结清。
+    // 只有新的实测采样证实退出进展，才结清未确认运动预算。
     if(stamp>last_stamp_&&progress_observed) {
       began_=stamp;ticks_=0;traveled_=admitted_=0.;
     }
     if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
     if(stamp-began_>time_limit_*1e9||ticks_>static_cast<unsigned>(std::ceil(time_limit_/c.sample_dt))
         ||traveled_>=distance_limit_||admitted_>=distance_limit_) {
-      active_=false;
-      throw std::runtime_error("Current body pose is occupied; escape time or distance budget exhausted");
+      failure_="Current body pose is occupied; escape time or distance budget exhausted";
+      throw std::runtime_error(failure_);
     }
     const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
@@ -301,7 +311,7 @@ class AuthorOverlapEscape {
       auto exits=contacts_;
       for(auto& contact:exits) {
         double after=depth(contact,c,state.position,state.yaw);
-        if(!latched_) {
+        if(!contact.directed) {
           // 法向不可执行时，选取同侧可达的侧面；最小穿透可先保持不变，退出距离必须下降。
           double best=std::numeric_limits<double>::infinity();
           const auto directions=axes(yaw);
@@ -321,6 +331,7 @@ class AuthorOverlapEscape {
         const double from=depth(contact,c,p,yaw);
         if(std::max(0.,after)>std::max(0.,from)+1e-10)same_side=false;
         if(after<from-1e-10)progress=true;
+        contact.directed=true;
       }
       if(!progress||!same_side)continue;
       output.command_forward=command.linear.x();output.command_lateral=command.linear.y();
@@ -345,8 +356,10 @@ class AuthorOverlapEscape {
       }
       return;
     }
-    throw std::runtime_error(exhausted?"Current body pose is occupied; escape proof computation exhausted"
-        :"Current body pose is occupied; no monotone collision-free escape and braking sweep");
+    const std::string reason=exhausted?"Current body pose is occupied; escape proof computation exhausted"
+        :"Current body pose is occupied; no safe escape candidate: no monotone collision-free escape and braking sweep";
+    if(latched_&&!exhausted)failure_=reason;
+    throw std::runtime_error(reason);
   }
 };
 }

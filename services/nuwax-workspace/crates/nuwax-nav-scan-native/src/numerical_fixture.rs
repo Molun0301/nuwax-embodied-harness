@@ -197,7 +197,7 @@ impl Planner {
         }
         if self.reference != r.reference {
             self.curve = None;
-            self.tracker.clear();
+            self.tracker.clear_trajectory();
             self.reference = r.reference.to_vec();
             self.progress = 0.;
         }

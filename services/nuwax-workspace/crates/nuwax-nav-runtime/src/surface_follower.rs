@@ -404,7 +404,7 @@ impl SurfaceFollower {
         self.epoch += 1;
         self.plan_worker.retire(self.epoch);
         self.map_worker.retire(self.epoch, false);
-        self.tracker.clear();
+        self.tracker.clear_trajectory();
         self.pending_curve = None;
         self.plan_snapshot = None;
         self.active = None;
@@ -615,6 +615,7 @@ impl NavPlanner for SurfaceFollower {
         options: GoalOptions,
     ) -> Result<(), RuntimeError> {
         self.retire_route();
+        self.tracker.clear();
         self.goal = Some(goal.clone());
         self.options = options;
         self.path = None;
@@ -687,7 +688,6 @@ impl NavPlanner for SurfaceFollower {
         self.prepared = None;
         self.map = None;
         self.registered_frame = None;
-        self.tracker = ScanTracker::default();
     }
     fn observe_applied_command(&mut self, command: Twist2) {
         self.applied = command;
@@ -704,7 +704,6 @@ impl NavPlanner for SurfaceFollower {
             self.retire_route();
             self.map_worker.retire(self.epoch, true);
             self.prepared = None;
-            self.tracker = ScanTracker::default();
         }
         self.registered_frame = frame;
         self.submit_map();
@@ -861,6 +860,46 @@ mod native_execution_tests {
             (1_000_000_000. / follower.config.controller.control_frequency) as i64;
         follower.update_odometry(current.clone());
         current
+    }
+
+    #[test]
+    fn n6_20_same_goal_route_keeps_fault_and_new_goal_reopens_escape() {
+        let (config, source) = crate::native_test_helpers::fixture();
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let goal = pose(3., 1., 0.);
+        follower.configure_goal(&goal, GoalOptions::default()).unwrap();
+        let c = follower.native_config(&source);
+        let initial = [c.body_length / 2. - c.body_center_x - 0.005, 0.025, 0.5];
+        let mut motion = MotionState {
+            position: initial, measured_velocity: 1, measured_yaw_rate: 1,
+            timestamp_ns: 1_000_000_000, ..Default::default()
+        };
+        let mut map = nuwax_nav_scan_native::MapOwner::new(&c).unwrap();
+        map.seed_occupied(&[], initial);
+        map.update_surface(&[[-0.025, 0.025, initial[2] + c.body_z_max - c.resolution / 2.]], &[], &[], &[]).unwrap();
+        let snapshot = map.snapshot();
+        assert!(!follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().recovery_samples.is_empty());
+        motion.position[0] -= 0.001;
+        motion.timestamp_ns += 50_000_000;
+        let fault = follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err();
+        assert!(fault.message.contains("penetration increased"));
+        follower.replace_execution_path(
+            ExecutionPath::Surface(Path3D { poses: vec![pose(initial[0], initial[1], 0.), goal.clone()] }),
+            None, goal.clone(),
+        ).unwrap();
+        motion.position = initial;
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message);
+        follower.stop();
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
+            "同目标请求重规划也会调用stop，不能借此解除故障锁");
+        follower.invalidate_execution_map();
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
+            "同目标地图退休不能借重建跟踪器解除故障锁");
+        follower.observe_registered_frame(Some(crate::registered_frame::test_frame(1)));
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
+            "同目标注册帧来源变化也保留故障锁");
+        follower.configure_goal(&goal, GoalOptions::default()).unwrap();
+        assert!(!follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().recovery_samples.is_empty());
     }
     fn advance_to_motion(follower: &mut SurfaceFollower) -> Twist2 {
         for _ in 0..20 {

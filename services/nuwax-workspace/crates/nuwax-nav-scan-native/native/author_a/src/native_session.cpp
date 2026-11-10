@@ -190,7 +190,8 @@ extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double d
 }
 extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
-extern "C" void nuwax_scan_tracker_clear(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
+extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
+extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
     const double previous[3],double terminal_yaw,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
@@ -209,6 +210,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
     const int occupied=s.map.getInflateOccupancy(position,yaw);
     if(occupied!=0) {
+      s.escape.observeOverlap();
       if(occupied==1 && !std::isfinite(terminal_yaw) && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
         s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
@@ -216,7 +218,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       }
       throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
     }
-    s.escape.observeClear(position,c->resolution);
+    s.escape.observeClear(position,state->timestamp_ns);
     Vector3d target=position;double desired_yaw=yaw;
     if(std::isfinite(terminal_yaw)) {
       const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;

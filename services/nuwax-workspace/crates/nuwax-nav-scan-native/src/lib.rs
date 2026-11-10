@@ -210,6 +210,7 @@ extern "C" {
     fn nuwax_scan_tracker_create() -> *mut c_void;
     fn nuwax_scan_tracker_destroy(tracker: *mut c_void);
     fn nuwax_scan_tracker_clear(tracker: *mut c_void);
+    fn nuwax_scan_tracker_clear_trajectory(tracker: *mut c_void);
     fn nuwax_scan_tracker_install(tracker: *mut c_void, trajectory: *const c_void);
     fn nuwax_scan_tracker_track(
         tracker: *mut c_void,
@@ -448,8 +449,13 @@ impl Default for ScanTracker {
     }
 }
 impl ScanTracker {
+    /// 新目标退休旧跟踪，同时结束原脱困事件和故障锁。
     pub fn clear(&mut self) {
         unsafe { nuwax_scan_tracker_clear(self.0.as_ptr()) }
+    }
+    /// 同目标换路线只清理轨迹，保留脱困事件与运动记账。
+    pub fn clear_trajectory(&mut self) {
+        unsafe { nuwax_scan_tracker_clear_trajectory(self.0.as_ptr()) }
     }
     pub fn install(&mut self, trajectory: &Trajectory) {
         unsafe { nuwax_scan_tracker_install(self.0.as_ptr(), trajectory.0 .0.as_ptr()) }

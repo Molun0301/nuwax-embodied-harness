@@ -334,12 +334,7 @@ impl Native {
             pose_isometry(&frame.odom_pose),
         );
         let request = self.request(frame, points, grid, sequence);
-        let response = self
-            .runtime
-            .as_ref()
-            .unwrap()
-            .block_on(self.ingress.as_mut().unwrap().submit(request))
-            .map_err(|e| e.to_string())?;
+        let response = self.submit(request)?;
         match response.disposition() {
             nuwax_nav_pgo_bridge::ValidatedOnlinePgoDisposition::Correction => {
                 let result = response.result();
@@ -381,6 +376,38 @@ impl Native {
                 response.result().rejection_reason
             )),
         }
+    }
+
+    fn submit(
+        &mut self,
+        request: nuwax_nav_pgo_bridge::NativePgoRequest,
+    ) -> Result<nuwax_nav_pgo_bridge::ValidatedOnlinePgoResult, String> {
+        let runtime = self.runtime.as_ref().unwrap();
+        let response = runtime.block_on(self.ingress.as_mut().unwrap().submit(request));
+        if let Err(error @ nuwax_nav_pgo_bridge::OnlinePgoError::RequestTimedOut { .. }) = &response {
+            let owner = self.owner.take().unwrap();
+            let diagnostics = owner.request_diagnostics();
+            // 等待原有关闭流程完成，保留之前被丢弃的停止原因和有界输出尾部。
+            let shutdown = runtime.block_on(owner.shutdown());
+            tracing::error!(
+                request_sequence = diagnostics.request_sequence,
+                submitted_count = diagnostics.submitted.count,
+                submitted_last_timestamp_ns = ?diagnostics.submitted.last_timestamp_ns,
+                publish_returned_count = diagnostics.publish_returned.count,
+                publish_returned_last_timestamp_ns = ?diagnostics.publish_returned.last_timestamp_ns,
+                native_received_count = diagnostics.native_received.count,
+                native_received_last_timestamp_ns = ?diagnostics.native_received.last_timestamp_ns,
+                result_received_count = diagnostics.result_received.count,
+                result_received_last_timestamp_ns = ?diagnostics.result_received.last_timestamp_ns,
+                stop_reason = ?shutdown.as_ref().map(|s| &s.cause),
+                process_stop = ?shutdown.as_ref().map(|s| &s.process),
+                stdout_tail = ?shutdown.as_ref().map(|s| String::from_utf8_lossy(&s.logs.stdout.bytes)),
+                stderr_tail = ?shutdown.as_ref().map(|s| String::from_utf8_lossy(&s.logs.stderr.bytes)),
+                error = %error,
+                "原生PGO请求超时取证"
+            );
+        }
+        response.map_err(|error| error.to_string())
     }
 
     fn request(

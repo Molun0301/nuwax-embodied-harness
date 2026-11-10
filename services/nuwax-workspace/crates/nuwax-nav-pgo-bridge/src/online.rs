@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -31,6 +31,40 @@ const STATUS_TYPE: &str = "nuwax_msgs.NativePgoStatus";
 const OWNER_COMMAND_CAPACITY: usize = 4;
 const ADMISSION_CAPACITY: usize = 1;
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// 一个请求阶段的计数和最后观察墙钟；没有观察到时保留空值。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OnlinePgoStageObservation {
+    /// 本请求观察到的次数。
+    pub count: u64,
+    /// 最后一次观察的Unix纳秒时间。
+    pub last_timestamp_ns: Option<i64>,
+}
+
+impl OnlinePgoStageObservation {
+    fn record(&mut self) {
+        self.record_at(timestamp_now_ns());
+    }
+    fn record_at(&mut self, timestamp_ns: i64) {
+        self.count += 1;
+        self.last_timestamp_ns = Some(timestamp_ns);
+    }
+}
+
+/// 只在内存保留当前请求的阶段证据，正常路径不记录逐请求日志。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OnlinePgoRequestDiagnostics {
+    /// 桥接分配的请求序号。
+    pub request_sequence: i64,
+    /// 请求已进入桥接提交处理。
+    pub submitted: OnlinePgoStageObservation,
+    /// 发布成功返回；不等于远端收到。
+    pub publish_returned: OnlinePgoStageObservation,
+    /// 已收到原生接纳状态，证明原生收到；空值不证明原生没收到。
+    pub native_received: OnlinePgoStageObservation,
+    /// 已收到并验证该请求结果。
+    pub result_received: OnlinePgoStageObservation,
+}
 
 /// Generation-private typed LCM topics owned by one online PGO generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -508,6 +542,7 @@ pub struct OnlinePgoOwner {
     control_tx: Option<mpsc::Sender<OwnerCommand>>,
     task: Option<JoinHandle<Result<OnlinePgoShutdown, OnlinePgoError>>>,
     topics: OnlinePgoTopics,
+    diagnostics: Arc<Mutex<OnlinePgoRequestDiagnostics>>,
 }
 
 impl OnlinePgoOwner {
@@ -606,6 +641,7 @@ impl OnlinePgoOwner {
         let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(OWNER_COMMAND_CAPACITY);
         let admitted = Arc::new(AtomicBool::new(false));
+        let diagnostics = Arc::new(Mutex::new(OnlinePgoRequestDiagnostics::default()));
         let runtime = OwnerRuntime {
             publisher,
             subscriber,
@@ -622,6 +658,7 @@ impl OnlinePgoOwner {
             next_request_sequence: 0,
             next_cancel_sequence: 0,
             admitted: Arc::clone(&admitted),
+            diagnostics: Arc::clone(&diagnostics),
         };
         let task = tokio::spawn(run_owner(runtime, admission_rx, control_rx));
         Ok((
@@ -629,6 +666,7 @@ impl OnlinePgoOwner {
                 control_tx: Some(control_tx),
                 task: Some(task),
                 topics,
+                diagnostics,
             },
             OnlinePgoIngress {
                 tx: admission_tx,
@@ -641,6 +679,11 @@ impl OnlinePgoOwner {
     #[must_use]
     pub fn topics(&self) -> &OnlinePgoTopics {
         &self.topics
+    }
+
+    /// 返回当前请求的阶段快照，供故障路径一次性取证。
+    pub fn request_diagnostics(&self) -> OnlinePgoRequestDiagnostics {
+        self.diagnostics.lock().unwrap().clone()
     }
 
     /// Publish exact typed cancellation and await ACK plus request terminal.
@@ -719,6 +762,7 @@ struct OwnerRuntime {
     next_request_sequence: i64,
     next_cancel_sequence: i64,
     admitted: Arc<AtomicBool>,
+    diagnostics: Arc<Mutex<OnlinePgoRequestDiagnostics>>,
 }
 
 struct ActiveRequest {
@@ -726,6 +770,7 @@ struct ActiveRequest {
     reply_tx: oneshot::Sender<Result<ValidatedOnlinePgoResult, OnlinePgoError>>,
     deadline: Instant,
     accepted: bool,
+    accepted_timestamp_ns: i64,
     running: bool,
     result: Option<ValidatedOnlinePgoResult>,
     terminal: Option<NativePgoStatus>,
@@ -839,6 +884,7 @@ async fn run_owner(
                     cause = Some(OnlinePgoStopCause::Terminal(error));
                     break;
                 }
+                let was_accepted = active.as_ref().is_some_and(|current| current.accepted);
                 if let Err(error) = handle_status_receive(
                     received,
                     &runtime.topics.status,
@@ -849,6 +895,10 @@ async fn run_owner(
                 ) {
                     cause = Some(OnlinePgoStopCause::Terminal(error));
                     break;
+                }
+                if !was_accepted && active.as_ref().is_some_and(|current| current.accepted) {
+                    runtime.diagnostics.lock().unwrap().native_received
+                        .record_at(active.as_ref().unwrap().accepted_timestamp_ns);
                 }
             }
             command = control_rx.recv() => {
@@ -932,6 +982,7 @@ async fn run_owner(
                     cause = Some(OnlinePgoStopCause::Terminal(error));
                     break;
                 }
+                runtime.diagnostics.lock().unwrap().result_received.record();
             }
             _ = poll.tick() => {
                 match runtime.child.is_finished() {
@@ -1062,6 +1113,14 @@ async fn admit_request(
             ));
         }
     };
+    {
+        let mut diagnostics = runtime.diagnostics.lock().unwrap();
+        *diagnostics = OnlinePgoRequestDiagnostics {
+            request_sequence: next_sequence,
+            ..Default::default()
+        };
+        diagnostics.submitted.record();
+    }
     let deadline = Instant::now()
         .checked_add(runtime.result_timeout)
         .expect("validated result timeout");
@@ -1073,7 +1132,7 @@ async fn admit_request(
     )
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => runtime.diagnostics.lock().unwrap().publish_returned.record(),
         Ok(Err(error)) => {
             return Err((
                 OnlinePgoError::Transport(format!("request publish: {error}")),
@@ -1095,6 +1154,7 @@ async fn admit_request(
         reply_tx: admission.reply_tx,
         deadline,
         accepted: false,
+        accepted_timestamp_ns: 0,
         running: false,
         result: None,
         terminal: None,
@@ -1289,6 +1349,7 @@ fn handle_status_receive(
             if !current.accepted && !current.running && current.terminal.is_none() =>
         {
             current.accepted = true;
+            current.accepted_timestamp_ns = status.status_timestamp_ns;
             Ok(())
         }
         codec::NATIVE_PGO_EVENT_RUNNING
@@ -1820,6 +1881,7 @@ mod tests {
                 reply_tx,
                 deadline: Instant::now() + Duration::from_secs(1),
                 accepted: false,
+                accepted_timestamp_ns: 0,
                 running: false,
                 result: None,
                 terminal: None,
@@ -2470,6 +2532,13 @@ mod tests {
             ValidatedOnlinePgoDisposition::NoCandidate
         );
         assert_eq!(stationary.accepted_keyframe(), Some(false));
+        let diagnostics = owner.request_diagnostics();
+        assert_eq!(diagnostics.request_sequence, 2);
+        for stage in [&diagnostics.submitted, &diagnostics.publish_returned,
+            &diagnostics.native_received, &diagnostics.result_received] {
+            assert_eq!(stage.count, 1);
+            assert!(stage.last_timestamp_ns.is_some());
+        }
         let shutdown = owner.shutdown().await.unwrap();
         assert_eq!(shutdown.cause, OnlinePgoStopCause::Requested);
         assert!(shutdown.logs.stdout.total_bytes < 64 * 1024);

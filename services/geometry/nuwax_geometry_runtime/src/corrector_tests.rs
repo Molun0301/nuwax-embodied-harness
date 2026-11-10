@@ -1,5 +1,82 @@
 use super::*;
 
+#[test]
+fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
+    use std::{io::Write, os::unix::fs::PermissionsExt, sync::{Arc, Mutex}};
+    use nuwax_nav_pgo_bridge as bridge;
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    let fixture = std::path::PathBuf::from(env!("OUT_DIR"))
+        .join(format!("pgo-timeout-{}", std::process::id()));
+    std::fs::create_dir_all(&fixture).unwrap();
+    let executable = fixture.join("pgo");
+    let pid_file = fixture.join("pid");
+    // 真实原生端先完成就绪，再暂停收发；不替换生产传输，不修改五秒期限。
+    std::fs::write(&executable, format!(
+        "#!/bin/sh\nprintf 'N6-20 stdout tail\\n'\nprintf 'N6-20 stderr tail\\n' >&2\nprintf '%s' \"$$\" > '{}'\nexec '{}' \"$@\"\n",
+        pid_file.display(), bridge::discovery_native_executable().display()
+    )).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::copy(bridge::discovery_group_guardian_executable(), fixture.join("nuwax-group-guardian")).unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let mut config = bridge::OnlinePgoConfig::new(format!("udpm://239.255.76.64:{port}?ttl=0"), 204, 1);
+    config.executable = executable;
+    assert_eq!(config.result_timeout, std::time::Duration::from_secs(5));
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let (owner, ingress) = runtime.block_on(bridge::OnlinePgoOwner::start(config)).unwrap();
+    let child: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    assert_eq!(unsafe { libc::kill(child, libc::SIGSTOP) }, 0);
+    let mut corrector = Corrector::from_config(
+        "native_pgo", &nuwax_config::test_support::section("geometry"),
+        &nuwax_config::test_support::section("robot"), &nuwax_config::test_support::section("transport"),
+    ).unwrap();
+    let Mode::Native(native) = &mut corrector.mode else { unreachable!() };
+    native.runtime = Some(runtime);
+    native.owner = Some(owner);
+    native.ingress = Some(ingress);
+    let stamp = 1_794_200_973_126_363_516;
+    let frame = crate::mapper::tests::room_frame(204, stamp);
+    let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
+    let mut grid = nuwax_mapping::OccupancyGrid::new(8, 8, 0.05);
+    grid.frame_id = "map".into();
+    let request = native.request(&frame, &points, (&grid, stamp), 1);
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogBuffer(Arc::clone(&buffer));
+    let subscriber = tracing_subscriber::fmt().json().with_ansi(false)
+        .with_writer(move || writer.clone()).finish();
+    let error = tracing::subscriber::with_default(subscriber, || native.submit(request)).unwrap_err();
+    assert!(error.contains("request 1 timed out"));
+    assert!(native.owner.is_none(), "故障关闭证据已经被消费，不能留待Drop丢弃");
+    let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let logs: Vec<serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|row: &serde_json::Value| row["fields"]["message"] == "原生PGO请求超时取证").collect();
+    assert_eq!(logs.len(), 1, "故障路径应一次记录完整证据：{text}");
+    let fields = &logs[0]["fields"];
+    assert_eq!(fields["request_sequence"], 1);
+    for (stage, count) in [("submitted", 1), ("publish_returned", 1), ("native_received", 0), ("result_received", 0)] {
+        assert_eq!(fields[format!("{stage}_count")], count);
+        let last = &fields[format!("{stage}_last_timestamp_ns")];
+        assert!(!last.is_null(), "每个阶段必须有最后观察时刻字段");
+        if count == 0 { assert_eq!(last, "None"); } else { assert!(last.as_str().unwrap().starts_with("Some(")); }
+    }
+    assert!(fields["stop_reason"].as_str().unwrap().contains("RequestTimedOut"));
+    assert!(fields["process_stop"].as_str().unwrap().contains("SupervisedShutdown"));
+    assert!(fields["stdout_tail"].as_str().unwrap().contains("N6-20 stdout tail"));
+    assert!(fields["stderr_tail"].as_str().unwrap().contains("N6-20 stderr tail"));
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
 impl PgoUpdate {
     pub(crate) fn constant_for_test(first_stamp: u64, correction: Isometry3<f64>) -> Self {
         Self {

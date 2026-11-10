@@ -46,7 +46,7 @@ def write_runtime(root, prefix, modules, robot, existing):
         raise ValueError("人员跟随需要导航与视觉感知模块")
     values = flatten(defaults(root))
     values.update(existing)
-    available = tuple(name for name in ("fastlio2", "pointlio") if name in selected)
+    available = tuple(name for name in ("pointlio", "fastlio2") if name in selected)
     backend = existing.get("geometry.lio_backend", "")
     values["geometry.lio_backend"] = backend if backend in ("device",) + available else next(iter(available), "device")
     pipeline = existing.get("geometry.pipeline") or ("slam_2d" if "slam2d" in selected and not available else "lio_3d")

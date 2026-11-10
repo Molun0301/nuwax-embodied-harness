@@ -22,7 +22,7 @@ from .runtime import read_settings
 PRESETS = {
     "basic": ("core",),
     "map2d": ("slam2d",),
-    "map3d": ("fastlio2",),
+    "map3d": ("pointlio",),
 }
 
 
@@ -37,8 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
   ./install.sh install --preset map2d   二维激光建图方案
   ./install.sh install --preset map3d   三维激光惯性建图方案
   ./install.sh doctor                   检查安装前提及已有产物
-  ./install.sh add fastlio2             增加建图，自动补齐依赖
-  ./install.sh add pointlio             将 FastLIO2 替换为 PointLIO
+  ./install.sh add pointlio             增加三维建图，自动补齐依赖
+  ./install.sh add fastlio2             增加 FastLIO2，可与 Point-LIO 共存
   ./install.sh remove perception        卸载视觉及依赖它的跟随模块
   ./install.sh list                     查看当前安装
   ./install.sh install --dry-run        只查看计划

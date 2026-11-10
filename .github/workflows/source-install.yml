@@ -85,6 +85,8 @@ jobs:
           cases = [
               (["--modules", "core"], ["core"]),
               (["--modules", "pointlio"], ["core", "geometry", "pointlio"]),
+              (["--modules", "fastlio2"], ["core", "geometry", "fastlio2"]),
+              (["--preset", "map3d"], ["core", "geometry", "pointlio"]),
               (["--preset", "map2d"], ["core", "geometry", "slam2d"]),
           ]
           for arguments, modules in cases:

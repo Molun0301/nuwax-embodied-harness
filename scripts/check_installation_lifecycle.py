@@ -130,6 +130,27 @@ class LifecycleChecks(unittest.TestCase):
         self.assertEqual(values["gateway.host"], "127.0.0.7")
         self.assertFalse((self.prefix / "settings.env").exists())
 
+    def test_lio_default_and_explicit_backend(self):
+        cases = (
+            ((), None, "device"),
+            (("fastlio2",), None, "fastlio2"),
+            (("pointlio",), None, "pointlio"),
+            (("fastlio2", "pointlio"), None, "pointlio"),
+            (("pointlio", "fastlio2"), None, "pointlio"),
+            (("fastlio2", "pointlio"), "device", "device"),
+            (("fastlio2", "pointlio"), "fastlio2", "fastlio2"),
+            (("fastlio2", "pointlio"), "pointlio", "pointlio"),
+        )
+        for modules, configured, expected in cases:
+            with self.subTest(modules=modules, configured=configured):
+                existing = {"gateway.host": "127.0.0.7"}
+                if configured is not None:
+                    existing["geometry.lio_backend"] = configured
+                values = write_runtime(self.root, self.prefix, ["core", "geometry", *modules], "customrobot", existing)
+                self.assertEqual(values["geometry.lio_backend"], expected)
+                self.assertEqual(values["gateway.host"], "127.0.0.7")
+                self.assertEqual(existing.get("geometry.lio_backend"), configured)
+
 
 if __name__ == "__main__":
     unittest.main()

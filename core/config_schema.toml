@@ -1531,7 +1531,7 @@ apply = "restart"
 type = "string"
 choices = ["device", "fastlio2", "pointlio"]
 default = "device"
-description = "三维定位采用设备里程计、FastLIO2（快速激光惯性定位）或 Point-LIO（逐点激光惯性定位）。安装时可按选定的原生定位模块填充。"
+description = "三维定位采用设备里程计、FastLIO2（快速激光惯性定位）或 Point-LIO（逐点激光惯性定位）。未指定后端时，安装按选定的原生定位模块优先填充 Point-LIO；已有后端配置沿用。"
 consumers = [
     "core/settings.py:load_config",
     "drivers/go2/settings.py:load_go2_data_plane_config",

@@ -4,11 +4,11 @@ Nuwax Embodied Harness（NEH，具身运行框架）的三维链路支持两种 
 
 ## 选择前端与后端
 
-先安装所选前端模块（`fastlio2` 或 `pointlio`，两者可共同安装），完成雷达、IMU（惯性测量单元）、源时间与外参配置。然后在设置页修改，或用命令行：
+先安装所选前端模块（`fastlio2` 或 `pointlio`，两者可共同安装），完成雷达、IMU（惯性测量单元）、源时间与外参配置。未指定后端时，安装器优先选择已选模块中的 Point-LIO，已有后端配置沿用。然后在设置页修改，或用命令行：
 
 ```bash
 neh config --set geometry.pipeline lio_3d
-neh config --set geometry.lio_backend fastlio2
+neh config --set geometry.lio_backend pointlio
 neh config --set geometry.mapping_backend voxel
 neh config --set geometry.correction_backend library_pgo
 neh restart --wait

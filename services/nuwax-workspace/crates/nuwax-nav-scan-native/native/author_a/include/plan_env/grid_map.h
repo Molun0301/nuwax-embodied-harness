@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <functional>
 #include <utility>
 #include <memory>
@@ -580,6 +581,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
 }
 
 inline double GridMap::fieldDistance(double x, double y) const {
+  if(!std::isfinite(x)||!std::isfinite(y))return std::numeric_limits<double>::quiet_NaN();
   const auto& field=snapshot_->clearance;
   const double u=std::clamp((x-field.origin_x)/field.resolution,0.,double(field.width-1));
   const double v=std::clamp((y-field.origin_y)/field.resolution,0.,double(field.height-1));
@@ -595,7 +597,8 @@ inline double GridMap::fieldDistance(double x, double y) const {
 // 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
 inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
   const double margin=std::max(.05,mp_.resolution_);
-  const double clearance=std::min(range,bodyFieldClearance(pos,yaw));
+  // 查询结果作为首项，使非有限试探的NaN继续进入原代价计算。
+  const double clearance=std::min(bodyFieldClearance(pos,yaw),range);
   const double deficit=range-clearance;
   return deficit*deficit/margin;
 }

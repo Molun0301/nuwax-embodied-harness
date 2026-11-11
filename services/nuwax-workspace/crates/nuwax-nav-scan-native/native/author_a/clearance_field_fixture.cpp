@@ -109,6 +109,17 @@ int main() {
   assert(query.fieldDistance(-.55,-.15)==old);
   GridMap empty;empty.bindCollisionSnapshot(owner.collisionSnapshot(c,nullptr,nullptr));
   assert(empty.fieldDistance(0.,0.)>1000.);
+  // 优化器的非有限试探只在点查询入口识别，矩形聚合和代价继续传播NaN。
+  for(double invalid:{std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity()}) {
+    assert(std::isnan(query.fieldDistance(invalid,0.)));
+    assert(std::isnan(query.fieldDistance(0.,invalid)));
+    assert(std::isnan(query.bodyFieldClearance(Eigen::Vector3d(invalid,0.,.4),0.)));
+    assert(std::isnan(query.bodyFieldClearance(Eigen::Vector3d(0.,invalid,.4),0.)));
+    assert(std::isnan(query.bodyFieldClearance(Eigen::Vector3d(0.,0.,.4),invalid)));
+    assert(std::isnan(query.bodyClearanceCost(Eigen::Vector3d(invalid,0.,.4),0.,.1)));
+    assert(std::isnan(query.bodyClearanceCost(Eigen::Vector3d(0.,0.,.4),invalid,.1)));
+  }
   std::cout<<"格数="<<(xmax-xmin+1)*(ymax-ymin+1)<<" 姿态数="<<poses
       <<" 逐格最大误差="<<max_field_error<<" 矩形最大误差="<<max_body_error<<"\n";
 }

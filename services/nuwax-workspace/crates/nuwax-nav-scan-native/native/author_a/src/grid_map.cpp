@@ -127,7 +127,7 @@ double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw) const {
   for(int x=0;x<=nx;++x)for(int y=0;y<=ny;++y) {
     const double u=mp_.body_center_offset_.x()-hx+mp_.body_length_*x/nx;
     const double v=mp_.body_center_offset_.y()-hy+mp_.body_width_*y/ny;
-    clearance=std::min(clearance,fieldDistance(pos.x()+c*u-s*v,pos.y()+s*u+c*v));
+    clearance=std::min(fieldDistance(pos.x()+c*u-s*v,pos.y()+s*u+c*v),clearance);
   }
   return clearance;
 }

@@ -138,7 +138,7 @@ fn heightfield_reader_native_members_metadata_withdrawal_and_retirement() {
                     let r=source.ground_record(GroundKey::HeightfieldV1([0,0,0])).unwrap();
                     assert_eq!(r.members().collect::<Vec<_>>(),vec![0,32,64]);assert_eq!(r.direction(),None);},
                 2=>{assert_eq!(delta,Some(vec![]));let old=&previous.as_ref().unwrap().1;
-                    assert!(source.same_geometry(old));assert!(Arc::ptr_eq(old,&source));},
+                    assert!(source.same_geometry(old));assert!(!Arc::ptr_eq(old,&source));},
                 3=>{assert_eq!(delta,Some(vec![[0,0]]));
                     assert!(source.get([0,0,32]).is_some());
                     assert_eq!(source.ground_record(GroundKey::HeightfieldV1([0,0,0])).unwrap().members().collect::<Vec<_>>(),vec![0,64]);},

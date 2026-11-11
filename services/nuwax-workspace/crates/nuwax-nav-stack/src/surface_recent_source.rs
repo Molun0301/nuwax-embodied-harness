@@ -110,7 +110,7 @@ mod tests {
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();
         let scheduler=nuwax_nav_runtime::NavScheduler::new(
-            crate::lcm_dataflow::guarded_tests::RecordingMotion(Arc::new(Mutex::new(Vec::new()))),
+            crate::lcm_dataflow::guarded_tests::RecordingMotion::new(Arc::new(Mutex::new(Vec::new()))),
             planner,nuwax_nav_runtime::SchedulerConfig::default()).unwrap();
         let (handle,task)=nuwax_nav_runtime::spawn_scheduler(scheduler);
         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
@@ -151,7 +151,7 @@ mod tests {
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();
         let scheduler=nuwax_nav_runtime::NavScheduler::new(
-            crate::lcm_dataflow::guarded_tests::RecordingMotion(Arc::new(Mutex::new(Vec::new()))),
+            crate::lcm_dataflow::guarded_tests::RecordingMotion::new(Arc::new(Mutex::new(Vec::new()))),
             planner,nuwax_nav_runtime::SchedulerConfig::default()).unwrap();
         let (handle,task)=nuwax_nav_runtime::spawn_scheduler(scheduler);
         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;

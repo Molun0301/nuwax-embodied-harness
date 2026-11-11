@@ -1813,7 +1813,7 @@ goal: schema::PoseStamped {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
                             let mut local = crate::static_map_follower(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
-                                RecordingMotion(motion_calls),local,scheduler_config)?);
+                                RecordingMotion::new(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();
                             Ok(pair)
                         }))

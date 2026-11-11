@@ -13,6 +13,8 @@ typedef struct {
     double max_reverse_velocity, max_lateral_velocity;
 } ScanConfig;
 typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
+typedef struct { double stop[3], turn[3], route_arc; } ScanTerminalPoints;
+typedef struct { double field_distance, body_clearance; int32_t occupied; } ScanPoseClearance;
 /* 浅接触退出复用原检查的样本输出，不携带任何速度有效期。 */
 typedef struct {
     double duration, reference_progress, reference_duration, local_target[3];
@@ -53,6 +55,9 @@ void nuwax_scan_map_seed_occupied(void *map,const double *points,size_t count,co
 void *nuwax_scan_map_snapshot(const void *map);
 int nuwax_scan_snapshot_affects(const void *current,const void *previous,const void *trajectory,double from);
 void nuwax_scan_snapshot_destroy(void *snapshot);
+void nuwax_scan_terminal_points(const void *snapshot,const ScanConfig *config,const double goal[3],
+    double yaw,double tolerance,const double *reference,size_t count,ScanTerminalPoints *output);
+void nuwax_scan_pose_clearance(const void *snapshot,const double position[3],double yaw,ScanPoseClearance *output);
 void *nuwax_scan_planner_create(void);
 void nuwax_scan_planner_destroy(void *planner);
 void *nuwax_scan_planner_plan(void *planner,const ScanConfig *config,const void *snapshot,
@@ -66,7 +71,7 @@ void nuwax_scan_tracker_clear(void *tracker);
 void nuwax_scan_tracker_clear_trajectory(void *tracker);
 void nuwax_scan_tracker_install(void *tracker,const void *trajectory);
 void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void *snapshot,
-    const ScanState *state,const double previous_command[3],double terminal_yaw,ScanTrackOutput *output,ScanOutput *recovery,
+    const ScanState *state,const double previous_command[3],double terminal_yaw,const double *terminal_position,ScanTrackOutput *output,ScanOutput *recovery,
     char *error,size_t error_capacity);
 void nuwax_scan_free(ScanOutput *output);
 #ifdef __cplusplus

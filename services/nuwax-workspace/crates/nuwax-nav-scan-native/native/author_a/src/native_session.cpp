@@ -2,6 +2,7 @@
 #include <author_controller.h>
 #include <author_command_check.h>
 #include <author_overlap_escape.h>
+#include <author_terminal.h>
 #include <author_diagnostics.h>
 #include <author_parameters.h>
 #include <business_constraint_mask.h>
@@ -178,6 +179,18 @@ extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previ
   return 0;
 }
 extern "C" void nuwax_scan_snapshot_destroy(void* p){delete static_cast<Snapshot*>(p);}
+extern "C" void nuwax_scan_terminal_points(const void* snapshot,const ScanConfig* config,const double* goal,
+    double yaw,double tolerance,const double* reference,size_t count,ScanTerminalPoints* output) {
+  GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
+  std::vector<Vector3d> route;for(size_t i=0;i<count;++i)route.emplace_back(Eigen::Map<const Vector3d>(reference+3*i));
+  *output=scan_planner::terminalPoints(map,*config,Eigen::Map<const Vector3d>(goal),yaw,tolerance,route);
+}
+extern "C" void nuwax_scan_pose_clearance(const void* snapshot,const double* position,double yaw,ScanPoseClearance* output) {
+  GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
+  const Vector3d point=Eigen::Map<const Vector3d>(position);
+  output->field_distance=map.fieldDistance(point.x(),point.y());
+  output->body_clearance=map.bodyFieldClearance(point,yaw);output->occupied=map.getInflateOccupancy(point,yaw);
+}
 extern "C" void* nuwax_scan_planner_create(){return new PlannerSession;}
 extern "C" void nuwax_scan_planner_destroy(void* p){delete static_cast<PlannerSession*>(p);}
 extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void* snapshot,const double* reference,size_t count,
@@ -226,7 +239,7 @@ extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cas
 extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
-    const double previous[3],double terminal_yaw,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
+    const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
   *out={};*recovery={};scan_native_diagnostic.clear();try {
     auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
     const Vector3d position=Eigen::Map<const Vector3d>(state->position);const double yaw=state->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
@@ -249,7 +262,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const int occupied=s.map.getInflateOccupancy(position,yaw);
     if(occupied!=0) {
       s.escape.observeOverlap();
-      if(occupied==1 && !std::isfinite(terminal_yaw) && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
+      if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
         s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
@@ -261,6 +274,14 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(std::isfinite(terminal_yaw)) {
       const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;
       s.raw={};s.raw.angular.z=std::copysign(std::min(c->max_yaw_rate,std::sqrt(step*step+2*c->max_yaw_acceleration*std::abs(diff))-step),diff);desired_yaw=terminal_yaw;
+      if(terminal_position) {
+        target=Eigen::Map<const Vector3d>(terminal_position);
+        s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
+        Eigen::Vector2d velocity=s.controller.kp_pos*(target-position).head<2>();
+        const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));
+        if(velocity.norm()>cap)velocity*=cap/velocity.norm();
+        s.raw.linear.x=cs*velocity.x()+sn*velocity.y();s.raw.linear.y=-sn*velocity.x()+cs*velocity.y();
+      }
     }else {
       if(!s.curve){out->reason|=SCAN_TRACK_NO_TRAJECTORY;return;}
       else {

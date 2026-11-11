@@ -38,7 +38,7 @@ pub mod replan_feedback;
 use replan_feedback::{ActualExecutionContext, SurfaceReplanFeedback};
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
-pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
+pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig, TerminalPhase};
 /// Shared ON/OFF source-change proofs.
 pub mod surface_changes;
 /// 原生地图输入适配。
@@ -2291,7 +2291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn n6_goal_without_path_turns_only_and_keeps_collision_checks() {
+    async fn n6_goal_without_path_turns_or_escapes_and_keeps_collision_checks() {
         for blocked in [false, true] {
             let (config, source) = crate::native_test_helpers::fixture();
             let source = if blocked {
@@ -2322,19 +2322,24 @@ mod tests {
             };
             scheduler.start_session(&status, goal).await.unwrap();
             let until = Instant::now() + Duration::from_secs(1);
-            let mut turned = false;
+            let mut acted = false;
             loop {
                 scheduler.session_tick(&status).await.unwrap();
                 let command = scheduler.status.last_applied_twist.unwrap_or(Twist2::ZERO);
-                assert_eq!(command.linear, Point2::new(0., 0.));
+                if blocked {
+                    assert!(command.linear.x.abs() <= 0.04);
+                    assert_eq!(command.linear.y, 0.);
+                } else {
+                    assert_eq!(command.linear, Point2::new(0., 0.));
+                }
                 assert_eq!(scheduler.status.last_terminal, None);
                 assert!(scheduler.current_path.is_none());
-                if command.angular_z != 0. { turned = true; break; }
+                if if blocked { command != Twist2::ZERO } else { command.angular_z != 0. } { acted = true; break; }
                 if blocked && scheduler.planner.execution_wait_reason().is_some() { break; }
                 assert!(Instant::now() < until, "等待原地朝向控制超时");
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            assert_eq!(turned, !blocked, "机身碰撞时不能通过无路线转向绕过检查");
+            assert!(acted, "自由位置执行末端转向；实体占据执行经证明的脱困");
             if !blocked {
                 target.stamp.nanos += 50_000_000;
                 scheduler.observe_odometry(&status, target, None).unwrap();

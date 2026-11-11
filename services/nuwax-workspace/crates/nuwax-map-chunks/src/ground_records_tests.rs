@@ -152,7 +152,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
         );
         records.insert(
             local,
-            GroundRecord::HeightfieldV1(HeightfieldFragment {
+            GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment {
                 anchor: [xy[0], xy[1], 0],
                 height_m: f64::from(Q) / 16.0,
                 occupied_bounds: [0.0, f64::from(Q)],
@@ -174,7 +174,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
                         point_index: u32::from(local),
                     })
                     .collect(),
-            }),
+            })),
         );
     }
     let records = GroundRecords::Versioned(Arc::new(records));
@@ -365,7 +365,7 @@ fn heightfield_full_horizontal_block_and_existing_byte_budget_roundtrip() {
     let (block,records)=decode_block_parts(&bytes).unwrap(); let mut oversized=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };
     // Real codec byte bound, without changing the original 4MiB limit.
     for record in oversized.values_mut() { if let GroundRecord::HeightfieldV1(f)=record {
-        f.samples=vec![LayerSample {source:Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(5000),clock_id:"clock".into(),runtime_generation:1,session_generation:1}),
+        Arc::make_mut(f).samples=vec![LayerSample {source:Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(5000),clock_id:"clock".into(),runtime_generation:1,session_generation:1}),
             point:[0.,0.,0.],source_sequence:0,source_timestamp_ns:20,point_index:0}];
     }}
     assert!(ground_binary::encode(&block, &oversized).unwrap_err().contains("budget"));

@@ -950,13 +950,13 @@ impl SurfaceInputBuilder {
             old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
         });
         let mut reader = nuwax_map_chunks::Receiver::new(map.repository.clone());
-        let (observations, _) = nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
+        let (observations, changes) = nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
             &mut reader, root, previous.map(|(old, grid)| (old.as_ref(), grid)),
         )?;
         let (updates, read_points) = nuwax_nav_mls_planner::surface_chunks::column_updates(
-            &mut reader, root, previous.map(|(old, _)| old.as_ref()),
-            self.planner_size,
-        )?;
+            root, previous.map(|(old, _)| old.as_ref()), self.planner_size,
+            &observations, changes.as_deref(),
+        );
         let snapshot = self.builder.build_column_updates(
             &updates, root.voxel_size_m, previous.is_none(), read_points,
         ).map_err(|e| e.to_string())?.snapshot;

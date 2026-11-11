@@ -19,7 +19,7 @@ pub struct HeightfieldFragment {
 #[serde(tag = "representation", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GroundRecord {
     #[serde(rename = "heightfield_v1_compact")]
-    HeightfieldV1(HeightfieldFragment),
+    HeightfieldV1(Arc<HeightfieldFragment>),
     /// Classified XY with no ground claim. Occupancy remains solid evidence.
     ClassifiedEmptyColumn {},
 }
@@ -30,9 +30,25 @@ pub enum GroundRecords {
 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum GroundRecordRef<'a> {
-    HeightfieldV1(&'a HeightfieldFragment),
+    HeightfieldV1(&'a Arc<HeightfieldFragment>),
     ClassifiedEmptyColumn,
 }
+impl GroundRecordRef<'_> {
+    /// 地面查询的原始几何；接收统计和诊断样本不改变支撑成员。
+    pub fn geometry_eq(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::HeightfieldV1(a), Self::HeightfieldV1(b)) => a.anchor == b.anchor
+                && a.height_m == b.height_m && a.occupied_bounds == b.occupied_bounds
+                && a.members.iter().map(|p| p.0).eq(b.members.iter().map(|p| p.0)),
+            (Self::ClassifiedEmptyColumn, Self::ClassifiedEmptyColumn) => true,
+            _ => false,
+        }
+    }
+}
+impl Default for GroundRecords {
+    fn default() -> Self { Self::empty() }
+}
+
 pub enum GroundRecordIter<'a> {
     Versioned(std::collections::btree_map::Iter<'a, u16, GroundRecord>),
 }
@@ -66,13 +82,7 @@ impl GroundRecords {
         loop { match (a.next(), b.next()) {
             (None, None) => return true,
             (Some((ka, va)), Some((kb, vb))) if ka == kb => {
-                let same = match (va, vb) {
-                    (GroundRecordRef::HeightfieldV1(a), GroundRecordRef::HeightfieldV1(b)) =>
-                        a.anchor == b.anchor && a.height_m == b.height_m && a.occupied_bounds == b.occupied_bounds
-                            && a.members.iter().map(|p| p.0).eq(b.members.iter().map(|p| p.0)),
-                    (GroundRecordRef::ClassifiedEmptyColumn, GroundRecordRef::ClassifiedEmptyColumn) => true,
-                    _ => false,
-                };
+                let same = va.geometry_eq(vb);
                 if !same { return false; }
             }
             _ => return false,
@@ -306,7 +316,7 @@ pub(crate) fn split_column(xy: [i32; 2], q: f32, column: &ColumnGroundRecords) -
         }
         for (block, fragment) in fragments {
             let key = fragment.members[0].0;
-            if out.entry(block).or_default().insert(key, GroundRecord::HeightfieldV1(fragment)).is_some() { return Err("duplicate ground anchor".into()); }
+            if out.entry(block).or_default().insert(key, GroundRecord::HeightfieldV1(Arc::new(fragment))).is_some() { return Err("duplicate ground anchor".into()); }
         }
     }
     Ok(out)

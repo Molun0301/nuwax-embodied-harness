@@ -11,7 +11,7 @@ fn fixture() -> (Block, GroundRecords) {
             point: [-0., f64::from_bits(1), f64::from_bits(0x3ff0000000000001)],
             source_sequence: u64::MAX, source_timestamp_ns: u64::MAX, point_index: u32::MAX }],
     };
-    (block, GroundRecords::Versioned(Arc::new([(0, GroundRecord::HeightfieldV1(field)),
+    (block, GroundRecords::Versioned(Arc::new([(0, GroundRecord::HeightfieldV1(Arc::new(field))),
         (1, GroundRecord::ClassifiedEmptyColumn {})].into())))
 }
 

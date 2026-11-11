@@ -201,8 +201,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
                 let height_m = input.floats::<1>()?[0]; let occupied_bounds = input.floats()?;
                 let mut members = Vec::new();
                 for _ in 0..input.count(MAX_LAYER_MEMBERS)? { members.push((u16::from_le_bytes(input.array()?), input.floats()?)); }
-                GroundRecord::HeightfieldV1(HeightfieldFragment { anchor, height_m, occupied_bounds, members,
-                    samples: input.samples(&sources, &mut used)? })
+                GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment { anchor, height_m, occupied_bounds, members,
+                    samples: input.samples(&sources, &mut used)? }))
             }
             2 if mode == 2 => GroundRecord::ClassifiedEmptyColumn {},
             _ => return Err("unknown BL6 ground record tag or mode".into()),

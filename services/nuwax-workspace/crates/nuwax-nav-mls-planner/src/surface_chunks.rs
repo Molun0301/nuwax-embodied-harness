@@ -10,7 +10,7 @@ pub fn observations_with_changes(
     previous: Option<(&Manifest, &Arc<crate::SurfaceObservations>)>,
 ) -> Result<(Arc<crate::SurfaceObservations>, Option<Vec<[i32; 2]>>), String> {
     use crate::{SurfaceObservation, SurfaceObservations};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     let previous = previous.filter(|(old, _)| old.domain == root.domain
         && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
     if let Some((_, grid)) = previous.filter(|(old, _)| *old == root) {
@@ -28,14 +28,12 @@ pub fn observations_with_changes(
     let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
     // 含类型化地面的根才需按竖直块组重建；变化对象只解码一次，零缓存时也复用。
     let typed = root.version >= 5 || previous.is_some_and(|(old,_)|old.version >= 5);
-    let mut native_groups = BTreeSet::new();
-    let mut records_by_block = BTreeMap::new();
-    for key in old.keys().filter(|key| !new.contains_key(*key)) {
+    let mut records_by_block = Vec::new();
+    let removed: Vec<_> = old.keys().filter(|key| !new.contains_key(*key)).copied().collect();
+    for key in &removed {
         mutated = true;
-        if typed { native_groups.insert([key[0],key[1]]); }
         changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
             .map_err(|e| e.to_string())?);
-        // 最后一个占据块删除时，也移除对应实测地面层。
         changed.extend(grid.replace_ground_layers(*key, Arc::new(BTreeMap::new()))
             .map_err(|e| e.to_string())?);
     }
@@ -44,28 +42,22 @@ pub fn observations_with_changes(
         let (block, records) = reader.ground_parts(reference)?;
         let mut values = BTreeMap::new();
         for (&local, evidence) in block.iter() {
-            if evidence.observed_ns > root.source_timestamp_ns { return Err("精细观察晚于提交根".into()); }
             values.insert(nuwax_map_chunks::global_key(reference.key, local)?,
                 SurfaceObservation { observed_ns: evidence.observed_ns, hits: evidence.hits });
         }
         mutated = true;
-        changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
+        changed.extend(grid.replace_block_with_ground_changes(reference.key, values, records.clone())
             .map_err(|e| e.to_string())?);
-        if typed {
-            native_groups.insert([reference.key[0],reference.key[1]]);
-            records_by_block.insert(reference.key,records);
-        }
+        if typed { records_by_block.push((reference.key, records)); }
     }
-    for xy in native_groups {
-        let mut group = Vec::new();
-        for (&key, reference) in new.range([xy[0],xy[1],i32::MIN]..=[xy[0],xy[1],i32::MAX]) {
-            let records = match records_by_block.remove(&key) {
-                Some(records) => records,
-                None => reader.ground_records(reference)?,
-            };
-            group.push((key,records));
+    if typed {
+        if let Some((_, previous)) = previous {
+            changed.extend(grid.replace_heightfield_blocks(previous, &records_by_block, &removed));
+        } else {
+            let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+            for (key, records) in records_by_block { groups.entry([key[0], key[1]]).or_default().push((key, records)); }
+            for (xy, records) in groups { changed.extend(grid.replace_heightfield_columns(xy, &records)); }
         }
-        changed.extend(grid.replace_heightfield_columns(xy,&group));
     }
 
     // 同一提交根覆盖完整几何源，缺少占据块不等于缺少已提交的几何源。
@@ -79,110 +71,20 @@ pub fn observations_with_changes(
     Ok((grid, known.then_some(changed)))
 }
 
-/// 只展开几何变化块涉及的完整规划列；上下叠层和跨块列共同聚合。
+/// 使用已经更新的观测列，不为规划列再次读取块；原输入点统计取变化几何块清单。
 pub fn column_updates(
-    reader: &mut Receiver,
     root: &Manifest,
     previous: Option<&Manifest>,
     planner_size: f32,
-) -> Result<(Vec<crate::SurfaceColumnUpdate>, usize), String> {
-    use std::collections::{BTreeMap, BTreeSet};
-    if !planner_size.is_finite() || planner_size < root.voxel_size_m {
-        return Err("规划精度小于精细源精度".into());
-    }
-    let compatible = previous.filter(|old| {
-        old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
-    });
-    let old: BTreeMap<_, _> = compatible
-        .into_iter()
-        .flat_map(|r| &r.blocks)
-        .map(|b| (b.key, b))
-        .collect();
-    let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
-    let mut dirty = BTreeSet::new();
-    for key in old.keys().chain(new.keys()) {
-        if old.get(key).map(|b| b.geometry_revision) == new.get(key).map(|b| b.geometry_revision) {
-            continue;
-        }
-        let (min, max) = planning_columns(*key, root.voxel_size_m, planner_size)?;
-        for x in min[0]..=max[0] {
-            for y in min[1]..=max[1] {
-                dirty.insert([x, y]);
-            }
-        }
-        if dirty.len() > 2_000_000 {
-            return Err("脏列超过规划工作集预算".into());
-        }
-    }
-    let mut columns: BTreeMap<[i32; 2], BTreeMap<i32, [f32; 2]>> = BTreeMap::new();
-    let mut read_points = 0;
-    for reference in &root.blocks {
-        let (min, max) = planning_columns(reference.key, root.voxel_size_m, planner_size)?;
-        if !dirty
-            .range([min[0], i32::MIN]..=[max[0], i32::MAX])
-            .any(|c| c[1] >= min[1] && c[1] <= max[1])
-        {
-            continue;
-        }
-        let block = reader.block(reference)?;
-        read_points += block.len();
-        for (&local, evidence) in block.iter() {
-            if evidence.observed_ns > root.source_timestamp_ns {
-                return Err("精细证据晚于提交根".into());
-            }
-            let key = nuwax_map_chunks::global_key(reference.key, local)?;
-            let xyz = key.map(|v| ((f64::from(v) + 0.5) * f64::from(root.voxel_size_m)) as f32);
-            let cell = xyz.map(|v| (v / planner_size).floor() as i32);
-            let column = [cell[0], cell[1]];
-            if !dirty.contains(&column) {
-                continue;
-            }
-            // 与完整点输入使用相同的精细高度量化，避免浮点边界出现两套语义。
-            let fine = (f64::from(xyz[2]) / f64::from(root.voxel_size_m)).floor();
-            let low = (fine * f64::from(root.voxel_size_m)) as f32;
-            let high = ((fine + 1.0) * f64::from(root.voxel_size_m)) as f32;
-            columns
-                .entry(column)
-                .or_default()
-                .entry(cell[2])
-                .and_modify(|b| {
-                    b[0] = b[0].min(low);
-                    b[1] = b[1].max(high);
-                })
-                .or_insert([low, high]);
-        }
-    }
-    let updates = dirty
-        .into_iter()
-        .map(|column| crate::SurfaceColumnUpdate {
-            column,
-            cells: columns
-                .remove(&column)
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-        })
-        .collect();
-    Ok((updates, read_points))
-}
-
-fn planning_columns(
-    key: [i32; 3],
-    source: f32,
-    planner: f32,
-) -> Result<([i32; 2], [i32; 2]), String> {
-    let first = nuwax_map_chunks::global_key(key, 0)?;
-    let last = nuwax_map_chunks::global_key(key, 32767)?;
-    let convert = |v| {
-        let point = ((f64::from(v) + 0.5) * f64::from(source)) as f32;
-        let column = (point / planner).floor();
-        if !column.is_finite() || column.abs() >= i32::MAX as f32 * 0.5 {
-            return Err("精细块规划坐标越界".to_owned());
-        }
-        Ok(column as i32)
-    };
-    Ok((
-        [convert(first[0])?, convert(first[1])?],
-        [convert(last[0])?, convert(last[1])?],
-    ))
+    observations: &crate::SurfaceObservations,
+    changes: Option<&[[i32; 2]]>,
+) -> (Vec<crate::SurfaceColumnUpdate>, usize) {
+    use std::collections::BTreeMap;
+    let previous = previous.filter(|old|
+        old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
+    let old: BTreeMap<_, _> = previous.into_iter().flat_map(|root| &root.blocks).map(|b| (b.key, b)).collect();
+    let input_points = root.blocks.iter().filter(|b|
+        old.get(&b.key).is_none_or(|old| old.geometry_revision != b.geometry_revision))
+        .map(|b| b.points as usize).sum();
+    (observations.planner_column_updates(changes, planner_size), input_points)
 }

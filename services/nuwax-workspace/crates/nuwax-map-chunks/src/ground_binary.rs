@@ -141,9 +141,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
                 let count = input.count(MAX_LAYER_MEMBERS)?;
                 let mut members = Vec::new();
                 for _ in 0..count { members.push((u16::from_le_bytes(input.array()?), input.floats()?)); }
-                GroundRecord::HeightfieldV1(HeightfieldFragment {
+                GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment {
                     anchor, height_m, occupied_bounds, members, samples: input.samples()?,
-                })
+                }))
             }
             2 => GroundRecord::ClassifiedEmptyColumn {},
             _ => return Err("unknown BL5 ground record tag".into()),

@@ -63,16 +63,18 @@ impl FineMapReader {
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
     }
-    /// 只展开几何变化块涉及的完整规划列。
-    pub(super) fn columns(
+    #[cfg(test)]
+    fn columns(
         &mut self,
         root: &Manifest,
-        previous: Option<&Manifest>,
+        previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
         planner_size: f32,
-    ) -> Result<(Vec<nuwax_nav_mls_planner::SurfaceColumnUpdate>, usize), String> {
-        nuwax_nav_mls_planner::surface_chunks::column_updates(
-            &mut self.receiver, root, previous, planner_size,
-        )
+    ) -> Result<(Vec<nuwax_nav_mls_planner::SurfaceColumnUpdate>, usize, Arc<nuwax_nav_mls_planner::SurfaceObservations>), String> {
+        let (grid, changes) = self.observations_with_changes(root, previous)?;
+        let (updates, count) = nuwax_nav_mls_planner::surface_chunks::column_updates(
+            root, previous.map(|(root, _)| root), planner_size, &grid, changes.as_deref(),
+        );
+        Ok((updates, count, grid))
     }
 
 }
@@ -210,7 +212,7 @@ mod tests {
         let blocks: Vec<_> = admitted.blocks.iter()
             .map(|reference| reader.receiver.block(reference).unwrap()).collect();
         let observations = reader.observations(&admitted, None).unwrap();
-        let (updates, count) = reader.columns(&admitted, None, 0.1).unwrap();
+        let (updates, count, _) = reader.columns(&admitted, None, 0.1).unwrap();
         assert_eq!(count, cells.len());
         assert_columns(&updates, &cells, 0.05, 0.1);
         for &cell in &cells {
@@ -261,7 +263,7 @@ mod tests {
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         let start = Instant::now();
-        let (initial_updates, initial_count) = reader.columns(&first, None, 0.1).unwrap();
+        let (initial_updates, initial_count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&first, None, 0.1, &old, None);
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert_eq!(initial_count, cells.len());
@@ -272,14 +274,14 @@ mod tests {
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         let start = Instant::now();
-        let next = reader.observations(&second, Some((&first, &old))).unwrap();
+        let (next, changes) = reader.observations_with_changes(&second, Some((&first, &old))).unwrap();
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert_eq!(first.geometry_revision, second.geometry_revision);
         assert!(first.blocks.iter().zip(&second.blocks).all(|(a, b)|
             a.block_revision < b.block_revision && a.geometry_revision == b.geometry_revision));
         let start = Instant::now();
-        let (updates, count) = reader.columns(&second, Some(&first), 0.1).unwrap();
+        let (updates, count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&second, Some(&first), 0.1, &next, changes.as_deref());
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert!(updates.is_empty());
@@ -346,27 +348,40 @@ mod tests {
     fn changed_blocks_merge_vertical_and_non_aligned_neighbors_and_keep_deletions() {
         let repository = Repository::temporary().unwrap();
         let mut reader = reader(repository.clone());
-        let mut cells: BTreeSet<_> = (-70..70)
+        let cells: BTreeSet<_> = (-70..70)
             .flat_map(|x| (-12..12).flat_map(move |y| [[x, y, 0], [x, y, 50]]))
             .collect();
         for size in [0.1, 0.13] {
+            let mut cells = cells.clone();
             let first = install_revisioned(&repository, &cells, 0.05, 1, None);
-            let (updates, read) = reader.columns(&first, None, size).unwrap();
+            let (updates, read, first_observations) = reader.columns(&first, None, size).unwrap();
             assert_eq!(read, cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             cells.remove(&[-32, 0, 0]);
             cells.insert([-33, 0, 8]);
             let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
-            let (updates, read) = reader.columns(&second, Some(&first), size).unwrap();
+            let (updates, read, second_observations) = reader.columns(&second, Some((&first, &first_observations)), size).unwrap();
             assert!(read < cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             let third = install_revisioned(&repository, &cells, 0.05, 3, Some(&second));
-            let (updates, read) = reader.columns(&third, Some(&second), size).unwrap();
+            let (updates, read, third_observations) = reader.columns(&third, Some((&second, &second_observations)), size).unwrap();
             assert!(updates.is_empty());
             assert_eq!(read, 0);
+            let mut previous_layers = BTreeMap::<[i32; 2], BTreeSet<i32>>::new();
+            for key in &cells {
+                let p = key.map(|v| ((f64::from(v) + 0.5) * f64::from(0.05_f32)) as f32);
+                let c = p.map(|v| (v / size).floor() as i32);
+                previous_layers.entry([c[0], c[1]]).or_default().insert(c[2]);
+            }
             cells.retain(|key| block_key(*key) != [-2, 0, 0]);
             let fourth = install_revisioned(&repository, &cells, 0.05, 4, Some(&third));
-            let (updates, _) = reader.columns(&fourth, Some(&third), size).unwrap();
+            let (updates, _, fourth_observations) = reader.columns(&fourth, Some((&third, &third_observations)), size).unwrap();
+            assert_columns(&updates, &cells, 0.05, size);
+            assert!(!updates.is_empty());
+            assert!(updates.iter().any(|u| u.cells.len() < previous_layers[&u.column].len()));
+            cells.retain(|key| block_key(*key) != [-2, 0, 1]);
+            let fifth = install_revisioned(&repository, &cells, 0.05, 5, Some(&fourth));
+            let (updates, _, _) = reader.columns(&fifth, Some((&fourth, &fourth_observations)), size).unwrap();
             assert_columns(&updates, &cells, 0.05, size);
             assert!(updates.iter().any(|u| u.cells.is_empty()));
         }
@@ -405,8 +420,8 @@ mod tests {
             keys.extend((0..4).flat_map(|x|(-50..100).filter(move|&y|y<0||y>=gap)
                 .flat_map(move|y|(0..80).map(move|z|[x,y,z]))));
             let root=install_revisioned(&repository,&keys,0.01,revision,previous.as_ref().map(|(root,_)| root));
-            let observations=reader.observations(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
-            let (updates,count)=reader.columns(&root,previous.as_ref().map(|(root,_)|root),0.1).unwrap();
+            let (observations,changes)=reader.observations_with_changes(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
+            let (updates,count)=nuwax_nav_mls_planner::surface_chunks::column_updates(&root,previous.as_ref().map(|(root,_)|root),0.1,&observations,changes.as_deref());
             let built=builder.build_column_updates(&updates,0.01,previous.is_none(),count).unwrap();
             let map=built.snapshot.with_observations(Some(Arc::clone(&observations)));
             let y=gap as f64*fine/2.0;let q=[0.0,0.0,0.0,1.0];
@@ -581,9 +596,10 @@ mod tests {
                 .flat_map(|x| (0..8).map(move |y| [x, y, 0]))
                 .collect();
             let first = install_revisioned(&repository, &cells, 0.05, 1, None);
+            let observations = reader.observations(&first, None).unwrap();
             cells.insert([10, 2, 2]);
             let next = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
-            let (_, count) = reader.columns(&next, Some(&first), 0.1).unwrap();
+            let (_, count, _) = reader.columns(&next, Some((&first, &observations)), 0.1).unwrap();
             reads.push(count);
         }
         assert_eq!(reads, vec![257, 257, 257]);

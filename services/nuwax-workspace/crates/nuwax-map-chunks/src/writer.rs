@@ -274,7 +274,7 @@ impl Writer {
         // 各列组装互不依赖：并行组装后按列升序取结果，返回列序上的第一个错误。
         let columns: Vec<_> = columns.into_iter().collect();
         let q = self.voxel_size_m;
-        let assembled: Vec<_> = columns.into_par_iter()
+        let assembled: Vec<_> = columns.into_par_iter().with_min_len(256)
             .map(|(xy, records)| (xy, ground_records::assemble_column_records(xy, q, records))).collect();
         for (xy, column) in assembled {
             let column = column?;
@@ -301,7 +301,7 @@ impl Writer {
         // 各列暂存只读���记录、互不依赖：并行计算后按列序合并，返回列序上的第一个错误。
         let columns: Vec<_> = columns.into_iter().collect();
         let q = self.voxel_size_m;
-        let staged: Vec<_> = columns.par_iter().map(|(xy, column)| Self::stage_column(*xy, q, column, &prepared)).collect();
+        let staged: Vec<_> = columns.par_iter().with_min_len(256).map(|(xy, column)| Self::stage_column(*xy, q, column, &prepared)).collect();
         let mut deltas = BTreeMap::new();
         let mut retained = Vec::with_capacity(columns.len());
         for ((xy, column), pieces) in columns.into_iter().zip(staged) {

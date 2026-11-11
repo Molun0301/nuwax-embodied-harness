@@ -804,8 +804,10 @@ fn classify(
         sequence,
         timestamp_ns,
     };
+    // 每个分片至少256列，减少细列任务的拆分与线程池窃取；结果仍按原列序合并。
     let results: Vec<_> = columns
         .par_iter()
+        .with_min_len(256)
         .map(|&(&xy, points)| frame.column(xy, points))
         .collect();
     let mut updates = BTreeMap::new();

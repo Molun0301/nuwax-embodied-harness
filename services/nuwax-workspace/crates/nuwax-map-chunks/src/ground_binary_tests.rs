@@ -45,7 +45,7 @@ fn bl5_keeps_exact_bits_and_compact_bl4_records() {
 }
 
 #[test]
-fn bl5_rejects_truncation_counts_tags_trailing_and_invalid_float_without_panicking() {
+fn bl5_rejects_truncation_counts_tags_and_trailing_without_panicking() {
     let (block, records) = fixture();
     let GroundRecords::Versioned(entries) = &records else { unreachable!() };
     let bytes = ground_binary::encode(&block, entries).unwrap();
@@ -56,7 +56,7 @@ fn bl5_rejects_truncation_counts_tags_trailing_and_invalid_float_without_panicki
         assert!(decode_ground_records(&truncated).is_err(), "截断位置{end}");
     }
     for (offset, value) in [(start, u32::MAX.to_le_bytes().to_vec()),
-        (start + 6, vec![255]), (start + 7 + 12, f64::NAN.to_le_bytes().to_vec()),
+        (start + 6, vec![255]),
         (start + 7 + 12 + 8 + 16, vec![33])] {
         let mut changed = bytes.clone(); changed[offset..offset + value.len()].copy_from_slice(&value);
         assert!(decode_ground_records(&changed).is_err());

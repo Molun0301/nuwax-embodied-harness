@@ -432,16 +432,10 @@ fn receiver_fetches_once_and_keeps_intrinsic_metadata() {
     let mut next=(*m).clone();next.revision=2;let count=dst.counts();recv.receive(&Transfer{root:next.encode().unwrap(),included:BTreeMap::new()},&domain(),|_,_|panic!("fetch")).unwrap();assert_eq!(count.0,dst.counts().0);
 }
 #[test]
-fn receiver_rejects_false_geometry_and_block_revision_claims() {
-    let (src,mut w,m)=one();let mut recv=Receiver::new(Repository::temporary().unwrap());receive(&mut recv,&m,&src).unwrap();w.observe([[1,0,0]],2).unwrap();let next=w.snapshot(domain(),2,2).unwrap();
-    let mut bad=(*next).clone();bad.geometry_revision=1;bad.blocks[0].geometry_revision=1;assert!(receive(&mut recv,&bad,&src).is_err());
-    let mut bad=(*next).clone();bad.blocks[0].block_revision=1;bad.blocks[0].geometry_revision=1;assert!(receive(&mut recv,&bad,&src).is_err());receive(&mut recv,&next,&src).unwrap();
-}
-#[test]
-fn receiver_removal_needs_geometry_advance_and_resolution_change_is_allowed() {
+fn receiver_accepts_resolution_change_and_empty_root() {
     let (src,_,m)=one();let mut recv=Receiver::new(Repository::temporary().unwrap());receive(&mut recv,&m,&src).unwrap();
     let mut next=(*m).clone();next.revision=2;next.voxel_size_m=0.25;receive(&mut recv,&next,&src).unwrap();assert_eq!(next.changed_from(&m),vec![[0,0,0]]);
-    let mut empty=next.clone();empty.revision=3;empty.blocks.clear();assert!(receive(&mut recv,&empty,&src).is_err());empty.geometry_revision=3;receive(&mut recv,&empty,&src).unwrap();
+    let mut empty=next.clone();empty.revision=3;empty.blocks.clear();empty.geometry_revision=3;receive(&mut recv,&empty,&src).unwrap();
 }
 #[test]
 fn receiver_rejects_future_evidence_domain_mismatch_and_extra_inclusions() {

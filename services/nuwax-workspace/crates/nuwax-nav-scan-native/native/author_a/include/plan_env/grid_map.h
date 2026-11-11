@@ -4,6 +4,7 @@
 // Ported from wuyi2121/SCAN-Planner@348e8a590a50a5a6bbab8d8c6dcfd171f009be26.
 // 保留作者A的占据概率、射线及滑动缓存；真实机体查询和静态夹具由宿主适配。
 #include <author_host.h>
+#include <author_clearance.h>
 #include <body_collision_cell.h>
 #include <scan_native.h>
 #include <Eigen/Eigen>
@@ -596,7 +597,7 @@ inline double GridMap::fieldDistance(double x, double y) const {
 
 // 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
 inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
-  const double margin=std::max(.05,mp_.resolution_);
+  const double margin=scan_planner::preferredClearance(mp_.resolution_);
   // 查询结果作为首项，使非有限试探的NaN继续进入原代价计算。
   const double clearance=std::min(bodyFieldClearance(pos,yaw),range);
   const double deficit=range-clearance;
@@ -604,7 +605,7 @@ inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double
 }
 
 inline bool GridMap::bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw) {
-  const double margin=std::max(.05,mp_.resolution_);
+  const double margin=scan_planner::preferredClearance(mp_.resolution_);
   if(bodyFieldClearance(pos,yaw)>=margin)return true;
   // 在参考方向横移一个余量即可留足空间时进入优化；两侧均受限的门洞保留原可行初值。
   const Eigen::Vector3d lateral(-std::sin(yaw)*margin,std::cos(yaw)*margin,0.);

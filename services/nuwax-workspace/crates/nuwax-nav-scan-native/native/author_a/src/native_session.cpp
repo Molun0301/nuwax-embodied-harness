@@ -20,6 +20,8 @@ using Snapshot = std::shared_ptr<const GridMap::CollisionSnapshot>;
 struct MapOwner {
   ScanConfig config;
   GridMap map;
+  std::shared_ptr<const SurfaceObstacleLayer> surface;
+  std::shared_ptr<const BusinessConstraintMask> business;
   explicit MapOwner(const ScanConfig& c):config(c) { auto p=scan_planner::authorParameters(c);map.initMap(p); }
 };
 struct Trajectory {
@@ -136,10 +138,12 @@ extern "C" int nuwax_scan_map_surface(void* p,const double* obstacles,size_t cou
     const double* boundary,size_t boundary_count,const int32_t* forbidden,size_t forbidden_count) {
   try {
     auto& o=*static_cast<MapOwner*>(p);auto surface=std::make_shared<SurfaceObstacleLayer>(o.config,obstacles,count,ground,ground_count);
+    o.surface=surface;
     o.map.setSurfaceCollisionQuery([surface](const Vector3d& x,double yaw,double pad,std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){return surface->contacts(x,yaw,pad,hits,initial,planar);});
     std::vector<Eigen::Vector2d> polygon;for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
     std::vector<Eigen::Vector2i> columns;for(size_t i=0;i<forbidden_count;++i)columns.emplace_back(forbidden[2*i],forbidden[2*i+1]);
     const auto& c=o.config;auto mask=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),columns);
+    o.business=mask;
     o.map.setBusinessConstraintQuery([mask](const Vector3d& x,double yaw){return mask->rejects(x,yaw);});
     o.map.setBusinessEnvelopeQuery([mask](const Vector3d& x,double yaw,double pad){return mask->rejectsEnvelope(x,yaw,pad);});return 0;
   }catch(...){return 1;}
@@ -156,7 +160,10 @@ extern "C" void nuwax_scan_map_seed_occupied(void* p,const double* points,size_t
   std::vector<Vector3d> values;for(size_t i=0;i<count;++i)values.emplace_back(Eigen::Map<const Vector3d>(points+3*i));
   static_cast<MapOwner*>(p)->map.repopulateStaticOccupied(values,Eigen::Map<const Vector3d>(body));
 }
-extern "C" void* nuwax_scan_map_snapshot(const void* p){return new Snapshot(static_cast<const MapOwner*>(p)->map.collisionSnapshot());}
+extern "C" void* nuwax_scan_map_snapshot(const void* p){
+  const auto& owner=*static_cast<const MapOwner*>(p);
+  return new Snapshot(owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get()));
+}
 extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previous,const void* trajectory,double from) {
   GridMap now,before;now.bindCollisionSnapshot(*static_cast<const Snapshot*>(current));before.bindCollisionSnapshot(*static_cast<const Snapshot*>(previous));
   auto curve=*static_cast<const Curve*>(trajectory);const double total=curve->duration(),dt=std::min(.01,now.getResolution()/2.);

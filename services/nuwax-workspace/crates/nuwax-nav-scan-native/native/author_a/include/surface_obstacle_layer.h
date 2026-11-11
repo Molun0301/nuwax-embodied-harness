@@ -42,6 +42,20 @@ class SurfaceObstacleLayer {
   bool intersects(const Eigen::Vector3d& reference,double yaw,double padding=0.)const {
     return contacts(reference,yaw,padding,nullptr,nullptr);
   }
+  const std::vector<double>& groundPoints() const { return ground_; }
+  // 硬接触和净空场的列分类共用高度带及开闭边界。
+  std::pair<double,double> heightBand(double reference_z) const {
+    return {reference_z+std::max(config_.max_step_up,config_.resolution)-config_.body_to_ground,
+            reference_z+config_.body_z_max};
+  }
+  bool columnContact(int x,int y,double reference_z) const {
+    const auto found=columns_.find(key(x,y));
+    if(found==columns_.end())return false;
+    const auto [low,high]=heightBand(reference_z);
+    for(const auto& band:found->second)
+      if(band.low==band.high ? band.low>=low&&band.low<high : band.high>low&&band.low<high)return true;
+    return false;
+  }
   bool contacts(const Eigen::Vector3d& reference,double yaw,double padding,
       std::vector<BodyCollisionCell>* output,const std::set<BodyCollisionCell>* initial,bool planar=false)const {
     if(columns_.empty())return false;
@@ -53,8 +67,7 @@ class SurfaceObstacleLayer {
     const double hx=cfg.body_length/2.+padding,hy=cfg.body_width/2.+padding;
     const double ex=ac*hx+as*hy,ey=as*hx+ac*hy;
     // 与原作者适配器使用相同的机体碰撞带，保持其地面/台阶语义。
-    const double low=reference.z()+std::max(cfg.max_step_up,r)-cfg.body_to_ground;
-    const double high=reference.z()+cfg.body_z_max;
+    const auto [low,high]=heightBand(reference.z());
     for(int ix=int(std::floor((x-ex)/r))-1;ix<=int(std::floor((x+ex)/r));++ix)
       for(int iy=int(std::floor((y-ey)/r))-1;iy<=int(std::floor((y+ey)/r));++iy) {
         const auto found=columns_.find(key(ix,iy));if(found==columns_.end())continue;

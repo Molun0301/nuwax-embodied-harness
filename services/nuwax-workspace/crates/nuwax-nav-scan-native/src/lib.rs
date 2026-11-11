@@ -524,6 +524,9 @@ impl Drop for ScanTracker {
 mod astar_endpoint_tests;
 
 #[cfg(test)]
+mod clearance_field_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     mod fixture {include!("numerical_fixture.rs");}

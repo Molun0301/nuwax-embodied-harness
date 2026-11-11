@@ -232,13 +232,12 @@ pub(crate) fn assemble_column(
     let block_xy = [xy[0].div_euclid(32), xy[1].div_euclid(32)];
     assemble_column_records(xy, q, blocks.iter().filter(|(block, _)| block[..2] == block_xy)
         .flat_map(|(block, records)| (0..32_u16)
-            .filter_map(move |z| records.get(local_xy + 1024 * z).map(|record| (*block, record)))), true)
+            .filter_map(move |z| records.get(local_xy + 1024 * z).map(|record| (*block, record)))))
 }
 /// 由同一列的全部原始记录组装完整列。记录须按块顺序、块内高度升序给出，
-/// 与逐块逐层查找的顺序相同，因此结果和首个错误也相同。`samples` 为假时不复制
-/// 高度场的诊断样本（样本不参与组装校验），其余内容不变。
+/// 与逐块逐层查找的顺序相同，因此结果和首个错误也相同。
 pub(crate) fn assemble_column_records<'a>(
-    xy: [i32; 2], q: f32, records: impl IntoIterator<Item = (Key, GroundRecordRef<'a>)>, samples: bool,
+    xy: [i32; 2], q: f32, records: impl IntoIterator<Item = (Key, GroundRecordRef<'a>)>,
 ) -> Result<ColumnGroundRecords, String> {
     let mut classified_empty = false;
     let mut groups: BTreeMap<Key, Vec<(Key, &HeightfieldFragment)>> = BTreeMap::new();
@@ -260,7 +259,6 @@ pub(crate) fn assemble_column_records<'a>(
     let mut heightfields = Vec::new();
     for (anchor, fragments) in groups {
         let first = fragments[0].1;
-        let keep_samples = samples;
         let mut mass = BTreeMap::new(); let mut samples = Vec::new();
         for (block, fragment) in fragments {
             if fragment.height_m != first.height_m || fragment.occupied_bounds != first.occupied_bounds {
@@ -270,7 +268,7 @@ pub(crate) fn assemble_column_records<'a>(
                 let key = global_key(block, *local)?;
                 if key[..2] != xy || mass.insert(key[2], *bins).is_some() { return Err("overlapping heightfield fragments".into()); }
             }
-            if keep_samples { samples.extend(fragment.samples.iter().cloned()); }
+            samples.extend(fragment.samples.iter().cloned());
         }
         let column = HeightfieldColumn::from_normalized_members(xy, q, mass)?;
         if [xy[0], xy[1], column.members().next().unwrap().0] != anchor

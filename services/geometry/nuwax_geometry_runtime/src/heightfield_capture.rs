@@ -785,22 +785,18 @@ fn classify(
     for p in returns {
         current.entry([p.key[0], p.key[1]]).or_default().push(p);
     }
-    // 原写入集为本帧触及列外扩4列、读取集再外扩8列；切比雪夫邻域半径可相加，
-    // 读取集即触及列外扩12列。按行区间交给Writer，不再逐列展开成集合。诊断样本
-    // 只在有回波的列合并时使用，其余列只取几何。
-    let old = writer.ground_columns_in_rows(&neighborhood_rows(&touched, 4 + 8), |xy| {
-        current.contains_key(&xy)
-    })?;
-    let context = Context::new(Columns::frame(&old, &current), q);
-    let historical = OnceLock::new();
+    // 原读取范围为触及列外扩12列；Writer在帧间保留其中完整的地面列。
     let voxel = writer.voxel_size_m();
+    let old = writer.ground_columns_in_rows(&neighborhood_rows(&touched, 4 + 8))?;
+    let context = Context::new(Columns::frame(old, &current), q);
+    let historical = OnceLock::new();
     // 原实现按升序遍历写入集，并跳过没有本帧回波的列；本帧回波列都在写入集内。
     // 各列只读本帧固定输入，按列并行计算后按升序合并；遇错返回列序上第一个错误，
     // 与串行遍历遇错即停的结果相同。
     let columns: Vec<_> = current.iter().collect();
     let frame = Frame {
         context: &context,
-        old: &old,
+        old,
         historical: &historical,
         q,
         voxel,

@@ -294,14 +294,16 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
         const double clearance=s.map.bodyFieldClearance(position,yaw);
         const double yaw_step=std::min(c->max_yaw_rate,scan_planner::clearanceSpeedCap(*c,clearance)/radius)*c->sample_dt;
         const int count=int(std::ceil((std::abs(yaw_error)-.3)/yaw_step));
-        double minimum=clearance;
-        // 当前实测姿态算第零拍；沿曲线逐拍转向，直到朝向误差落入0.3弧度。
+        double moving_minimum=std::numeric_limits<double>::infinity();
+        double turning_minimum=std::numeric_limits<double>::infinity();
+        // 只比较未来各拍；原地转向的最小净空不低于边走边转时才先转。
         for(int k=1;k<=count;++k) {
           const auto point=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+k*c->sample_dt));
           const double heading=yaw+std::copysign(std::min(std::abs(yaw_error),k*yaw_step),yaw_error);
-          minimum=std::min(minimum,s.map.bodyFieldClearance(point,heading));
+          moving_minimum=std::min(moving_minimum,s.map.bodyFieldClearance(point,heading));
+          turning_minimum=std::min(turning_minimum,s.map.bodyFieldClearance(position,heading));
         }
-        out->turn_first=minimum<.10;
+        out->turn_first=moving_minimum<.10&&turning_minimum>=moving_minimum;
       }
       if(!out->turn_first)s.reference_time=reference_time;
       s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();

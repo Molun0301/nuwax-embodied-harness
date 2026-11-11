@@ -1373,17 +1373,17 @@ goal: schema::PoseStamped {
         let old_evidence = observed_first.observations().unwrap().get([40,30,40]).unwrap();
         assert_eq!(cache.last_build_stats().unwrap().input_points,cells.len());
         let same=cache.build(&message(&cells,2)).unwrap();
-        // 无完整外形时也须保留真实精细几何与新观察时刻，不能复用带旧证据的快照。
+        // 几何不变时沿用原观测；当前消息的来源时刻仍由外层拥有方保留。
         assert!(first.same_geometry(&same));
-        assert!(!Arc::ptr_eq(&first,&same));
+        assert!(Arc::ptr_eq(&first,&same));
         assert_eq!(same.navigation_source_columns(None).0,f64::from(0.05_f32));
         let second_message = message(&cells, 2);
         assert_eq!(same.observations().unwrap().get([40,30,40]).unwrap().observed_ns,
-            second_message.source_timestamp_ns as u64);
+            old_evidence.observed_ns);
         let observed_second = observed_cache.build(&second_message).unwrap();
         assert!(observed_first.same_geometry(&observed_second));
-        assert!(!Arc::ptr_eq(&observed_first, &observed_second));
-        assert_eq!(observed_second.observations().unwrap().get([40,30,40]).unwrap().observed_ns, second_message.source_timestamp_ns as u64);
+        assert!(Arc::ptr_eq(&observed_first, &observed_second));
+        assert_eq!(observed_second.observations().unwrap().get([40,30,40]), Some(old_evidence));
         assert_eq!(observed_first.observations().unwrap().get([40,30,40]), Some(old_evidence));
         // Occupancy-only progress retains the physical graph and original fine
         // observation allocation/time. A newer mask never refreshes evidence age.
@@ -1395,14 +1395,18 @@ goal: schema::PoseStamped {
         assert!(Arc::ptr_eq(&retained_physical, &crate::surface_map::tests::physical_snapshot(&observed_cache).unwrap()));
         assert!(Arc::ptr_eq(&retained_observations, masked.observations().unwrap()));
         assert_eq!(masked.observations().unwrap().get([40,30,40]).unwrap().observed_ns,
-            second_message.source_timestamp_ns as u64);
+            old_evidence.observed_ns);
         assert_eq!(mask_only.source_timestamp_ns, second_message.source_timestamp_ns);
         assert_eq!(observed_cache.last_build_stats().unwrap().input_points, 0);
         assert_eq!(observed_cache.last_build_stats().unwrap().kind,
             nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
         cells.retain(|c|!(40..42).contains(&c[0]) || !(28..34).contains(&c[1]));
         let mut bad=message(&cells,3);
-        bad.fine.as_mut().unwrap().included.values_mut().next().unwrap()[0]^=1;
+        let before = nuwax_map_chunks::Manifest::decode(&second_message.fine.as_ref().unwrap().root).unwrap();
+        let candidate = nuwax_map_chunks::Manifest::decode(&bad.fine.as_ref().unwrap().root).unwrap();
+        let changed = candidate.blocks.iter().find(|block| before.blocks.iter().find(|old| old.key == block.key)
+            .is_none_or(|old| old.geometry_revision != block.geometry_revision)).unwrap().object;
+        bad.fine.as_mut().unwrap().included.get_mut(&changed).unwrap()[0]^=1;
         assert!(cache.build(&bad).is_err());
         assert!(observed_cache.build(&bad).is_err());
         let next=cache.build(&message(&cells,4)).unwrap();

@@ -38,18 +38,26 @@ impl FineMapReader {
             lcm_url,
         })
     }
+    #[cfg(test)]
     pub(super) fn receive(
         &mut self,
         message: &schema::NavigationMap3D,
     ) -> Result<Arc<Manifest>, String> {
+        let previous = self.receiver.current();
+        self.receive_geometry(message, previous.as_deref())
+    }
+    /// 几何差分相对实际已交付的观测根，而非仅通过接收的候选根。
+    pub(super) fn receive_geometry(
+        &mut self,
+        message: &schema::NavigationMap3D,
+        previous: Option<&Manifest>,
+    ) -> Result<Arc<Manifest>, String> {
         let transfer = message.fine.as_ref().ok_or("消息缺少精细根")?;
-        // Receiver must also inspect included bytes on duplicate publications:
-        // an identical root cannot hide an immutable-object conflict.
         let expected = schema::navigation_map_3d_domain(message);
         let client = &mut self.client;
         let url = &self.lcm_url;
         let mut fetched_blocks=0_usize;
-        let received=self.receiver.receive(transfer, &expected, |_, reference| {
+        let received=self.receiver.receive_geometry(transfer, &expected, previous, |_, reference| {
             fetched_blocks+=1;
             if client.is_none() {
                 *client = Some(nuwax_rpc::RpcClient::new(
@@ -194,7 +202,10 @@ mod tests {
         let mut block = decode_block(bytes).unwrap();
         block.values_mut().next().unwrap().hits += 1;
         *bytes = encode_block(&block).unwrap();
-        assert!(receiver.receive(&conflicting).unwrap_err().to_string().contains("identity conflicts"));
+        // 完整接收的不可变对象协议仍由同一接收核心验证。
+        assert!(receiver.receiver.receive(conflicting.fine.as_ref().unwrap(),
+            &schema::navigation_map_3d_domain(&conflicting), |_, _| panic!("内联完整对象不应补取"))
+            .unwrap_err().to_string().contains("identity conflicts"));
         assert!(Arc::ptr_eq(&receiver.receiver.current().unwrap(), &committed));
         let observations = receiver.observations(&committed, None).unwrap();
         assert_eq!(observations.get([0, 0, 0]).unwrap().hits, 1);
@@ -289,10 +300,9 @@ mod tests {
         for &cell in &cells {
             assert_eq!(old.get(cell).unwrap().observed_ns, 1);
             assert_eq!(old.get(cell).unwrap().hits, 1);
-            assert_eq!(next.get(cell).unwrap().observed_ns, 2);
-            assert_eq!(next.get(cell).unwrap().hits, 2);
+            assert_eq!(next.get(cell), old.get(cell));
         }
-        assert!(!Arc::ptr_eq(&old, &next));
+        assert!(Arc::ptr_eq(&old, &next));
         let start = Instant::now();
         let repeated = reader.receive(&second_message).unwrap();
         timings_us.push(start.elapsed().as_micros());

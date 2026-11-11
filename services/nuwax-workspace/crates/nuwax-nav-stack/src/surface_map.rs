@@ -185,7 +185,7 @@ impl SurfaceMapCache {
                     self.lcm_url.clone(),
                 )?);
             }
-            Some(self.fine.as_mut().unwrap().receive(message)?)
+            Some(self.fine.as_mut().unwrap().receive_geometry(message, self.fine_observed_root.as_deref())?)
         } else {
             None
         };

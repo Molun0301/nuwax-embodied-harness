@@ -3,7 +3,7 @@
 use nuwax_map_chunks::{Manifest, Receiver};
 use std::sync::Arc;
 
-/// 按块修订替换观测，返回相对兼容旧根的完整变化列；首帧及切域返回未知范围。
+/// 按几何修订替换观测，返回相对兼容旧根的完整变化列；首帧及切域返回未知范围。
 pub fn observations_with_changes(
     reader: &mut Receiver,
     root: &Manifest,
@@ -17,7 +17,7 @@ pub fn observations_with_changes(
         return Ok((Arc::clone(grid), Some(Vec::new())));
     }
     let known = previous.is_some();
-    // 几何未变不代表观测证据和分层统计未变。
+    // 未变几何沿用原观测；证据字段不参与导航与探索的计算。
     let mut mutated = false;
     let mut changed = Vec::new();
     let mut grid = match previous {
@@ -38,7 +38,7 @@ pub fn observations_with_changes(
             .map_err(|e| e.to_string())?);
     }
     for reference in &root.blocks {
-        if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
+        if old.get(&reference.key).is_some_and(|old| old.geometry_revision == reference.geometry_revision) { continue; }
         let (block, records) = reader.ground_parts(reference)?;
         let mut values = BTreeMap::new();
         for (&local, evidence) in block.iter() {

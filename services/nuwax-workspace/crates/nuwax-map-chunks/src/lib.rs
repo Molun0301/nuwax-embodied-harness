@@ -325,6 +325,21 @@ impl Receiver {
     pub fn collection_error(&self) -> Option<&str> { self.collection_error.as_deref() }
     pub fn clear(&mut self) { self.current = None; self.verified.clear(); self.layer_bindings.clear(); }
     pub fn receive(&mut self, transfer: &Transfer, expected: &Domain,
+        fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
+        self.receive_selected(transfer, expected, |_, _| true, fetch)
+    }
+    /// 表面消费者只读取几何变化对象；原封图根照常前进，不刷新未变几何的证据。
+    pub fn receive_geometry(&mut self, transfer: &Transfer, expected: &Domain, previous: Option<&Manifest>,
+        fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
+        self.receive_selected(transfer, expected, |root, block| {
+            previous.filter(|old| old.domain == root.domain
+                && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits())
+                .and_then(|old| old.blocks.binary_search_by_key(&block.key, |b| b.key).ok().map(|i| &old.blocks[i]))
+                .is_none_or(|old| old.geometry_revision != block.geometry_revision)
+        }, fetch)
+    }
+    fn receive_selected(&mut self, transfer: &Transfer, expected: &Domain,
+        select: impl Fn(&Manifest, &BlockRef) -> bool,
         mut fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
         let candidate = Arc::new(Manifest::decode(&transfer.root)?);
         if &candidate.domain != expected { return Err("root belongs to another domain".into()); }
@@ -335,9 +350,11 @@ impl Receiver {
         // A true duplicate with no payload does no object IO, membership read or GC scan.
         if same && transfer.included.is_empty() { return Ok(self.current.as_ref().unwrap().clone()); }
         let result = (|| {
-            let required: BTreeMap<_, _> = candidate.blocks.iter().map(|b| (b.object, (b.points, b.key))).collect();
+            let required: BTreeMap<_, _> = candidate.blocks.iter().map(|b|
+                (b.object, (b.points, b.key, select(&candidate, b)))).collect();
             for (&object, bytes) in &transfer.included {
-                let (points, key) = *required.get(&object).ok_or("included object is outside root")?;
+                let (points, key, selected) = *required.get(&object).ok_or("included object is outside root")?;
+                if !selected { continue; }
                 let (decoded, layers) = decode_block_parts(bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(bytes, &decoded);
                 admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
@@ -350,6 +367,7 @@ impl Receiver {
             }
             if same { return Ok(self.current.as_ref().unwrap().clone()); }
             for block in &candidate.blocks {
+                if !required[&block.object].2 { continue; }
                 if let Some(&info) = self.verified.get(&block.object) {
                     admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
                     if info.source_budget_required {

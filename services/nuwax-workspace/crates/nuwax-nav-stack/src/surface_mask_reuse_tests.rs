@@ -318,14 +318,12 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
     let refreshed = cache.build(&refreshed_message).unwrap();
     assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
     assert!(first.same_geometry(&refreshed));
-    assert!(!Arc::ptr_eq(&first, &refreshed));
-    assert!(!first.same_body_query_view(&refreshed));
-    assert!(!Arc::ptr_eq(&first_observations, refreshed.observations().unwrap()));
+    assert!(Arc::ptr_eq(&first, &refreshed));
+    assert!(first.same_body_query_view(&refreshed));
+    assert!(Arc::ptr_eq(&first_observations, refreshed.observations().unwrap()));
     assert!(first_observations.same_geometry(refreshed.observations().unwrap()));
     let fresh_evidence = refreshed.observations().unwrap().get([40,30,0]).unwrap();
-    assert_eq!(fresh_evidence.observed_ns, refreshed_message.source_timestamp_ns as u64);
-    assert!(fresh_evidence.observed_ns > evidence.observed_ns);
-    assert!(fresh_evidence.hits > evidence.hits);
+    assert_eq!(fresh_evidence, evidence);
     assert_eq!(first_observations.get([40,30,0]), Some(evidence));
     assert_current_message_oracle(&refreshed, &refreshed_message, &configured, true);
 }

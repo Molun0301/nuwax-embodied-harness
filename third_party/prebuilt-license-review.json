@@ -60,7 +60,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "0aa2e7b2e6463b4997afea59c50ce9abc464f35bdafed05adba6bc57488f8b21",
+          "review_key": "c675a132512c5ba9dff715e24c181f59c7110705648a58adf934041ed6711590",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -76,20 +76,22 @@
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp、path_searching/src/dyn_a_star.cpp，源码文件无新增或删除；用途仍为build-component（构建组件）",
+            "本次仓库内crate及Cargo依赖无新增、删除、版本或许可变更；原生库清单、全部许可正文与NOTICE、系统包均无变化"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 42952575550,
+            "source_revision": "8cfacbc7d43e636a7ca1cd403ca0cfc58c910602",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-geometry-runtime.json",
-            "reviewed_at": "2026-11-07T05:48:33.370406+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
+            "reviewed_at": "2026-11-11T03:52:58.845869+00:00",
+            "说明": "对比运行42332792045的已批准审计，旧批准review_key逐项复算一致。唯一核查输入变化为SCAN内嵌源码Git树f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；三处源码修改分别增加固定停车控制点、冻结对应优化梯度、在A*端点调整前识别地图外或允许域外的起终点，Apache-2.0许可及构建/链接角色不变。仓库内crate、Cargo依赖、其他组件、原生库清单、系统包及全部许可正文逐项一致；SCAN的LICENSE、NOTICE、THIRD_PARTY_NOTICES摘要与本地文件一致。仅替换旧审计的上述Git树即可精确复现本次review_key，无新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "9b718700b2dd31a5f82e4e0d02905c2b293e3d8d9c059b25b9207d71bc82a51e",
+          "review_key": "06d4117ca130163794287d3d2370a3703ba5b8ac3ded89d44d2b089e667c6277",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -105,15 +107,17 @@
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp、path_searching/src/dyn_a_star.cpp，源码文件无新增或删除；用途仍为build-component（构建组件）",
+            "本次仓库内crate及Cargo依赖无新增、删除、版本或许可变更；原生库清单、全部许可正文与NOTICE、系统包均无变化"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 42952575550,
+            "source_revision": "8cfacbc7d43e636a7ca1cd403ca0cfc58c910602",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-geometry-runtime.json",
-            "reviewed_at": "2026-11-07T05:48:33.435174+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
+            "reviewed_at": "2026-11-11T03:52:58.845869+00:00",
+            "说明": "对比运行42332792045的已批准审计，旧批准review_key逐项复算一致。唯一核查输入变化为SCAN内嵌源码Git树f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；三处源码修改分别增加固定停车控制点、冻结对应优化梯度、在A*端点调整前识别地图外或允许域外的起终点，Apache-2.0许可及构建/链接角色不变。仓库内crate、Cargo依赖、其他组件、原生库清单、系统包及全部许可正文逐项一致；SCAN的LICENSE、NOTICE、THIRD_PARTY_NOTICES摘要与本地文件一致。仅替换旧审计的上述Git树即可精确复现本次review_key，无新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
           }
         }
       }
@@ -122,7 +126,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "1186a210bb740309082de34a79c2335a9ff35887026e131e238c660d8499435d",
+          "review_key": "5d0402333de3009d7374e1d83d2a9a4baa842cf318c8690dbcde7427f6383211",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -132,20 +136,22 @@
             "Eigen3",
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp、path_searching/src/dyn_a_star.cpp，源码文件无新增或删除；用途仍为linked-native（已链接原生组件）",
+            "本次仓库内crate及Cargo依赖无新增、删除、版本或许可变更；原生库清单、全部许可正文与NOTICE、系统包均无变化"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 42952575550,
+            "source_revision": "8cfacbc7d43e636a7ca1cd403ca0cfc58c910602",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-nav-stack.json",
-            "reviewed_at": "2026-11-07T05:48:33.383238+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
+            "reviewed_at": "2026-11-11T03:52:58.845869+00:00",
+            "说明": "对比运行42332792045的已批准审计，旧批准review_key逐项复算一致。唯一核查输入变化为SCAN内嵌源码Git树f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；三处源码修改分别增加固定停车控制点、冻结对应优化梯度、在A*端点调整前识别地图外或允许域外的起终点，Apache-2.0许可及构建/链接角色不变。仓库内crate、Cargo依赖、其他组件、原生库清单、系统包及全部许可正文逐项一致；SCAN的LICENSE、NOTICE、THIRD_PARTY_NOTICES摘要与本地文件一致。仅替换旧审计的上述Git树即可精确复现本次review_key，无新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "be61ca7d7ec6b53f4ecf1c9342af78bf9499db7c3ff8195056d906376bf1370d",
+          "review_key": "47809b4c5ba6d140ad5f60474eb5bf0eda1dc6972ae08f827c0c49bc9565852d",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -155,15 +161,17 @@
             "Eigen3",
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp、path_searching/src/dyn_a_star.cpp，源码文件无新增或删除；用途仍为linked-native（已链接原生组件）",
+            "本次仓库内crate及Cargo依赖无新增、删除、版本或许可变更；原生库清单、全部许可正文与NOTICE、系统包均无变化"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 42952575550,
+            "source_revision": "8cfacbc7d43e636a7ca1cd403ca0cfc58c910602",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-nav-stack.json",
-            "reviewed_at": "2026-11-07T05:48:33.446634+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
+            "reviewed_at": "2026-11-11T03:52:58.845869+00:00",
+            "说明": "对比运行42332792045的已批准审计，旧批准review_key逐项复算一致。唯一核查输入变化为SCAN内嵌源码Git树f421f0707a9f5bbf33ec94df2a2cde9f307c4772变为64fa391e62478abaedfb16711824d8ab6a353436；三处源码修改分别增加固定停车控制点、冻结对应优化梯度、在A*端点调整前识别地图外或允许域外的起终点，Apache-2.0许可及构建/链接角色不变。仓库内crate、Cargo依赖、其他组件、原生库清单、系统包及全部许可正文逐项一致；SCAN的LICENSE、NOTICE、THIRD_PARTY_NOTICES摘要与本地文件一致。仅替换旧审计的上述Git树即可精确复现本次review_key，无新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
           }
         }
       }

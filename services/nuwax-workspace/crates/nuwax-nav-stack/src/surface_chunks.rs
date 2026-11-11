@@ -1,13 +1,10 @@
-//! 原表面构建任务拥有的块接收、对象补取和有界磁盘缓存。
+//! 原表面构建任务拥有的只读块接收与有界解码缓存。
 use nuwax_codec::lcm::schema;
-use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSFER_PART_BYTES};
+use nuwax_map_chunks::{Manifest, Receiver};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub(super) struct FineMapReader {
     receiver: Receiver,
-    client: Option<nuwax_rpc::RpcClient>,
-    lcm_url: String,
 }
 impl FineMapReader {
     /// 按块证据修订刷新观察块；几何未变化的时间更新也必须交付。
@@ -30,38 +27,12 @@ impl FineMapReader {
         )
     }
 
-    pub(super) fn new(lcm_url: String) -> Result<Self, String> {
-        let repository = Repository::temporary()?;
-        Ok(Self {
-            receiver: Receiver::with_cache_budget(repository, 32 * 1024 * 1024),
-            client: None,
-            lcm_url,
-        })
+    pub(super) fn new(repository_path: impl AsRef<std::path::Path>) -> Self {
+        Self { receiver: Receiver::with_cache_budget(nuwax_map_chunks::ReadOnlyRepository::open(repository_path), 32 * 1024 * 1024) }
     }
-    pub(super) fn receive(
-        &mut self,
-        message: &schema::NavigationMap3D,
-    ) -> Result<Arc<Manifest>, String> {
+    pub(super) fn receive(&mut self, message: &schema::NavigationMap3D) -> Result<Arc<Manifest>, String> {
         let transfer = message.fine.as_ref().ok_or("消息缺少精细根")?;
-        // Receiver must also inspect included bytes on duplicate publications:
-        // an identical root cannot hide an immutable-object conflict.
-        let expected = schema::navigation_map_3d_domain(message);
-        let client = &mut self.client;
-        let url = &self.lcm_url;
-        let mut fetched_blocks=0_usize;
-        let received=self.receiver.receive(transfer, &expected, |_, reference| {
-            fetched_blocks+=1;
-            if client.is_none() {
-                *client = Some(nuwax_rpc::RpcClient::new(
-                    Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(url).map_err(|e| e.to_string())?),
-                    "GeometryRuntimeService/get_navigation_map_block",
-                ).map_err(|e| e.to_string())?);
-            }
-            let runtime = tokio::runtime::Handle::try_current().map_err(|_| "可靠补取必须在原受管阻塞构建任务中执行")?;
-            runtime.block_on(fetch_block_parts(client.as_ref().unwrap(), reference))
-        })?;
-        if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
-        Ok(received)
+        self.receiver.receive(transfer, &schema::navigation_map_3d_domain(message))
     }
     #[cfg(test)]
     fn columns(
@@ -79,59 +50,13 @@ impl FineMapReader {
 
 }
 
-/// 同一对象最多四段并发；每段只请求一次，超时为350毫秒。
-async fn fetch_block_parts(client: &nuwax_rpc::RpcClient,
-    reference: &nuwax_map_chunks::BlockRef) -> Result<Vec<u8>, String> {
-    async fn part(client: &nuwax_rpc::RpcClient, request: serde_json::Value) -> Result<(Vec<u8>, usize), String> {
-        let reply = client.call((vec![request.clone()], Default::default()),
-            Duration::from_millis(350)).await.map_err(|e| e.to_string())?;
-        let data = block_response(&request, &reply)?;
-        Ok((data, reply["total_bytes"].as_u64().expect("分段格式已检查") as usize))
-    }
-    let request = block_request(reference);
-    let (mut joined, total) = part(client, request.clone()).await?;
-    while joined.len() < total {
-        let requests = (joined.len()..total).step_by(MAX_BLOCK_TRANSFER_PART_BYTES).take(4).map(|offset| {
-            let mut request = request.clone();
-            request["offset"] = serde_json::json!(offset);
-            part(client, request)
-        });
-        for (bytes, length) in futures::future::try_join_all(requests).await? {
-            if length != total { return Err("精细块分段总长变化".into()); }
-            joined.extend_from_slice(&bytes);
-        }
-    }
-    Ok(joined)
-}
-
-pub(super) fn block_request(reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
-    let nuwax_map_chunks::ObjectIdentity::Assigned(id) = reference.object;
-    serde_json::json!({"object_id": id.0, "offset": 0})
-}
-
-fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> Result<Vec<u8>, String> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let offset = request["offset"].as_u64().expect("本地分段偏移") as usize;
-    let total = response["total_bytes"].as_u64().filter(|&v| v <= MAX_BLOCK_BYTES as u64)
-        .ok_or("精细块响应总长错误")? as usize;
-    let expected = total.saturating_sub(offset).min(MAX_BLOCK_TRANSFER_PART_BYTES);
-    let compressed = response.get("data_lz4_base64");
-    let encoded = compressed.or_else(|| response.get("data_base64")).and_then(serde_json::Value::as_str)
-        .ok_or("精细块响应格式错误")?;
-    let data = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
-    let data = if compressed.is_some() { nuwax_codec::lcm::map_block_part::decompress(&data, expected)? } else { data };
-    if data.len() != expected { return Err("精细块响应长度错误".into()); }
-    Ok(data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Instant, Duration};
     use nuwax_map_chunks::*;
     use std::collections::{BTreeMap, BTreeSet};
     include!("surface_layer_transfer_tests.rs");
-    include!("surface_object_fetch_tests.rs");
     include!("surface_input_capture.rs");
 
     // Fresh-root compatibility for existing doorway diagnostic recipes.
@@ -161,21 +86,14 @@ mod tests {
         writer.snapshot(Domain {
             session: "test".into(), }, revision, revision).unwrap().as_ref().clone()
     }
-    fn reader(repository: Repository) -> FineMapReader {
-        FineMapReader {
-            receiver: Receiver::with_cache_budget(repository, 1024 * 1024),
-            client: None,
-            lcm_url: String::new(),
-        }
-    }
+    fn reader(repository: Repository) -> FineMapReader { FineMapReader::new(repository.path()) }
     fn transfer_message(repository: &Repository, root: &Manifest) -> schema::NavigationMap3D {
         schema::NavigationMap3D {
             session_id: root.domain.session.clone(),
 
             fine: Some(Transfer {
                 root: root.encode().unwrap(),
-                included: root.blocks.iter().map(|block| (block.object,
-                    repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect(),
+                repository_path: repository.path().to_string_lossy().into_owned(),
             }),
             ..Default::default()
         }
@@ -185,19 +103,11 @@ mod tests {
     fn duplicate_root_still_rejects_conflicting_included_body_without_installing_it() {
         let repository = Repository::temporary().unwrap();
         let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
-        let mut receiver = FineMapReader::new(String::new()).unwrap();
+        let mut receiver = FineMapReader::new("");
         let message = transfer_message(&repository, &root);
         let committed = receiver.receive(&message).unwrap();
         assert!(Arc::ptr_eq(&receiver.receive(&message).unwrap(), &committed));
-        let mut conflicting = message.clone();
-        let bytes = conflicting.fine.as_mut().unwrap().included.values_mut().next().unwrap();
-        let mut block = decode_block(bytes).unwrap();
-        block.values_mut().next().unwrap().hits += 1;
-        *bytes = encode_block(&block).unwrap();
-        assert!(receiver.receive(&conflicting).unwrap_err().to_string().contains("identity conflicts"));
-        assert!(Arc::ptr_eq(&receiver.receiver.current().unwrap(), &committed));
-        let observations = receiver.observations(&committed, None).unwrap();
-        assert_eq!(observations.get([0, 0, 0]).unwrap().hits, 1);
+
     }
 
     #[test]
@@ -206,7 +116,7 @@ mod tests {
         let cells: BTreeSet<_> = (0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])).collect();
         let root = install_revisioned(&repository, &cells, 0.05, 1, None);
         let message = transfer_message(&repository, &root);
-        let mut reader = FineMapReader::new(String::new()).unwrap();
+        let mut reader = FineMapReader::new("");
         let admitted = reader.receive(&message).unwrap();
         // 与计时测试分开，避免额外缓存访问改变其操作顺序。
         let blocks: Vec<_> = admitted.blocks.iter()
@@ -224,7 +134,6 @@ mod tests {
         for (reference, block) in admitted.blocks.iter().zip(&blocks) {
             assert!(Arc::ptr_eq(block, &reader.receiver.block(reference).unwrap()));
         }
-        assert!(reader.client.is_none());
     }
 
     #[test]
@@ -235,9 +144,10 @@ mod tests {
         let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
         let first_message = transfer_message(&repository, &first);
         let second_message = transfer_message(&repository, &second);
-        let mut included_bytes = Vec::new();
+        let mut root_sizes = Vec::new();
         for (revision, root, message) in [(1, &first, &first_message), (2, &second, &second_message)] {
             let transfer = message.fine.as_ref().unwrap();
+            root_sizes.push(transfer.root.len());
             assert_eq!(root.revision, revision);
             assert_eq!(root.source_timestamp_ns, revision);
             assert_eq!(root.points(), 4096);
@@ -245,45 +155,33 @@ mod tests {
             assert!(root.blocks.iter().all(|b| matches!(b.object, ObjectIdentity::Assigned(_))));
             let objects: BTreeSet<_> = root.blocks.iter().map(|b| b.object).collect();
             assert_eq!(objects.len(), root.blocks.len());
-            assert_eq!(objects, transfer.included.keys().copied().collect::<BTreeSet<_>>());
-            let bytes: usize = transfer.included.values().map(Vec::len).sum();
-            assert_eq!(bytes, 49_216);
-            assert!(bytes <= 128 * 1024);
-            included_bytes.push(bytes);
         }
-        let mut reader = FineMapReader::new(String::new()).unwrap();
-        assert!(reader.client.is_none());
+        let mut reader = FineMapReader::new("");
         let mut timings_us = Vec::new();
         let start = Instant::now();
         let first = reader.receive(&first_message).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         let start = Instant::now();
         let old = reader.observations(&first, None).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         let start = Instant::now();
         let (initial_updates, initial_count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&first, None, 0.1, &old, None);
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         assert_eq!(initial_count, cells.len());
         assert!(!initial_updates.is_empty());
         assert_columns(&initial_updates, &cells, 0.05, 0.1);
         let start = Instant::now();
         let second = reader.receive(&second_message).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         let start = Instant::now();
         let (next, changes) = reader.observations_with_changes(&second, Some((&first, &old))).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         assert_eq!(first.geometry_revision, second.geometry_revision);
         assert!(first.blocks.iter().zip(&second.blocks).all(|(a, b)|
             a.block_revision < b.block_revision && a.geometry_revision == b.geometry_revision));
         let start = Instant::now();
         let (updates, count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&second, Some(&first), 0.1, &next, changes.as_deref());
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         assert!(updates.is_empty());
         assert_eq!(count, 0);
         for &cell in &cells {
@@ -296,15 +194,13 @@ mod tests {
         let start = Instant::now();
         let repeated = reader.receive(&second_message).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         assert!(Arc::ptr_eq(&second, &repeated));
         let start = Instant::now();
         let repeated_observations = reader.observations(&repeated, Some((&second, &next))).unwrap();
         timings_us.push(start.elapsed().as_micros());
-        assert!(reader.client.is_none());
         assert!(Arc::ptr_eq(&next, &repeated_observations));
-        eprintln!("inline fine cells={} blocks={} included_bytes={included_bytes:?} stages=receive1,observations1,columns1,receive2,observations2,columns2,repeat_receive2,repeat_observations2 operation_us={timings_us:?} columns_read_points=[{initial_count},{count}] client_initialized={}",
-            cells.len(), second.blocks.len(), reader.client.is_some());
+        eprintln!("inline fine cells={} blocks={} root_bytes={root_sizes:?} stages=receive1,observations1,columns1,receive2,observations2,columns2,repeat_receive2,repeat_observations2 operation_us={timings_us:?} columns_read_points=[{initial_count},{count}] ",
+            cells.len(), second.blocks.len());
     }
 
     fn assert_columns(

@@ -836,38 +836,10 @@ mod tests {
     #[ignore = "需要本轮冻结的实机规范地图、机体位姿及实机配置"]
     async fn recorded_live_surface_navigation_diagnostic() {
         nuwax_core::logging::init_component_logging("navigation-diagnostic", "nuwax_nav_mls_planner=debug");
-        struct Blocks {
-            repository: nuwax_map_chunks::Repository,
-        }
-        #[async_trait::async_trait]
-        impl nuwax_rpc::RpcHandler for Blocks {
-            async fn handle(&self, request: nuwax_rpc::RpcRequest) -> nuwax_rpc::RpcResponse {
-                let Some(scope) = request.args.0.first() else {
-                    return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"missing block scope"}));
-                };
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
-                let id: [u8;16] = serde_json::from_value(scope["object_id"].clone()).unwrap();
-                match self.repository.read_object_range(nuwax_map_chunks::ObjectIdentity::Assigned(nuwax_map_chunks::ObjectId(id)),
-                    nuwax_map_chunks::MAX_BLOCK_BYTES, scope["offset"].as_u64().unwrap() as usize,
-                    nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES) {
-                    Ok(nuwax_map_chunks::ObjectRangeRead::Data {bytes,total_bytes}) =>
-                        nuwax_rpc::RpcResponse::ok(request.id, serde_json::json!({"total_bytes":total_bytes,"data_base64":STANDARD.encode(bytes)})),
-                    Ok(_) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"偏移超出范围"})),
-                    Err(error) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":error})),
-                }
-            }
-        }
         let directory = std::path::PathBuf::from(std::env::var("NUWAX_NAV_DIAGNOSTIC_INPUT").unwrap());
         let bytes = std::fs::read(directory.join("navigation-map.lcm")).unwrap();
-        let message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
-        let broker = nuwax_rpc::RpcBroker::new();
-        let method = "GeometryRuntimeService/get_navigation_map_block";
-        let blocks = Blocks {
-            repository: nuwax_map_chunks::Repository::open(directory.join("blocks")).unwrap(),
-        };
-        broker.register(method, Box::new(blocks)).await.unwrap();
-        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&nuwax_config::transport().unwrap().lcm_url).unwrap());
-        let server = broker.serve(transport, method).await.unwrap();
+        let mut message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
+        message.fine.as_mut().unwrap().repository_path = directory.join("blocks").to_string_lossy().into_owned();
         let pose_file = std::env::var("NUWAX_NAV_DIAGNOSTIC_POSE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_|directory.join("pose.json"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(pose_file).unwrap()).unwrap();
         let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
@@ -898,8 +870,7 @@ mod tests {
                     eprintln!("原地转向 yaw={yaw:.3} 投影={target:?} 扫掠={swept:?}");
                 }
             }
-            server.stop().await.unwrap();
-            return;
+                return;
         }
         if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_EDGES").is_some() {
             let mut printed=std::collections::BTreeSet::new();
@@ -1007,8 +978,7 @@ mod tests {
                 eprintln!("原路径闭环 outcome={outcome}, replans={replans}, commands={commands}, travelled={travelled}");
                 let output=std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT").unwrap();
                 std::fs::write(std::path::Path::new(&output).join("原路径闭环.json"),serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
-                server.stop().await.unwrap();
-                return;
+                        return;
             }
             let mut results = Vec::new();
             for tick in 0..12 {
@@ -1024,8 +994,7 @@ mod tests {
             if let Ok(output) = std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT") {
                 std::fs::write(std::path::Path::new(&output).join("原路径控制统计.json"), serde_json::to_vec_pretty(&results).unwrap()).unwrap();
             }
-            server.stop().await.unwrap();
-            return;
+                return;
         }
         let mut current = goal_for(&message, 1, position);
         current.goal.pose.orientation_xyzw = quaternion;
@@ -1179,7 +1148,6 @@ mod tests {
                 follower.stop();
             }
         }
-        server.stop().await.unwrap();
     }
 
     #[test]
@@ -1361,9 +1329,7 @@ goal: schema::PoseStamped {
             writer.observe(cells.iter().copied(), message.source_timestamp_ns as u64).unwrap();
             let root = writer.snapshot(schema::navigation_map_3d_domain(&message),
                 revision as u64, message.source_timestamp_ns as u64).unwrap();
-            let included = root.blocks.iter().map(|block| (block.object,
-                repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
-            message.fine=Some(Transfer { root: root.encode().unwrap(), included });
+                message.fine=Some(Transfer { root: root.encode().unwrap(), repository_path: repository.path().to_string_lossy().into_owned() });
             previous_cells = cells.clone();
             publications.insert(revision, message.clone());
             message
@@ -1402,7 +1368,7 @@ goal: schema::PoseStamped {
             nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
         cells.retain(|c|!(40..42).contains(&c[0]) || !(28..34).contains(&c[1]));
         let mut bad=message(&cells,3);
-        bad.fine.as_mut().unwrap().included.values_mut().next().unwrap()[0]^=1;
+        bad.fine.as_mut().unwrap().root[0]^=1;
         assert!(cache.build(&bad).is_err());
         assert!(observed_cache.build(&bad).is_err());
         let next=cache.build(&message(&cells,4)).unwrap();

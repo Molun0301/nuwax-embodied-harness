@@ -278,9 +278,7 @@ impl FineFixture {
         self.writer.observe(cells.iter().copied(), message.source_timestamp_ns as u64).unwrap();
         let root = self.writer.snapshot(schema::navigation_map_3d_domain(&message),
             revision as u64, message.source_timestamp_ns as u64).unwrap();
-        let included = root.blocks.iter().map(|block| (block.object,
-            self.repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
-        message.fine = Some(Transfer { root: root.encode().unwrap(), included });
+        message.fine = Some(Transfer { root: root.encode().unwrap(), repository_path: self.repository.path().to_string_lossy().into_owned() });
         message.virtual_obstacles = Some(virtual_mask(&message, false));
         self.previous = cells.clone();
         schema::validate_navigation_map_3d(&message).unwrap();

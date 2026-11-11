@@ -87,7 +87,6 @@ pub struct SurfaceMapCache {
     latest: Option<DerivedSurface>,
     last_stats: Option<SurfaceBuildStats>,
     fine: Option<crate::surface_chunks::FineMapReader>,
-    lcm_url: String,
     fine_built_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     fine_observed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     observations: Option<Arc<nuwax_nav_mls_planner::SurfaceObservations>>,
@@ -106,26 +105,14 @@ impl SurfaceMapCache {
             fine_built_root: None,
             fine_observed_root: None,
             observations: None,
-            lcm_url: String::new(),
         }
     }
 
     /// 使用启动时捕获的同一完整模型构建消费者缓存。
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
-        cache.lcm_url = config.lcm_url.clone();
         cache.builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
-        cache
-    }
-
-    /// 同`configured`，精细地图缺块补取改用调用方给定的LCM地址，不读进程环境变量。
-    pub fn configured_with_lcm_url(
-        config: &crate::surface_config::SurfaceNavigationConfig,
-        lcm_url: impl Into<String>,
-    ) -> Self {
-        let mut cache = Self::configured(config);
-        cache.lcm_url = lcm_url.into();
         cache
     }
 
@@ -181,9 +168,7 @@ impl SurfaceMapCache {
         }
         let fine_root = if message.fine.is_some() {
             if self.fine.is_none() {
-                self.fine = Some(crate::surface_chunks::FineMapReader::new(
-                    self.lcm_url.clone(),
-                )?);
+                self.fine = Some(crate::surface_chunks::FineMapReader::new(&message.fine.as_ref().unwrap().repository_path));
             }
             Some(self.fine.as_mut().unwrap().receive(message)?)
         } else {

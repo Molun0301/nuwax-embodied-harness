@@ -92,11 +92,9 @@ click-goal = ["lcm-runtime", "dep:nuwax-nav-click-goal-bridge"]
 
 # ---- 3D / 探索(可选,本 crate 默认不引入 explore)----
 mls = [
-    "dep:base64",
     "dep:nuwax-nav-pct-native",
     "guard-runtime",
     "dep:nuwax-map-chunks",
-    "dep:nuwax-rpc",
     "dep:nuwax-nav-mls-planner",
     "click-goal",
 ]
@@ -144,7 +142,6 @@ full = [
 
 [dependencies]
 nuwax-config = { path = "../nuwax-config" }
-base64 = { version = "0.22.1", optional = true }
 nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native", optional = true }
 nuwax-nav-control = { path = "../nuwax-nav-control" }
 nuwax-core = { path = "../nuwax-core" }
@@ -189,7 +186,6 @@ nuwax-nav-bbox-tracker = { path = "../nuwax-nav-bbox-tracker", optional = true }
 # ---- MLS Planner(可选)----
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 nuwax-map-chunks = { path = "../nuwax-map-chunks", optional = true }
-nuwax-rpc = { path = "../nuwax-rpc", features = ["link-liblcm"], optional = true }
 
 # 通用依赖(必须出现在共享 workspace.dependencies 中)
 serde = { workspace = true }

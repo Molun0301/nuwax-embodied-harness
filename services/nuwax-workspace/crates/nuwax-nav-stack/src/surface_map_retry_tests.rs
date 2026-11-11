@@ -433,8 +433,7 @@ async fn complete_candidate_build_failure_keeps_the_installed_map_and_active_goa
     next.source_voxel_size=0.2;
     next.cloud.width=0;next.cloud.row_step=0;next.cloud.data.clear();
     let root=writer.snapshot(schema::navigation_map_3d_domain(&next),next.revision as u64,next.source_timestamp_ns as u64).unwrap();
-    next.fine=Some(Transfer {root:root.encode().unwrap(),included:root.blocks.iter().map(|b|
-        (b.object,repository.read_object(b.object,MAX_BLOCK_BYTES).unwrap())).collect()});
+    next.fine=Some(Transfer {root:root.encode().unwrap(),repository_path:repository.path().to_string_lossy().into_owned()});
     let mut cache=SurfaceGeometryCache::configured(&config());
     let failed=prepare_surface_map(next.clone(),Instant::now(),&config(),&mut cache);
     assert!(failed.snapshot.is_err() && failed.awaiting_build,"对象已齐，规划精度不兼容仍只放弃候选");
@@ -448,6 +447,44 @@ async fn complete_candidate_build_failure_keeps_the_installed_map_and_active_goa
     assert_eq!(status.phase,SchedulerPhase::Controlling);
     assert_eq!(status.path_revision,path_revision as u64);
     assert!(status.last_terminal.is_none());
+    harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
+}
+
+// 原补取失败用例改为真实文件回收：候选失败不能撤掉已安装地图，新根应立即恢复。
+#[tokio::test]
+async fn reclaimed_object_keeps_installed_map_and_newer_root_is_built() {
+    use nuwax_map_chunks::{Repository,Writer,Transfer,ObjectIdentity};
+    let probe = Probe::new();
+    let (mut harness, first, goal, path_revision) = active(&probe).await;
+    let installed = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    let repository = Repository::temporary().unwrap();
+    let mut writer = Writer::new(repository.clone(),0.1,4*1024*1024).unwrap();
+    let cells:Vec<_>=(0..40).flat_map(|x|(0..30).map(move|y|[x,y,20])).collect();
+    let mut missing = map_message(first.revision+1,&first.session_id);
+    writer.observe(cells.iter().copied(),missing.source_timestamp_ns as u64).unwrap();
+    let root = writer.snapshot(schema::navigation_map_3d_domain(&missing),missing.revision as u64,missing.source_timestamp_ns as u64).unwrap();
+    missing.cloud.width=0;missing.cloud.row_step=0;missing.cloud.data.clear();
+    missing.fine=Some(Transfer {root:root.encode().unwrap(),repository_path:repository.path().to_string_lossy().into_owned()});
+    // 先准备之后的实际新根，再让旧候选要读的对象被回收。
+    let mut latest = map_message(missing.revision+1,&first.session_id);
+    writer.observe(cells.iter().copied(),latest.source_timestamp_ns as u64).unwrap();
+    let next = writer.snapshot(schema::navigation_map_3d_domain(&latest),latest.revision as u64,latest.source_timestamp_ns as u64).unwrap();
+    latest.cloud.width=0;latest.cloud.row_step=0;latest.cloud.data.clear();
+    latest.fine=Some(Transfer {root:next.encode().unwrap(),repository_path:repository.path().to_string_lossy().into_owned()});
+    let ObjectIdentity::Assigned(id)=root.blocks[0].object;
+    std::fs::remove_file(repository.path().join(format!("id-{}",id.0.iter().map(|v|format!("{v:02x}")).collect::<String>()))).unwrap();
+    harness.map(&missing).await;
+    wait(||probe.count(missing.revision)==1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let retained=harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    assert_eq!(retained.authority,installed.authority);
+    assert!(Arc::ptr_eq(retained.snapshot.as_ref().unwrap(),installed.snapshot.as_ref().unwrap()));
+    assert_eq!(harness.scheduler.status().path_revision,path_revision as u64);
+    assert!(harness.scheduler.status().last_terminal.is_none());
+    harness.map(&latest).await;
+    wait(||harness.hub.latest.lock().unwrap().as_ref().is_some_and(|m|m.authority.revision==latest.revision && m.snapshot.is_ok())).await;
+    assert_eq!(probe.count(latest.revision),1);
     harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
     harness.shutdown().await;
 }

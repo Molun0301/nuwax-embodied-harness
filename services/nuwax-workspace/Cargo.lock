@@ -2112,7 +2112,6 @@ name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "bitflags 2.13.0",
  "futures",
  "nuwax-codec",
@@ -2148,7 +2147,6 @@ dependencies = [
  "nuwax-nav-visual-query",
  "nuwax-nav-visual-servoing",
  "nuwax-protocol",
- "nuwax-rpc",
  "nuwax-transport",
  "pretty_assertions",
  "prost",

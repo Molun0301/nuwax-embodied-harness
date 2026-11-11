@@ -11,12 +11,10 @@ struct NavigationMap3D {
     // 仅表示同次提交的虚拟禁区，不包含二维物理投影。
     int8_t has_virtual_obstacles;
     nav_msgs.OccupancyGrid virtual_obstacles;
-    // Manifest v2 完整根清单加有界变动块；身份由域、修订和分配对象标识组成。
-    // 缺片只能携带完整根身份及精确块引用，通过可靠请求通道补取。
+    // 完整根清单及其所在的同机只读对象目录。
     int8_t has_fine_map;
     int32_t fine_manifest_length;
     byte fine_manifest[fine_manifest_length];
-    int32_t fine_blocks_length;
-    NavigationMapBlock fine_blocks[fine_blocks_length];
+    string fine_repository_path;
     sensor_msgs.PointCloud2 cloud;
 }

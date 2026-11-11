@@ -16,7 +16,6 @@ extern "C" {
 #endif
 
 #include "nav_msgs_OccupancyGrid.h"
-#include "nuwax_msgs_NavigationMapBlock.h"
 #include "sensor_msgs_PointCloud2.h"
 typedef struct _nuwax_msgs_NavigationMap3D nuwax_msgs_NavigationMap3D;
 struct _nuwax_msgs_NavigationMap3D
@@ -47,8 +46,7 @@ struct _nuwax_msgs_NavigationMap3D
     nav_msgs_OccupancyGrid virtual_obstacles;
 
     /**
-     * Manifest v2 完整根清单加有界变动块；身份由域、修订和分配对象标识组成。
-     * 缺片只能携带完整根身份及精确块引用，通过可靠请求通道补取。
+     * 完整根清单及其所在的同机只读对象目录。
      */
     int8_t     has_fine_map;
     int32_t    fine_manifest_length;
@@ -57,12 +55,11 @@ struct _nuwax_msgs_NavigationMap3D
      * LCM Type: byte[fine_manifest_length]
      */
     uint8_t    *fine_manifest;
-    int32_t    fine_blocks_length;
 
     /**
-     * LCM Type: nuwax_msgs.NavigationMapBlock[fine_blocks_length]
+     * LCM Type: string
      */
-    nuwax_msgs_NavigationMapBlock *fine_blocks;
+    char*      fine_repository_path;
     sensor_msgs_PointCloud2 cloud;
 };
 

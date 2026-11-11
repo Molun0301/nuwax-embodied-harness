@@ -1,13 +1,12 @@
 //! 墙代价只在配置缓冲距离内传播；局部重算包含完整来源外圈，不借旧边界值续接。
 use super::*;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 
 fn limit(config: &Config) -> f32 {
     (config.wall_clearance_m + config.wall_buffer_m).max(config.voxel_size)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy)]
 struct WallEdge {
     cell: VoxelKey,
     direction: (i32, i32),
@@ -26,37 +25,6 @@ impl WallEdge {
     }
 }
 
-#[derive(Clone, Copy)]
-struct WallWave {
-    distance: f32,
-    id: CellId,
-    cell: VoxelKey,
-    edge: WallEdge,
-}
-
-impl PartialEq for WallWave {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl Eq for WallWave {}
-impl PartialOrd for WallWave {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for WallWave {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // 最小距离先出队；等距按墙边和坐标固定顺序，不依赖散列表遍历。
-        other
-            .distance
-            .total_cmp(&self.distance)
-            .then_with(|| other.edge.cmp(&self.edge))
-            .then_with(|| other.cell.cmp(&self.cell))
-            .then_with(|| other.id.cmp(&self.id))
-    }
-}
-
 /// 以单元真实边界为障碍位置，计算水平欧氏距离；不把边界格中心当成墙。
 fn distances(
     graph: &PlannerGraph,
@@ -71,12 +39,14 @@ fn distances(
     let ramp_jump = config.max_slope_deg.to_radians().tan() * size + size;
     let height_cells = (config.step_threshold_m.max(ramp_jump) / size).ceil() as i32;
     let mut result: AHashMap<_, _> = domain.iter().map(|&id| (id, cap)).collect();
-    let mut queue = BinaryHeap::new();
+    let mut queue = VecDeque::new();
+    let mut seen = AHashSet::new();
     for &id in domain {
         let cell = cells.coord(id);
         let height = heights
             .get(&cell)
             .map_or((cell.2 as f32 + 1.0) * size, |b| b[1]);
+        let mut edges = Vec::new();
         for &(dx, dy) in &DIRECTIONS {
             // 墙边仍按全图邻列判定；domain只限制传播范围。
             let connected = graph
@@ -99,51 +69,47 @@ fn distances(
             {
                 continue;
             }
-            let edge = WallEdge {
+            edges.push(WallEdge {
                 cell,
                 direction: (dx, dy),
-            };
-            let distance = edge.distance(cell, size);
-            result.insert(id, distance);
-            // 同一墙边单元的各条边都是种子，等距种子均参与首次传播。
-            queue.push(WallWave {
-                distance,
-                id,
-                cell,
-                edge,
             });
         }
-    }
-    while let Some(wave) = queue.pop() {
-        if wave.distance > result[&wave.id] {
+        if edges.is_empty() {
             continue;
         }
-        for &(dx, dy) in &DIRECTIONS {
-            for &z in graph
-                .surface_lookup
-                .get(&(wave.cell.0 + dx, wave.cell.1 + dy))
-                .into_iter()
-                .flatten()
-            {
-                if (z - wave.cell.2).abs() > height_cells {
-                    continue;
-                }
-                let next = (wave.cell.0 + dx, wave.cell.1 + dy, z);
-                let Some(next_id) = cells.id(next) else {
-                    continue;
-                };
-                if !domain.contains(&next_id) {
-                    continue;
-                }
-                let distance = wave.edge.distance(next, size);
-                if distance < result[&next_id] && distance <= cap {
-                    result.insert(next_id, distance);
-                    queue.push(WallWave {
-                        distance,
-                        id: next_id,
-                        cell: next,
-                        edge: wave.edge,
-                    });
+        // 每个带墙边单元独立搜索，不按其它墙边的距离截断连通路径。
+        queue.clear();
+        seen.clear();
+        queue.push_back(id);
+        seen.insert(id);
+        while let Some(current_id) = queue.pop_front() {
+            let current = cells.coord(current_id);
+            let nearest = result.get_mut(&current_id).unwrap();
+            for edge in &edges {
+                *nearest = nearest.min(edge.distance(current, size));
+            }
+            for &(dx, dy) in &DIRECTIONS {
+                for &z in graph
+                    .surface_lookup
+                    .get(&(current.0 + dx, current.1 + dy))
+                    .into_iter()
+                    .flatten()
+                {
+                    if (z - current.2).abs() > height_cells {
+                        continue;
+                    }
+                    let next = (current.0 + dx, current.1 + dy, z);
+                    let Some(next_id) = cells.id(next) else {
+                        continue;
+                    };
+                    let x = (next.0 - cell.0) as f32;
+                    let y = (next.1 - cell.1) as f32;
+                    if x.hypot(y) * size <= cap + size
+                        && domain.contains(&next_id)
+                        && seen.insert(next_id)
+                    {
+                        queue.push_back(next_id);
+                    }
                 }
             }
         }

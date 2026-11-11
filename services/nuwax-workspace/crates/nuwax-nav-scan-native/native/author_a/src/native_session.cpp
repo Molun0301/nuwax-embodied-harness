@@ -275,20 +275,41 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.reference_time=s.phase;s.reference_stamp.reset();s.install_pending=false;}
       // 实际投影用于进度；期望参考按控制周期推进，超出原偏离距离时停表。
       const double next_reference=std::min(s.curve->duration(),std::max(s.phase,s.reference_time+c->sample_dt));
-      s.reference_time=std::max(s.reference_time,s.phase);
+      double reference_time=std::max(s.reference_time,s.phase);
       // 同一来源采样的重复计算仍只算一拍，保留既有控制时钟语义。
       if(s.reference_stamp!=state->timestamp_ns) {
         if((s.curve->position.evaluateDeBoorT(next_reference)-position).norm()<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution))
-          s.reference_time=next_reference;
+          reference_time=next_reference;
         s.reference_stamp=state->timestamp_ns;
       }
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       // 完整参考末段继续位置反馈；局部窗口仍保留原末端减速，不把期望走完当作实际到达。
       s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
-      s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
-      const auto before=s.curve->position.evaluateDeBoorT(s.reference_time);desired_yaw=s.controller.estimateDesiredYaw(s.reference_time,before);
+      s.controller.odomCallback(odometry(*state));
+      const auto before=s.curve->position.evaluateDeBoorT(reference_time);desired_yaw=s.controller.estimateDesiredYaw(reference_time,before);
+      const double yaw_error=std::atan2(std::sin(desired_yaw-yaw),std::cos(desired_yaw-yaw));
+      if(std::abs(yaw_error)>.3) {
+        const double radius=std::hypot(c->body_length/2.+std::abs(c->body_center_x),c->body_width/2.+std::abs(c->body_center_y));
+        const double clearance=s.map.bodyFieldClearance(position,yaw);
+        const double yaw_step=std::min(c->max_yaw_rate,scan_planner::clearanceSpeedCap(*c,clearance)/radius)*c->sample_dt;
+        const int count=int(std::ceil((std::abs(yaw_error)-.3)/yaw_step));
+        double minimum=clearance;
+        // 当前实测姿态算第零拍；沿曲线逐拍转向，直到朝向误差落入0.3弧度。
+        for(int k=1;k<=count;++k) {
+          const auto point=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+k*c->sample_dt));
+          const double heading=yaw+std::copysign(std::min(std::abs(yaw_error),k*yaw_step),yaw_error);
+          minimum=std::min(minimum,s.map.bodyFieldClearance(point,heading));
+        }
+        out->turn_first=minimum<.10;
+      }
+      if(!out->turn_first)s.reference_time=reference_time;
+      s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
+      if(out->turn_first) {
+        s.raw.linear={};
+        s.raw.angular.z=std::clamp(s.controller.kp_yaw*yaw_error,-c->max_yaw_rate,c->max_yaw_rate);
+      }
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }

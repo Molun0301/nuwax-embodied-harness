@@ -99,6 +99,7 @@ struct TrackRaw {
     pub reason: u32,
     pub limited: u32,
     pub installed: u32,
+    pub turn_first: u32,
 }
 #[derive(Default, Debug)]
 pub struct TrackResult {
@@ -109,6 +110,7 @@ pub struct TrackResult {
     pub reason: u32,
     pub limited: u32,
     pub installed: bool,
+    pub turn_first: bool,
     pub recovery_samples: Vec<TrajectorySample>,
 }
 /// 原生跟踪失败的原因位及原始文本。
@@ -507,6 +509,7 @@ impl ScanTracker {
                 reason: result.reason,
                 limited: result.limited,
                 installed: result.installed != 0,
+                turn_first: result.turn_first != 0,
                 recovery_samples: samples,
             })
         } else {

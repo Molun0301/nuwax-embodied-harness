@@ -40,7 +40,7 @@ typedef enum {
 typedef struct {
     double command[3], phase, remaining, deviation;
     /* 1无轨迹，2偏离，4走完，8无合法候选，16提前请求，32恢复失败，64新曲线偏离（旧曲线继续）。 */
-    uint32_t reason, limited, installed;
+    uint32_t reason, limited, installed, turn_first;
 } ScanTrackOutput;
 void *nuwax_scan_map_create(const ScanConfig *config);
 void nuwax_scan_map_destroy(void *map);

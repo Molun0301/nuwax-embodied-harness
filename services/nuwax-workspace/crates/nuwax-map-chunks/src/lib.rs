@@ -85,18 +85,15 @@ fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
     visit_block_records(bytes, |key, evidence| { block.insert(key, evidence); })?;
     let layers = if bytes.starts_with(b"NUWAXBL6") {
         let records = ground_shared::decode(&bytes[16 + block.len() * 12..])?;
-        ground_records::validate_records(&records, &block)?;
         records
     } else if bytes.starts_with(b"NUWAXBL5") {
         let records = ground_binary::decode(&bytes[16 + block.len() * 12..])?;
-        ground_records::validate_records(&records, &block)?;
         records
     } else if bytes.starts_with(b"NUWAXBL4") {
         let start = 16 + block.len() * 12;
         let entries: Vec<(u16, GroundRecord)> = serde_json::from_slice(&bytes[start..]).map_err(|e| e.to_string())?;
         if entries.is_empty() || entries.windows(2).any(|w| w[0].0 >= w[1].0) { return Err("invalid ground record anchors".into()); }
         let records = GroundRecords::Versioned(Arc::new(entries.into_iter().collect()));
-        ground_records::validate_records(&records, &block)?;
         records
     } else { GroundRecords::empty() };
     Ok((block, layers))
@@ -119,7 +116,6 @@ pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
 pub fn encode_ground_block(block: &Block, records: &GroundRecords) -> Result<Vec<u8>, String> {
     match records {
         GroundRecords::Versioned(v) => {
-            ground_records::validate_records(records, block)?;
             if v.is_empty() { return encode_block(block); }
             ground_shared::encode(block, records)
         }
@@ -401,33 +397,6 @@ impl Receiver {
                     return Err("layer object rebound to another spatial key/resolution".into());
                 }
             }
-            if candidate.version >= 5 {
-                let previous = self.current.as_ref().filter(|old| old.domain == candidate.domain && old.voxel_size_m == candidate.voxel_size_m);
-                let mut columns = BTreeSet::new();
-                for r in &candidate.blocks {
-                    let unchanged = previous.is_some_and(|old| old.blocks.binary_search_by_key(&r.key, |b| b.key).ok()
-                        .is_some_and(|i| old.blocks[i].object == r.object));
-                    if !unchanged {
-                        ground_records::heightfield_columns(r.key, &self.reader.ground_records(r)?, &mut columns)?;
-                        if let Some(old) = previous {
-                            if let Ok(i) = old.blocks.binary_search_by_key(&r.key, |b| b.key) {
-                                ground_records::heightfield_columns(r.key, &self.reader.ground_records(&old.blocks[i])?, &mut columns)?;
-                            }
-                        }
-                    }
-                }
-                if let Some(old) = previous {
-                    for r in &old.blocks {
-                        if candidate.blocks.binary_search_by_key(&r.key, |b| b.key).is_err() {
-                            ground_records::heightfield_columns(r.key, &self.reader.ground_records(r)?, &mut columns)?;
-                        }
-                    }
-                }
-                ground_records::validate_root_columns(&candidate, &mut self.reader, &columns)?;
-            }
-            if let Some(old) = self.current.clone() {
-                if old.domain == candidate.domain { self.validate_progression(&old, &candidate)?; }
-            }
             Ok(candidate.clone())
         })();
         // Valid duplicate inclusions cannot create garbage outside the pinned current root.
@@ -451,25 +420,7 @@ impl Receiver {
     fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, block: &Block, key: Key, quantum: f32) -> Result<(), String> {
         admit_layer_spatial_binding(&mut self.layer_bindings, object, layers, key, quantum)
     }
-    fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
-        if new.geometry_revision < old.geometry_revision { return Err("root geometry revision rolled back".into()); }
-        let mut membership_changed = old.blocks.iter().any(|a| new.blocks.binary_search_by_key(&a.key, |b| b.key).is_err());
-        for b in &new.blocks {
-            let Ok(index) = old.blocks.binary_search_by_key(&b.key, |a| a.key) else { membership_changed = true; continue; };
-            let a = &old.blocks[index];
-            if b.block_revision < a.block_revision || b.geometry_revision < a.geometry_revision { return Err("block revision rolled back".into()); }
-            if b.object != a.object {
-                if b.block_revision <= a.block_revision { return Err("changed object needs advanced evidence revision".into()); }
-                let (after, after_records) = self.reader.ground_parts(b)?; let (before, before_records) = self.reader.ground_parts(a)?;
-                if before.keys().ne(after.keys()) || !before_records.geometry_eq(&after_records) {
-                    membership_changed = true;
-                    if b.geometry_revision <= a.geometry_revision { return Err("changed members need advanced geometry revision".into()); }
-                }
-            }
-        }
-        if membership_changed && new.geometry_revision <= old.geometry_revision { return Err("changed membership needs advanced root geometry revision".into()); }
-        Ok(())
-    }
+
 }
 #[cfg(test)]
 mod tests;

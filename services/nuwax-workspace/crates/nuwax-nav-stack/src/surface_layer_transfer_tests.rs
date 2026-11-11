@@ -216,8 +216,8 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
     // an additional receiver admission rule.
     let mut even = original.clone();
     let mut odd = original.clone();
-    even.members.retain(|(local, _)| (local / 1024) % 2 == 0);
-    odd.members.retain(|(local, _)| (local / 1024) % 2 == 1);
+    Arc::make_mut(&mut even).members.retain(|(local, _)| (local / 1024) % 2 == 0);
+    Arc::make_mut(&mut odd).members.retain(|(local, _)| (local / 1024) % 2 == 1);
     let split = GroundRecords::Versioned(Arc::new(BTreeMap::from([
         (even.members[0].0, GroundRecord::HeightfieldV1(even)),
         (odd.members[0].0, GroundRecord::HeightfieldV1(odd)),

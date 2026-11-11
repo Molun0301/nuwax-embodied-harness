@@ -2,7 +2,8 @@ fn assert_accounting(w: &Writer) {
     let bytes: usize = w.dirty.values().map(|d| d.layers.bytes()).sum();
     assert_eq!(w.dirty_layer_bytes(), bytes);
     assert_eq!(w.resident_bytes(), w.source_watermark_bytes + bytes + w.dirty_points * 64 + w.reader.cached_bytes()
-        + w.pending.values().map(|p| p.bytes.len()).sum::<usize>());
+        + w.pending.values().map(|p| p.bytes.len()).sum::<usize>()
+        + w.dirty.values().map(|d| d.original.block.len() * 64 + d.original.layers.bytes()).sum::<usize>());
 }
 use super::*;
 

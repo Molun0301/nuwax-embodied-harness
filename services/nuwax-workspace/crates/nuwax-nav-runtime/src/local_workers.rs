@@ -127,17 +127,20 @@ impl MapWorker {
         let mut owner: Option<MapOwner> = None;
         let mut previous: Option<MapInput> = None;
         let mut prepared: Option<PreparedMap> = None;
+        let mut static_view: Option<([f64; 2], crate::native_map::NativeMap)> = None;
         Ok(Self(Worker::new(
             "nav-map-maintenance",
             move |input: MapInput, reset| {
-                let same_geometry = previous.as_ref().is_some_and(|old| {
+                let same_static_geometry = previous.as_ref().is_some_and(|old| {
                     crate::native_map::same_source_geometry(&old.source, &input.source)
-                        && old.source.same_body_query_view(&input.source)
                         && old.config.planning_horizon == input.config.planning_horizon
+                        && map_geometry(&old.config) == map_geometry(&input.config)
+                });
+                let same_geometry = same_static_geometry && previous.as_ref().is_some_and(|old| {
+                    old.source.same_body_query_view(&input.source)
                         && crate::native_map::collision_ground_padding(&old.config)
                             == crate::native_map::collision_ground_padding(&input.config)
                         && old.boundary == input.boundary
-                        && map_geometry(&old.config) == map_geometry(&input.config)
                 });
                 let same_frame = previous.as_ref().is_some_and(|old| {
                     old.frame.as_ref().map(|f| &f.identity)
@@ -158,6 +161,7 @@ impl MapWorker {
                 {
                     owner = None;
                     prepared = None;
+                    static_view = None;
                 }
                 let rebuilt = owner.is_none();
                 if rebuilt {
@@ -166,22 +170,16 @@ impl MapWorker {
                 let changed = !same_geometry || !same_frame || !same_pose || prepared.is_none();
                 if changed {
                     let c = input.config;
-                    let radius = c.planning_horizon
-                        + (c.body_length * 0.5 + c.body_center_x.abs())
-                            .hypot(c.body_width * 0.5 + c.body_center_y.abs());
-                    let native = crate::native_map::from_surface_window(
-                        &input.source,
-                        Some(([input.pose[0], input.pose[1]], radius + c.resolution)),
-                    )?;
+                    let native = static_surface_view(&mut static_view, &input, same_static_geometry)?;
                     let (recent_ground, recent_obstacles) =
                         input.source.navigation_recent_samples();
                     let obstacles: Vec<_> = native
                         .obstacles
-                        .into_iter()
+                        .iter().copied()
                         .chain(recent_obstacles)
                         .collect();
                     let ground = crate::native_map::collision_ground(
-                        native.static_collision_ground,
+                        native.static_collision_ground.clone(),
                         recent_ground,
                         &c,
                         input.pose,
@@ -257,6 +255,27 @@ impl MapWorker {
         self.0.take()
     }
 }
+/// 静态转换仅随来源几何或窗口锚点变化；机身相关处理仍留在原逐拍分支。
+fn static_surface_view<'a>(
+    cached: &'a mut Option<([f64; 2], crate::native_map::NativeMap)>,
+    input: &MapInput,
+    same_geometry: bool,
+) -> Result<&'a crate::native_map::NativeMap, String> {
+    let c = input.config;
+    let d = c.planning_horizon * 0.25;
+    let moved = cached.as_ref().is_none_or(|(anchor, _)|
+        (input.pose[0] - anchor[0]).hypot(input.pose[1] - anchor[1]) > d);
+    if !same_geometry || moved {
+        let anchor = if moved { [input.pose[0], input.pose[1]] } else { cached.as_ref().unwrap().0 };
+        let radius = c.planning_horizon
+            + (c.body_length * 0.5 + c.body_center_x.abs())
+                .hypot(c.body_width * 0.5 + c.body_center_y.abs())
+            + c.resolution + d;
+        *cached = Some((anchor, crate::native_map::from_surface_window(&input.source, Some((anchor, radius)))?));
+    }
+    Ok(&cached.as_ref().unwrap().1)
+}
+
 fn map_geometry(c: &Config) -> [u64; 12] {
     [
         c.resolution,
@@ -404,5 +423,84 @@ mod tests {
             free(&rebuilt.snapshot, &input.config),
             "新地图只注入当前帧一次，不继承旧概率或遗漏当前帧"
         );
+    }
+}
+
+#[cfg(test)]
+mod static_window_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use nuwax_map_chunks::{ColumnGroundRecords, HeightfieldSurface, Repository, Writer};
+
+    #[test]
+    fn anchored_window_keeps_current_window_ground_obstacles_layers_bands_and_forbidden() {
+        let q = 0.1_f32;
+        let repository = Repository::temporary().unwrap();
+        let mut writer = Writer::new(repository.clone(), q, 8 * 1024 * 1024).unwrap();
+        let mut keys = BTreeSet::new();
+        for x in -25..25 { for y in -20..20 {
+            let z = if x >= 0 { 2 } else { 0 };
+            keys.insert([x, y, z]);
+            if y == 5 || (x == -8 && (-7..3).contains(&y)) {
+                keys.extend((z+1..=z+10).map(|z| [x, y, z]));
+            }
+        }}
+        writer.observe(keys.iter().copied(), 1).unwrap();
+        for x in -25..25 { for y in -20..20 {
+            let z = if x >= 0 { 2 } else { 0 };
+            let column = nuwax_map_chunks::heightfield_observations::HeightfieldColumn::from_counts(
+                [x,y], q, BTreeMap::from([(z,[1,0,0,0,0,0,0,0])]),
+            ).unwrap().unwrap();
+            writer.replace_ground_column([x,y], &ColumnGroundRecords { classified_empty: false,
+                heightfields: vec![HeightfieldSurface {column,samples:vec![]}], }).unwrap();
+        }}
+        let root = writer.snapshot(nuwax_map_chunks::Domain {session:"anchor-window".into()},1,1).unwrap();
+        let mut receiver = nuwax_map_chunks::Receiver::new(repository);
+        let (observations, _) = nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
+            &mut receiver, &root, None,
+        ).unwrap();
+        let (configured, base) = crate::native_test_helpers::fixture();
+        let mut geometry = base.config().clone();geometry.voxel_size=q;
+        let points: Vec<_> = keys.iter().map(|key| {
+            let p=key.map(|v|((f64::from(v)+0.5)*f64::from(q))as f32);(p[0],p[1],p[2])
+        }).collect();
+        let mut mask=vec![false;400];mask[8*20+9]=true;mask[10*20+12]=true;
+        let source = Arc::new(SurfaceSnapshot::from_points(&points,geometry,q).unwrap()
+            .with_observations(Some(observations))
+            .with_virtual_obstacles([-2.,-2.],0.2,20,20,&mask).unwrap());
+        let mut config=configured.scan;config.resolution=f64::from(q);config.planning_horizon=0.6;
+        let mut input=MapInput {epoch:1,source,config,boundary:Arc::new(vec![]),pose:[-1.,0.,0.5],yaw:0.,
+            frame:None,active:None,phase:0.,active_snapshot:None};
+        let full=crate::native_map::from_surface(&input.source).unwrap();
+        assert!(!full.ground.is_empty() && !full.obstacles.is_empty() && !full.cells.is_empty()
+            && !full.bands.is_empty() && !full.forbidden_columns.is_empty());
+        let mut cached=None;
+        for i in 0..=50 {
+            input.pose=[-1.+f64::from(i)*0.04, f64::from(i%9)*0.025, 0.5];
+            let radius=config.planning_horizon+(config.body_length*0.5+config.body_center_x.abs())
+                .hypot(config.body_width*0.5+config.body_center_y.abs())+config.resolution;
+            // 原算法每拍以当前位姿转换；参照取原窗口，缓存取外扩锚点窗口。
+            let old=crate::native_map::from_surface_window(&input.source,
+                Some(([input.pose[0],input.pose[1]],radius))).unwrap();
+            let view=static_surface_view(&mut cached,&input,i>0).unwrap();
+            let inside=|xy:[f64;2]| (xy[0]-input.pose[0]).abs()<=radius && (xy[1]-input.pose[1]).abs()<=radius;
+            let points=|v:&[[f64;3]]| v.iter().filter(|p|inside([p[0],p[1]]))
+                .map(|p|p.map(f64::to_bits)).collect::<BTreeSet<_>>();
+            let cells=|m:&crate::native_map::NativeMap| m.cells.iter().filter(|c|inside([
+                (f64::from(c.x)+0.5)*m.resolution,(f64::from(c.y)+0.5)*m.resolution]))
+                .map(|c|(c.x,c.y,c.ground.to_bits(),c.ceiling.to_bits())).collect::<BTreeSet<_>>();
+            let bands=|m:&crate::native_map::NativeMap| m.bands.iter().filter(|b|inside([
+                (f64::from(b.x)+0.5)*m.resolution,(f64::from(b.y)+0.5)*m.resolution]))
+                .map(|b|(b.x,b.y,b.low.to_bits(),b.high.to_bits())).collect::<BTreeSet<_>>();
+            let forbidden=|m:&crate::native_map::NativeMap|m.forbidden_columns.iter().copied()
+                .filter(|c|inside(c.map(|v|(f64::from(v)+0.5)*m.resolution))).collect::<BTreeSet<_>>();
+            for reference in [&old,&full] {
+                assert_eq!(points(&view.ground),points(&reference.ground));
+                assert_eq!(points(&view.static_collision_ground),points(&reference.static_collision_ground));
+                assert_eq!(points(&view.obstacles),points(&reference.obstacles));
+                assert_eq!(cells(view),cells(reference));assert_eq!(bands(view),bands(reference));
+                assert_eq!(forbidden(view),forbidden(reference));
+            }
+        }
     }
 }

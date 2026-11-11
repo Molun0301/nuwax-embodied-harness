@@ -82,6 +82,7 @@ pub fn from_surface_window(
     let occupied_volume =
         map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume;
     let (resolution, columns) = map.navigation_source_columns(window);
+    let columns: Vec<_> = columns.collect();
     let nearby = |point: &[f64; 3]| {
         window.is_none_or(|(center, radius)| {
             (point[0] - center[0]).abs() <= radius && (point[1] - center[1]).abs() <= radius
@@ -136,7 +137,7 @@ pub fn from_surface_window(
         // 旧精细存档只有实际体素，未保存格内均值与独立地面记录；按原量化中心恢复这些已有测量样本。
         // 明确的地面分类（包括空列）优先，不从缺测列或已分类为空的列重新生成候选。
         let mut samples = Vec::new();
-        for (column, bands) in map.navigation_source_columns(window).1 {
+        for &(column, ref bands) in &columns {
             if raw.contains_key(&column)
                 || map.observations().is_some_and(|observations| {
                     observations.ground_records(column).next().is_some()
@@ -146,7 +147,7 @@ pub fn from_surface_window(
                 continue;
             }
             let xy = column.map(|v| (f64::from(v) + 0.5) * resolution);
-            for [low, high] in bands {
+            for &[low, high] in bands {
                 let count = ((high - low) / point_resolution).round().max(1.0) as usize;
                 for index in 0..count {
                     samples.push([

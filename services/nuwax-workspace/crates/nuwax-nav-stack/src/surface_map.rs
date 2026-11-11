@@ -234,11 +234,10 @@ impl SurfaceMapCache {
                     old.domain == root.domain
                         && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
                 });
-                let (updates, read_points) =
-                    self.fine
-                        .as_mut()
-                        .unwrap()
-                        .columns(root, previous, self.config.voxel_size)?;
+                let (updates, read_points) = nuwax_nav_mls_planner::surface_chunks::column_updates(
+                    root, previous, self.config.voxel_size,
+                    observations.as_ref().unwrap(), fine_changes.as_deref(),
+                );
                 self.builder
                     .build_column_updates(
                         &updates,

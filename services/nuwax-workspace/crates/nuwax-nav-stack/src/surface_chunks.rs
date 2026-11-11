@@ -19,82 +19,15 @@ impl FineMapReader {
         self.observations_with_changes(root, previous).map(|(grid, _)| grid)
     }
 
-    /// The optional delta is complete relative to the compatible previous root.
-    /// None means first/root-domain/resolution change, never an empty proof.
+    /// 按块修订替换观测，变化列相对兼容旧根。
     pub(super) fn observations_with_changes(
         &mut self,
         root: &Manifest,
         previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
     ) -> Result<(Arc<nuwax_nav_mls_planner::SurfaceObservations>, Option<Vec<[i32; 2]>>), String> {
-        use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
-        use std::collections::{BTreeMap, BTreeSet};
-        let previous = previous.filter(|(old, _)| old.domain == root.domain
-            && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
-        if let Some((_, grid)) = previous.filter(|(old, _)| *old == root) {
-            return Ok((Arc::clone(grid), Some(Vec::new())));
-        }
-        let known = previous.is_some();
-        // Empty geometry changes do not prove unchanged evidence or layer statistics.
-        let mut mutated = false;
-        let mut changed = Vec::new();
-        let mut grid = match previous {
-            Some((_, grid)) => grid.as_ref().clone(),
-            None => SurfaceObservations::new(root.voxel_size_m, 32).map_err(|e| e.to_string())?,
-        };
-        let old: BTreeMap<_, _> = previous.into_iter().flat_map(|(r, _)| &r.blocks).map(|b| (b.key, b)).collect();
-        let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
-        // Only roots containing typed ground need the vertical native-group pass.
-        // Reuse each changed object's one parts decode, including with zero cache.
-        let typed = root.version >= 5 || previous.is_some_and(|(old,_)|old.version >= 5);
-        let mut native_groups = BTreeSet::new();
-        let mut records_by_block = BTreeMap::new();
-        for key in old.keys().filter(|key| !new.contains_key(*key)) {
-            mutated = true;
-            if typed { native_groups.insert([key[0],key[1]]); }
-            changed.extend(grid.replace_block_with_geometry_changes(*key, BTreeMap::new())
-                .map_err(|e| e.to_string())?);
-            // Removing the final occupied block also retires its measured layers.
-            changed.extend(grid.replace_ground_layers(*key, Arc::new(BTreeMap::new()))
-                .map_err(|e| e.to_string())?);
-        }
-        for reference in &root.blocks {
-            if old.get(&reference.key).is_some_and(|old| old.block_revision == reference.block_revision) { continue; }
-            let (block, records) = self.receiver.ground_parts(reference)?;
-            let mut values = BTreeMap::new();
-            for (&local, evidence) in block.iter() {
-                if evidence.observed_ns > root.source_timestamp_ns { return Err("精细观察晚于提交根".into()); }
-                values.insert(nuwax_map_chunks::global_key(reference.key, local)?,
-                    SurfaceObservation { observed_ns: evidence.observed_ns, hits: evidence.hits });
-            }
-            mutated = true;
-            changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
-                .map_err(|e| e.to_string())?);
-            if typed {
-                native_groups.insert([reference.key[0],reference.key[1]]);
-                records_by_block.insert(reference.key,records);
-            }
-        }
-        for xy in native_groups {
-            let mut group = Vec::new();
-            for (&key, reference) in new.range([xy[0],xy[1],i32::MIN]..=[xy[0],xy[1],i32::MAX]) {
-                let records = match records_by_block.remove(&key) {
-                    Some(records) => records,
-                    None => self.receiver.ground_records(reference)?,
-                };
-                group.push((key,records));
-            }
-            changed.extend(grid.replace_heightfield_columns(xy,&group));
-        }
-
-        // 同一提交根的全部块已经读取并验证，缺少占据块不等于缺少已提交的几何源。
-        grid.mark_complete_geometry_source();
-        changed.sort_unstable();
-        changed.dedup();
-        let grid = match previous {
-            Some((_, previous)) if !mutated && previous.is_complete_geometry_source() => Arc::clone(previous),
-            _ => Arc::new(grid),
-        };
-        Ok((grid, known.then_some(changed)))
+        nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
+            &mut self.receiver, root, previous,
+        )
     }
 
     pub(super) fn new(lcm_url: String) -> Result<Self, String> {
@@ -130,92 +63,20 @@ impl FineMapReader {
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
     }
-    /// 只展开几何变化块涉及的完整规划列；上下叠层和跨块列共同聚合。
-    pub(super) fn columns(
+    #[cfg(test)]
+    fn columns(
         &mut self,
         root: &Manifest,
-        previous: Option<&Manifest>,
+        previous: Option<(&Manifest, &Arc<nuwax_nav_mls_planner::SurfaceObservations>)>,
         planner_size: f32,
-    ) -> Result<(Vec<nuwax_nav_mls_planner::SurfaceColumnUpdate>, usize), String> {
-        use std::collections::{BTreeMap, BTreeSet};
-        if !planner_size.is_finite() || planner_size < root.voxel_size_m {
-            return Err("规划精度小于精细源精度".into());
-        }
-        let compatible = previous.filter(|old| {
-            old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
-        });
-        let old: BTreeMap<_, _> = compatible
-            .into_iter()
-            .flat_map(|r| &r.blocks)
-            .map(|b| (b.key, b))
-            .collect();
-        let new: BTreeMap<_, _> = root.blocks.iter().map(|b| (b.key, b)).collect();
-        let mut dirty = BTreeSet::new();
-        for key in old.keys().chain(new.keys()) {
-            if old.get(key).map(|b| b.geometry_revision) == new.get(key).map(|b| b.geometry_revision) {
-                continue;
-            }
-            let (min, max) = planning_columns(*key, root.voxel_size_m, planner_size)?;
-            for x in min[0]..=max[0] {
-                for y in min[1]..=max[1] {
-                    dirty.insert([x, y]);
-                }
-            }
-            if dirty.len() > 2_000_000 {
-                return Err("脏列超过规划工作集预算".into());
-            }
-        }
-        let mut columns: BTreeMap<[i32; 2], BTreeMap<i32, [f32; 2]>> = BTreeMap::new();
-        let mut read_points = 0;
-        for reference in &root.blocks {
-            let (min, max) = planning_columns(reference.key, root.voxel_size_m, planner_size)?;
-            if !dirty
-                .range([min[0], i32::MIN]..=[max[0], i32::MAX])
-                .any(|c| c[1] >= min[1] && c[1] <= max[1])
-            {
-                continue;
-            }
-            let block = self.receiver.block(reference)?;
-            read_points += block.len();
-            for (&local, evidence) in block.iter() {
-                if evidence.observed_ns > root.source_timestamp_ns {
-                    return Err("精细证据晚于提交根".into());
-                }
-                let key = nuwax_map_chunks::global_key(reference.key, local)?;
-                let xyz = key.map(|v| ((f64::from(v) + 0.5) * f64::from(root.voxel_size_m)) as f32);
-                let cell = xyz.map(|v| (v / planner_size).floor() as i32);
-                let column = [cell[0], cell[1]];
-                if !dirty.contains(&column) {
-                    continue;
-                }
-                // 与完整点输入使用相同的精细高度量化，避免浮点边界出现两套语义。
-                let fine = (f64::from(xyz[2]) / f64::from(root.voxel_size_m)).floor();
-                let low = (fine * f64::from(root.voxel_size_m)) as f32;
-                let high = ((fine + 1.0) * f64::from(root.voxel_size_m)) as f32;
-                columns
-                    .entry(column)
-                    .or_default()
-                    .entry(cell[2])
-                    .and_modify(|b| {
-                        b[0] = b[0].min(low);
-                        b[1] = b[1].max(high);
-                    })
-                    .or_insert([low, high]);
-            }
-        }
-        let updates = dirty
-            .into_iter()
-            .map(|column| nuwax_nav_mls_planner::SurfaceColumnUpdate {
-                column,
-                cells: columns
-                    .remove(&column)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-            })
-            .collect();
-        Ok((updates, read_points))
+    ) -> Result<(Vec<nuwax_nav_mls_planner::SurfaceColumnUpdate>, usize, Arc<nuwax_nav_mls_planner::SurfaceObservations>), String> {
+        let (grid, changes) = self.observations_with_changes(root, previous)?;
+        let (updates, count) = nuwax_nav_mls_planner::surface_chunks::column_updates(
+            root, previous.map(|(root, _)| root), planner_size, &grid, changes.as_deref(),
+        );
+        Ok((updates, count, grid))
     }
+
 }
 
 /// 同一对象最多四段并发；每段只请求一次，超时为350毫秒。
@@ -261,27 +122,6 @@ fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> 
     let data = if compressed.is_some() { nuwax_codec::lcm::map_block_part::decompress(&data, expected)? } else { data };
     if data.len() != expected { return Err("精细块响应长度错误".into()); }
     Ok(data)
-}
-
-fn planning_columns(
-    key: [i32; 3],
-    source: f32,
-    planner: f32,
-) -> Result<([i32; 2], [i32; 2]), String> {
-    let first = nuwax_map_chunks::global_key(key, 0)?;
-    let last = nuwax_map_chunks::global_key(key, 32767)?;
-    let convert = |v| {
-        let point = ((f64::from(v) + 0.5) * f64::from(source)) as f32;
-        let column = (point / planner).floor();
-        if !column.is_finite() || column.abs() >= i32::MAX as f32 * 0.5 {
-            return Err("精细块规划坐标越界".to_owned());
-        }
-        Ok(column as i32)
-    };
-    Ok((
-        [convert(first[0])?, convert(first[1])?],
-        [convert(last[0])?, convert(last[1])?],
-    ))
 }
 
 #[cfg(test)]
@@ -372,7 +212,7 @@ mod tests {
         let blocks: Vec<_> = admitted.blocks.iter()
             .map(|reference| reader.receiver.block(reference).unwrap()).collect();
         let observations = reader.observations(&admitted, None).unwrap();
-        let (updates, count) = reader.columns(&admitted, None, 0.1).unwrap();
+        let (updates, count, _) = reader.columns(&admitted, None, 0.1).unwrap();
         assert_eq!(count, cells.len());
         assert_columns(&updates, &cells, 0.05, 0.1);
         for &cell in &cells {
@@ -423,7 +263,7 @@ mod tests {
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         let start = Instant::now();
-        let (initial_updates, initial_count) = reader.columns(&first, None, 0.1).unwrap();
+        let (initial_updates, initial_count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&first, None, 0.1, &old, None);
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert_eq!(initial_count, cells.len());
@@ -434,14 +274,14 @@ mod tests {
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         let start = Instant::now();
-        let next = reader.observations(&second, Some((&first, &old))).unwrap();
+        let (next, changes) = reader.observations_with_changes(&second, Some((&first, &old))).unwrap();
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert_eq!(first.geometry_revision, second.geometry_revision);
         assert!(first.blocks.iter().zip(&second.blocks).all(|(a, b)|
             a.block_revision < b.block_revision && a.geometry_revision == b.geometry_revision));
         let start = Instant::now();
-        let (updates, count) = reader.columns(&second, Some(&first), 0.1).unwrap();
+        let (updates, count) = nuwax_nav_mls_planner::surface_chunks::column_updates(&second, Some(&first), 0.1, &next, changes.as_deref());
         timings_us.push(start.elapsed().as_micros());
         assert!(reader.client.is_none());
         assert!(updates.is_empty());
@@ -508,27 +348,40 @@ mod tests {
     fn changed_blocks_merge_vertical_and_non_aligned_neighbors_and_keep_deletions() {
         let repository = Repository::temporary().unwrap();
         let mut reader = reader(repository.clone());
-        let mut cells: BTreeSet<_> = (-70..70)
+        let cells: BTreeSet<_> = (-70..70)
             .flat_map(|x| (-12..12).flat_map(move |y| [[x, y, 0], [x, y, 50]]))
             .collect();
         for size in [0.1, 0.13] {
+            let mut cells = cells.clone();
             let first = install_revisioned(&repository, &cells, 0.05, 1, None);
-            let (updates, read) = reader.columns(&first, None, size).unwrap();
+            let (updates, read, first_observations) = reader.columns(&first, None, size).unwrap();
             assert_eq!(read, cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             cells.remove(&[-32, 0, 0]);
             cells.insert([-33, 0, 8]);
             let second = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
-            let (updates, read) = reader.columns(&second, Some(&first), size).unwrap();
+            let (updates, read, second_observations) = reader.columns(&second, Some((&first, &first_observations)), size).unwrap();
             assert!(read < cells.len());
             assert_columns(&updates, &cells, 0.05, size);
             let third = install_revisioned(&repository, &cells, 0.05, 3, Some(&second));
-            let (updates, read) = reader.columns(&third, Some(&second), size).unwrap();
+            let (updates, read, third_observations) = reader.columns(&third, Some((&second, &second_observations)), size).unwrap();
             assert!(updates.is_empty());
             assert_eq!(read, 0);
+            let mut previous_layers = BTreeMap::<[i32; 2], BTreeSet<i32>>::new();
+            for key in &cells {
+                let p = key.map(|v| ((f64::from(v) + 0.5) * f64::from(0.05_f32)) as f32);
+                let c = p.map(|v| (v / size).floor() as i32);
+                previous_layers.entry([c[0], c[1]]).or_default().insert(c[2]);
+            }
             cells.retain(|key| block_key(*key) != [-2, 0, 0]);
             let fourth = install_revisioned(&repository, &cells, 0.05, 4, Some(&third));
-            let (updates, _) = reader.columns(&fourth, Some(&third), size).unwrap();
+            let (updates, _, fourth_observations) = reader.columns(&fourth, Some((&third, &third_observations)), size).unwrap();
+            assert_columns(&updates, &cells, 0.05, size);
+            assert!(!updates.is_empty());
+            assert!(updates.iter().any(|u| u.cells.len() < previous_layers[&u.column].len()));
+            cells.retain(|key| block_key(*key) != [-2, 0, 1]);
+            let fifth = install_revisioned(&repository, &cells, 0.05, 5, Some(&fourth));
+            let (updates, _, _) = reader.columns(&fifth, Some((&fourth, &fourth_observations)), size).unwrap();
             assert_columns(&updates, &cells, 0.05, size);
             assert!(updates.iter().any(|u| u.cells.is_empty()));
         }
@@ -567,8 +420,8 @@ mod tests {
             keys.extend((0..4).flat_map(|x|(-50..100).filter(move|&y|y<0||y>=gap)
                 .flat_map(move|y|(0..80).map(move|z|[x,y,z]))));
             let root=install_revisioned(&repository,&keys,0.01,revision,previous.as_ref().map(|(root,_)| root));
-            let observations=reader.observations(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
-            let (updates,count)=reader.columns(&root,previous.as_ref().map(|(root,_)|root),0.1).unwrap();
+            let (observations,changes)=reader.observations_with_changes(&root,previous.as_ref().map(|(root,grid)|(root,grid))).unwrap();
+            let (updates,count)=nuwax_nav_mls_planner::surface_chunks::column_updates(&root,previous.as_ref().map(|(root,_)|root),0.1,&observations,changes.as_deref());
             let built=builder.build_column_updates(&updates,0.01,previous.is_none(),count).unwrap();
             let map=built.snapshot.with_observations(Some(Arc::clone(&observations)));
             let y=gap as f64*fine/2.0;let q=[0.0,0.0,0.0,1.0];
@@ -743,9 +596,10 @@ mod tests {
                 .flat_map(|x| (0..8).map(move |y| [x, y, 0]))
                 .collect();
             let first = install_revisioned(&repository, &cells, 0.05, 1, None);
+            let observations = reader.observations(&first, None).unwrap();
             cells.insert([10, 2, 2]);
             let next = install_revisioned(&repository, &cells, 0.05, 2, Some(&first));
-            let (_, count) = reader.columns(&next, Some(&first), 0.1).unwrap();
+            let (_, count, _) = reader.columns(&next, Some((&first, &observations)), 0.1).unwrap();
             reads.push(count);
         }
         assert_eq!(reads, vec![257, 257, 257]);

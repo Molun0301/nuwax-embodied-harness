@@ -10,7 +10,7 @@ fn dense(layers: u16) -> (Block, GroundRecords, Arc<LayerSource>) {
         for xy in 0..1024 {
             let local = xy + 1024*z; let x = i32::from(xy%32); let y = i32::from(xy/32);
             block.insert(local, Evidence {observed_ns:STAMP,hits:32});
-            records.insert(local, GroundRecord::HeightfieldV1(HeightfieldFragment {
+            records.insert(local, GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment {
                 anchor:[x,y,i32::from(z)], height_m:(f64::from(z)+0.0625)*f64::from(Q),
                 occupied_bounds:[f64::from(z)*f64::from(Q),(f64::from(z)+1.)*f64::from(Q)],
                 members:vec![(local,[1.,0.,0.,0.,0.,0.,0.,0.])],
@@ -18,7 +18,7 @@ fn dense(layers: u16) -> (Block, GroundRecords, Arc<LayerSource>) {
                     point:[(f64::from(x)+0.03141592653589793+f64::from(i)/33.)*f64::from(Q),
                         (f64::from(y)+0.04+f64::from(i)/34.)*f64::from(Q), (f64::from(z)+0.0625)*f64::from(Q)],
                     source_sequence:u64::from(i)+1,source_timestamp_ns:STAMP-31+u64::from(i),point_index:u32::from(local)}).collect(),
-            }));
+            })));
         }
     }
     (block,GroundRecords::Versioned(Arc::new(records)),source)
@@ -70,9 +70,9 @@ fn bl6_near_full_source_and_numeric_bounds_fit_and_removing_root_sources_revalid
     let old=Arc::new(LayerSource::Auxiliary {sensor_id:format!("y{}","a".repeat(MAX_V1_TO_V5_BLOCK_BYTES-1024-26)),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
     let field=match records.versioned_mut().get_mut(&0).unwrap() {GroundRecord::HeightfieldV1(f)=>f,_=>unreachable!()};
-    field.samples[30].source=old.clone(); field.samples[31].source=declared.clone();
+    Arc::make_mut(field).samples[30].source=old.clone(); Arc::make_mut(field).samples[31].source=declared.clone();
     // 未声明来源确实能完整来自旧BL5，而非凭空增加兼容额度。
-    let mut legacy=field.clone();legacy.samples=vec![legacy.samples[30].clone()];
+    let mut legacy=field.clone();let sample=legacy.samples[30].clone();Arc::make_mut(&mut legacy).samples=vec![sample];
     assert!(ground_binary::encode(&[(0,block[&0])].into(),&[(0,GroundRecord::HeightfieldV1(legacy))].into()).unwrap().len()<=MAX_V1_TO_V5_BLOCK_BYTES);
     let bytes=encode_ground_block(&block,&records).unwrap();
     assert!(bytes.len()<=MAX_BLOCK_BYTES && MAX_BLOCK_BYTES-bytes.len()<8192);
@@ -133,7 +133,7 @@ fn failed_candidate_cannot_lend_its_source_declaration_to_a_later_root() {
     let source=Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(MAX_V1_TO_V5_BLOCK_BYTES+1),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
     let GroundRecord::HeightfieldV1(field)=records.get_mut(&0).unwrap() else{unreachable!()};
-    field.samples.truncate(1);field.samples[0].source=source.clone();
+    Arc::make_mut(field).samples.truncate(1);Arc::make_mut(field).samples[0].source=source.clone();
     let bytes=encode_ground_block(&base,&GroundRecords::Versioned(Arc::new(records))).unwrap();
     let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
     let mut candidate=root(id,1,vec![source]);candidate.revision=2;candidate.geometry_revision=2;

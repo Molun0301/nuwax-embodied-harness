@@ -292,11 +292,31 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }
-    const double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
+    // 归档271次停车的滑行P95：≥0.5米/秒为0.105米，0.2—0.3为0.037米，<0.1为0.017米，另需留约0.03米定位抖动。
+    const double clearance=s.map.bodyFieldClearance(position,yaw);
+    double speed_cap=scan_planner::clearanceSpeedCap(*c,clearance);
+    if(s.curve&&!std::isfinite(terminal_yaw)) {
+      const double horizon=std::max(0.,(scan_planner::deviceSpeedMagnitude(*c)-.10)/c->max_acceleration);
+      const double remaining=std::max(0.,s.curve->duration()-s.reference_time),period=2.*c->sample_dt;
+      const int count=int(std::ceil(std::min(horizon,remaining)/period));
+      double tangent=yaw;
+      for(int k=1;k<=count;++k) {
+        const double t=std::min(k*period,remaining),at=s.reference_time+t;
+        const auto point=s.curve->position.evaluateDeBoorT(at),velocity=s.curve->velocity.evaluateDeBoorT(at);
+        if(velocity.head<2>().squaredNorm()>1e-8)tangent=std::atan2(velocity.y(),velocity.x());
+        const double available=scan_planner::clearanceSpeedCap(*c,s.map.bodyFieldClearance(point,tangent));
+        speed_cap=std::min(speed_cap,available+c->max_acceleration*t);
+      }
+    }
+    const double radius=std::hypot(c->body_length/2.+std::abs(c->body_center_x),c->body_width/2.+std::abs(c->body_center_y));
+    double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
+    const double requested_speed=std::hypot(vx,vy);
+    if(requested_speed>speed_cap){vx*=speed_cap/requested_speed;vy*=speed_cap/requested_speed;}
+    const double requested_w=std::clamp(s.raw.angular.z,-speed_cap/radius,speed_cap/radius);
     Eigen::Vector2d preferred_world(cs*vx-sn*vy,sn*vx+cs*vy),delta=preferred_world-command_world;const double step=c->max_acceleration*c->sample_dt;
     if(delta.norm()>step)delta*=step/delta.norm();const auto chosen=(command_world+delta).eval();
     const Eigen::Vector2d preferred(std::clamp(cs*chosen.x()+sn*chosen.y(),-c->max_reverse_velocity,c->max_velocity),std::clamp(-sn*chosen.x()+cs*chosen.y(),-c->max_lateral_velocity,c->max_lateral_velocity));
-    const double w=std::clamp(s.raw.angular.z,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
+    const double w=std::clamp(requested_w,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
     const auto checked=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
     out->limited=checked.limited;if(!checked.found){out->reason=SCAN_TRACK_NO_CANDIDATE;s.curve.reset();return;}
     out->command[0]=checked.linear.x();out->command[1]=checked.linear.y();out->command[2]=checked.angular;

@@ -83,7 +83,7 @@ impl FineMapReader {
 async fn fetch_block_parts(client: &nuwax_rpc::RpcClient,
     reference: &nuwax_map_chunks::BlockRef) -> Result<Vec<u8>, String> {
     async fn part(client: &nuwax_rpc::RpcClient, request: serde_json::Value) -> Result<(Vec<u8>, usize), String> {
-        let reply = client.call_scoped((vec![request.clone()], Default::default()),
+        let reply = client.call((vec![request.clone()], Default::default()),
             Duration::from_millis(350)).await.map_err(|e| e.to_string())?;
         let data = block_response(&request, &reply)?;
         Ok((data, reply["total_bytes"].as_u64().expect("分段格式已检查") as usize))

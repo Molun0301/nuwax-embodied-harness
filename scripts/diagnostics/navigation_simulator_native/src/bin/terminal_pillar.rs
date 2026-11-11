@@ -37,7 +37,7 @@ fn stamped(body: Body, tick: usize) -> PoseStamped {
         },
     }
 }
-fn run_pillar(lateral: bool) -> (Value, Vec<Value>) {
+fn run_pillar(lateral: bool, goal_yaw: f64) -> (Value, Vec<Value>) {
     let mut config = SurfaceNavigationConfig::from_runtime().unwrap();
     let body = config.body_envelope.clone();
     let d = config.follower.body_to_support_z_m;
@@ -58,7 +58,10 @@ fn run_pillar(lateral: bool) -> (Value, Vec<Value>) {
         }],
     };
     let start = world.plane.body([0., 0.], 0., d);
-    let goal = world.plane.body([2., 0.], std::f64::consts::FRAC_PI_2, d);
+    let goal = world.plane.body([2., 0.], goal_yaw, d);
+    let goal_edge = body.footprint_xy_m.iter().map(|p| goal_yaw.cos()*p[0]-goal_yaw.sin()*p[1])
+        .fold(f64::NEG_INFINITY,f64::max);
+    let goal_clearance = world.solids[0].low[0]-goal.0[0]-goal_edge;
     let points = world.observations();
     let q = f64::from(0.05_f32);
     let mut blocks = BTreeMap::<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>::new();
@@ -125,7 +128,7 @@ fn run_pillar(lateral: bool) -> (Value, Vec<Value>) {
         .update_execution_map(ExecutionMap::Surface(source))
         .unwrap();
     follower.update_odometry(stamped(start, 0));
-    // 来向沿X轴，原业务目标朝向沿Y轴；完整参考故意保留原目标。
+    // 来向沿X轴，目标朝向为90或96度；完整参考保留原业务目标。
     follower
         .replace_execution_path(
             ExecutionPath::Surface(Path3D {
@@ -223,7 +226,7 @@ fn run_pillar(lateral: bool) -> (Value, Vec<Value>) {
         "wall_seconds":began.elapsed().as_secs_f64(),"position_error_m":error,"yaw_error_rad":yaw_error,
         "stopped":stopped,"final_pose":current,"world_failures":world_failures,"failure":failure,
         "phase_ticks":{"行进":phases[0],"转向":phases[1],"平移":phases[2]},"terminal":rows.last().and_then(|r|r.get("terminal")),
-        "goal":goal,"goal_physical_clearance_m":0.06,"source_voxel_m":q,
+        "goal":goal,"goal_physical_clearance_m":goal_clearance,"source_voxel_m":q,
         "method":"生产SurfaceFollower及原生规划/跟踪；独立分析世界的完整机身实体扫掠；按原分析世界执行器加减速积分"}),
         rows,
     )
@@ -231,9 +234,9 @@ fn run_pillar(lateral: bool) -> (Value, Vec<Value>) {
 fn main() {
     let output = std::path::PathBuf::from(std::env::args().nth(1).expect("提供证据输出目录"));
     std::fs::create_dir_all(&output).unwrap();
-    for lateral in [true, false] {
-        let (summary, rows) = run_pillar(lateral);
-        let name = if lateral { "可横移" } else { "不可横移" };
+    for (name,lateral,yaw) in [("可横移90度",true,90_f64.to_radians()),
+        ("可横移96度",true,96_f64.to_radians()),("不可横移",false,90_f64.to_radians())] {
+        let (summary, rows) = run_pillar(lateral,yaw);
         std::fs::write(
             output.join(format!("{name}_汇总.json")),
             serde_json::to_vec_pretty(&summary).unwrap(),
@@ -249,7 +252,7 @@ mod tests {
     use super::*;
     #[test]
     fn pillar_goal_with_lateral_motion_arrives_without_any_solid_intersection() {
-        let (result, _) = run_pillar(true);
+        let (result, _) = run_pillar(true,90_f64.to_radians());
         println!("{result}");
         assert_eq!(result["world_failures"], 0);
         assert_eq!(result["succeeded"], true, "{result}");
@@ -258,9 +261,24 @@ mod tests {
         assert_eq!(result["stopped"], true);
     }
     #[test]
-    fn pillar_goal_without_lateral_motion_records_the_existing_outcome() {
-        let (result, _) = run_pillar(false);
+    fn pillar_goal_without_lateral_motion_keeps_the_pre_rule4_behavior() {
+        let (result, rows) = run_pillar(false,90_f64.to_radians());
         println!("{result}");
         assert_eq!(result["world_failures"], 0, "{result}");
+        assert_eq!(result["succeeded"],false);
+        assert_eq!(result["position_error_m"],2.0);
+        assert!(rows.iter().all(|r|r["command"]==json!([0.,0.,0.])));
+        assert_eq!(result["terminal"]["S"],result["goal"][0]);
+        assert_eq!(result["terminal"]["P"],result["goal"][0]);
+    }
+    #[test]
+    fn pillar_goal_at_96_degrees_projects_reverse_then_arrives_without_intersection() {
+        let (result, _) = run_pillar(true,96_f64.to_radians());
+        println!("{result}");
+        assert_eq!(result["world_failures"],0);
+        assert_eq!(result["succeeded"],true,"{result}");
+        assert!(result["position_error_m"].as_f64().unwrap()<0.15);
+        assert!(result["yaw_error_rad"].as_f64().unwrap()<0.08);
+        assert_eq!(result["stopped"],true);
     }
 }

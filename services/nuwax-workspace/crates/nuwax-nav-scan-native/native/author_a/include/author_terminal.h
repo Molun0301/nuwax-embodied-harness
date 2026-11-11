@@ -4,7 +4,7 @@
 #include <scan_native.h>
 
 namespace scan_planner {
-// 停点按目标朝向留净空；转向点沿原路线回溯，随后只按目标朝向直线进停点。
+// 停点按目标朝向留净空；回溯候选按设备能力平移后，再固定目标朝向直线进停点。
 inline ScanTerminalPoints terminalPoints(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& goal,
     double yaw,double tolerance,const std::vector<Eigen::Vector3d>& reference) {
   Eigen::Vector3d stop=goal;
@@ -29,20 +29,23 @@ inline ScanTerminalPoints terminalPoints(GridMap& map,const ScanConfig& c,const 
   RouteHeightReference route;route.set(reference);
   ScanTerminalPoints result{};
   std::copy_n(stop.data(),3,result.stop);std::copy_n(stop.data(),3,result.turn);
+  std::copy_n(stop.data(),3,result.route_point);
   result.route_arc=route.end_arc;
   const double radius=std::hypot(c.body_length/2.+std::abs(c.body_center_x),c.body_width/2.+std::abs(c.body_center_y));
   if(map.fieldDistance(stop.x(),stop.y())>=radius+.05)return result;
   const int count=int(std::floor(std::min(1.5,route.end_arc)/spacing));
   for(int k=0;!route.points.empty()&&k<=count;++k) {
     const double arc=route.end_arc-k*spacing;
-    const auto point=route.positionAtArc(arc);
+    const auto route_point=route.positionAtArc(arc);
+    Eigen::Vector3d point=route_point;
+    const double dx=stop.x()-point.x(),dy=stop.y()-point.y();
+    const double forward=std::cos(yaw)*dx+std::sin(yaw)*dy;
+    const double lateral=-std::sin(yaw)*dx+std::cos(yaw)*dy;
+    // 沿不可用通道平移候选点，去掉末段平移所需的倒退或横移分量。
+    if(c.max_reverse_velocity==0.&&forward<0.)point+=forward*Eigen::Vector3d(std::cos(yaw),std::sin(yaw),0.);
+    if(c.max_lateral_velocity==0.&&lateral!=0.)point+=lateral*Eigen::Vector3d(-std::sin(yaw),std::cos(yaw),0.);
     if(map.fieldDistance(point.x(),point.y())<radius+.05)continue;
     const auto delta=(stop-point).eval();
-    const double forward=std::cos(yaw)*delta.x()+std::sin(yaw)*delta.y();
-    const double lateral=-std::sin(yaw)*delta.x()+std::cos(yaw)*delta.y();
-    // 旋转轴表达只忽略三角函数的浮点尾差，不把未声明的运动通道变成可用。
-    if((std::abs(lateral)>1e-8&&c.max_lateral_velocity==0.)
-        ||(forward< -1e-8&&c.max_reverse_velocity==0.))continue;
     const double distance=delta.norm();
     const int samples=int(std::ceil(distance/spacing));
     bool free=true;
@@ -51,9 +54,13 @@ inline ScanTerminalPoints terminalPoints(GridMap& map,const ScanConfig& c,const 
       if(map.getInflateOccupancy(sample,yaw)!=0){free=false;break;}
     }
     if(free) {
-      std::copy_n(point.data(),3,result.turn);result.route_arc=arc;break;
+      std::copy_n(point.data(),3,result.turn);std::copy_n(route_point.data(),3,result.route_point);
+      result.route_arc=arc;return result;
     }
   }
+  // 无可用转向点时整套选点退回原目标，保留原参考路线。
+  std::copy_n(goal.data(),3,result.stop);std::copy_n(goal.data(),3,result.turn);
+  std::copy_n(goal.data(),3,result.route_point);
   return result;
 }
 }

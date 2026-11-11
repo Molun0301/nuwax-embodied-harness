@@ -481,7 +481,12 @@ impl SurfaceFollower {
                 if arc >= points.route_arc { break; }
                 clipped.push(*point);
             }
-            clipped.push(points.turn);
+            if clipped.last() != Some(&points.route_point) {
+                clipped.push(points.route_point);
+            }
+            if points.turn != points.route_point {
+                clipped.push(points.turn);
+            }
             clipped
         } else {
             let mut reference = self.reference.as_ref().clone();
@@ -604,7 +609,10 @@ impl SurfaceFollower {
         let config = self.native_config(&map.source);
         self.prepare_terminal(&map, &config);
         let at_turn_point = self.at_turn_point(&state, config.resolution);
-        if self.terminal_phase == TerminalPhase::Travel && self.options.requires_orientation()
+        if self.terminal_phase == TerminalPhase::Turning && !at_turn_point {
+            self.terminal_phase = TerminalPhase::Travel;
+            self.needs_plan = true;
+        } else if self.terminal_phase == TerminalPhase::Travel && self.options.requires_orientation()
             && at_turn_point && ((self.active.is_none() && self.pending_curve.is_none()) || state.stopped()) {
             self.begin_terminal_turn();
         }
@@ -951,6 +959,31 @@ mod native_execution_tests {
         assert!(!follower.position_reached());
         follower.goal.as_mut().unwrap().pose.position.z = 0.5;
         assert!(follower.position_reached());
+    }
+
+    #[test]
+    fn terminal_turn_leaving_the_same_position_region_requests_a_travel_plan() {
+        let (config, source) = crate::native_test_helpers::fixture();
+        let mut follower = crate::native_test_helpers::author_static_map_follower(config);
+        let start = pose(0.,0.,0.);
+        let goal = pose(0.1,0.,0.6);
+        follower.configure_goal(&goal, GoalOptions {position_tolerance_m:0.15,yaw_tolerance_rad:0.1,..Default::default()}).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        follower.update_odometry(start.clone());
+        follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,goal.clone()]}),None,goal).unwrap();
+        for _ in 0..1000 {
+            follower.step();
+            if follower.terminal_phase()==TerminalPhase::Turning {break;}
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(follower.terminal_phase(),TerminalPhase::Turning);
+        let mut drifted=pose(0.3,0.,0.);
+        drifted.stamp.nanos+=50_000_000;
+        follower.update_odometry(drifted);
+        follower.step();
+        assert_eq!(follower.terminal_phase(),TerminalPhase::Travel);
+        assert!(follower.planning,"漂出后须请求原行进规划");
     }
 
     fn pose(x: f64, y: f64, yaw: f64) -> PoseStamped {

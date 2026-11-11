@@ -625,7 +625,7 @@ mod tests {
                     };
                     let mut applied=Twist2::ZERO;let mut reached=false;let mut passed_opening=false;
                     let mut inputs=Vec::new();
-                    for tick in 0..240 {
+                    for tick in 0..320 {
                         let yaw=stamped(current,time).pose.orientation.yaw();
                         request.start_position=current.0;request.start_yaw=yaw;request.odometry_timestamp_ns=time;
                         request.start_velocity=Some([yaw.cos()*applied.linear.x-yaw.sin()*applied.linear.y,

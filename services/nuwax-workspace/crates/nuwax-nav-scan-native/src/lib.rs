@@ -119,9 +119,11 @@ pub struct TrackResult {
 pub struct TerminalPoints {
     /// 按目标朝向进入的位置。
     pub stop: [f64; 3],
-    /// 沿原参考路线选定的原地转向位置。
+    /// 按设备能力调整后的原地转向位置P。
     pub turn: [f64; 3],
-    /// 转向点对应的原参考三维弧长。
+    /// 能力投影之前的路线点Q；参考先截到这里，再接转向点。
+    pub route_point: [f64; 3],
+    /// 投影之前的Q在原参考上的三维弧长。
     pub route_arc: f64,
 }
 /// 同一碰撞快照的只读净空与占据查询。

@@ -348,22 +348,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    fn free(snapshot: &CollisionSnapshot, config: &Config) -> bool {
-        let mut tracker = nuwax_nav_scan_native::ScanTracker::default();
-        tracker
-            .track_and_check(
-                config,
-                snapshot,
-                &MotionState {
-                    position: [1.55, 1.05, 0.5],
-                    measured_velocity: 1,
-                    measured_yaw_rate: 1,
-                    ..Default::default()
-                },
-                [0.; 3],
-                Some(0.),
-            )
-            .is_ok()
+    fn free(snapshot: &CollisionSnapshot, _config: &Config) -> bool {
+        snapshot.pose_clearance([1.55, 1.05, 0.5], 0.).occupied == 0
     }
     #[test]
     fn one_fusion_per_frame_and_immutable_snapshots_survive_rebuild() {

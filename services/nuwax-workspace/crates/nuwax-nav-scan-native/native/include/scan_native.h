@@ -13,7 +13,7 @@ typedef struct {
     double max_reverse_velocity, max_lateral_velocity;
 } ScanConfig;
 typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
-typedef struct { double stop[3], turn[3], route_arc; } ScanTerminalPoints;
+typedef struct { double stop[3], turn[3], route_point[3], route_arc; } ScanTerminalPoints;
 typedef struct { double field_distance, body_clearance; int32_t occupied; } ScanPoseClearance;
 /* 浅接触退出复用原检查的样本输出，不携带任何速度有效期。 */
 typedef struct {

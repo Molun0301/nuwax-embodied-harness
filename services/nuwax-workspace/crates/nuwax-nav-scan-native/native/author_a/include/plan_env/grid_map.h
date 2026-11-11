@@ -192,6 +192,7 @@ public:
       bool planar = false);
   inline double fieldDistance(double x, double y) const;
   double bodyFieldClearance(Eigen::Vector3d pos, double yaw) const;
+  double bodyFieldClearance(Eigen::Vector3d pos, double yaw, double upper_bound) const;
   inline double bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range);
   inline bool bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw);
   // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
@@ -598,8 +599,7 @@ inline double GridMap::fieldDistance(double x, double y) const {
 // 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
 inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
   const double margin=scan_planner::preferredClearance(mp_.resolution_);
-  // 查询结果作为首项，使非有限试探的NaN继续进入原代价计算。
-  const double clearance=std::min(bodyFieldClearance(pos,yaw),range);
+  const double clearance=bodyFieldClearance(pos,yaw,range);
   const double deficit=range-clearance;
   return deficit*deficit/margin;
 }

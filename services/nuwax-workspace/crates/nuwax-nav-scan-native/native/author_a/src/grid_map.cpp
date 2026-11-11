@@ -132,6 +132,17 @@ double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw) const {
   return clearance;
 }
 
+double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw,double upper_bound) const {
+  const double c=std::cos(yaw),s=std::sin(yaw);
+  const double x=mp_.body_center_offset_.x(),y=mp_.body_center_offset_.y();
+  const double radius=std::hypot(mp_.body_length_/2.,mp_.body_width_/2.);
+  // 距离变化不超过位移；另留一格覆盖双线性插值误差。
+  if(fieldDistance(pos.x()+c*x-s*y,pos.y()+s*x+c*y)>=radius+upper_bound+mp_.resolution_)
+    return upper_bound;
+  // 原查询作为首项，保留非有限试探的NaN传播。
+  return std::min(bodyFieldClearance(pos,yaw),upper_bound);
+}
+
 void GridMap::initMap(ros::NodeHandle &nh)
 {
   node_ = nh;

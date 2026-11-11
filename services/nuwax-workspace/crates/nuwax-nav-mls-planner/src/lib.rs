@@ -30,6 +30,7 @@ pub mod edges;
 pub mod mls_planner;
 pub mod nodes;
 pub mod surface;
+pub mod surface_chunks;
 pub mod surfaces;
 pub mod voxel;
 

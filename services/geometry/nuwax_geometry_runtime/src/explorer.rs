@@ -12,7 +12,7 @@ use nuwax_exploration::{
 };
 use nuwax_explore_wavefront::WavefrontConfig;
 use nuwax_nav_mls_planner::{
-    SurfaceMapBuilder, SurfaceObservation, SurfaceObservations, SurfaceSnapshot,
+    SurfaceMapBuilder, SurfaceObservations, SurfaceSnapshot,
 };
 use nuwax_nav_stack::surface_config::SurfaceNavigationConfig;
 use nuwax_nav_types_messages::frames::NavFrameId;
@@ -922,55 +922,47 @@ fn coverage(grid: &OccupancyGrid2D, boundary: Option<&ExplorationBoundary>) -> f
     }
 }
 
-/// 本地读取完整精细地图，保留原生高度场记录和真实观察证据后交原表面构建器。
-pub fn build_surface_input(
-    map: Arc<nuwax_map_chunks::SealedMap>,
-) -> Result<Arc<SurfaceSnapshot>, String> {
-    use std::collections::BTreeMap;
-    let config = SurfaceNavigationConfig::from_runtime().map_err(|e| e.to_string())?;
-    let root = map.manifest();
-    let mut reader = nuwax_map_chunks::Receiver::new(map.repository.clone());
-    let mut observations =
-        SurfaceObservations::new(root.voxel_size_m, 32).map_err(|e| e.to_string())?;
-    let mut groups: BTreeMap<[i32; 2], Vec<([i32; 3], nuwax_map_chunks::GroundRecords)>> =
-        BTreeMap::new();
-    let mut points = Vec::new();
-    for reference in &root.blocks {
-        let (block, records) = reader.ground_parts(reference)?;
-        let mut values = BTreeMap::new();
-        for (&local, evidence) in block.iter() {
-            let key = nuwax_map_chunks::global_key(reference.key, local)?;
-            let xyz = key.map(|v| ((f64::from(v) + 0.5) * f64::from(root.voxel_size_m)) as f32);
-            points.push((xyz[0], xyz[1], xyz[2]));
-            values.insert(
-                key,
-                SurfaceObservation {
-                    observed_ns: evidence.observed_ns,
-                    hits: evidence.hits,
-                },
-            );
-        }
-        observations
-            .replace_block(reference.key, values)
-            .map_err(|e| e.to_string())?;
-        groups
-            .entry([reference.key[0], reference.key[1]])
-            .or_default()
-            .push((reference.key, records));
+/// 探索线程持有的表面构建器，保存上一封图根和观测。
+pub struct SurfaceInputBuilder {
+    builder: SurfaceMapBuilder,
+    planner_size: f32,
+    previous: Option<(Arc<nuwax_map_chunks::Manifest>, Arc<SurfaceObservations>)>,
+}
+
+impl SurfaceInputBuilder {
+    /// 捕获探索使用的几何配置和机体能力。
+    pub fn new() -> Result<Self, String> {
+        let config = SurfaceNavigationConfig::from_runtime().map_err(|e| e.to_string())?;
+        Ok(Self {
+            planner_size: config.geometry.voxel_size,
+            builder: SurfaceMapBuilder::configured(config.geometry, Some(config.body_envelope)),
+            previous: None,
+        })
     }
-    for (xy, records) in groups {
-        observations.replace_heightfield_columns(xy, &records);
+
+    /// 与导航共用封图差分，只替换变化的观测块和规划列。
+    pub fn build(
+        &mut self,
+        map: Arc<nuwax_map_chunks::SealedMap>,
+    ) -> Result<Arc<SurfaceSnapshot>, String> {
+        let root = map.manifest();
+        let previous = self.previous.as_ref().filter(|(old, _)| {
+            old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
+        });
+        let mut reader = nuwax_map_chunks::Receiver::new(map.repository.clone());
+        let (observations, _) = nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
+            &mut reader, root, previous.map(|(old, grid)| (old.as_ref(), grid)),
+        )?;
+        let (updates, read_points) = nuwax_nav_mls_planner::surface_chunks::column_updates(
+            &mut reader, root, previous.map(|(old, _)| old.as_ref()),
+            self.planner_size,
+        )?;
+        let snapshot = self.builder.build_column_updates(
+            &updates, root.voxel_size_m, previous.is_none(), read_points,
+        ).map_err(|e| e.to_string())?.snapshot;
+        self.previous = Some((Arc::clone(root), Arc::clone(&observations)));
+        Ok(Arc::new(snapshot.with_observations(Some(observations))))
     }
-    observations.mark_complete_geometry_source();
-    let mut builder =
-        SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
-    let snapshot = builder
-        .build(&points, root.voxel_size_m)
-        .map_err(|e| e.to_string())?
-        .snapshot;
-    Ok(Arc::new(
-        snapshot.with_observations(Some(Arc::new(observations))),
-    ))
 }
 
 /// 在已构建的物理表面叠加当前地图禁区；文件变化只改变下一次规划输入。

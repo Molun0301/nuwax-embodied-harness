@@ -1959,6 +1959,21 @@ goal: schema::PoseStamped {
             .unwrap_or_else(|_| panic!("完整三维路径未实际执行: {:?}", self.scheduler.status()));
         }
 
+        async fn wait_local_stop_or_reverse(&self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let status=self.scheduler.status();
+                    let safe=status.last_applied_twist.is_some_and(|twist| {
+                        (twist==Twist2::ZERO && status.message.contains("重规划"))
+                            || (twist.linear.x<0. && twist.linear.x>=-0.04
+                                && twist.linear.y==0. && twist.angular_z==0.)
+                    });
+                    if status.phase==SchedulerPhase::Controlling && safe {break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap_or_else(|_|panic!("物理占据后应停车重规划或执行已证明的低速倒退：{:?}",self.scheduler.status()));
+        }
+
         async fn wait_local_zero(&self){
             tokio::time::timeout(Duration::from_secs(3),async{
                 loop{let status=self.scheduler.status();
@@ -2599,7 +2614,7 @@ goal: schema::PoseStamped {
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
         assert_eq!(starts.lock().unwrap().len(), 1, "新图不能触发全程重复检查和搜索");
         harness.feed.lock().unwrap().position[0] = 1.85;
-        harness.wait_local_zero().await;
+        harness.wait_local_stop_or_reverse().await;
         assert_eq!(starts.lock().unwrap().len(),1,"局部受阻由局部规划线程处理，保留全局路线身份");
         assert_eq!(harness.scheduler.status().path_revision,1);
         assert!(harness.scheduler.status().pose_source_timestamp_ns>0);
@@ -2728,7 +2743,7 @@ goal: schema::PoseStamped {
         first.path_for(&pending).await;
         first.wait_controlling().await;
 
-        // 同域的新点云新增真实占据冲突，实际执行先零速等待；清障后连续重规划。
+        // 同域真实占据冲突允许经证明低速倒退；清障后连续重规划。
         // 缺测本身不是障碍，不能只删除地面采样就要求执行端宣告阻塞。
         let original = first.feed.lock().unwrap().map.cloud.clone();
         {
@@ -2739,11 +2754,10 @@ goal: schema::PoseStamped {
             feed.map.cloud.width = (feed.map.cloud.data.len() / 12) as i32;
             feed.map.cloud.row_step = feed.map.cloud.data.len() as i32;
         }
-        first.wait_local_zero().await;
-        assert_eq!(
-            first.scheduler.status().last_applied_twist,
-            Some(Twist2::ZERO)
-        );
+        first.wait_local_stop_or_reverse().await;
+        let action=first.scheduler.status().last_applied_twist.unwrap();
+        assert!(action.linear.x>=-0.04 && action.linear.x<=0.
+            && action.linear.y==0. && action.angular_z==0.);
         assert!(first.scheduler.status().last_terminal.is_none());
         {
             let mut feed = first.feed.lock().unwrap();

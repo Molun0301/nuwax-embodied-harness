@@ -240,6 +240,12 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
     const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
+    if(s.escape.hasDecision(state->timestamp_ns)) {
+      s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,
+          state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
+      s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
+      out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
+    }
     const int occupied=s.map.getInflateOccupancy(position,yaw);
     if(occupied!=0) {
       s.escape.observeOverlap();

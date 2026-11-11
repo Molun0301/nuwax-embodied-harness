@@ -872,7 +872,7 @@ mod native_execution_tests {
     }
 
     #[test]
-    fn n6_20_same_goal_route_keeps_fault_and_new_goal_reopens_escape() {
+    fn n6_20_same_goal_route_keeps_same_source_stop_and_new_goal_reopens_escape() {
         let (config, source) = crate::native_test_helpers::fixture();
         let mut follower = SurfaceFollower::new(config).unwrap();
         let goal = pose(3., 1., 0.);
@@ -897,16 +897,16 @@ mod native_execution_tests {
             None, goal.clone(),
         ).unwrap();
         motion.position = initial;
-        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message);
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().command, [0.; 3]);
         follower.stop();
-        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
-            "同目标请求重规划也会调用stop，不能借此解除故障锁");
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().command, [0.; 3],
+            "同目标请求重规划也会调用stop，同源仍只停车");
         follower.invalidate_execution_map();
-        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
-            "同目标地图退休不能借重建跟踪器解除故障锁");
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().command, [0.; 3],
+            "同目标地图退休不能借重建跟踪器重复输出动作");
         follower.observe_registered_frame(Some(crate::registered_frame::test_frame(1)));
-        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err().message, fault.message,
-            "同目标注册帧来源变化也保留故障锁");
+        assert_eq!(follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().command, [0.; 3],
+            "同目标注册帧来源变化后同源仍只停车");
         follower.configure_goal(&goal, GoalOptions::default()).unwrap();
         assert!(!follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().recovery_samples.is_empty());
     }

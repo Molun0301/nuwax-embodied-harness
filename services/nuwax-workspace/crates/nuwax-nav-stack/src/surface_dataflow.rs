@@ -814,6 +814,16 @@ async fn run_surface_planner_with_computer(
 
 #[cfg(test)]
 mod tests {
+    mod test_source { include!("surface_test_source.rs"); }
+    use test_source::{FixtureSurfaceCache as SurfaceGeometryCache, FineFixtureSource};
+
+    fn prepare_surface_map(message: impl Into<Arc<schema::NavigationMap3D>>, received_at: Instant,
+        config: &SurfaceNavigationConfig, cache: &mut SurfaceGeometryCache) -> PreparedSurfaceMap {
+        let message=message.into();
+        let fine=cache.source.message(&message);
+        super::prepare_surface_map(fine,received_at,config,&mut cache.inner)
+    }
+
     mod replan_feedback_tests { include!("surface_replan_feedback_tests.rs"); }
     mod mask_reuse_tests { include!("surface_mask_reuse_tests.rs"); }
     mod mask_work_tests { include!("surface_mask_work_tests.rs"); }
@@ -1171,6 +1181,10 @@ mod tests {
         geometry.wall_buffer_m = 0.0;
         geometry.wall_buffer_weight = 0.0;
         let map = SurfaceSnapshot::from_points(&[(0.55,0.55,0.05)], geometry, 0.1).unwrap();
+        let mut observations=nuwax_nav_mls_planner::SurfaceObservations::new(0.1,32).unwrap();
+        observations.replace_block([0,0,0], [([5,5,0],nuwax_nav_mls_planner::SurfaceObservation {observed_ns:1,hits:1})].into()).unwrap();
+        observations.mark_complete_geometry_source();
+        let map=map.with_observations(Some(Arc::new(observations)));
         let standing = PoseStamped { frame_id: nuwax_nav_types_messages::NavFrameId::Map, stamp: Default::default(), pose: Pose3 { position: Point3::new(0.55, 0.55, 0.5), orientation: Quaternion::IDENTITY } };
         let mut lying = standing.clone(); lying.pose.position.z = 0.2;
         let placed = place_surface_start(&map, &standing, &config.body_envelope);
@@ -1377,7 +1391,12 @@ goal: schema::PoseStamped {
         assert_eq!(observed_first.observations().unwrap().get([40,30,40]), Some(old_evidence));
         let points:Vec<_>=cells.iter().map(|c|((c[0] as f32+0.5)*0.05,(c[1] as f32+0.5)*0.05,(c[2] as f32+0.5)*0.05)).collect();
         let full=nuwax_nav_mls_planner::SurfaceSnapshot::from_points(&points,configured.geometry,0.05).unwrap();
-        assert_eq!(next.cell_keys().collect::<BTreeSet<_>>(),full.cell_keys().collect());
+        assert_eq!(next.navigation_height_columns().collect::<BTreeMap<_,_>>(),
+            full.navigation_height_columns().collect::<BTreeMap<_,_>>());
+        {
+            let next=test_source::full_surface_fixture(&next);
+            assert_eq!(next.cell_keys().collect::<BTreeSet<_>>(),full.cell_keys().collect());
+        }
         for goal in [[0.8,0.8,2.05],[3.2,2.2,2.05],[2.025,1.525,2.05]] {
             assert_eq!(native_ground_route(&next,[0.55,1.55,2.05],goal),native_ground_route(&full,[0.55,1.55,2.05],goal));
         }
@@ -1442,39 +1461,7 @@ goal: schema::PoseStamped {
         assert_eq!(cache.last_build_stats().unwrap().kind, SurfaceBuildKind::Full);
     }
 
-    #[test]
-    fn production_derived_surface_carries_deferred_frontier_updates() {
-        let configured = config();
-        let mut cache = SurfaceGeometryCache::new(configured.geometry.clone());
-        let mut first_message = map_message(1, "map");
-        first_message.virtual_obstacles = Some(virtual_mask(&first_message, false));
-        let first = prepare_surface_map(first_message, Instant::now(), &configured, &mut cache)
-            .snapshot
-            .unwrap();
-        first.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap();
-        let old_stats = first.frontier_cache_stats().unwrap();
-        let mut changed = map_message(2, "map");
-        changed.virtual_obstacles = Some(virtual_mask(&changed, false));
-        for value in [3.55_f32, 0.55, 2.35] {
-            changed.cloud.data.extend_from_slice(&value.to_le_bytes());
-        }
-        changed.cloud.width += 1;
-        changed.cloud.row_step += 12;
-        let next = prepare_surface_map(changed.clone(), Instant::now(), &configured, &mut cache)
-            .snapshot
-            .unwrap();
-        assert!(next.frontier_cache_stats().is_none());
-        let mut fresh_cache = SurfaceGeometryCache::new(configured.geometry.clone());
-        let full = prepare_surface_map(changed, Instant::now(), &configured, &mut fresh_cache)
-            .snapshot
-            .unwrap();
-        assert_eq!(
-            next.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap(),
-            full.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap()
-        );
-        assert!(next.frontier_cache_stats().unwrap().incremental);
-        assert_eq!(first.frontier_cache_stats(), Some(old_stats));
-    }
+
 
     #[test]
     fn virtual_mask_is_applied_to_the_surface_and_cache_ignores_only_its_clock() {
@@ -1526,19 +1513,7 @@ goal: schema::PoseStamped {
         assert!(native_ground_route(&cleared_mask,[0.55,1.55,2.1],[3.05,1.55,2.1]));
     }
 
-    #[test]
-    fn fullcloud_publication_reuses_only_after_exact_builder_change_detection() {
-        let mut cache = SurfaceGeometryCache::new(config().geometry);
-        let first = map_message(1, "legacy-fullcloud");
-        let old = cache.build(&first).unwrap();
-        assert!(Arc::ptr_eq(&old, &cache.build(&first).unwrap()));
-        assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
-        let second = map_message(2, "legacy-fullcloud");
-        let next = cache.build(&second).unwrap();
-        assert!(Arc::ptr_eq(&old, &next));
-        assert_eq!(cache.last_build_stats().unwrap().kind, nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
-        assert_eq!(cache.last_build_stats().unwrap().input_points, 40 * 30);
-    }
+
 
     #[test]
     fn generated_body_path_does_not_turn_quantization_duplicates_into_vertical_motion() {
@@ -1666,6 +1641,7 @@ goal: schema::PoseStamped {
     }
 
     struct FeedState {
+        source: FineFixtureSource,
         map: schema::NavigationMap3D,
         map_enabled: bool,
         frozen_pose_stamp: Option<i64>,
@@ -1743,7 +1719,7 @@ goal: schema::PoseStamped {
             .await
             .unwrap();
             let hub = SurfaceMapHub::new(Arc::from("base_link"));
-            let map_computer = map_computer.unwrap_or_else(|| Arc::new(prepare_surface_map));
+            let map_computer = map_computer.unwrap_or_else(|| Arc::new(super::prepare_surface_map));
             let planner_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let planner_hub = hub.clone();
             let planner_spec = planner_node.clone();
@@ -1768,6 +1744,7 @@ goal: schema::PoseStamped {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let motion_calls = Arc::clone(&calls);
             let initial_position = [0.55, 1.55, 2.5];
+            let fixture_geometry = configured.geometry.clone();
             let scheduler_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let scheduler_hub = hub.clone();
             let scheduler_spec = scheduler_node.clone();
@@ -1787,6 +1764,7 @@ goal: schema::PoseStamped {
             ).unwrap();
             let scheduler = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
             let feed = Arc::new(Mutex::new(FeedState {
+                source: FineFixtureSource::new(fixture_geometry),
                 map: map_message(1, "first-map"),
                 map_enabled: true,
                 frozen_pose_stamp: None,
@@ -1856,7 +1834,7 @@ goal: schema::PoseStamped {
                             }
                             let map = state.map.clone();
                             state.last_published = Some(map.clone());
-                            Some(map)
+                            Some(state.source.message(&map))
                         } else {
                             None
                         };
@@ -1956,11 +1934,12 @@ goal: schema::PoseStamped {
             .unwrap();
         }
         async fn map(&self, map: &schema::NavigationMap3D) {
+            let map = self.feed.lock().unwrap().source.message(map);
             publish_body(
                 &self.transport,
                 &self.planner_node.inputs[0],
                 "nuwax_msgs.NavigationMap3D",
-                schema::encode_navigation_map_3d_body(map).unwrap(),
+                schema::encode_navigation_map_3d_body(&map).unwrap(),
             )
             .await
             .unwrap();

@@ -456,7 +456,7 @@ pub struct NavigationMap3D {
     pub virtual_obstacles: Option<OccupancyGrid>,
     /// 固定精度完整根；有该字段时不另携带全量云。
     pub fine: Option<nuwax_map_chunks::Transfer>,
-    /// 位于地图坐标系的三维点云。
+    /// 保留消息头与空载荷占位，不承载全点云输入。
     pub cloud: PointCloud2,
 }
 
@@ -478,10 +478,10 @@ fn validate_navigation_map_3d_with_root(
         return Err("NavigationMap3D revision must be positive".into());
     }
     if !message.cleared
-        && (!message.source_voxel_size.is_finite() || message.source_voxel_size <= 0.0
+        && (message.fine.is_none() || !message.source_voxel_size.is_finite() || message.source_voxel_size <= 0.0
             || message.source_timestamp_ns <= 0)
     {
-        return Err("NavigationMap3D requires valid voxel size and source time".into());
+        return Err("NavigationMap3D requires fine root, valid voxel size and source time".into());
     }
     let header = &message.cloud.header;
     if header.frame_id != message.frame_id || header.stamp_sec < 0
@@ -652,44 +652,7 @@ fn navigation_map_3d_coordinate(cloud: &PointCloud2, offset: usize, bytes: usize
 }
 
 /// 校验消息并按真实布局提取单精度三维点；清空返回空列表，非法缩窄明确拒绝。
-pub fn navigation_map_3d_points(message: &NavigationMap3D) -> CodecResult<Vec<(f32, f32, f32)>> {
-    validate_navigation_map_3d(message).map_err(CodecError::LcmDecode)?;
-    if message.fine.is_some() { return Err(CodecError::LcmDecode("精细地图必须先完成缺片补取，再按空间范围读取".into())); }
-    if message.cleared {
-        return Ok(Vec::new());
-    }
-    let cloud = &message.cloud;
-    let axes = ["x", "y", "z"].map(|name| {
-        let field = cloud
-            .fields
-            .iter()
-            .find(|field| field.name == name)
-            .expect("消息校验已确认唯一三维字段");
-        (
-            field.offset as usize,
-            if field.datatype == 7 { 4 } else { 8 },
-        )
-    });
-    let count = (cloud.height as usize)
-        .checked_mul(cloud.width as usize)
-        .ok_or_else(|| CodecError::LcmDecode("NavigationMap3D point count exceeds usize".into()))?;
-    let mut points = Vec::with_capacity(count);
-    for row in 0..cloud.height as usize {
-        for col in 0..cloud.width as usize {
-            let base = row * cloud.row_step as usize + col * cloud.point_step as usize;
-            let xyz = axes.map(|(offset, bytes)| {
-                navigation_map_3d_coordinate(cloud, base + offset, bytes) as f32
-            });
-            if !xyz.iter().all(|value| value.is_finite()) {
-                return Err(CodecError::LcmDecode(
-                    "NavigationMap3D XYZ conversion to float32 must remain finite".into(),
-                ));
-            }
-            points.push((xyz[0], xyz[1], xyz[2]));
-        }
-    }
-    Ok(points)
-}
+
 
 /// 编码包含真实LCM指纹的三维导航地图。
 pub fn encode_navigation_map_3d(message: &NavigationMap3D) -> CodecResult<Vec<u8>> {
@@ -2045,7 +2008,7 @@ mod navigation_map_3d_tests {
     use super::*;
 
     fn live_map() -> NavigationMap3D {
-        NavigationMap3D {
+        let mut message = NavigationMap3D {
             session_id: "mapping:test".into(), frame_id: "robot/map".into(),
 
             revision: 17,
@@ -2080,30 +2043,22 @@ mod navigation_map_3d_tests {
                 ..PointCloud2::default()
             },
             ..NavigationMap3D::default()
-        }
+        };
+        let root = nuwax_map_chunks::Manifest {
+            source_watermarks: Vec::new(), version:4, domain:navigation_map_3d_domain(&message),
+            revision:17, geometry_revision:17, source_timestamp_ns:message.source_timestamp_ns as u64,
+            voxel_size_m:message.source_voxel_size, blocks:Vec::new(),
+        };
+        message.fine=Some(nuwax_map_chunks::Transfer {root:root.encode().unwrap(),repository_path:"fixture-blocks".into()});
+        message.cloud.width=0;message.cloud.row_step=0;message.cloud.data.clear();message
     }
 
-    #[test]
-    #[ignore = "release codec allocation/copy timing diagnostic"]
-    fn navigation_nested_cloud_decode_cost() {
-        let mut message = live_map();
-        message.cloud.width = 100_000;
-        message.cloud.row_step = message.cloud.width * message.cloud.point_step;
-        message.cloud.data = vec![0; message.cloud.row_step as usize];
-        let wire = encode_navigation_map_3d(&message).unwrap();
-        assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
-        let iterations = 2_000;
-        let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            std::hint::black_box(decode_navigation_map_3d(std::hint::black_box(&wire)).unwrap());
-        }
-        eprintln!("navigation_nested_cloud iterations={iterations} data_bytes={} elapsed_ms={:.3}",
-            message.cloud.data.len(), start.elapsed().as_secs_f64() * 1000.0);
-    }
+
 
     fn cleared_map() -> NavigationMap3D {
         let mut message = live_map();
         message.cleared = true;
+        message.fine = None;
 
         message.source_timestamp_ns = 0;
 
@@ -2246,11 +2201,6 @@ mod navigation_map_3d_tests {
         let message_type =
             nuwax_protocol::LcmMessageType::new("nuwax_msgs.NavigationMap3D").unwrap();
         assert_eq!(message_type.fingerprint(), NAVIGATION_MAP_3D_FINGERPRINT);
-        assert_eq!(
-            navigation_map_3d_points(&live_map()).unwrap(),
-            vec![(1.0, -2.0, 3.0), (4.0, 5.0, 6.0)]
-        );
-        assert!(navigation_map_3d_points(&cleared_map()).unwrap().is_empty());
         for message in [live_map(), cleared_map()] {
             let wire = encode_navigation_map_3d(&message).unwrap();
             let body = encode_navigation_map_3d_body(&message).unwrap();
@@ -2303,74 +2253,9 @@ mod navigation_map_3d_tests {
         }
     }
 
-    #[test]
-    fn invalid_layout_and_nonfinite_coordinates_are_rejected() {
-        let mutations: &[fn(&mut NavigationMap3D)] = &[
-            |m| m.cloud.width = 0,
-            |m| m.cloud.height = -1,
-            |m| m.cloud.row_step = 23,
-            |m| m.cloud.point_step = 8,
-            |m| {
-                m.cloud.data.pop();
-            },
-            |m| m.cloud.fields.pop().map(|_| ()).unwrap(),
-            |m| m.cloud.fields[1].name = "x".into(),
-            |m| m.cloud.fields[1].offset = 0,
-            |m| m.cloud.fields[2].count = 2,
-            |m| m.cloud.fields[0].datatype = 5,
-            |m| m.cloud.fields[0].offset = -1,
-            |m| m.cloud.fields[0].count = i32::MAX,
-            |m| m.cloud.data[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
-            |m| {
-                m.cloud.is_dense = false;
-                m.cloud.data[20..24].copy_from_slice(&f32::INFINITY.to_le_bytes());
-            },
-        ];
-        for (index, mutate) in mutations.iter().enumerate() {
-            let mut message = live_map();
-            mutate(&mut message);
-            assert!(
-                validate_navigation_map_3d(&message).is_err(),
-                "非法布局用例{index}"
-            );
-        }
-    }
 
-    #[test]
-    fn float64_big_endian_and_padded_rows_are_supported() {
-        let mut message = live_map();
-        message.cloud.width = 1;
-        message.cloud.height = 2;
-        message.cloud.point_step = 24;
-        message.cloud.row_step = 32;
-        message.cloud.is_bigendian = true;
-        for (index, field) in message.cloud.fields.iter_mut().enumerate() {
-            field.offset = [16, 0, 8][index];
-            field.datatype = 8;
-        }
-        message.cloud.fields.reverse();
-        message.cloud.data = [1.0_f64, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0]
-            .iter()
-            .flat_map(|value| value.to_be_bytes())
-            .collect();
-        let wire = encode_navigation_map_3d(&message).unwrap();
-        assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
-        assert_eq!(
-            navigation_map_3d_points(&message).unwrap(),
-            vec![(3.0, 1.0, 2.0), (6.0, 4.0, 5.0)]
-        );
-        for finite_but_too_large in [f64::MAX, -f64::MAX] {
-            message.cloud.data[32..40].copy_from_slice(&finite_but_too_large.to_be_bytes());
-            assert!(validate_navigation_map_3d(&message).is_ok());
-            assert!(navigation_map_3d_points(&message)
-                .unwrap_err()
-                .to_string()
-                .contains("float32"));
-        }
-        message.cloud.data[32..40].copy_from_slice(&f64::INFINITY.to_be_bytes());
-        assert!(validate_navigation_map_3d(&message).is_err());
-        assert!(navigation_map_3d_points(&message).is_err());
-    }
+
+
 
     #[test]
     fn truncated_trailing_and_invalid_clear_flag_wires_are_rejected() {
@@ -2386,7 +2271,8 @@ mod navigation_map_3d_tests {
         corrupted.push(0);
         assert!(decode_navigation_map_3d(&corrupted).is_err());
         let clear_offset = wire.len()
-            - 10 // 空精细根标志、根长度和空目录字符串。
+            - (1 + 4 + message.fine.as_ref().unwrap().root.len()
+                + 4 + message.fine.as_ref().unwrap().repository_path.len() + 1)
             - encode_point_cloud2_body(&message.cloud).unwrap().len()
             - encode_occupancy_grid_body(&OccupancyGrid::default())
                 .unwrap()
@@ -2415,7 +2301,6 @@ mod navigation_map_3d_tests {
             let message = fine_map(object);
             let wire = encode_navigation_map_3d(&message).unwrap();
             assert_eq!(decode_navigation_map_3d(&wire).unwrap(), message);
-            assert!(navigation_map_3d_points(&message).is_err());
             let mut corrupted = message.clone();
             corrupted.session_id.push_str("-foreign");
             assert!(validate_navigation_map_3d(&corrupted).is_err());

@@ -58,6 +58,9 @@ pub struct SurfaceMapBuilder {
     current: Option<Arc<SurfaceSnapshot>>,
 }
 
+type SurfaceProduct = fn(&SurfaceMapBuilder, ColumnIz, HeightBounds, &[(i32,i32)], f32, i32, i32, usize, bool)
+    -> Result<(SurfaceSnapshot,usize,usize,bool),SurfaceError>;
+
 impl SurfaceMapBuilder {
     /// 捕获本拥有方的固定物理配置，实际输入时校验精度与计算预算。
     pub fn new(config: Config) -> Self {
@@ -128,6 +131,7 @@ impl SurfaceMapBuilder {
             source_voxel_size_m,
             points.len(),
             count,
+            Self::graph_product,
         )?;
         let snapshot = result
             .snapshot
@@ -149,16 +153,29 @@ impl SurfaceMapBuilder {
         Ok(result)
     }
 
+    /// 完整图产物；几何探索调用此入口。
+    pub fn build_column_updates(&mut self, updates: &[SurfaceColumnUpdate], source_voxel_size_m: f32,
+        reset: bool, input_points: usize) -> Result<SurfaceMapBuild, SurfaceError> {
+        self.build_updates(updates, source_voxel_size_m, reset, input_points, Self::graph_product)
+    }
+
+    /// 导航列产物：保留占据与高度，不构造单元、边、墙距离或方向代价。
+    pub fn build_column_data(&mut self, updates: &[SurfaceColumnUpdate], source_voxel_size_m: f32,
+        reset: bool, input_points: usize) -> Result<SurfaceMapBuild, SurfaceError> {
+        self.build_updates(updates, source_voxel_size_m, reset, input_points, Self::column_product)
+    }
+
     /// 适配由同一完整根导出的脏列。重置用于首次输入、切域和精度变化。
     /// 校验和候选构建失败均不推进基线；调用者只在成功后记录根。
     /// 空的完整根或删除最后一列是有效的未知地图。调用者必须先验证根的完整性与域；
     /// 这不把缺帧、清空事件或损坏点云转成有效输入。
-    pub fn build_column_updates(
+    fn build_updates(
         &mut self,
         updates: &[SurfaceColumnUpdate],
         source_voxel_size_m: f32,
         reset: bool,
         input_points: usize,
+        product: SurfaceProduct,
     ) -> Result<SurfaceMapBuild, SurfaceError> {
         validate_config(&self.config, source_voxel_size_m)?;
         let previous = self.current.as_ref().filter(|_| !reset);
@@ -237,6 +254,7 @@ impl SurfaceMapBuilder {
                 source_voxel_size_m,
                 input_points,
                 count,
+                product,
             );
             if result.is_err() {
                 self.current = old;
@@ -250,6 +268,7 @@ impl SurfaceMapBuilder {
                 source_voxel_size_m,
                 input_points,
                 count,
+                product,
             )
         }
     }
@@ -262,6 +281,7 @@ impl SurfaceMapBuilder {
         source_voxel_size_m: f32,
         input_points: usize,
         occupied_voxels: usize,
+        product: SurfaceProduct,
     ) -> Result<SurfaceMapBuild, SurfaceError> {
         let (profile_cells, candidate_step_cells) =
             validate_config(&self.config, source_voxel_size_m)?;
@@ -290,27 +310,9 @@ impl SurfaceMapBuilder {
         let work = changes.len().saturating_mul(1 + 4 * reach as usize);
         let local_budget = (columns.len() / 2).max(64).min(200_000);
         let incremental = same_precision && work <= local_budget;
-        let (snapshot, changed_surface_cells, checked_cells, global_cost_refresh) = if incremental {
-            update_columns(
-                self.current.as_ref().expect("已确认基线"),
-                columns,
-                heights,
-                &changes,
-                profile_cells,
-                candidate_step_cells,
-                occupied_voxels,
-            )?
-        } else {
-            let snapshot = from_columns(
-                columns,
-                heights,
-                self.config.clone(),
-                source_voxel_size_m,
-                self.body.as_ref(),
-            )?;
-            let count = snapshot.data.graph.cells.ids().count();
-            (snapshot, count, count, true)
-        };
+        let (snapshot, changed_surface_cells, checked_cells, global_cost_refresh) = product(
+            self, columns, heights, &changes, source_voxel_size_m, profile_cells,
+            candidate_step_cells, occupied_voxels, incremental)?;
         let snapshot = Arc::new(snapshot);
         let stats = SurfaceBuildStats {
             kind: if incremental {
@@ -331,6 +333,40 @@ impl SurfaceMapBuilder {
             stats,
         })
     }
+    fn graph_product(&self, columns: ColumnIz, heights: HeightBounds, changes: &[(i32,i32)],
+        source_voxel_size_m: f32, profile_cells: i32, candidate_step_cells: i32,
+        occupied_voxels: usize, incremental: bool) -> Result<(SurfaceSnapshot,usize,usize,bool),SurfaceError> {
+        Ok(if incremental {
+            update_columns(
+                self.current.as_ref().expect("已确认基线"),
+                columns,
+                heights,
+                changes,
+                profile_cells,
+                candidate_step_cells,
+                occupied_voxels,
+            )?
+        } else {
+            let snapshot = from_columns(
+                columns,
+                heights,
+                self.config.clone(),
+                source_voxel_size_m,
+                self.body.as_ref(),
+            )?;
+            let count = snapshot.data.graph.cells.ids().count();
+            (snapshot, count, count, true)
+        })
+    }
+
+    fn column_product(&self, columns: ColumnIz, heights: HeightBounds, _changes: &[(i32,i32)],
+        source_voxel_size_m: f32, profile_cells: i32, candidate_step_cells: i32,
+        occupied_voxels: usize, _incremental: bool) -> Result<(SurfaceSnapshot,usize,usize,bool),SurfaceError> {
+        let snapshot = snapshot_columns(columns, heights, self.config.clone(), source_voxel_size_m,
+            self.body.as_ref(), Arc::new(PlannerGraph::new()), occupied_voxels, profile_cells, candidate_step_cells);
+        Ok((snapshot,0,0,false))
+    }
+
 }
 
 pub(super) fn voxel_columns(
@@ -497,7 +533,14 @@ pub(super) fn from_columns(
     }
     let graph = Arc::new(graph);
     let occupied_voxels = columns.values().map(Vec::len).sum();
-    Ok(SurfaceSnapshot {
+    Ok(snapshot_columns(columns, heights, config, source_voxel_size_m, model, graph,
+        occupied_voxels, profile_cells, candidate_step_cells))
+}
+
+fn snapshot_columns(columns: ColumnIz, heights: HeightBounds, config: Config,
+    source_voxel_size_m: f32, model: Option<&SurfaceBodyEnvelope>, graph: Arc<PlannerGraph>,
+    occupied_voxels: usize, profile_cells: i32, candidate_step_cells: i32) -> SurfaceSnapshot {
+    SurfaceSnapshot {
         navigation_measurements: None,
         ground_evidence:GroundEvidence::MeasuredSurface,
         recent_obstacles:None,
@@ -519,7 +562,7 @@ pub(super) fn from_columns(
             profile_cells,
             candidate_step_cells,
         }),
-    })
+    }
 }
 
 fn update_columns(

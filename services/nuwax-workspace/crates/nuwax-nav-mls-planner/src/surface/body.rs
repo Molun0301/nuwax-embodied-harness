@@ -2888,15 +2888,7 @@ impl SurfaceSnapshot {
                     .expect("有效地面带").representative_z).collect();
             if !heights.is_empty() || observations.is_complete_geometry_source() { return heights; }
         }
-        let size = f64::from(self.config().voxel_size);
-        let x = (xy[0] / size).floor() as i32;
-        let y = (xy[1] / size).floor() as i32;
-        self.data.physical_graph.surface_lookup.get(&(x, y)).into_iter().flatten().filter_map(|&z| {
-            let top = self.ground_cell_position((x, y, z))[2];
-            let quantum = f64::from(self.source_voxel_size_m());
-            let bottom = self.observed_support_lower_bound((x, y, z)).min(top - quantum);
-            GroundLayer::from_legacy_band([bottom, top], quantum, self.ground_evidence).map(|layer| layer.representative_z)
-        }).collect()
+        Vec::new()
     }
 
     fn direct_ground_query_selected(&self,xy:[f64;2],reference:f64,selected:Option<GroundKey>,

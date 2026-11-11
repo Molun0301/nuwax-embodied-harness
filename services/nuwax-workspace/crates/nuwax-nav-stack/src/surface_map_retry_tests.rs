@@ -50,7 +50,7 @@ impl Probe {
                     geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown),
                 };
             }
-            prepare_surface_map(message, received_at, config, cache)
+            super::super::prepare_surface_map(message, received_at, config, cache)
         })
     }
     fn count(&self, revision: i64) -> usize {

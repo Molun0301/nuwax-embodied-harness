@@ -45,7 +45,7 @@ fn flat_message(width: i32, height: i32, session: &str) -> schema::NavigationMap
     mask.info.height = height;
     mask.data = vec![0; (width * height) as usize];
     message.virtual_obstacles = Some(mask);
-    schema::validate_navigation_map_3d(&message).unwrap();
+    schema::validate_navigation_map_3d(&FineFixtureSource::new(config().geometry).message(&message)).unwrap();
     message
 }
 
@@ -126,7 +126,11 @@ fn assert_current_message_oracle(
 ) {
     let cold_config = calibrated_config();
     let cold = SurfaceGeometryCache::configured(&cold_config).build(message).unwrap();
-    assert_eq!(actual.cell_keys().collect::<BTreeSet<_>>(), cold.cell_keys().collect());
+    {
+        let actual=super::test_source::full_surface_fixture(actual);
+        let cold=super::test_source::full_surface_fixture(&cold);
+        assert_eq!(actual.cell_keys().collect::<BTreeSet<_>>(), cold.cell_keys().collect());
+    }
     assert_eq!(canonical_columns(actual), canonical_columns(&cold));
     let actual_pct = native_input(actual).unwrap();
     let cold_pct = native_input(&cold).unwrap();
@@ -213,7 +217,7 @@ fn mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry(
                 _ => unreachable!(),
             }
         }
-        schema::validate_navigation_map_3d(&next).unwrap();
+        schema::validate_navigation_map_3d(&FineFixtureSource::new(config().geometry).message(&next)).unwrap();
         let current = cache.build(&next).unwrap();
         assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()), "{variant}");
         assert!(!old.same_geometry(&current), "{variant} must not reuse the old derived graph");
@@ -281,7 +285,7 @@ impl FineFixture {
         message.fine = Some(Transfer { root: root.encode().unwrap(), repository_path: self.repository.path().to_string_lossy().into_owned() });
         message.virtual_obstacles = Some(virtual_mask(&message, false));
         self.previous = cells.clone();
-        schema::validate_navigation_map_3d(&message).unwrap();
+        schema::validate_navigation_map_3d(&FineFixtureSource::new(config().geometry).message(&message)).unwrap();
         message
     }
 }
@@ -381,7 +385,7 @@ fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
             "session" => next_message.session_id = "replacement-domain".into(),
             _ => unreachable!(),
         }
-        schema::validate_navigation_map_3d(&next_message).unwrap();
+        schema::validate_navigation_map_3d(&FineFixtureSource::new(config().geometry).message(&next_message)).unwrap();
         let next = cache.build(&next_message).unwrap();
         assert!(!first.same_geometry(&next), "{variant}");
         assert_current_message_oracle(&next, &next_message, &configured, true);

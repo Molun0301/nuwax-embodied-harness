@@ -383,10 +383,7 @@ impl SurfaceSnapshot {
         if let Some(source)=self.observations.as_ref().filter(|o|o.is_complete_geometry_source()
             && o.size_m.to_bits()==self.source_voxel_size_m().to_bits()) {
             let size=f64::from(source.size_m);
-            return (size,Box::new(source.navigation_columns().filter(move|(column,_)| {
-                window.is_none_or(|(center,radius)|((f64::from(column[0])+0.5)*size-center[0]).abs()<=radius
-                    && ((f64::from(column[1])+0.5)*size-center[1]).abs()<=radius)
-            }).map(move|(column,levels)| {
+            return (size,Box::new(source.navigation_window_columns(window).map(move|(column,levels)| {
                 (column,levels.iter().map(|&z|[f64::from(z)*size,f64::from(z+1)*size]).collect())
             })));
         }

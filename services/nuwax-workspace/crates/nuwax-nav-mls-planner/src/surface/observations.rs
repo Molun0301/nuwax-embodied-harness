@@ -450,6 +450,29 @@ impl SurfaceObservations {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))
     }
 
+    /// 局部输入只展开与窗口相交的原观测块，同一细列只交付一次。
+    pub(super) fn navigation_window_columns(&self, window: Option<([f64; 2], f64)>)
+        -> Box<dyn Iterator<Item=([i32; 2], &[i32])> + '_> {
+        let Some((center, radius)) = window else {
+            return Box::new(self.navigation_columns());
+        };
+        let size = f64::from(self.size_m);
+        let edge = f64::from(self.block_edge) * size;
+        let mut seen = AHashSet::new();
+        Box::new(self.blocks.iter().filter(move |(block, _)| {
+            (0..2).all(|axis| {
+                let low = f64::from(block[axis]) * edge;
+                low <= center[axis] + radius && low + edge >= center[axis] - radius
+            })
+        }).flat_map(|(_, block)| block.values.keys()).filter_map(move |key| {
+            let xy = [key[0], key[1]];
+            let inside = (0..2).all(|axis|
+                ((f64::from(xy[axis]) + 0.5) * size - center[axis]).abs() <= radius);
+            (inside && seen.insert(xy)).then(||
+                (xy, self.columns[&xy].as_slice()))
+        }))
+    }
+
     /// 查询实际位置的证据，不修改时间或命中次数。
     pub fn get(&self, key: [i32; 3]) -> Option<SurfaceObservation> {
         self.blocks

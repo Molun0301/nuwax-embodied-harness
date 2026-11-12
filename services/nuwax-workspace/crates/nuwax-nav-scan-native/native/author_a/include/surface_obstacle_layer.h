@@ -8,6 +8,7 @@
 #include <map>
 #include <array>
 #include <memory>
+#include <cstring>
 #include <set>
 #include <vector>
 
@@ -64,6 +65,11 @@ class SurfaceObstacleLayer {
     std::map<Key,std::shared_ptr<Chunk>> changed;
     for(size_t i=0;i<count;++i) {
       const auto& c=columns[i];const Key key{c.x,c.y},part_key=chunk(key);
+      const auto* old=column(c.x,c.y);
+      if(old&&old->obstacles.size()==c.obstacle_count*3&&old->ground.size()==c.ground_count*3
+          &&(!c.obstacle_count||std::memcmp(old->obstacles.data(),c.obstacles,c.obstacle_count*3*sizeof(double))==0)
+          &&(!c.ground_count||std::memcmp(old->ground.data(),c.ground,c.ground_count*3*sizeof(double))==0))continue;
+      if(!old&&!c.obstacle_count&&!c.ground_count)continue;
       auto& part=changed[part_key];
       if(!part) {auto found=chunks_.find(part_key);part=found==chunks_.end()
           ?std::make_shared<Chunk>():std::make_shared<Chunk>(*found->second);}
@@ -74,6 +80,23 @@ class SurfaceObstacleLayer {
   }
   template<class F> void eachColumn(F&& function) const {
     for(const auto& [_,chunk]:chunks_)for(const auto& [xy,column]:*chunk)function(xy[0],xy[1],*column);
+  }
+  bool sameColumns(const SurfaceObstacleLayer& other,int x0,int x1,int y0,int y1) const {
+    const auto first=chunk({x0,y0}),last=chunk({x1,y1});
+    for(int bx=first[0];bx<=last[0];++bx)for(int by=first[1];by<=last[1];++by) {
+      const auto a=chunks_.find({bx,by}),b=other.chunks_.find({bx,by});
+      if(a==chunks_.end()&&b==other.chunks_.end())continue;
+      if(a!=chunks_.end()&&b!=other.chunks_.end()&&a->second==b->second)continue;
+      for(int x=std::max(x0,bx*32);x<=std::min(x1,bx*32+31);++x)
+        for(int y=std::max(y0,by*32);y<=std::min(y1,by*32+31);++y) {
+          const auto* one=column(x,y);const auto* two=other.column(x,y);
+          if(one==two)continue;
+          if(!one||!two) {if((one&&!one->bands.empty())||(two&&!two->bands.empty()))return false;continue;}
+          if(one->bands.size()!=two->bands.size()||!std::equal(one->bands.begin(),one->bands.end(),two->bands.begin(),
+              [](const Band& a,const Band& b){return a.low==b.low&&a.high==b.high;}))return false;
+        }
+    }
+    return true;
   }
   bool intersects(const Eigen::Vector3d& reference,double yaw,double padding=0.)const {
     return contacts(reference,yaw,padding,nullptr,nullptr);

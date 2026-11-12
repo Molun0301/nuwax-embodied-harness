@@ -31,8 +31,9 @@ void squaredDistanceTransform(const std::vector<double>& input,int count,
 }
 }
 
-BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
-    const SurfaceObstacleLayer* surface,const BusinessConstraintMask* business) const {
+std::shared_ptr<const BodyClearanceField> GridMap::buildClearanceField(const ScanConfig& config,
+    const SurfaceObstacleLayer* surface,const BusinessConstraintMask* business,
+    std::shared_ptr<const BodyClearanceField> previous) const {
   const int width=mp_.map_voxel_num_.x(),height=mp_.map_voxel_num_.y();
   const int min_x=mp_.map_bound_min_idx_.x(),min_y=mp_.map_bound_min_idx_.y();
   const double r=mp_.resolution_;
@@ -101,7 +102,13 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
     field.distances[index]=occupied?0.:far_squared;
     any_obstacle|=occupied;
   }
-  if(!any_obstacle){std::fill(field.distances.begin(),field.distances.end(),1e6);return field;}
+  // 直接比较本次障碍格与原场的零距离格；相同输入沿用同一不可变场。
+  if(previous&&previous->width==width&&previous->height==height
+      &&previous->origin_x==field.origin_x&&previous->origin_y==field.origin_y
+      &&previous->resolution==r&&std::equal(field.distances.begin(),field.distances.end(),
+          previous->distances.begin(),[](double next,double old){return (next==0.)==(old==0.);}))return previous;
+  if(!any_obstacle){std::fill(field.distances.begin(),field.distances.end(),1e6);
+    return std::make_shared<const BodyClearanceField>(std::move(field));}
   const int longest=std::max(width,height);
   std::vector<double> input(longest),output(longest),boundaries(longest+1);
   std::vector<int> vertices(longest);
@@ -115,7 +122,7 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
     squaredDistanceTransform(input,height,output,vertices,boundaries);
     for(int y=0;y<height;++y)field.distances[y*width+x]=std::max(0.,std::sqrt(output[y])*r-r/2.);
   }
-  return field;
+  return std::make_shared<const BodyClearanceField>(std::move(field));
 }
 
 double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw) const {
@@ -983,3 +990,75 @@ void GridMap::publishDepth() {}
 void GridMap::publishDepthCloud() {}
 void GridMap::publishSlidingMapBBox() {}
 void GridMap::publishSlidingMapFrame() {}
+
+// 比较原查询实际依赖的局部碰撞输入；相同内容不必再执行两次硬检查。
+bool GridMap::sameCollisionNeighborhood(const GridMap& other,const Eigen::Vector3d& point,
+    double yaw,double padding) const {
+  const auto& a=*snapshot_;const auto& b=*other.snapshot_;
+  const auto& p=a.parameters;const auto& q=b.parameters;
+  if(p.resolution_!=q.resolution_||p.resolution_inv_!=q.resolution_inv_||p.map_voxel_num_!=q.map_voxel_num_
+      ||p.body_length_!=q.body_length_||p.body_width_!=q.body_width_
+      ||p.body_center_offset_!=q.body_center_offset_
+      ||p.obstacles_inflation_z_up!=q.obstacles_inflation_z_up
+      ||p.obstacles_inflation_z_down!=q.obstacles_inflation_z_down
+      ||p.double_cylinder_offset_!=q.double_cylinder_offset_
+      ||a.business_layer!=b.business_layer)return false;
+  const double r=p.resolution_,c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
+  const double x=point.x()+c*p.body_center_offset_.x()-s*p.body_center_offset_.y();
+  const double y=point.y()+s*p.body_center_offset_.x()+c*p.body_center_offset_.y();
+  const double hx=p.body_length_/2.+padding,hy=p.body_width_/2.+padding;
+  const double ex=ac*hx+as*hy,ey=as*hx+ac*hy;
+  const double low=point.z()+p.body_center_offset_.z()-p.obstacles_inflation_z_up;
+  const double high=point.z()+p.body_center_offset_.z()+p.obstacles_inflation_z_down;
+  // 滑窗边界变化只影响贴边查询；完全落在两个窗口内时仍可比较同一组全局格。
+  const Eigen::Vector3d first(x-ex,y-ey,low),last(x+ex,y+ey,high);
+  for(const auto* bounds:{&p,&q})for(int axis=0;axis<3;++axis)
+    if(first[axis]<bounds->map_min_boundary_[axis]+1e-4
+        ||last[axis]>bounds->map_max_boundary_[axis]-1e-4)return false;
+  const int x0=int(std::floor((x-ex)/r))-1,x1=int(std::floor((x+ex)/r));
+  const int y0=int(std::floor((y-ey)/r))-1,y1=int(std::floor((y+ey)/r));
+  if(a.surface_layer!=b.surface_layer) {
+    if(!a.surface_layer||!b.surface_layer)return false;
+    if(!a.surface_layer->sameColumns(*b.surface_layer,x0,x1,y0,y1))return false;
+  }
+  if(a.collision==b.collision)return true;
+  // 双圆柱候选缓冲也是原查询输入，不能仅比较矩形内的原始占据。
+  for(double sign:{-1.,1.}) {
+    Eigen::Vector3d candidate(x+sign*p.double_cylinder_offset_*c,
+        y+sign*p.double_cylinder_offset_*s,point.z()+p.body_center_offset_.z());
+    if(candidate.x()>=p.map_min_boundary_.x()&&candidate.x()<=p.map_max_boundary_.x()
+        &&candidate.y()>=p.map_min_boundary_.y()&&candidate.y()<=p.map_max_boundary_.y()
+        &&candidate.z()>=p.map_min_boundary_.z()&&candidate.z()<=p.map_max_boundary_.z()) {
+      const int ix=int(std::floor(candidate.x()*p.resolution_inv_)),iy=int(std::floor(candidate.y()*p.resolution_inv_)),iz=int(std::floor(candidate.z()*p.resolution_inv_));
+      const size_t addr=(getLocalIndex(ix,0)*p.map_voxel_num_.y()+getLocalIndex(iy,1))*p.map_voxel_num_.z()+getLocalIndex(iz,2);
+      if(a.collision->occupancy_buffer_inflate_[addr]!=b.collision->occupancy_buffer_inflate_[addr])return false;
+    }
+  }
+  int z0=std::max(int(std::floor(low/r)),p.map_bound_min_idx_.z());
+  int z1=std::min(int(std::ceil(high/r))-1,p.map_bound_max_idx_.z());
+  while(z0<=z1&&(z0+1.)*r<=low)++z0;
+  while(z0<=z1&&z1*r>=high)--z1;
+  const int nz=p.map_voxel_num_.z();
+  for(int ix=std::max(x0,p.map_bound_min_idx_.x());ix<=std::min(x1,p.map_bound_max_idx_.x());++ix)
+    for(int iy=std::max(y0,p.map_bound_min_idx_.y());iy<=std::min(y1,p.map_bound_max_idx_.y());++iy) {
+      const size_t column=getLocalIndex(ix,0)*p.map_voxel_num_.y()+getLocalIndex(iy,1);
+      for(int z=z0;z<=z1;) {
+        const int local=getLocalIndex(z,2),count=std::min({z1-z+1,nz-local,64-local%64});
+        uint64_t mask=~uint64_t{0}<<(local%64);
+        if((local+count)%64)mask&=(uint64_t{1}<<((local+count)%64))-1;
+        const size_t word=column*a.collision->occupancy_words_per_column_+local/64;
+        const auto bits=a.collision->occupancy_bits_[word]&mask;
+        if(bits!=(b.collision->occupancy_bits_[word]&mask))return false;
+        auto hits=bits;
+        while(hits) {
+          const int address=int(column)*nz+(local/64)*64+__builtin_ctzll(hits);
+          const auto first=a.collision->support_member_max_z_.find(address),second=b.collision->support_member_max_z_.find(address);
+          if((first==a.collision->support_member_max_z_.end())!=(second==b.collision->support_member_max_z_.end()))return false;
+          if(first!=a.collision->support_member_max_z_.end()&&first->second!=second->second)return false;
+          hits&=hits-1;
+        }
+        z+=count;
+      }
+    }
+  return true;
+}

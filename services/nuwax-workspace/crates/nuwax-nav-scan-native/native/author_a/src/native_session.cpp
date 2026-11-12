@@ -23,6 +23,7 @@ struct MapOwner {
   GridMap map;
   std::shared_ptr<const SurfaceObstacleLayer> surface;
   std::shared_ptr<const BusinessConstraintMask> business;
+  mutable Snapshot snapshot;
   explicit MapOwner(const ScanConfig& c):config(c) { auto p=scan_planner::authorParameters(c);map.initMap(p); }
 };
 struct Trajectory {
@@ -154,7 +155,6 @@ extern "C" int nuwax_scan_map_surface_columns(void* p,const ScanSurfaceColumn* c
   try {
     auto& o=*static_cast<MapOwner*>(p);
     if(count) {
-      if(!o.surface)o.surface=std::make_shared<SurfaceObstacleLayer>(o.config,nullptr,0,nullptr,0);
       auto surface=std::make_shared<SurfaceObstacleLayer>(*o.surface,columns,count);o.surface=surface;
       o.map.setSurfaceCollisionQuery([surface](const Vector3d& x,double yaw,double pad,
           std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){
@@ -186,7 +186,9 @@ extern "C" void nuwax_scan_map_seed_occupied(void* p,const double* points,size_t
 }
 extern "C" void* nuwax_scan_map_snapshot(const void* p){
   const auto& owner=*static_cast<const MapOwner*>(p);
-  return new Snapshot(owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get()));
+  owner.snapshot=owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get(),
+      owner.snapshot);
+  return new Snapshot(owner.snapshot);
 }
 extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previous,const void* trajectory,double from) {
   GridMap now,before;now.bindCollisionSnapshot(*static_cast<const Snapshot*>(current));before.bindCollisionSnapshot(*static_cast<const Snapshot*>(previous));
@@ -196,6 +198,7 @@ extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previ
     const double t=from+(total-from)*i/count;const Vector3d p=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t);
     if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);
     const double pad=2.*now.getResolution();
+    if(now.sameCollisionNeighborhood(before,p,yaw,pad))continue;
     if(now.getInflateOccupancy(p,yaw)!=before.getInflateOccupancy(p,yaw)
         || now.bodyContacts(p,yaw,pad)!=before.bodyContacts(p,yaw,pad))return 1;
   }

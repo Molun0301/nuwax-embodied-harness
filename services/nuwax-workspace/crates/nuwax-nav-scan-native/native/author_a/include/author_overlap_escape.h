@@ -203,7 +203,7 @@ class AuthorOverlapEscape {
   }
 
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
-      const double* velocity,double angular,int64_t stamp,ScanOutput& output) {
+      const double* velocity,double angular,int64_t stamp,const double previous[3],ScanOutput& output) {
     if(hasDecision(stamp)) {
       // 同源重复只停车，沿用首拍证明样本，不重新准入、记账或失败。
       output=decision_output_;
@@ -216,7 +216,7 @@ class AuthorOverlapEscape {
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
     decision_stamp_=stamp;decision_samples_.clear();decision_output_={};
     try {
-      planImpl(map,c,p,yaw,velocity,angular,stamp,recontact_,output);
+      planImpl(map,c,p,yaw,velocity,angular,stamp,previous,recontact_,output);
       recontact_=false;
       // 只有输出非零动作，才开始事件运动预算。
       latched_|=output.command_forward!=0.||output.command_lateral!=0.||output.command_yaw_rate!=0.;
@@ -229,7 +229,7 @@ class AuthorOverlapEscape {
 
  private:
   void planImpl(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
-      const double* velocity,double angular,int64_t stamp,bool recontact,ScanOutput& output) {
+      const double* velocity,double angular,int64_t stamp,const double previous[3],bool recontact,ScanOutput& output) {
     using namespace command_check_detail;
     const double escape_speed=escapeSpeed(c);
     // 每个新来源先按当前接触检查三格上限，优先于旧事件故障和动作后增深。
@@ -339,9 +339,11 @@ class AuthorOverlapEscape {
     bool exhausted=false,budget_exhausted=false;
     // 恢复允许既有低速倒退，普通导航的后退选项不限制退出证明。
     ScanConfig escape_config=c;escape_config.max_reverse_velocity=escape_speed;
+    // 命令加速以上拍下发值为基准；运动与扫掠仍从实测状态开始。
+    const State command_base{p,yaw,{previous[0],previous[1]},previous[2]};
     for(const auto& requested:candidates) {
       if(Clock::now()>=deadline){exhausted=true;break;}
-      const auto command=bounded(requested.first,requested.second,actual,escape_config,false);
+      const auto command=bounded(requested.first,requested.second,command_base,escape_config,false);
       State state=actual;
       double path_bound=0.;
       std::vector<State> samples{actual};

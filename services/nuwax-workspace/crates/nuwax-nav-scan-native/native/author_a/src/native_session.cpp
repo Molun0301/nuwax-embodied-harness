@@ -248,7 +248,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
     if(s.escape.hasDecision(state->timestamp_ns)) {
       s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,
-          state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
+          state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
       s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
       out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
     }
@@ -256,7 +256,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(occupied!=0) {
       s.escape.observeOverlap();
       if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
-        s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
+        s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
       }

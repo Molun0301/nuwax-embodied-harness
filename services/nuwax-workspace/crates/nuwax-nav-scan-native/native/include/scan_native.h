@@ -14,7 +14,7 @@ typedef struct {
     double obstacle_clearance_m;
 } ScanConfig;
 typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
-typedef struct { double stop[3], turn[3], route_point[3], route_arc; } ScanTerminalPoints;
+typedef struct { double stop[3]; } ScanTerminalPoints;
 typedef struct { double field_distance, body_clearance; int32_t occupied; } ScanPoseClearance;
 /* 浅接触退出复用原检查的样本输出，不携带任何速度有效期。 */
 typedef struct {
@@ -43,7 +43,7 @@ typedef enum {
 typedef struct {
     double command[3], phase, remaining, deviation;
     /* 1无轨迹，2偏离，4走完，8无合法候选，16提前请求，32恢复失败，64新曲线偏离（旧曲线继续）。 */
-    uint32_t reason, limited, installed, turn_first;
+    uint32_t reason, limited, installed;
 } ScanTrackOutput;
 void *nuwax_scan_map_create(const ScanConfig *config);
 void nuwax_scan_map_destroy(void *map);
@@ -57,7 +57,7 @@ void *nuwax_scan_map_snapshot(const void *map);
 int nuwax_scan_snapshot_affects(const void *current,const void *previous,const void *trajectory,double from);
 void nuwax_scan_snapshot_destroy(void *snapshot);
 void nuwax_scan_terminal_points(const void *snapshot,const ScanConfig *config,const double goal[3],
-    double yaw,double tolerance,const double *reference,size_t count,ScanTerminalPoints *output);
+    double yaw,double tolerance,ScanTerminalPoints *output);
 void nuwax_scan_pose_clearance(const void *snapshot,const double position[3],double yaw,ScanPoseClearance *output);
 void *nuwax_scan_planner_create(void);
 void nuwax_scan_planner_destroy(void *planner);

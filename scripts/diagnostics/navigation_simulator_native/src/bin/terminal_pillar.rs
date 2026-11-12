@@ -191,7 +191,7 @@ fn run_pillar(lateral: bool, goal_yaw: f64) -> (Value, Vec<Value>) {
         let next = advance(&world, current, mean, DT, d);
         let selected = follower
             .terminal_points()
-            .map(|p| json!({"S":p.stop,"P":p.turn,"route_arc":p.route_arc}));
+            .map(|p| json!({"S":p.stop}));
         rows.push(
             json!({"tick":tick,"time_s":tick as f64*DT,"position":current.0,"yaw":heading(current),
             "command":command,"applied":applied,"phase":format!("{phase:?}"),"terminal":selected,

@@ -100,7 +100,6 @@ struct TrackRaw {
     pub reason: u32,
     pub limited: u32,
     pub installed: u32,
-    pub turn_first: u32,
 }
 #[derive(Default, Debug)]
 pub struct TrackResult {
@@ -111,21 +110,14 @@ pub struct TrackResult {
     pub reason: u32,
     pub limited: u32,
     pub installed: bool,
-    pub turn_first: bool,
     pub recovery_samples: Vec<TrajectorySample>,
 }
-/// 要求末端朝向时选定的停点、转向点及转向点在原路线上的弧长。
+/// 要求末端朝向时选定的停点。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TerminalPoints {
     /// 按目标朝向进入的位置。
     pub stop: [f64; 3],
-    /// 按设备能力调整后的原地转向位置P。
-    pub turn: [f64; 3],
-    /// 能力投影之前的路线点Q；参考先截到这里，再接转向点。
-    pub route_point: [f64; 3],
-    /// 投影之前的Q在原参考上的三维弧长。
-    pub route_arc: f64,
 }
 /// 同一碰撞快照的只读净空与占据查询。
 #[repr(C)]
@@ -222,7 +214,7 @@ extern "C" {
     fn nuwax_scan_snapshot_destroy(map: *mut c_void);
     fn nuwax_scan_terminal_points(
         map: *const c_void, config: *const Config, goal: *const f64,
-        yaw: f64, tolerance: f64, reference: *const f64, count: usize,
+        yaw: f64, tolerance: f64,
         output: *mut TerminalPoints,
     );
     fn nuwax_scan_pose_clearance(
@@ -369,15 +361,14 @@ impl Drop for SnapshotHandle {
 #[derive(Clone)]
 pub struct CollisionSnapshot(Arc<SnapshotHandle>);
 impl CollisionSnapshot {
-    /// 为要求朝向的目标选择停点和转向点。
+    /// 为要求朝向的目标选择停点。
     pub fn terminal_points(
         &self, config: &Config, goal: [f64; 3], yaw: f64, tolerance: f64,
-        reference: &[[f64; 3]],
     ) -> TerminalPoints {
         let mut output = TerminalPoints::default();
         unsafe {
             nuwax_scan_terminal_points(self.0 .0.as_ptr(), config, goal.as_ptr(), yaw,
-                tolerance, reference.as_ptr().cast(), reference.len(), &mut output);
+                tolerance, &mut output);
         }
         output
     }
@@ -574,7 +565,6 @@ impl ScanTracker {
                 reason: result.reason,
                 limited: result.limited,
                 installed: result.installed != 0,
-                turn_first: result.turn_first != 0,
                 recovery_samples: samples,
             })
         } else {

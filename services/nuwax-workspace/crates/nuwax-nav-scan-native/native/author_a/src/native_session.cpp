@@ -160,10 +160,9 @@ extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previ
 }
 extern "C" void nuwax_scan_snapshot_destroy(void* p){delete static_cast<Snapshot*>(p);}
 extern "C" void nuwax_scan_terminal_points(const void* snapshot,const ScanConfig* config,const double* goal,
-    double yaw,double tolerance,const double* reference,size_t count,ScanTerminalPoints* output) {
+    double yaw,double tolerance,ScanTerminalPoints* output) {
   GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
-  std::vector<Vector3d> route;for(size_t i=0;i<count;++i)route.emplace_back(Eigen::Map<const Vector3d>(reference+3*i));
-  *output=scan_planner::terminalPoints(map,*config,Eigen::Map<const Vector3d>(goal),yaw,tolerance,route);
+  *output=scan_planner::terminalPoints(map,*config,Eigen::Map<const Vector3d>(goal),yaw,tolerance);
 }
 extern "C" void nuwax_scan_pose_clearance(const void* snapshot,const double* position,double yaw,ScanPoseClearance* output) {
   GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
@@ -297,30 +296,9 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       // 本拍已推进并检查参考，回调不再额外推进一拍。
       s.controller.odomCallback(odometry(*state));
       const auto before=s.curve->position.evaluateDeBoorT(reference_time);desired_yaw=s.controller.estimateDesiredYaw(reference_time,before);
-      const double yaw_error=std::atan2(std::sin(desired_yaw-yaw),std::cos(desired_yaw-yaw));
-      if(std::abs(yaw_error)>.3) {
-        const double radius=std::hypot(c->body_length/2.+std::abs(c->body_center_x),c->body_width/2.+std::abs(c->body_center_y));
-        const double clearance=s.map.bodyFieldClearance(position,yaw);
-        const double yaw_step=std::min(c->max_yaw_rate,scan_planner::clearanceSpeedCap(*c,clearance)/radius)*c->sample_dt;
-        const int count=int(std::ceil((std::abs(yaw_error)-.3)/yaw_step));
-        double moving_minimum=std::numeric_limits<double>::infinity();
-        double turning_minimum=std::numeric_limits<double>::infinity();
-        // 只比较未来各拍；原地转向的最小净空不低于边走边转时才先转。
-        for(int k=1;k<=count;++k) {
-          const auto point=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+k*c->sample_dt));
-          const double heading=yaw+std::copysign(std::min(std::abs(yaw_error),k*yaw_step),yaw_error);
-          moving_minimum=std::min(moving_minimum,s.map.bodyFieldClearance(point,heading));
-          turning_minimum=std::min(turning_minimum,s.map.bodyFieldClearance(position,heading));
-        }
-        out->turn_first=moving_minimum<.10&&turning_minimum>=moving_minimum;
-      }
-      if(!out->turn_first)s.reference_time=reference_time;
+      s.reference_time=reference_time;
       s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
-      if(out->turn_first) {
-        s.raw.linear={};
-        s.raw.angular.z=std::clamp(s.controller.kp_yaw*yaw_error,-c->max_yaw_rate,c->max_yaw_rate);
-      }
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }

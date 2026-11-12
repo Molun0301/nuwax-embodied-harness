@@ -480,42 +480,21 @@ impl SurfaceFollower {
         }
         let goal = self.goal.as_ref().unwrap();
         let points = map.snapshot.terminal_points(config, Self::position(goal),
-            goal.pose.orientation.yaw(), self.options.position_tolerance_m, &self.reference);
-        let reference = if points.turn != points.stop {
-            let mut clipped = Vec::new();
-            let mut arc = 0.;
-            for (i, point) in self.reference.iter().enumerate() {
-                if i > 0 {
-                    arc += (0..3).map(|axis| (point[axis] - self.reference[i-1][axis]).powi(2)).sum::<f64>().sqrt();
-                }
-                if arc >= points.route_arc { break; }
-                clipped.push(*point);
-            }
-            if clipped.last() != Some(&points.route_point) {
-                clipped.push(points.route_point);
-            }
-            if points.turn != points.route_point {
-                clipped.push(points.turn);
-            }
-            clipped
-        } else {
-            let mut reference = self.reference.as_ref().clone();
-            if points.stop != Self::position(goal) {
-                if let Some(last) = reference.last_mut() { *last = points.stop; }
-            }
-            reference
-        };
+            goal.pose.orientation.yaw(), self.options.position_tolerance_m);
+        let mut reference = self.reference.as_ref().clone();
+        if points.stop != Self::position(goal) {
+            if let Some(last) = reference.last_mut() { *last = points.stop; }
+        }
         self.needs_plan |= self.terminal_approach.as_ref().is_some_and(|old| *old.reference != reference);
         self.terminal_approach = Some(TerminalApproach { points, snapshot: map.snapshot.clone(), reference: Arc::new(reference) });
     }
-    fn at_turn_point(&self, state: &MotionState, resolution: f64) -> bool {
-        match self.terminal_approach.as_ref() {
-            Some(approach) if approach.points.turn != approach.points.stop => {
-                let point = approach.points.turn;
-                (state.position[0] - point[0]).hypot(state.position[1] - point[1])
-                    < self.options.position_tolerance_m.min(0.05_f64.max(resolution))
-            }
-            _ => self.position_reached(),
+    fn at_terminal_stop(&self, state: &MotionState) -> bool {
+        let stop = self.terminal_approach.as_ref().map_or_else(
+            || Self::position(self.goal.as_ref().unwrap()), |a| a.points.stop);
+        if self.options.position_tolerance_m == 0. {
+            self.position_reached()
+        } else {
+            (state.position[0] - stop[0]).hypot(state.position[1] - stop[1]) < self.options.position_tolerance_m
         }
     }
     fn begin_terminal_turn(&mut self) {
@@ -629,12 +608,12 @@ impl SurfaceFollower {
         };
         let config = self.native_config(&map.source);
         self.prepare_terminal(&map, &config);
-        let at_turn_point = self.at_turn_point(&state, config.resolution);
-        if self.terminal_phase == TerminalPhase::Turning && !at_turn_point {
+        let at_terminal_stop = self.at_terminal_stop(&state);
+        if self.terminal_phase == TerminalPhase::Turning && !at_terminal_stop {
             self.terminal_phase = TerminalPhase::Travel;
             self.needs_plan = true;
         } else if self.terminal_phase == TerminalPhase::Travel
-            && at_turn_point && ((self.active.is_none() && self.pending_curve.is_none()) || state.stopped()) {
+            && at_terminal_stop && ((self.active.is_none() && self.pending_curve.is_none()) || state.stopped()) {
             self.begin_terminal_turn();
         }
         if self.terminal_phase == TerminalPhase::Turning {
@@ -710,7 +689,7 @@ impl SurfaceFollower {
             self.needs_plan = true;
         }
         self.phase = checked.phase;
-        if checked.replan_early() && !self.early_requested && !at_turn_point {
+        if checked.replan_early() && !self.early_requested && !at_terminal_stop {
             self.needs_plan = true;
             self.early_requested = true;
         }
@@ -733,7 +712,7 @@ impl SurfaceFollower {
         }
         // 已有计算时合并请求；这次计算交付后只由后续新事件再次请求。
         if self.needs_plan {
-            if !self.planning && self.terminal_phase == TerminalPhase::Travel && !at_turn_point {
+            if !self.planning && self.terminal_phase == TerminalPhase::Travel && !at_terminal_stop {
                 self.plan_snapshot = Some(map.snapshot.clone());
                 self.plan_worker.submit(PlanInput {
                     epoch: self.epoch,

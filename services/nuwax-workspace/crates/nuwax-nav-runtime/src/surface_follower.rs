@@ -722,6 +722,7 @@ impl SurfaceFollower {
                     state,
                     active: self.active.clone(),
                     phase: self.phase,
+                    goal_yaw: self.options.requires_orientation().then(|| self.goal.as_ref().unwrap().pose.orientation.yaw()),
                 });
                 self.planning = true;
             }

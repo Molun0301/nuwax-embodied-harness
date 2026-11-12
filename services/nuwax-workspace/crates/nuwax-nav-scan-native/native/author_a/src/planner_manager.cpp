@@ -463,6 +463,9 @@ namespace scan_planner
     nh.param("manager/max_acc", pp_.max_acc_, -1.0);
     nh.param("manager/max_jerk", pp_.max_jerk_, -1.0);
     nh.param("manager/max_yaw_rate", pp_.max_yaw_rate_, -1.0);
+    nh.param("manager/max_reverse", heading_.reverse, 0.0);
+    nh.param("manager/max_lateral", heading_.lateral, 0.0);
+    heading_.omega=pp_.max_yaw_rate_/2.;
     nh.param("optimization/vel_tolerance", pp_.vel_tolerance_, 1.0);
     nh.param("optimization/acc_tolerance", pp_.acc_tolerance_, 1.0);
     nh.param("manager/feasibility_tolerance", pp_.feasibility_tolerance_, 0.0);
@@ -504,6 +507,7 @@ namespace scan_planner
   {
 
     const double resolution = grid_map_->getResolution();
+    heading_.yaw0=start_yaw;
     bspline_optimizer_rebound_->setInitialClearance(std::min(2.*grid_map_->preferredClearance(),
         grid_map_->bodyFieldClearance(start_pt,start_yaw)));
     bool reference_detour = false;
@@ -828,6 +832,9 @@ namespace scan_planner
       if(route_time_seed&&seed_anchor_points[i])break;
       if(std::find(transition_points.begin(),transition_points.end(),i)==transition_points.end())transition_points.push_back(i);
     }
+    heading_.goal=(route_height_.ready() && local_target_pt==route_height_.points.back())?goal_yaw_:std::nullopt;
+    bspline_optimizer_rebound_->setHeadingPlan(heading_);
+    bspline_optimizer_rebound_->setBsplineInterval(ts);
     const Eigen::MatrixXd reference_controls=ctrl_pts;
     UniformBspline reference_curve(reference_controls,3,ts);
     const bool reference_free=route_time_seed&&trajectoryCollisionFree(reference_curve);
@@ -891,6 +898,7 @@ namespace scan_planner
     if(flag_step_2_success)pos.setKnot(final_knots);
     else ROS_WARN_STREAM("局部结点定时失败："<<timing_reason);
 
+    if(flag_step_2_success)arrangeHeadingTime(pos,heading_);
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
         && trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.;
     if (!accepted)
@@ -1084,6 +1092,7 @@ namespace scan_planner
 
   void SCANPlannerManager::updateTrajInfo(const UniformBspline &position_traj, const ros::Time time_now)
   {
+    local_data_.heading = heading_;
     local_data_.start_time_ = time_now;
     local_data_.position_traj_ = position_traj;
     local_data_.velocity_traj_ = local_data_.position_traj_.getDerivative();
@@ -1131,6 +1140,7 @@ namespace scan_planner
 
   bool SCANPlannerManager::trajectoryCollisionFree(UniformBspline& trajectory)
   {
+    arrangeHeadingTime(trajectory,heading_);
     const double duration = trajectory.getTimeSum();
     auto velocity=trajectory.getDerivative();
     const double dt = std::min(.01, grid_map_->getResolution() / (4. * pp_.max_vel_));
@@ -1138,7 +1148,7 @@ namespace scan_planner
     for (int i = 0; i <= samples; ++i) {
       const double time = duration * i / samples;
       const Eigen::Vector3d point = trajectory.evaluateDeBoorT(time);
-      const double yaw = trajectoryHeading(velocity,duration,time,dt,0.);
+      const double yaw = heading_.at(trajectoryHeading(velocity,duration,time,dt,heading_.yaw0),time,duration);
       if (grid_map_->getInflateOccupancy(point, yaw) != 0) return false;
     }
     return true;
@@ -1147,13 +1157,14 @@ namespace scan_planner
   // 已有余量或确实窄到无法留足余量时可直交参考，其余情况进入原样条优化。
   bool SCANPlannerManager::trajectoryHasPreferredClearance(UniformBspline& trajectory)
   {
+    arrangeHeadingTime(trajectory,heading_);
     const double duration=trajectory.getTimeSum();
     auto velocity=trajectory.getDerivative();
     const double dt=std::min(.01,grid_map_->getResolution()/(4.*pp_.max_vel_));
     const int samples=std::max(1,static_cast<int>(std::ceil(duration/dt)));
     for(int i=0;i<=samples;++i) {
       const double time=duration*i/samples;
-      const double yaw=trajectoryHeading(velocity,duration,time,dt,0.);
+      const double yaw=heading_.at(trajectoryHeading(velocity,duration,time,dt,heading_.yaw0),time,duration);
       if(!grid_map_->bodyHasPreferredClearance(trajectory.evaluateDeBoorT(time),yaw))return false;
     }
     return true;

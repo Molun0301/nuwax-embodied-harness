@@ -302,6 +302,7 @@ pub(crate) struct PlanInput {
     pub state: MotionState,
     pub active: Option<Trajectory>,
     pub phase: f64,
+    pub goal_yaw: Option<f64>,
 }
 pub(crate) struct PlanWorker(Worker<PlanInput, (u64, Result<Trajectory, String>)>);
 impl PlanWorker {
@@ -320,6 +321,7 @@ impl PlanWorker {
                 &job.state,
                 job.active.as_ref(),
                 job.phase,
+                job.goal_yaw,
             )
         })
     }

@@ -296,7 +296,7 @@ namespace scan_planner
     const Eigen::Vector3d final_pt = route.ready()?route.points.back():global_data.global_traj_.evaluate(duration);
     const Eigen::Vector3d final_prev = route.ready()?route.points[route.points.size()-2]
         :global_data.global_traj_.evaluate(duration * (sample_num - 1) / sample_num);
-    const int final_occ = map->getInflateOccupancy(final_pt, estimateYawFromSegment(final_prev, final_pt));
+    const int final_occ = map->getInflateOccupancy(final_pt, planner_manager_->goal_yaw_.value_or(estimateYawFromSegment(final_prev, final_pt)));
     if (final_occ <= 0)
       return true;
 
@@ -797,7 +797,7 @@ namespace scan_planner
         break;
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
-      const double yaw=trajectoryHeading(info->velocity_traj_,info->duration_,t,time_step,getOdomYaw());
+      const double yaw=info->heading.at(trajectoryHeading(info->velocity_traj_,info->duration_,t,time_step,info->heading.yaw0),t,info->duration_);
       if (map->getInflateOccupancy(pos, yaw))
       {
         if (planFromCurrentTraj()) // Make a chance
@@ -984,7 +984,8 @@ namespace scan_planner
     planner_manager_->global_data_.last_progress_time_ = target_found ? target_t : duration;
 
     auto targetOccupancy = [&](const Eigen::Vector3d &pt) {
-      return planner_manager_->grid_map_->getInflateOccupancy(pt, estimateYawFromSegment(odom_pos_, pt));
+      const bool final=route.ready() && pt==route.points.back();
+      return planner_manager_->grid_map_->getInflateOccupancy(pt, final?planner_manager_->goal_yaw_.value_or(estimateYawFromSegment(odom_pos_,pt)):estimateYawFromSegment(odom_pos_,pt));
     };
 
     if (targetOccupancy(local_target_pt_) != 0)

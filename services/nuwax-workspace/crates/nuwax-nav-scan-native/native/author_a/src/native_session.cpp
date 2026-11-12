@@ -5,6 +5,7 @@
 #include <author_terminal.h>
 #include <author_diagnostics.h>
 #include <author_parameters.h>
+#include <trajectory_heading.h>
 #include <business_constraint_mask.h>
 #include <surface_obstacle_layer.h>
 #include <scan_native.h>
@@ -30,6 +31,11 @@ struct Trajectory {
   scan_planner::UniformBspline position,velocity,acceleration;
   uint32_t sources[3]{2,2,3};
   Vector3d local_target=Vector3d::Zero();double reference_progress=0.,reference_duration=0.;
+  scan_planner::HeadingPlan heading;
+  double headingAt(double time) {
+    const double total=duration();
+    return heading.at(scan_planner::trajectoryHeading(velocity,total,time,.01,heading.yaw0),time,total);
+  }
   explicit Trajectory(const scan_planner::Bspline& s):spline(s) {
     Eigen::MatrixXd points(3,s.pos_pts.size());Eigen::VectorXd knots(s.knots.size());
     for(size_t i=0;i<s.pos_pts.size();++i)points.col(i)=Vector3d(s.pos_pts[i].x,s.pos_pts[i].y,s.pos_pts[i].z);
@@ -91,7 +97,7 @@ struct PlannerSession {
   ScanConfig config{};
   void initialize(const ScanConfig& c) {
     auto p=scan_planner::authorParameters(c);fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(p,map);
-    fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s);});
+    fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s);produced->heading=fsm->manager().local_data_.heading;});
     config=c;reference.clear();
   }
 };
@@ -151,7 +157,7 @@ extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previ
   const int count=std::max(1,int(std::ceil((total-from)/dt)));double yaw=0.;
   for(int i=0;i<=count;++i) {
     const double t=from+(total-from)*i/count;const Vector3d p=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t);
-    if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);
+    yaw=curve->headingAt(t);
     const double pad=2.*now.getResolution();
     if(now.getInflateOccupancy(p,yaw)!=before.getInflateOccupancy(p,yaw)
         || now.bodyContacts(p,yaw,pad)!=before.bodyContacts(p,yaw,pad))return 1;
@@ -173,11 +179,14 @@ extern "C" void nuwax_scan_pose_clearance(const void* snapshot,const double* pos
 extern "C" void* nuwax_scan_planner_create(){return new PlannerSession;}
 extern "C" void nuwax_scan_planner_destroy(void* p){delete static_cast<PlannerSession*>(p);}
 extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void* snapshot,const double* reference,size_t count,
-    const ScanState* state,const void* active,double phase,char* error,size_t capacity) {
+    const ScanState* state,const void* active,double phase,double goal_yaw,char* error,size_t capacity) {
   try {
     auto& s=*static_cast<PlannerSession*>(p);s.map->bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
     ros::host_time_seconds=state->timestamp_ns*1e-9;
     if(!s.fsm || std::memcmp(&s.config,c,sizeof(*c))!=0)s.initialize(*c);
+    auto& manager=s.fsm->manager();
+    manager.heading_={state->yaw,std::nullopt,c->max_reverse_velocity,c->max_lateral_velocity,c->max_yaw_rate/2.};
+    manager.goal_yaw_=std::isfinite(goal_yaw)?std::optional<double>(goal_yaw):std::nullopt;
     scan_native_diagnostic.clear();s.fsm->onOdometry(odometry(*state),state->measured_velocity,Eigen::Map<const Vector3d>(state->planning_velocity));
     std::vector<double> incoming(reference,reference+count*3);
     if(incoming!=s.reference) {
@@ -188,6 +197,7 @@ extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void*
     if(active) {
       auto curve=*static_cast<const Curve*>(active);auto& local=s.fsm->manager().local_data_;
       local.position_traj_=curve->position;local.velocity_traj_=curve->velocity;local.acceleration_traj_=curve->acceleration;
+      local.heading=curve->heading;
       local.duration_=curve->duration();local.start_time_=ros::Time(ros::Time::now().toSec()-phase);
       local.start_pos_=curve->position.evaluateDeBoorT(0.);
     }
@@ -206,7 +216,7 @@ extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double d
   out->reference_progress=curve->reference_progress;out->reference_duration=curve->reference_duration;
   const auto end=curve->local_target;for(int i=0;i<3;++i)out->local_target[i]=end[i];
   out->sample_count=std::ceil(out->duration/dt)+1;out->samples=static_cast<ScanSample*>(std::calloc(out->sample_count,sizeof(ScanSample)));
-  double yaw=0.;for(size_t i=0;i<out->sample_count;++i){auto& x=out->samples[i];x.time=std::min(out->duration,i*dt);const double t=std::min(curve->duration(),from+x.time);const auto pos=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t),a=curve->acceleration.evaluateDeBoorT(t);if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);for(int j=0;j<3;++j){x.position[j]=pos[j];x.velocity[j]=v[j];x.acceleration[j]=a[j];}x.yaw=yaw;}
+  double yaw=0.;for(size_t i=0;i<out->sample_count;++i){auto& x=out->samples[i];x.time=std::min(out->duration,i*dt);const double t=std::min(curve->duration(),from+x.time);const auto pos=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t),a=curve->acceleration.evaluateDeBoorT(t);yaw=curve->headingAt(t);for(int j=0;j<3;++j){x.position[j]=pos[j];x.velocity[j]=v[j];x.acceleration[j]=a[j];}x.yaw=yaw;}
 }
 extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
 extern "C" int nuwax_scan_motion_stopped(const ScanState* state) {
@@ -295,10 +305,11 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
       s.controller.odomCallback(odometry(*state));
-      const auto before=s.curve->position.evaluateDeBoorT(reference_time);desired_yaw=s.controller.estimateDesiredYaw(reference_time,before);
+      desired_yaw=s.curve->headingAt(reference_time);
       s.reference_time=reference_time;
       s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
+      s.raw.angular.z=std::clamp(s.controller.kp_yaw*scan_planner::headingDifference(desired_yaw,yaw),-c->max_yaw_rate,c->max_yaw_rate);
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }
@@ -313,7 +324,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       for(int k=1;k<=count;++k) {
         const double t=std::min(k*period,remaining),at=s.reference_time+t;
         const auto point=s.curve->position.evaluateDeBoorT(at),velocity=s.curve->velocity.evaluateDeBoorT(at);
-        if(velocity.head<2>().squaredNorm()>1e-8)tangent=std::atan2(velocity.y(),velocity.x());
+        tangent=s.curve->headingAt(at);
         const double available=scan_planner::clearanceSpeedCap(*c,s.map.bodyFieldClearance(point,tangent));
         speed_cap=std::min(speed_cap,available+c->max_acceleration*t);
       }

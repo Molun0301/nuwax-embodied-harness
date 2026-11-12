@@ -231,6 +231,7 @@ extern "C" {
         state: *const MotionState,
         active: *const c_void,
         phase: f64,
+        goal_yaw: f64,
         error: *mut c_char,
         capacity: usize,
     ) -> *mut c_void;
@@ -466,6 +467,7 @@ impl ScanPlanner {
         state: &MotionState,
         active: Option<&Trajectory>,
         phase: f64,
+        goal_yaw: Option<f64>,
     ) -> Result<Trajectory, String> {
         let mut error = [0 as c_char; 1024];
         let result = unsafe {
@@ -478,6 +480,7 @@ impl ScanPlanner {
                 state,
                 active.map_or(std::ptr::null(), |t| t.0 .0.as_ptr()),
                 phase,
+                goal_yaw.unwrap_or(f64::NAN),
                 error.as_mut_ptr(),
                 error.len(),
             )

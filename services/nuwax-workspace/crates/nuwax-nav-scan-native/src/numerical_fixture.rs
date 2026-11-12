@@ -287,6 +287,7 @@ impl Planner {
                 &state,
                 self.curve.as_ref(),
                 tracked.phase,
+                None,
             );
             self.changed = false;
             match result {

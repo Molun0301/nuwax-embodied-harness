@@ -1,4 +1,40 @@
 #[test]
+fn planned_heading_honors_constraint_priority_wraps_continuously_and_extends_time() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = std::env::temp_dir().join(format!("nuwax-heading-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let source = temp.join("heading.cpp");
+    let binary = temp.join("heading");
+    std::fs::write(&source, r#"
+#include <planned_heading.h>
+#include <cassert>
+int main() {
+  using scan_planner::plannedHeading;
+  const auto close=[](double actual,double expected){assert(std::abs(actual-expected)<1e-10);};
+  close(plannedHeading(.4,5.,10.,0.,std::nullopt,1.,1.,1.),.4);
+  close(plannedHeading(0.,3.,4.,0.,2.,1.,1.,1.),1.);
+  close(plannedHeading(0.,4.,4.,0.,2.5,0.,1.,1.),M_PI/2.);
+  close(plannedHeading(.3,4.,4.,0.,2.5,1.,0.,1.),.3);
+  close(plannedHeading(1.,.1,4.,0.,2.5,1.,0.,1.),.1);
+  close(plannedHeading(2.,0.,4.,-.7,std::nullopt,1.,1.,1.),-.7);
+  const double before=plannedHeading(M_PI-.001,2.,4.,3.,-3.,1.,1.,1.);
+  const double after=plannedHeading(-M_PI+.001,2.,4.,3.,-3.,1.,1.,1.);
+  close(after-before,.002);
+  scan_planner::HeadingPlan heading{0.,1.5,1.,1.,.5};
+  close(heading.duration(.3),3.);
+  close(heading.duration(4.),4.);
+}
+"#).unwrap();
+    let output = std::process::Command::new("c++").args(["-std=c++17", "-O2"])
+        .arg(format!("-I{}",root.join("native/author_a/include").display()))
+        .arg(&source).arg("-o").arg(&binary).output().unwrap();
+    assert!(output.status.success(), "朝向约束回归编译失败：{}",String::from_utf8_lossy(&output.stderr));
+    let output = std::process::Command::new(&binary).output().unwrap();
+    std::fs::remove_dir_all(temp).unwrap();
+    assert!(output.status.success(), "朝向约束/优先级/跨π/时长回归失败：{}",String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn terminal_heading_uses_the_existing_proportional_gain_while_turning_or_translating() {
     let mut c = config();
     c.max_yaw_acceleration = 20.;

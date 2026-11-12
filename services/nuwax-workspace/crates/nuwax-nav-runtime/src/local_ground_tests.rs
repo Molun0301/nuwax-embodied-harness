@@ -197,6 +197,7 @@ fn n6_raised_persistent_ground_under_body_produces_trajectory() {
             },
             None,
             0.,
+            None,
         )
         .expect("过滤后必须能产出真实原生轨迹");
     assert!(!curve.samples(0., 0.05).is_empty());
@@ -347,6 +348,7 @@ fn n6_multilayer_ground_eight_cm_apart_produces_trajectory() {
             },
             None,
             0.,
+            None,
         )
         .expect("剔除后必须产出原生轨迹");
     assert!(!curve.samples(0., 0.05).is_empty());
@@ -433,6 +435,7 @@ fn n6_archived_column_ground_is_removed_and_produces_trajectory() {
                 &state,
                 None,
                 0.,
+                None,
             )
             .expect("真实归档地面过滤后必须产出原生轨迹");
         assert!(!curve.samples(0., input.config.sample_dt).is_empty());

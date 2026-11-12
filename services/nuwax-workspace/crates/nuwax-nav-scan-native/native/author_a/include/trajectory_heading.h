@@ -2,8 +2,19 @@
 #include <bspline_opt/uniform_bspline.h>
 #include <algorithm>
 #include <cmath>
+#include <planned_heading.h>
 
 namespace scan_planner {
+// 只等比放大结点间隔，控制点及曲线几何保持不变。
+inline void arrangeHeadingTime(UniformBspline& trajectory,const HeadingPlan& heading) {
+  const double duration=trajectory.getTimeSum(),required=heading.duration(duration);
+  if(required>duration) {
+    auto knots=trajectory.getKnot();
+    double begin,end;trajectory.getTimeSpan(begin,end);
+    knots=((knots.array()-begin)*(required/duration)+begin).matrix();
+    trajectory.setKnot(knots);
+  }
+}
 // 未来曲线减速时，微小但非零位移仍决定该处朝向，不能替换为当前机体或世界零角。
 // 终点使用进入方向；完全静止的一段才沿用调用者的静止朝向。
 inline double trajectoryHeading(UniformBspline& velocity,double duration,double time,double step,double stationary_yaw) {

@@ -6,6 +6,7 @@
 #include <bspline_opt/uniform_bspline.h>
 #include <plan_env/grid_map.h>
 #include <author_host.h>
+#include <planned_heading.h>
 #include "bspline_opt/lbfgs.hpp"
 
 // Gradient and elastic band optimization
@@ -62,6 +63,7 @@ namespace scan_planner
     // required inputs
     void setControlPoints(const Eigen::MatrixXd &points);
     void setBsplineInterval(const double &ts);
+    void setHeadingPlan(const HeadingPlan& heading) { heading_=heading; }
     void setInitialClearance(double distance) { initial_clearance_=distance; }
     void setCostFunction(const int &cost_function);
     void setTerminateCond(const int &max_num_id, const int &max_time_id);
@@ -89,6 +91,8 @@ namespace scan_planner
 
   private:
     GridMap::Ptr grid_map_;
+    HeadingPlan heading_;
+    double controlHeading(double tangent,double time,int count) const;
 
     enum FORCE_STOP_OPTIMIZE_TYPE
     {

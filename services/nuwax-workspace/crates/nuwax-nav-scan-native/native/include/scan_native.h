@@ -62,7 +62,7 @@ void nuwax_scan_pose_clearance(const void *snapshot,const double position[3],dou
 void *nuwax_scan_planner_create(void);
 void nuwax_scan_planner_destroy(void *planner);
 void *nuwax_scan_planner_plan(void *planner,const ScanConfig *config,const void *snapshot,
-    const double *reference,size_t count,const ScanState *state,const void *active,double phase,
+    const double *reference,size_t count,const ScanState *state,const void *active,double phase,double goal_yaw,
     char *error,size_t error_capacity);
 void nuwax_scan_trajectory_destroy(void *trajectory);
 void nuwax_scan_trajectory_samples(const void *trajectory,double from,double dt,ScanOutput *output);

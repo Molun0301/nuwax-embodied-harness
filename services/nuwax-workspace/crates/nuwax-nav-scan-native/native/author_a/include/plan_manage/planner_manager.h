@@ -44,6 +44,8 @@ namespace scan_planner
     PlanParameters pp_;
     LocalTrajData local_data_;
     GlobalTrajData global_data_;
+    HeadingPlan heading_;
+    std::optional<double> goal_yaw_;
     GridMap::Ptr grid_map_;
 
   private:

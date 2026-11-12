@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <bspline_opt/uniform_bspline.h>
+#include <planned_heading.h>
 #include <traj_utils/polynomial_traj.h>
 
 using std::vector;
@@ -205,6 +206,7 @@ namespace scan_planner
 
   struct LocalTrajData
   {
+    HeadingPlan heading;
     /* info of generated traj */
 
     int traj_id_;

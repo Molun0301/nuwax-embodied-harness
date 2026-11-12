@@ -25,7 +25,7 @@ fn stationary_centimeter_approach_produces_a_dynamically_feasible_curve() {
         map.update_surface(&[], &[], &[], &[]).unwrap();
         let state = MotionState { position: route[0], measured_velocity: 1,
             measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None)
             .expect("静止几厘米接近必须在原求解调用中产出可执行轨迹");
         let samples = curve.samples(0., 0.001);
         for sample in &samples {
@@ -51,7 +51,7 @@ fn stationary_short_seed_uses_the_fitted_spline_dynamic_bound() {
         map.update_surface(&[], &[], &[], &[]).unwrap();
         let state = MotionState { position: route[0], measured_velocity: 1,
             measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+        let curve = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None)
             .expect("紧化短程初值必须通过原规划接纳检查");
         let samples = curve.samples(0., 0.001);
         let before = (5. * distance / cfg.max_velocity).max((20. * distance / cfg.max_acceleration).sqrt());
@@ -78,7 +78,7 @@ fn reference_seed_flows_through_a_small_turn_and_stops_at_a_large_turn() {
     map.update_surface(&[], &[], &[], &[]).unwrap();
     let state = MotionState { position: route[0], measured_velocity: 1,
         measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.).unwrap();
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None).unwrap();
     let samples = trajectory.samples(0., 0.001);
     let nearest = |point: [f64; 3]| samples.iter().min_by(|a, b| {
         let distance = |s: &TrajectorySample| (s.position[0] - point[0]).hypot(s.position[1] - point[1]);
@@ -92,7 +92,7 @@ fn reference_seed_flows_through_a_small_turn_and_stops_at_a_large_turn() {
     // 此角为75.964度，与14.036度的首角均属于不超过90度的连续通过范围。
     assert!(large.velocity[0].hypot(large.velocity[1]) > 1e-5, "不超过90度的拐角应连续通过：{large:?}");
     let stop_route = [[0., 0., 0.35], [1., 0., 0.35], [0.5, 1., 0.35]];
-    let stopped = ScanPlanner::default().plan(&cfg, &map.snapshot(), &stop_route, &state, None, 0.).unwrap();
+    let stopped = ScanPlanner::default().plan(&cfg, &map.snapshot(), &stop_route, &state, None, 0., None).unwrap();
     let stopped_samples = stopped.samples(0., 0.0001);
     let corner = stopped_samples.iter().min_by(|a,b| {
         let distance=|s:&TrajectorySample| (s.position[0]-1.).hypot(s.position[1]);
@@ -125,7 +125,7 @@ fn recorded_long_detour_uses_local_segment_times() {
     map.update_surface(&[], &[], &[], &forbidden).unwrap();
     let state = MotionState { position: route[0], measured_velocity: 1,
         measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None)
         .expect("原归档长绕行应通过原规划接纳检查");
     let samples = trajectory.samples(0., 0.001);
     let duration = samples.last().unwrap().time;
@@ -160,7 +160,7 @@ fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
         position: route[0], timestamp_ns: 1_000_000_000,
         measured_velocity: 1, measured_yaw_rate: 1, ..MotionState::default()
     };
-    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0.).unwrap();
+    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0., None).unwrap();
     let samples = curve.samples(0., cfg.sample_dt);
     let speed = |s: &TrajectorySample| s.velocity[0].hypot(s.velocity[1]);
     let normal_speed = samples.iter().map(speed).fold(0., f64::max);
@@ -227,7 +227,7 @@ fn reference_time_waits_at_deviation_bound_and_restarts_at_installed_projection(
     let snapshot = map.snapshot();
     let mut state = MotionState { position: route[0], measured_velocity: 1,
         measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-    let curve = ScanPlanner::default().plan(&planning, &snapshot, &route, &state, None, 0.).unwrap();
+    let curve = ScanPlanner::default().plan(&planning, &snapshot, &route, &state, None, 0., None).unwrap();
     let samples = curve.samples(0., cfg.sample_dt);
     let bound = samples.iter().take_while(|s| s.position[0] <= 0.2).last().unwrap();
     let expected = bound.velocity[0] + 0.8 * bound.position[0];
@@ -274,7 +274,7 @@ fn reference_end_does_not_stop_before_actual_projection_finishes() {
     let snapshot = map.snapshot();
     let mut state = MotionState { position: route[0], measured_velocity: 1,
         measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0.).unwrap();
+    let curve = ScanPlanner::default().plan(&cfg, &snapshot, &route, &state, None, 0., None).unwrap();
     let endpoint = *curve.samples(0., cfg.sample_dt).last().unwrap();
     let expected = endpoint.velocity[0] + 0.8 * (endpoint.position[0] - 0.9);
     eprintln!("实际样条末端={endpoint:?}，末端追踪期望={expected}");
@@ -529,7 +529,7 @@ fn obstacle_adjacent_zigzag_over_capacity_shortens_local_target() {
         position: route[0], timestamp_ns: 1_000_000_000,
         measured_velocity: 1, measured_yaw_rate: 1, ..MotionState::default()
     };
-    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0.)
+    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None)
         .expect("贴障参考锚点超过容量时应缩短本次目标并产出轨迹");
     let view = trajectory.inspect(0., 0.01);
     assert!(view.local_target[0] > 0.1 && view.local_target[0] < 1., "应交付窗口前段：{view:?}");
@@ -622,7 +622,7 @@ fn ninth_round_install_starts_at_measured_position_despite_finished_route_hint()
     let mut map=MapOwner::new(&cfg).unwrap();
     map.seed_occupied(&[],state.position);map.update_surface(&[],&[],&[],&[]).unwrap();
     let snapshot=map.snapshot();
-    let curve=ScanPlanner::default().plan(&cfg,&snapshot,&reference,&state,None,0.).unwrap();
+    let curve=ScanPlanner::default().plan(&cfg,&snapshot,&reference,&state,None,0.,None).unwrap();
     let sample=curve.samples(0.,cfg.sample_dt)[0];
     assert!((0..3).map(|i|(sample.position[i]-state.position[i]).powi(2)).sum::<f64>().sqrt()<1e-10);
     let mut tracker=ScanTracker::default();tracker.install(&curve);

@@ -118,6 +118,7 @@ fn ninth_round_stopped_arrival_succeeds_with_unfinished_curve() {
     goal.pose.orientation=Quaternion::from_yaw(-1.006363320716952);
     actual.pose.orientation=Quaternion::from_yaw(-1.072751879536303);
     f.goal=Some(goal);f.odometry=Some(actual);
+    f.terminal_approach=None;
     f.options.position_tolerance_m=0.15;f.options.yaw_tolerance_rad=0.3;
     f.observe_measured_motion(Some(crate::motion_feedback::tests::measured(
         [6.771426847813366e-05,-0.0002417263976858355,-0.00018311811803040358],
@@ -143,6 +144,7 @@ fn delayed_planner(
             &job.state,
             job.active.as_ref(),
             job.phase,
+            job.goal_yaw,
         )?;
         *saved.lock().unwrap() = Some(curve.clone());
         Ok(curve)
@@ -341,7 +343,7 @@ fn distant_new_curve_keeps_valid_old_curve_and_requests_again() {
             .iter()
             .map(|p| [p[0], p[1] + 1., p[2]])
             .collect();
-        planner.plan(&job.config, &job.map.snapshot, &reference, &state, None, 0.)
+        planner.plan(&job.config, &job.map.snapshot, &reference, &state, None, 0., None)
     })
     .unwrap();
     f.needs_plan = true;

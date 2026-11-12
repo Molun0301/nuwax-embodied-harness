@@ -99,6 +99,7 @@ struct TrackRaw {
     pub reason: u32,
     pub limited: u32,
     pub installed: u32,
+    pub turn_first: u32,
 }
 #[derive(Default, Debug)]
 pub struct TrackResult {
@@ -109,7 +110,32 @@ pub struct TrackResult {
     pub reason: u32,
     pub limited: u32,
     pub installed: bool,
+    pub turn_first: bool,
     pub recovery_samples: Vec<TrajectorySample>,
+}
+/// 要求末端朝向时选定的停点、转向点及转向点在原路线上的弧长。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TerminalPoints {
+    /// 按目标朝向进入的位置。
+    pub stop: [f64; 3],
+    /// 按设备能力调整后的原地转向位置P。
+    pub turn: [f64; 3],
+    /// 能力投影之前的路线点Q；参考先截到这里，再接转向点。
+    pub route_point: [f64; 3],
+    /// 投影之前的Q在原参考上的三维弧长。
+    pub route_arc: f64,
+}
+/// 同一碰撞快照的只读净空与占据查询。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoseClearance {
+    /// 参考点的净空场值。
+    pub field_distance: f64,
+    /// 机身在指定朝向下的净空场最小值。
+    pub body_clearance: f64,
+    /// 原硬占据查询结果，零表示可放下。
+    pub occupied: i32,
 }
 /// 原生跟踪失败的原因位及原始文本。
 #[derive(Debug)]
@@ -193,6 +219,14 @@ extern "C" {
         from: f64,
     ) -> i32;
     fn nuwax_scan_snapshot_destroy(map: *mut c_void);
+    fn nuwax_scan_terminal_points(
+        map: *const c_void, config: *const Config, goal: *const f64,
+        yaw: f64, tolerance: f64, reference: *const f64, count: usize,
+        output: *mut TerminalPoints,
+    );
+    fn nuwax_scan_pose_clearance(
+        map: *const c_void, position: *const f64, yaw: f64, output: *mut PoseClearance,
+    );
     fn nuwax_scan_planner_create() -> *mut c_void;
     fn nuwax_scan_planner_destroy(planner: *mut c_void);
     fn nuwax_scan_planner_plan(
@@ -226,6 +260,7 @@ extern "C" {
         state: *const MotionState,
         previous: *const f64,
         terminal_yaw: f64,
+        terminal_position: *const f64,
         out: *mut TrackRaw,
         recovery: *mut SamplesRaw,
         error: *mut c_char,
@@ -333,6 +368,24 @@ impl Drop for SnapshotHandle {
 #[derive(Clone)]
 pub struct CollisionSnapshot(Arc<SnapshotHandle>);
 impl CollisionSnapshot {
+    /// 为要求朝向的目标选择停点和转向点。
+    pub fn terminal_points(
+        &self, config: &Config, goal: [f64; 3], yaw: f64, tolerance: f64,
+        reference: &[[f64; 3]],
+    ) -> TerminalPoints {
+        let mut output = TerminalPoints::default();
+        unsafe {
+            nuwax_scan_terminal_points(self.0 .0.as_ptr(), config, goal.as_ptr(), yaw,
+                tolerance, reference.as_ptr().cast(), reference.len(), &mut output);
+        }
+        output
+    }
+    /// 读取现有碰撞与净空查询，不建立新的运动准入。
+    pub fn pose_clearance(&self, position: [f64; 3], yaw: f64) -> PoseClearance {
+        let mut output = PoseClearance::default();
+        unsafe { nuwax_scan_pose_clearance(self.0 .0.as_ptr(), position.as_ptr(), yaw, &mut output) };
+        output
+    }
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -475,6 +528,18 @@ impl ScanTracker {
         previous: [f64; 3],
         terminal_yaw: Option<f64>,
     ) -> Result<TrackResult, TrackFailure> {
+        self.track_terminal_position(config, map, state, previous, terminal_yaw, None)
+    }
+    /// 末端位置只与末端朝向一起传入；其余跟踪、限速和命令扫掠共用同一条路径。
+    pub fn track_terminal_position(
+        &mut self,
+        config: &Config,
+        map: &CollisionSnapshot,
+        state: &MotionState,
+        previous: [f64; 3],
+        terminal_yaw: Option<f64>,
+        terminal_position: Option<[f64; 3]>,
+    ) -> Result<TrackResult, TrackFailure> {
         let mut result = TrackRaw::default();
         let mut recovery = SamplesRaw::default();
         let mut error = [0 as c_char; 1024];
@@ -486,6 +551,7 @@ impl ScanTracker {
                 state,
                 previous.as_ptr(),
                 terminal_yaw.unwrap_or(f64::NAN),
+                terminal_position.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
                 &mut result,
                 &mut recovery,
                 error.as_mut_ptr(),
@@ -507,6 +573,7 @@ impl ScanTracker {
                 reason: result.reason,
                 limited: result.limited,
                 installed: result.installed != 0,
+                turn_first: result.turn_first != 0,
                 recovery_samples: samples,
             })
         } else {
@@ -524,6 +591,9 @@ impl Drop for ScanTracker {
 mod astar_endpoint_tests;
 
 #[cfg(test)]
+mod clearance_field_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     mod fixture {include!("numerical_fixture.rs");}
@@ -534,6 +604,7 @@ mod tests {
     include!("overlap_escape_tests.rs");
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
+    include!("terminal_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {
@@ -698,11 +769,15 @@ mod tests {
         let route = [[0.0, 0.0, 0.35], [4.0, 0.0, 0.35]];
         let obstacles = [[0.0, 0.55, 0.35]];
         let mut req = request(&route, &obstacles);
-        // 原地朝向入口直接核对机身碰撞，避免把允许的平移脱困误当成无碰撞。
+        // 直接查询占据，不把允许的末端脱困误当成自由空间。
         req.goal_yaw = Some(0.);
-        assert!(fixture_planner().step(&req).is_ok());
+        let mut narrow = fixture_planner();
+        assert!(narrow.step(&req).is_ok());
+        assert_eq!(narrow.pose_clearance(req.start_position, req.start_yaw).occupied, 0);
         req.config.body_width = 1.4;
-        assert!(fixture_planner().step(&req).is_err());
+        let mut wide = fixture_planner();
+        wide.step(&req).unwrap();
+        assert_eq!(wide.pose_clearance(req.start_position, req.start_yaw).occupied, 1);
     }
     #[test]
     fn terminal_rotation_uses_real_body_sweep() {
@@ -802,7 +877,10 @@ mod tests {
         let mut req = request(&[], &[]);
         req.goal_yaw = Some(0.5);
         req.ground = &ceiling;
-        assert!(plan(&req).is_err());
+        let mut lower = fixture_planner();
+        let recovery = lower.step(&req).unwrap();
+        assert_eq!(lower.pose_clearance(req.start_position, req.start_yaw).occupied, 1);
+        assert!(!recovery.samples.is_empty());
         req.start_position[2] = 1.35;
         let upper_floor = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         req.ground = &upper_floor;
@@ -968,16 +1046,22 @@ mod tests {
         assert!(planner.step(&req).is_ok());
         let table = [[0.05, 0., 0.35]];
         req.obstacles = &table;
-        // 用原地朝向入口核对当前占据；平移脱困现在允许离开这类误差带内接触。
+        // 末端占据也走脱困；直接查询当前占据，恢复样本仍须通过原完整安全证明。
         req.goal_yaw = Some(0.);
         req.odometry_timestamp_ns += 100_000_000;
-        let failure = planner.step(&req).expect_err("当前已知深度实体必须阻止原雷达未知区域内的动作");
-        assert!(failure.contains("Current body pose is occupied"), "{failure}");
+        let recovery = planner.step(&req).unwrap();
+        assert_eq!(planner.pose_clearance(req.start_position, req.start_yaw).occupied, 1);
+        assert!(!recovery.samples.is_empty());
+        check_escape_sweep(&req.config, &table, &recovery.samples);
         planner.reset_execution();
         req.obstacles = &[];
         req.ground = &table;
         req.odometry_timestamp_ns += 100_000_000;
-        assert!(planner.step(&req).is_err(), "高处支撑面同样是下层机体不能穿越的实体");
+        let recovery = planner.step(&req).unwrap();
+        assert_eq!(planner.pose_clearance(req.start_position, req.start_yaw).occupied, 1,
+            "高处支撑面同样保留为下层机体不能穿越的实体");
+        assert!(!recovery.samples.is_empty());
+        check_escape_sweep(&req.config, &table, &recovery.samples);
         planner.reset_execution();
         req.ground = &[[0.05, 0., 0.0]];
         req.odometry_timestamp_ns += 100_000_000;

@@ -42,18 +42,22 @@ int main(int argc, char** argv) {
   auto c = config();
   auto params = scan_planner::authorParameters(c);
   for (double distance : {.03, .4}) {
-    auto empty = std::make_shared<GridMap>(); empty->initMap(params);
+    GridMap owner; owner.initMap(params);
     const Eigen::Vector3d start(0., 0., .5);
-    empty->importStaticOccupied({}, start);
+    owner.importStaticOccupied({}, start);
+    auto empty = std::make_shared<GridMap>();
+    empty->bindCollisionSnapshot(owner.collisionSnapshot(c,nullptr,nullptr));
     scan_planner::SCANPlannerManager short_plan;
     short_plan.initPlanModules(params, std::make_shared<scan_planner::PlanningVisualization>(params), empty);
     assert(short_plan.reboundReplan(start, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
         start + Eigen::Vector3d(distance, 0., 0.), Eigen::Vector3d::Zero(), true, false, 0.));
   }
   // 执行中带真实非零速度、加速度重新锚定；不能因存在历史而跳过初值定时。
-  auto empty = std::make_shared<GridMap>(); empty->initMap(params);
+  GridMap owner; owner.initMap(params);
   const Eigen::Vector3d start(0., 0., .5), velocity(.12, 0., 0.), acceleration(.1, 0., .05);
-  empty->importStaticOccupied({}, start);
+  owner.importStaticOccupied({}, start);
+  auto empty = std::make_shared<GridMap>();
+  empty->bindCollisionSnapshot(owner.collisionSnapshot(c,nullptr,nullptr));
   scan_planner::SCANPlannerManager moving;
   moving.initPlanModules(params, std::make_shared<scan_planner::PlanningVisualization>(params), empty);
   moving.route_height_.set({start, Eigen::Vector3d(1., 0., .5), Eigen::Vector3d(1., 1., .5)});

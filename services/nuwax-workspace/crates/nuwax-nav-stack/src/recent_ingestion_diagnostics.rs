@@ -45,7 +45,7 @@ fn scheduler(
     let calls = Arc::new(Mutex::new(Vec::new()));
     let planner = nuwax_nav_runtime::SurfaceFollower::new(config.follower.clone()).unwrap();
     let scheduler = nuwax_nav_runtime::NavScheduler::new(
-        crate::lcm_dataflow::guarded_tests::RecordingMotion(calls.clone()),
+        crate::lcm_dataflow::guarded_tests::RecordingMotion::new(calls.clone()),
         planner,
         nuwax_nav_runtime::SchedulerConfig::default(),
     )

@@ -136,8 +136,10 @@ fn registered_surface_failed_first_proof_can_retry_without_rearming_issued_budge
         "同一事件必须保留预算耗尽首因");
     let replan = [route[0], [0.6, 0.025, 0.35], route[1]];
     req.reference = &replan;
-    assert_eq!(planner.step(&req).unwrap_err(), exhausted,
-        "同目标参考路线变化不能解除预算故障锁");
+    let repeated = planner.step(&req).unwrap();
+    assert_eq!([repeated.command_forward, repeated.command_lateral, repeated.command_yaw_rate], [0.; 3],
+        "同目标参考路线变化后同源仍只停车，不重复报预算失败");
+    assert!(!repeated.execution_failed);
     // 新目标可以结束故障锁；重新准入仍过原安全证明。
     planner.reset_execution();
     req.start_position = route[0];
@@ -190,17 +192,15 @@ fn registered_surface_escape_keeps_time_distance_and_geometry_generation_limits(
     assert!(planner.step(&req).unwrap_err().contains("budget exhausted"));
     req.odometry_timestamp_ns = 0;
     let mut planner = registered_fixture(&req);
-    let mut exhausted = false;
-    for _ in 0..20 {
-        match planner.step(&req) {
-            Ok(out) => assert!(out.command_forward > 0.),
-            Err(_) => {
-                exhausted = true;
-                break;
-            }
+    for call in 0..20 {
+        let out = planner.step(&req).unwrap();
+        let command = [out.command_forward, out.command_lateral, out.command_yaw_rate];
+        if call == 0 {
+            assert_ne!(command, [0.; 3]);
+        } else {
+            assert_eq!(command, [0.; 3], "重复来源时间不能反复续发逃逸命令");
         }
     }
-    assert!(exhausted, "重复来源时间不能反复续发逃逸命令");
     let mut planner = registered_fixture(&req);
     assert!(planner.step(&req).is_ok());
     planner.reset_execution();
@@ -339,7 +339,10 @@ fn registered_surface_deeper_escape_rejects_increased_measured_penetration() {
     let error = planner.step(&req).unwrap_err();
     assert!(error.contains("measured escape penetration increased"));
     req.start_position = route[0];
-    assert_eq!(planner.step(&req).unwrap_err(), error, "同事件回到浅接触仍保留真实增深故障");
+    let repeated = planner.step(&req).unwrap();
+    assert_eq!([repeated.command_forward, repeated.command_lateral, repeated.command_yaw_rate], [0.; 3],
+        "同源回到浅接触仍只停车，等待新来源再证明");
+    assert!(!repeated.execution_failed);
     planner.reset_execution();
     assert!(planner.step(&req).unwrap().command_forward > 0., "新目标解除故障后仍须取得安全动作");
 }

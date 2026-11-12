@@ -1,7 +1,7 @@
 //! Diagnostic artifact admission. Ground is read only from the actual publication.
 use super::*;
 use nuwax_codec::lcm::schema;
-use nuwax_map_chunks::{Receiver, Repository, MAX_BLOCK_BYTES};
+use nuwax_map_chunks::{Receiver, Repository};
 use nuwax_nav_stack::surface_map::SurfaceMapCache;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -59,37 +59,31 @@ impl CapturedSource {
             return Err("captured object repository is missing".into());
         }
         let source = Repository::open(objects).map_err(|e| e.to_string())?;
-        // Receiver may collect its objects. Never give it the preserved source store.
+        // 根旁指定归档对象目录；接收器只读原始对象，临时目录仍由夹具拥有。
+        let mut complete = message.clone();
+        complete.fine.as_mut().unwrap().repository_path = source.path().to_string_lossy().into_owned();
         let target = Repository::temporary().map_err(|e| e.to_string())?;
         let target_path = target.path().to_path_buf();
         let mut receiver = Receiver::with_cache_budget(target, 32 * 1024 * 1024);
         let mut fetched = BTreeSet::new();
         let mut fetch_calls = 0;
         let root = receiver.receive(
-            transfer,
+            complete.fine.as_ref().unwrap(),
             &schema::navigation_map_3d_domain(&message),
-            |_, reference| {
-                fetch_calls += 1;
-                fetched.insert(reference.object);
-                source.read_object(reference.object, MAX_BLOCK_BYTES)
-            },
         )?;
+        // 原取块完整性计数沿用；对象现在由只读接收器读取，不再经远程闭包。
+        for reference in &root.blocks {
+            receiver.block(reference)?;
+            fetch_calls += 1;
+            fetched.insert(reference.object);
+        }
         let expected: BTreeSet<_> = root
             .blocks
             .iter()
-            .filter(|r| !transfer.included.contains_key(&r.object))
             .map(|r| r.object)
             .collect();
         if fetched != expected || fetch_calls != expected.len() {
             return Err("missing-object fetch mismatch".into());
-        }
-        // 归档缺块已由原接收器准入；将完整对象交给现行生产缓存构建。
-        let mut complete = message.clone();
-        let included = &mut complete.fine.as_mut().unwrap().included;
-        for reference in &root.blocks {
-            if !included.contains_key(&reference.object) {
-                included.insert(reference.object, source.read_object(reference.object, MAX_BLOCK_BYTES)?);
-            }
         }
         drop(receiver);
         let mut cache = SurfaceMapCache::configured(config);
@@ -125,8 +119,8 @@ impl CapturedSource {
                 return Err(format!("Reader occupancy column mismatch {key:?}"));
             }
         }
-        let admission = json!({"blocks": root.blocks.len(), "inline_objects":transfer.included.len(),
-            "inline_bytes":transfer.included.values().map(Vec::len).sum::<usize>(),
+        let admission = json!({"blocks": root.blocks.len(), "inline_objects":0,
+            "inline_bytes":0,
             "fetch_calls":fetch_calls,"fetched_objects":fetched.len(),"root_version":root.version,
             "same_publication_arc":true,"receiver_store":target_path});
         drop(cache);

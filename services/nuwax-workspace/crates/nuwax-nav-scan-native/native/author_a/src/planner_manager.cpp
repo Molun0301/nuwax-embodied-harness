@@ -279,7 +279,7 @@ namespace scan_planner
         if (farthest == first && last > first+1) {
           const double yaw=std::atan2(delta.y(),delta.x());
           const int steps=std::max(1,static_cast<int>(std::ceil(delta.norm()/(resolution*.25))));
-          const double margin=std::max(.05,resolution);
+          const double margin=preferredClearance(resolution);
           double reference_clearance=margin;
           // 宽处保留目标余量；已知窄段沿原硬可行规则简化，由最小净距软代价选择可留余量。
           for(int j=0;j<=steps;++j) {
@@ -287,7 +287,7 @@ namespace scan_planner
             const Eigen::Vector3d before=route.positionAtArc(std::max(input[first].arc,arc-resolution*.25));
             const Eigen::Vector3d after=route.positionAtArc(std::min(input[last].arc,arc+resolution*.25));
             const double heading=std::atan2(after.y()-before.y(),after.x()-before.x());
-            if(map.bodyClearance(route.positionAtArc(arc),heading,margin)<margin) {
+            if(map.bodyFieldClearance(route.positionAtArc(arc),heading)<margin) {
               reference_clearance=0.;
               break;
             }
@@ -300,7 +300,7 @@ namespace scan_planner
                 +(1.-fraction)*(input[first].point.z()-route.heightAtArc(input[first].arc))
                 +fraction*(input[last].point.z()-route.heightAtArc(input[last].arc));
             if (map.getInflateOccupancy(point,yaw)==0
-                && map.bodyClearance(point,yaw,margin)>=reference_clearance)continue;
+                && map.bodyFieldClearance(point,yaw)>=reference_clearance)continue;
             double deviation=-1.;
             for (std::size_t i=first+1;i<last;++i) {
               const double along=length2>0.?std::clamp((input[i].point-input[first].point).dot(delta)/length2,0.,1.):0.;
@@ -504,8 +504,8 @@ namespace scan_planner
   {
 
     const double resolution = grid_map_->getResolution();
-    bspline_optimizer_rebound_->setInitialClearance(grid_map_->bodyClearance(
-        start_pt,start_yaw,2.*std::max(.05,resolution)));
+    bspline_optimizer_rebound_->setInitialClearance(std::min(2.*preferredClearance(resolution),
+        grid_map_->bodyFieldClearance(start_pt,start_yaw)));
     bool reference_detour = false;
     if (route_height_.ready()) {
       const Eigen::Vector2d chord = (local_target_pt - start_pt).head<2>();

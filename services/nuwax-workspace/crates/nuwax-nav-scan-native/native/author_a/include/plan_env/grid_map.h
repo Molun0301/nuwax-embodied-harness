@@ -4,7 +4,9 @@
 // Ported from wuyi2121/SCAN-Planner@348e8a590a50a5a6bbab8d8c6dcfd171f009be26.
 // 保留作者A的占据概率、射线及滑动缓存；真实机体查询和静态夹具由宿主适配。
 #include <author_host.h>
+#include <author_clearance.h>
 #include <body_collision_cell.h>
+#include <scan_native.h>
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <functional>
 #include <utility>
 #include <memory>
@@ -149,6 +152,16 @@ struct MappingData : CollisionData {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+class SurfaceObstacleLayer;
+class BusinessConstraintMask;
+
+// 按全局格顺序存放，随碰撞快照发布后只读。
+struct BodyClearanceField {
+  int width, height;
+  double origin_x, origin_y, resolution;
+  std::vector<double> distances;
+};
+
 class GridMap {
 public:
   GridMap() {}
@@ -177,7 +190,9 @@ public:
   inline int bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
       std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr,
       bool planar = false);
-  inline double bodyClearance(Eigen::Vector3d pos, double yaw, double range);
+  inline double fieldDistance(double x, double y) const;
+  double bodyFieldClearance(Eigen::Vector3d pos, double yaw) const;
+  double bodyFieldClearance(Eigen::Vector3d pos, double yaw, double upper_bound) const;
   inline double bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range);
   inline bool bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw);
   // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
@@ -210,11 +225,15 @@ public:
     BusinessConstraintQuery business;
     BusinessEnvelopeQuery envelope;
     SurfaceContactQuery surface;
+    BodyClearanceField clearance;
   };
-  std::shared_ptr<const CollisionSnapshot> collisionSnapshot() const {
-    return std::make_shared<const CollisionSnapshot>(CollisionSnapshot{
+  std::shared_ptr<const CollisionSnapshot> collisionSnapshot(const ScanConfig& config,
+      const SurfaceObstacleLayer* surface, const BusinessConstraintMask* business) const {
+    auto result = std::make_shared<CollisionSnapshot>(CollisionSnapshot{
         static_cast<const CollisionParameters&>(mp_), static_cast<const CollisionData&>(md_), business_constraint_query_,
-        business_envelope_query_, surface_collision_query_});
+        business_envelope_query_, surface_collision_query_, {}});
+    result->clearance = buildClearanceField(config, surface, business);
+    return result;
   }
   void bindCollisionSnapshot(std::shared_ptr<const CollisionSnapshot> snapshot) {
     snapshot_ = std::move(snapshot);
@@ -276,6 +295,12 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+  // 输入是已加机身中心偏移的高度；硬查询和距离场共用原高度带表达式。
+  std::pair<double, double> bodyCollisionBand(double center_z) const {
+    return {center_z - mp_.obstacles_inflation_z_up, center_z + mp_.obstacles_inflation_z_down};
+  }
+  BodyClearanceField buildClearanceField(const ScanConfig& config,
+      const SurfaceObstacleLayer* surface, const BusinessConstraintMask* business) const;
   MappingParameters mp_;
   MappingData md_;
   std::shared_ptr<const CollisionSnapshot> snapshot_;
@@ -514,7 +539,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
       s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y(),mp_.body_center_offset_.z());
   const double hx=mp_.body_length_/2.+padding,hy=mp_.body_width_/2.+padding;
   const double ex=ac*hx+as*hy,ey=as*hx+ac*hy,r=mp_.resolution_,half=r/2.;
-  const double low=pos.z()-mp_.obstacles_inflation_z_up,high=pos.z()+mp_.obstacles_inflation_z_down;
+  const auto [low,high]=bodyCollisionBand(pos.z());
   // 外包必须完整位于当前环形缓存内，不能把未扫描的图外当成自由。
   if (!isInMap(Eigen::Vector3d(pos.x()-ex,pos.y()-ey,low))
       || !isInMap(Eigen::Vector3d(pos.x()+ex,pos.y()+ey,high))) return -1;
@@ -557,52 +582,34 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
   return found?1:0;
 }
 
-// 只供软代价：实际矩形向四边扩张至当前实体所需的距离，硬查询仍使用零扩张。
-inline double GridMap::bodyClearance(Eigen::Vector3d pos, double yaw, double range) {
-  if (bodyContacts(pos,yaw,range)==0) return range;
-  double low=0.,high=range;
-  for(int i=0;i<8;++i) {
-    const double middle=(low+high)/2.;
-    if(bodyContacts(pos,yaw,middle)==0)low=middle;
-    else high=middle;
-  }
-  return low;
+inline double GridMap::fieldDistance(double x, double y) const {
+  if(!std::isfinite(x)||!std::isfinite(y))return std::numeric_limits<double>::quiet_NaN();
+  const auto& field=snapshot_->clearance;
+  const double u=std::clamp((x-field.origin_x)/field.resolution,0.,double(field.width-1));
+  const double v=std::clamp((y-field.origin_y)/field.resolution,0.,double(field.height-1));
+  const int x0=int(std::floor(u)),y0=int(std::floor(v));
+  const int x1=std::min(x0+1,field.width-1),y1=std::min(y0+1,field.height-1);
+  const double dx=u-x0,dy=v-y0;
+  const auto& values=field.distances;
+  const double lower=(1.-dx)*values[y0*field.width+x0]+dx*values[y0*field.width+x1];
+  const double upper=(1.-dx)*values[y1*field.width+x0]+dx*values[y1*field.width+x1];
+  return (1.-dy)*lower+dy*upper;
 }
 
 // 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
 inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
-  std::vector<BodyCell> cells;
-  const double margin=std::max(.05,mp_.resolution_);
-  if(bodyContacts(pos,yaw,range,&cells,nullptr,true)<0) {
-    // 显式边界或局部缓存的边缘仍按原外包查询计算可用扩张距离。
-    const double clearance=bodyClearance(pos,yaw,range),deficit=range-clearance;
-    return deficit*deficit/margin;
-  }
-  const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
-  pos.x()+=c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y();
-  pos.y()+=s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y();
-  const double hx=mp_.body_length_/2.,hy=mp_.body_width_/2.,half=mp_.resolution_/2.;
-  double clearance=range;
-  for(const auto& cell:cells) {
-    const double dx=(cell[0]+.5)*mp_.resolution_-pos.x();
-    const double dy=(cell[1]+.5)*mp_.resolution_-pos.y();
-    const double u=c*dx+s*dy,v=-s*dx+c*dy;
-    const double distance=std::max({0.,
-        (std::abs(dx)-ac*hx-as*hy-half)/(ac+as),
-        (std::abs(dy)-as*hx-ac*hy-half)/(ac+as),
-        std::abs(u)-hx-half*(ac+as),std::abs(v)-hy-half*(ac+as)});
-    clearance=std::min(clearance,distance);
-  }
+  const double margin=scan_planner::preferredClearance(mp_.resolution_);
+  const double clearance=bodyFieldClearance(pos,yaw,range);
   const double deficit=range-clearance;
   return deficit*deficit/margin;
 }
 
 inline bool GridMap::bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw) {
-  const double margin=std::max(.05,mp_.resolution_);
-  if(bodyContacts(pos,yaw,margin)==0)return true;
+  const double margin=scan_planner::preferredClearance(mp_.resolution_);
+  if(bodyFieldClearance(pos,yaw)>=margin)return true;
   // 在参考方向横移一个余量即可留足空间时进入优化；两侧均受限的门洞保留原可行初值。
   const Eigen::Vector3d lateral(-std::sin(yaw)*margin,std::cos(yaw)*margin,0.);
-  return bodyContacts(pos+lateral,yaw,margin)!=0&&bodyContacts(pos-lateral,yaw,margin)!=0;
+  return bodyFieldClearance(pos+lateral,yaw)<margin&&bodyFieldClearance(pos-lateral,yaw)<margin;
 }
 
 inline int GridMap::getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw) {

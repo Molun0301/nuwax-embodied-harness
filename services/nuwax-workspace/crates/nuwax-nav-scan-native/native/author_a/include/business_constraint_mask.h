@@ -43,6 +43,15 @@ class BusinessConstraintMask {
     return rejectsEnvelope(reference, yaw, 0.0);
   }
 
+  // 距离场标记原业务列，不预先叠加机身外包。
+  bool rejectsColumn(int x,int y) const {
+    const Eigen::Vector2d center((x+.5)*resolution_,(y+.5)*resolution_);
+    if(boundary_.size()>=3 && !insideBoundary(center))return true;
+    const auto found=buckets_.find(bucketKey(center.x(),center.y()));
+    return found!=buckets_.end() && std::any_of(found->second.begin(),found->second.end(),
+        [x,y](const Eigen::Vector2i& cell){return cell.x()==x&&cell.y()==y;});
+  }
+
   // 半径padding包住整段机体点的位移，业务边界与禁行格同样不能在采样间隙穿越。
   bool rejectsEnvelope(const Eigen::Vector3d& reference, double yaw, double padding) const {
     Eigen::Vector2d heading(std::cos(yaw), std::sin(yaw));

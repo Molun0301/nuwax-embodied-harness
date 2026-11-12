@@ -640,7 +640,16 @@ async fn run_surface_planner_with_computer(
                 }
                 geometry_retired = false;
                 match result {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        if plan.kind == nuwax_nav_runtime::RouteKind::Approach {
+                            let end = plan.path.poses.last().expect("原生非空路线").pose.position;
+                            if nuwax_nav_runtime::surface_follower::position_within_tolerance(
+                                [end.x, end.y, end.z], planned_goal.goal.pose.position,
+                                planned_goal.options().position_tolerance_m,
+                                f64::from(input.source.config().step_threshold_m)) {
+                                plan.kind = nuwax_nav_runtime::RouteKind::Complete;
+                            }
+                        }
                         let is_approach=plan.kind==nuwax_nav_runtime::RouteKind::Approach;
                         if is_approach {
                             let end=plan.path.poses.last().expect("原生非空路线").pose.position;
@@ -653,7 +662,11 @@ async fn run_surface_planner_with_computer(
                                 // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
                                 let at_end=pose.as_ref().is_some_and(|current|
                                     current.pose.position.distance(state.endpoint)<=0.15);
-                                if at_end {
+                                let terminal = execution_feedback.as_ref().is_some_and(|feedback|
+                                    feedback.path_identity.session_id == planned_goal.session_id
+                                        && feedback.path_identity.goal_key == planned_goal.goal_key()
+                                        && feedback.terminal_phase != nuwax_nav_runtime::TerminalPhase::Travel);
+                                if at_end && !terminal {
                                     state.stagnant+=1;
                                     if state.stagnant>=3 {
                                         let reason=approach_failure(end,target,state.stagnant);
@@ -1756,7 +1769,7 @@ goal: schema::PoseStamped {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
                             let mut local = crate::static_map_follower(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
-                                RecordingMotion(motion_calls),local,scheduler_config)?);
+                                RecordingMotion::new(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();
                             Ok(pair)
                         }))
@@ -1901,6 +1914,21 @@ goal: schema::PoseStamped {
             })
             .await
             .unwrap_or_else(|_| panic!("完整三维路径未实际执行: {:?}", self.scheduler.status()));
+        }
+
+        async fn wait_local_stop_or_reverse(&self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let status=self.scheduler.status();
+                    let safe=status.last_applied_twist.is_some_and(|twist| {
+                        (twist==Twist2::ZERO && status.message.contains("重规划"))
+                            || (twist.linear.x<0. && twist.linear.x>=-0.04
+                                && twist.linear.y==0. && twist.angular_z==0.)
+                    });
+                    if status.phase==SchedulerPhase::Controlling && safe {break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap_or_else(|_|panic!("物理占据后应停车重规划或执行已证明的低速倒退：{:?}",self.scheduler.status()));
         }
 
         async fn wait_local_zero(&self){
@@ -2239,6 +2267,29 @@ goal: schema::PoseStamped {
     }
 
     #[tokio::test]
+    async fn approach_endpoint_inside_goal_tolerance_executes_as_complete_and_arrives() {
+        let computer: SurfacePathComputer = Arc::new(|map, pose, goal, config| {
+            let mut endpoint = goal.clone();
+            endpoint.goal.pose.position[0] -= 0.10;
+            endpoint.goal.pose.position[2] += 0.05;
+            Ok(SurfacePlan { path: body_path(map, pose, &endpoint, config)?,
+                kind: nuwax_nav_runtime::RouteKind::Approach, resolution: 0.1 })
+        });
+        let mut harness = Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [1.15, 1.55, 2.5]);
+        harness.goal(&goal).await;
+        let route = harness.path_for(&goal).await;
+        assert_eq!(route.route_kind, 0, "端点满足平面及高度容差时按完整路线交付");
+        harness.wait_controlling().await;
+        assert_eq!(harness.scheduler.status().last_terminal, None, "路线接纳不能替代实测到达");
+        harness.feed.lock().unwrap().position = route.path.poses.last().unwrap().pose.position;
+        harness.terminal(TerminalOutcome::Succeeded).await;
+        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn n6_first_short_approach_is_published_and_executes_before_stagnation() {
         let computer: SurfacePathComputer = Arc::new(|map, pose, goal, config| {
             let mut endpoint = goal.clone();
@@ -2544,7 +2595,7 @@ goal: schema::PoseStamped {
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
         assert_eq!(starts.lock().unwrap().len(), 1, "新图不能触发全程重复检查和搜索");
         harness.feed.lock().unwrap().position[0] = 1.85;
-        harness.wait_local_zero().await;
+        harness.wait_local_stop_or_reverse().await;
         assert_eq!(starts.lock().unwrap().len(),1,"局部受阻由局部规划线程处理，保留全局路线身份");
         assert_eq!(harness.scheduler.status().path_revision,1);
         assert!(harness.scheduler.status().pose_source_timestamp_ns>0);
@@ -2673,7 +2724,7 @@ goal: schema::PoseStamped {
         first.path_for(&pending).await;
         first.wait_controlling().await;
 
-        // 同域的新点云新增真实占据冲突，实际执行先零速等待；清障后连续重规划。
+        // 同域真实占据冲突允许经证明低速倒退；清障后连续重规划。
         // 缺测本身不是障碍，不能只删除地面采样就要求执行端宣告阻塞。
         let original = first.feed.lock().unwrap().map.cloud.clone();
         {
@@ -2684,11 +2735,10 @@ goal: schema::PoseStamped {
             feed.map.cloud.width = (feed.map.cloud.data.len() / 12) as i32;
             feed.map.cloud.row_step = feed.map.cloud.data.len() as i32;
         }
-        first.wait_local_zero().await;
-        assert_eq!(
-            first.scheduler.status().last_applied_twist,
-            Some(Twist2::ZERO)
-        );
+        first.wait_local_stop_or_reverse().await;
+        let action=first.scheduler.status().last_applied_twist.unwrap();
+        assert!(action.linear.x>=-0.04 && action.linear.x<=0.
+            && action.linear.y==0. && action.angular_z==0.);
         assert!(first.scheduler.status().last_terminal.is_none());
         {
             let mut feed = first.feed.lock().unwrap();

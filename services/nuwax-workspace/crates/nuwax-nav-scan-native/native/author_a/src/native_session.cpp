@@ -2,6 +2,7 @@
 #include <author_controller.h>
 #include <author_command_check.h>
 #include <author_overlap_escape.h>
+#include <author_terminal.h>
 #include <author_diagnostics.h>
 #include <author_parameters.h>
 #include <business_constraint_mask.h>
@@ -20,6 +21,8 @@ using Snapshot = std::shared_ptr<const GridMap::CollisionSnapshot>;
 struct MapOwner {
   ScanConfig config;
   GridMap map;
+  std::shared_ptr<const SurfaceObstacleLayer> surface;
+  std::shared_ptr<const BusinessConstraintMask> business;
   explicit MapOwner(const ScanConfig& c):config(c) { auto p=scan_planner::authorParameters(c);map.initMap(p); }
 };
 struct Trajectory {
@@ -136,10 +139,12 @@ extern "C" int nuwax_scan_map_surface(void* p,const double* obstacles,size_t cou
     const double* boundary,size_t boundary_count,const int32_t* forbidden,size_t forbidden_count) {
   try {
     auto& o=*static_cast<MapOwner*>(p);auto surface=std::make_shared<SurfaceObstacleLayer>(o.config,obstacles,count,ground,ground_count);
+    o.surface=surface;
     o.map.setSurfaceCollisionQuery([surface](const Vector3d& x,double yaw,double pad,std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){return surface->contacts(x,yaw,pad,hits,initial,planar);});
     std::vector<Eigen::Vector2d> polygon;for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
     std::vector<Eigen::Vector2i> columns;for(size_t i=0;i<forbidden_count;++i)columns.emplace_back(forbidden[2*i],forbidden[2*i+1]);
     const auto& c=o.config;auto mask=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),columns);
+    o.business=mask;
     o.map.setBusinessConstraintQuery([mask](const Vector3d& x,double yaw){return mask->rejects(x,yaw);});
     o.map.setBusinessEnvelopeQuery([mask](const Vector3d& x,double yaw,double pad){return mask->rejectsEnvelope(x,yaw,pad);});return 0;
   }catch(...){return 1;}
@@ -156,7 +161,10 @@ extern "C" void nuwax_scan_map_seed_occupied(void* p,const double* points,size_t
   std::vector<Vector3d> values;for(size_t i=0;i<count;++i)values.emplace_back(Eigen::Map<const Vector3d>(points+3*i));
   static_cast<MapOwner*>(p)->map.repopulateStaticOccupied(values,Eigen::Map<const Vector3d>(body));
 }
-extern "C" void* nuwax_scan_map_snapshot(const void* p){return new Snapshot(static_cast<const MapOwner*>(p)->map.collisionSnapshot());}
+extern "C" void* nuwax_scan_map_snapshot(const void* p){
+  const auto& owner=*static_cast<const MapOwner*>(p);
+  return new Snapshot(owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get()));
+}
 extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previous,const void* trajectory,double from) {
   GridMap now,before;now.bindCollisionSnapshot(*static_cast<const Snapshot*>(current));before.bindCollisionSnapshot(*static_cast<const Snapshot*>(previous));
   auto curve=*static_cast<const Curve*>(trajectory);const double total=curve->duration(),dt=std::min(.01,now.getResolution()/2.);
@@ -171,6 +179,18 @@ extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previ
   return 0;
 }
 extern "C" void nuwax_scan_snapshot_destroy(void* p){delete static_cast<Snapshot*>(p);}
+extern "C" void nuwax_scan_terminal_points(const void* snapshot,const ScanConfig* config,const double* goal,
+    double yaw,double tolerance,const double* reference,size_t count,ScanTerminalPoints* output) {
+  GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
+  std::vector<Vector3d> route;for(size_t i=0;i<count;++i)route.emplace_back(Eigen::Map<const Vector3d>(reference+3*i));
+  *output=scan_planner::terminalPoints(map,*config,Eigen::Map<const Vector3d>(goal),yaw,tolerance,route);
+}
+extern "C" void nuwax_scan_pose_clearance(const void* snapshot,const double* position,double yaw,ScanPoseClearance* output) {
+  GridMap map;map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
+  const Vector3d point=Eigen::Map<const Vector3d>(position);
+  output->field_distance=map.fieldDistance(point.x(),point.y());
+  output->body_clearance=map.bodyFieldClearance(point,yaw);output->occupied=map.getInflateOccupancy(point,yaw);
+}
 extern "C" void* nuwax_scan_planner_create(){return new PlannerSession;}
 extern "C" void nuwax_scan_planner_destroy(void* p){delete static_cast<PlannerSession*>(p);}
 extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void* snapshot,const double* reference,size_t count,
@@ -219,7 +239,7 @@ extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cas
 extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
-    const double previous[3],double terminal_yaw,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
+    const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
   *out={};*recovery={};scan_native_diagnostic.clear();try {
     auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
     const Vector3d position=Eigen::Map<const Vector3d>(state->position);const double yaw=state->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
@@ -233,10 +253,16 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
     const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
+    if(s.escape.hasDecision(state->timestamp_ns)) {
+      s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,
+          state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
+      s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
+      out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
+    }
     const int occupied=s.map.getInflateOccupancy(position,yaw);
     if(occupied!=0) {
       s.escape.observeOverlap();
-      if(occupied==1 && !std::isfinite(terminal_yaw) && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
+      if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
         s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
@@ -248,6 +274,14 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(std::isfinite(terminal_yaw)) {
       const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;
       s.raw={};s.raw.angular.z=std::copysign(std::min(c->max_yaw_rate,std::sqrt(step*step+2*c->max_yaw_acceleration*std::abs(diff))-step),diff);desired_yaw=terminal_yaw;
+      if(terminal_position) {
+        target=Eigen::Map<const Vector3d>(terminal_position);
+        s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
+        Eigen::Vector2d velocity=s.controller.kp_pos*(target-position).head<2>();
+        const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));
+        if(velocity.norm()>cap)velocity*=cap/velocity.norm();
+        s.raw.linear.x=cs*velocity.x()+sn*velocity.y();s.raw.linear.y=-sn*velocity.x()+cs*velocity.y();
+      }
     }else {
       if(!s.curve){out->reason|=SCAN_TRACK_NO_TRAJECTORY;return;}
       else {
@@ -268,28 +302,71 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.reference_time=s.phase;s.reference_stamp.reset();s.install_pending=false;}
       // 实际投影用于进度；期望参考按控制周期推进，超出原偏离距离时停表。
       const double next_reference=std::min(s.curve->duration(),std::max(s.phase,s.reference_time+c->sample_dt));
-      s.reference_time=std::max(s.reference_time,s.phase);
+      double reference_time=std::max(s.reference_time,s.phase);
       // 同一来源采样的重复计算仍只算一拍，保留既有控制时钟语义。
       if(s.reference_stamp!=state->timestamp_ns) {
         if((s.curve->position.evaluateDeBoorT(next_reference)-position).norm()<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution))
-          s.reference_time=next_reference;
+          reference_time=next_reference;
         s.reference_stamp=state->timestamp_ns;
       }
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       // 完整参考末段继续位置反馈；局部窗口仍保留原末端减速，不把期望走完当作实际到达。
       s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
-      s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
-      const auto before=s.curve->position.evaluateDeBoorT(s.reference_time);desired_yaw=s.controller.estimateDesiredYaw(s.reference_time,before);
+      s.controller.odomCallback(odometry(*state));
+      const auto before=s.curve->position.evaluateDeBoorT(reference_time);desired_yaw=s.controller.estimateDesiredYaw(reference_time,before);
+      const double yaw_error=std::atan2(std::sin(desired_yaw-yaw),std::cos(desired_yaw-yaw));
+      if(std::abs(yaw_error)>.3) {
+        const double radius=std::hypot(c->body_length/2.+std::abs(c->body_center_x),c->body_width/2.+std::abs(c->body_center_y));
+        const double clearance=s.map.bodyFieldClearance(position,yaw);
+        const double yaw_step=std::min(c->max_yaw_rate,scan_planner::clearanceSpeedCap(*c,clearance)/radius)*c->sample_dt;
+        const int count=int(std::ceil((std::abs(yaw_error)-.3)/yaw_step));
+        double moving_minimum=std::numeric_limits<double>::infinity();
+        double turning_minimum=std::numeric_limits<double>::infinity();
+        // 只比较未来各拍；原地转向的最小净空不低于边走边转时才先转。
+        for(int k=1;k<=count;++k) {
+          const auto point=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+k*c->sample_dt));
+          const double heading=yaw+std::copysign(std::min(std::abs(yaw_error),k*yaw_step),yaw_error);
+          moving_minimum=std::min(moving_minimum,s.map.bodyFieldClearance(point,heading));
+          turning_minimum=std::min(turning_minimum,s.map.bodyFieldClearance(position,heading));
+        }
+        out->turn_first=moving_minimum<.10&&turning_minimum>=moving_minimum;
+      }
+      if(!out->turn_first)s.reference_time=reference_time;
+      s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
+      if(out->turn_first) {
+        s.raw.linear={};
+        s.raw.angular.z=std::clamp(s.controller.kp_yaw*yaw_error,-c->max_yaw_rate,c->max_yaw_rate);
+      }
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }
-    const double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
+    // 归档271次停车的滑行P95：≥0.5米/秒为0.105米，0.2—0.3为0.037米，<0.1为0.017米，另需留约0.03米定位抖动。
+    const double clearance=s.map.bodyFieldClearance(position,yaw);
+    double speed_cap=scan_planner::clearanceSpeedCap(*c,clearance);
+    if(s.curve&&!std::isfinite(terminal_yaw)) {
+      const double horizon=std::max(0.,(scan_planner::deviceSpeedMagnitude(*c)-.10)/c->max_acceleration);
+      const double remaining=std::max(0.,s.curve->duration()-s.reference_time),period=2.*c->sample_dt;
+      const int count=int(std::ceil(std::min(horizon,remaining)/period));
+      double tangent=yaw;
+      for(int k=1;k<=count;++k) {
+        const double t=std::min(k*period,remaining),at=s.reference_time+t;
+        const auto point=s.curve->position.evaluateDeBoorT(at),velocity=s.curve->velocity.evaluateDeBoorT(at);
+        if(velocity.head<2>().squaredNorm()>1e-8)tangent=std::atan2(velocity.y(),velocity.x());
+        const double available=scan_planner::clearanceSpeedCap(*c,s.map.bodyFieldClearance(point,tangent));
+        speed_cap=std::min(speed_cap,available+c->max_acceleration*t);
+      }
+    }
+    const double radius=std::hypot(c->body_length/2.+std::abs(c->body_center_x),c->body_width/2.+std::abs(c->body_center_y));
+    double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
+    const double requested_speed=std::hypot(vx,vy);
+    if(requested_speed>speed_cap){vx*=speed_cap/requested_speed;vy*=speed_cap/requested_speed;}
+    const double requested_w=std::clamp(s.raw.angular.z,-speed_cap/radius,speed_cap/radius);
     Eigen::Vector2d preferred_world(cs*vx-sn*vy,sn*vx+cs*vy),delta=preferred_world-command_world;const double step=c->max_acceleration*c->sample_dt;
     if(delta.norm()>step)delta*=step/delta.norm();const auto chosen=(command_world+delta).eval();
     const Eigen::Vector2d preferred(std::clamp(cs*chosen.x()+sn*chosen.y(),-c->max_reverse_velocity,c->max_velocity),std::clamp(-sn*chosen.x()+cs*chosen.y(),-c->max_lateral_velocity,c->max_lateral_velocity));
-    const double w=std::clamp(s.raw.angular.z,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
+    const double w=std::clamp(requested_w,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
     const auto checked=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
     out->limited=checked.limited;if(!checked.found){out->reason=SCAN_TRACK_NO_CANDIDATE;s.curve.reset();return;}
     out->command[0]=checked.linear.x();out->command[1]=checked.linear.y();out->command[2]=checked.angular;

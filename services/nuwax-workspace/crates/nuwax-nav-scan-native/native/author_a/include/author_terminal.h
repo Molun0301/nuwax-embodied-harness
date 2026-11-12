@@ -10,7 +10,7 @@ inline ScanTerminalPoints terminalPoints(GridMap& map,const ScanConfig& c,const 
   Eigen::Vector3d stop=goal;
   const double spacing=c.resolution/2.;
   if(map.getInflateOccupancy(goal,yaw)!=0 || map.bodyFieldClearance(goal,yaw)<.10) {
-    const double range=tolerance-.03;
+    const double range=tolerance/2.;
     const int count=int(std::floor(range/spacing));
     double best_distance=INFINITY,best_clearance=-INFINITY;
     bool preferred=false;

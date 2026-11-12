@@ -27,7 +27,7 @@ fn pillar_terminal_points_leave_turning_room_and_require_the_actual_lateral_chan
     map.update_surface(&[], &[], &[], &[]).unwrap();
     let snapshot = map.snapshot();
     let selected = snapshot.terminal_points(&c, goal, yaw, 0.15, &route);
-    assert!(selected.stop[0].hypot(selected.stop[1]) <= 0.12);
+    assert!(selected.stop[0].hypot(selected.stop[1]) <= 0.075);
     assert_eq!(selected.stop[2], goal[2]);
     let stop = snapshot.pose_clearance(selected.stop, yaw);
     assert_eq!(stop.occupied, 0);

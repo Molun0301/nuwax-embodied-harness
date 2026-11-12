@@ -508,6 +508,7 @@ namespace scan_planner
 
     const double resolution = grid_map_->getResolution();
     heading_.yaw0=start_yaw;
+    heading_.turn_first=false;
     bspline_optimizer_rebound_->setInitialClearance(std::min(2.*grid_map_->preferredClearance(),
         grid_map_->bodyFieldClearance(start_pt,start_yaw)));
     bool reference_detour = false;
@@ -837,7 +838,7 @@ namespace scan_planner
     bspline_optimizer_rebound_->setBsplineInterval(ts);
     const Eigen::MatrixXd reference_controls=ctrl_pts;
     UniformBspline reference_curve(reference_controls,3,ts);
-    const bool reference_free=route_time_seed&&trajectoryCollisionFree(reference_curve);
+    const bool reference_free=route_time_seed&&trajectoryCollisionFree(reference_curve,false);
     // 初值和优化结果统一在优化后定时，避免端部定时成功使曲折初值跳过几何优化。
     std::string timing_reason;
     if(!height_sample_arcs.empty()) {
@@ -884,7 +885,7 @@ namespace scan_planner
     // 保留原有无碰撞参考回退；数值状态失败但几何已无碰撞时保留排斥后的结果。
     if(!flag_step_1_success&&reference_free) {
       UniformBspline optimized_geometry(ctrl_pts,3,ts);
-      if(!trajectoryCollisionFree(optimized_geometry))ctrl_pts=reference_controls;
+      if(!trajectoryCollisionFree(optimized_geometry,false))ctrl_pts=reference_controls;
     }
     t_opt = ros::WallTime::now() - t_start;
     t_start = ros::WallTime::now();
@@ -899,8 +900,12 @@ namespace scan_planner
     else ROS_WARN_STREAM("局部结点定时失败："<<timing_reason);
 
     if(flag_step_2_success)arrangeHeadingTime(pos,heading_);
-    bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
-        && trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.;
+    bool accepted = flag_step_2_success && checkDynamicFeasibility(pos);
+    if(accepted) {
+      heading_.turn_first=!trajectoryCollisionFree(pos,true);
+      accepted=!heading_.turn_first||trajectoryCollisionFree(pos,false);
+    }
+    accepted=accepted&&strictDynamicScale(pos)<=1.;
     if (!accepted)
     {
       std::fprintf(stderr,"\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
@@ -1138,7 +1143,7 @@ namespace scan_planner
     return true;
   }
 
-  bool SCANPlannerManager::trajectoryCollisionFree(UniformBspline& trajectory)
+  bool SCANPlannerManager::trajectoryCollisionFree(UniformBspline& trajectory,bool use_start)
   {
     arrangeHeadingTime(trajectory,heading_);
     const double duration = trajectory.getTimeSum();
@@ -1148,7 +1153,8 @@ namespace scan_planner
     for (int i = 0; i <= samples; ++i) {
       const double time = duration * i / samples;
       const Eigen::Vector3d point = trajectory.evaluateDeBoorT(time);
-      const double yaw = heading_.at(trajectoryHeading(velocity,duration,time,dt,heading_.yaw0),time,duration);
+      const double yaw = plannedHeading(trajectoryHeading(velocity,duration,time,dt,heading_.yaw0),time,duration,
+          heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,use_start);
       if (grid_map_->getInflateOccupancy(point, yaw) != 0) return false;
     }
     return true;

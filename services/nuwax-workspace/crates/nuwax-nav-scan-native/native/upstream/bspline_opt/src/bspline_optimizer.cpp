@@ -40,7 +40,8 @@ namespace scan_planner
   {
     const double duration=count*bspline_interval_;
     const double scale=heading_.duration(duration)/duration;
-    return heading_.at(tangent,std::max(0.,time)*scale,duration*scale);
+    return plannedHeading(tangent,std::max(0.,time)*scale,duration*scale,
+        heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false);
   }
 
   double BsplineOptimizer::estimateControlPointYaw(const Eigen::MatrixXd &q, int id) const
@@ -1078,7 +1079,8 @@ namespace scan_planner
         {
           Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
           Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-          flag_occ = grid_map_->getInflateOccupancy(pos, heading_.at(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum()));
+          flag_occ = grid_map_->getInflateOccupancy(pos, plannedHeading(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum(),
+              heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false));
           if (flag_occ)
           {
             //std::cerr << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
@@ -1174,7 +1176,8 @@ namespace scan_planner
       {
         Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
         Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-        if (grid_map_->getInflateOccupancy(pos, heading_.at(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum())))
+        if (grid_map_->getInflateOccupancy(pos, plannedHeading(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum(),
+            heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false)))
         {
           // std::cerr << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
 

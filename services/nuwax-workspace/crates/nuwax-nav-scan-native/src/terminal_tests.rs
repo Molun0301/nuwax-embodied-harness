@@ -17,13 +17,17 @@ int main() {
   close(plannedHeading(.3,4.,4.,0.,2.5,1.,0.,1.),.3);
   close(plannedHeading(1.,.1,4.,0.,2.5,1.,0.,1.),.1);
   close(plannedHeading(2.,0.,4.,-.7,std::nullopt,1.,1.,1.),-.7);
+  close(plannedHeading(2.,0.,4.,-.7,std::nullopt,1.,1.,1.,false),2.);
   const double before=plannedHeading(M_PI-.001,2.,4.,3.,-3.,1.,1.,1.);
   const double after=plannedHeading(-M_PI+.001,2.,4.,3.,-3.,1.,1.,1.);
   close(after-before,.002);
   scan_planner::HeadingPlan heading{0.,1.5,1.,1.,.5};
   close(heading.duration(.3),3.);
   close(heading.duration(4.),4.);
+  heading.turn_first=true;
+  close(heading.at(.8,0.,3.),.8);
 }
+
 "#).unwrap();
     let output = std::process::Command::new("c++").args(["-std=c++17", "-O2"])
         .arg(format!("-I{}",root.join("native/author_a/include").display()))
@@ -34,6 +38,42 @@ int main() {
     assert!(output.status.success(), "朝向约束/优先级/跨π/时长回归失败：{}",String::from_utf8_lossy(&output.stderr));
 }
 
+#[test]
+fn final_heading_acceptance_marks_only_the_curve_that_needs_turning_before_translation() {
+    let mut c = config();
+    c.resolution = 0.05;
+    c.body_length = 0.6;
+    c.body_width = 0.32;
+    c.max_yaw_acceleration = 20.;
+    c.obstacle_clearance_m = 0.05;
+    let state = MotionState {position:[0.,0.,0.4],yaw:std::f64::consts::FRAC_PI_2,
+        measured_velocity:1,measured_yaw_rate:1,timestamp_ns:1_000_000_000,..Default::default()};
+    let route = [state.position,[1.,0.,0.4]];
+    for occupied in [false,true] {
+        let obstacles = if occupied {vec![[0.425,0.275,0.425]]} else {Vec::new()};
+        let mut map = MapOwner::new(&c).unwrap();
+        map.seed_occupied(&[],state.position);
+        map.update_surface(&obstacles,&[],&[],&[]).unwrap();
+        let snapshot = map.snapshot();
+        assert_eq!(snapshot.pose_clearance(state.position,state.yaw).occupied,0);
+        let trajectory = ScanPlanner::default().plan(&c,&snapshot,&route,&state,None,0.,None).unwrap();
+        let sample = trajectory.samples(0.,c.sample_dt)[0];
+        if occupied {
+            assert!(sample.yaw.abs()<1e-8,"只有去掉起点限制才可接纳的曲线采用前三条：{sample:?}");
+            let mut tracker = ScanTracker::default();
+            tracker.install(&trajectory);
+            let command = tracker.track_and_check(&c,&snapshot,&state,[0.;3],None).unwrap();
+            assert!(!command.invalid(),"原地转向仍须经过硬命令检查：{command:?}");
+            assert_eq!(&command.command[..2],&[0.,0.]);
+            assert!(command.command[2]<0.);
+            let aligned = MotionState {yaw:sample.yaw,timestamp_ns:state.timestamp_ns+50_000_000,..state};
+            let command = tracker.track_and_check(&c,&snapshot,&aligned,[0.;3],None).unwrap();
+            assert!(command.command[0].hypot(command.command[1])>0.,"朝向对齐后沿原曲线平移：{command:?}");
+        } else {
+            assert!((sample.yaw-state.yaw).abs()<1e-8,"开阔处保留含起点限制的边走边转曲线：{sample:?}");
+        }
+    }
+}
 #[test]
 fn terminal_heading_uses_the_existing_proportional_gain_while_turning_or_translating() {
     let mut c = config();

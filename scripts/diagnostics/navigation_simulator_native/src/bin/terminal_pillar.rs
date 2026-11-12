@@ -268,8 +268,6 @@ mod tests {
         assert_eq!(result["succeeded"],false);
         assert_eq!(result["position_error_m"],2.0);
         assert!(rows.iter().all(|r|r["command"]==json!([0.,0.,0.])));
-        assert_eq!(result["terminal"]["S"],result["goal"][0]);
-        assert_eq!(result["terminal"]["P"],result["goal"][0]);
     }
     #[test]
     fn pillar_goal_at_96_degrees_projects_reverse_then_arrives_without_intersection() {

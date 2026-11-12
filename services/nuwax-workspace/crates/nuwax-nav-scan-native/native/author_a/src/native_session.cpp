@@ -305,10 +305,13 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
       s.controller.odomCallback(odometry(*state));
-      desired_yaw=s.curve->headingAt(reference_time);
-      s.reference_time=reference_time;
+      const bool turning=s.curve->heading.turn_first
+          &&std::abs(scan_planner::headingDifference(s.curve->headingAt(s.reference_time),yaw))>.3;
+      if(!turning)s.reference_time=reference_time;
+      desired_yaw=s.curve->headingAt(s.reference_time);
       s.controller.exec_time=s.reference_time;s.controller.last_update_time=ros::Time::now();
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
+      if(turning)s.raw.linear={};
       s.raw.angular.z=std::clamp(s.controller.kp_yaw*scan_planner::headingDifference(desired_yaw,yaw),-c->max_yaw_rate,c->max_yaw_rate);
       if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }

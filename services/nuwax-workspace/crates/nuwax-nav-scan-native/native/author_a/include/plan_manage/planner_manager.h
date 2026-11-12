@@ -60,7 +60,7 @@ namespace scan_planner
 
     void updateTrajInfo(const UniformBspline &position_traj, const ros::Time time_now);
     bool checkDynamicFeasibility(UniformBspline position_traj);
-    bool trajectoryCollisionFree(UniformBspline& trajectory);
+    bool trajectoryCollisionFree(UniformBspline& trajectory,bool use_start);
     bool trajectoryHasPreferredClearance(UniformBspline& trajectory);
     double strictDynamicScale(UniformBspline& trajectory);
 

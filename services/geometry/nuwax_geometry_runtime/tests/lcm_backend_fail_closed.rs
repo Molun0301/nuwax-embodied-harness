@@ -74,6 +74,8 @@ impl Fixture {
         config.set("geometry", "fine_cloud_cache_mib", 16i64);
         config.set("derived","robot_geometry_json",r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"会话进程测试"}"#);
         config.set("derived", "nav_profile", "pct-scan-3d");
+        config.set("derived", "min_executable_linear_mps", 0.0);
+        config.set("derived", "min_executable_angular_rps", 0.0);
         config.set("derived", "actuator_max_linear_mps", 0.0);
         config.set("derived", "actuator_max_yaw_rps", 0.0);
         config.set("derived", "actuator_motion_model", "");

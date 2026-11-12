@@ -46,13 +46,6 @@ typedef struct {
 } ScanTrackOutput;
 void *nuwax_scan_map_create(const ScanConfig *config);
 void nuwax_scan_map_destroy(void *map);
-typedef struct ScanSurfaceColumn {
-  int32_t x,y;
-  const double* obstacles;size_t obstacle_count;
-  const double* ground;size_t ground_count;
-} ScanSurfaceColumn;
-int nuwax_scan_map_surface_columns(void *map,const ScanSurfaceColumn *columns,size_t count,
-    const double *boundary,size_t boundary_count,const int32_t *forbidden,size_t forbidden_count);
 int nuwax_scan_map_surface(void *map,const double *obstacles,size_t count,const double *ground,size_t ground_count,
     const double *boundary,size_t boundary_count,const int32_t *forbidden,size_t forbidden_count);
 int nuwax_scan_map_ingest(void *map,const double *points,size_t count,const uint32_t *ground,size_t ground_count,

@@ -185,8 +185,6 @@ extern "C" {
     fn nuwax_scan_motion_stopped(state: *const MotionState) -> i32;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
     fn nuwax_scan_map_destroy(map: *mut c_void);
-    fn nuwax_scan_map_surface_columns(p: *mut c_void, columns: *const SurfaceColumnRaw, count: usize,
-        boundary: *const f64, boundary_count: usize, forbidden: *const i32, forbidden_count: usize) -> i32;
     fn nuwax_scan_map_surface(
         map: *mut c_void,
         obstacles: *const f64,
@@ -275,17 +273,6 @@ fn error_message(error: &[c_char]) -> String {
         .to_string_lossy()
         .into_owned()
 }
-/// 单个原生列的完整替换；空载荷表示删除该列。
-pub struct SurfaceColumn<'a> {
-    pub xy: [i32; 2],
-    pub obstacles: &'a [[f64; 3]],
-    pub ground: &'a [[f64; 3]],
-}
-#[repr(C)]
-struct SurfaceColumnRaw {
-    x: i32, y: i32, obstacles: *const f64, obstacle_count: usize,
-    ground: *const f64, ground_count: usize,
-}
 /// 唯一可变概率地图；必须由地图维护线程独占。
 pub struct MapOwner(NonNull<c_void>);
 // 原生句柄只通过可变借用访问，可移交到地图线程。
@@ -321,17 +308,6 @@ impl MapOwner {
         } else {
             Err("原生实体与业务掩码更新失败".into())
         }
-    }
-    /// 仅转交本次变化列；原生快照继续共享未变列。
-    pub fn update_surface_columns(&mut self, columns: &[SurfaceColumn<'_>],
-        boundary: &[[f64; 2]], forbidden: &[[i32; 2]]) -> Result<(), String> {
-        let raw: Vec<_> = columns.iter().map(|c| SurfaceColumnRaw {
-            x: c.xy[0], y: c.xy[1], obstacles: c.obstacles.as_ptr().cast(), obstacle_count: c.obstacles.len(),
-            ground: c.ground.as_ptr().cast(), ground_count: c.ground.len(),
-        }).collect();
-        let result = unsafe { nuwax_scan_map_surface_columns(self.0.as_ptr(), raw.as_ptr(), raw.len(),
-            boundary.as_ptr().cast(), boundary.len(), forbidden.as_ptr().cast(), forbidden.len()) };
-        if result == 0 { Ok(()) } else { Err("原生实体与业务掩码更新失败".into()) }
     }
     pub fn ingest(
         &mut self,

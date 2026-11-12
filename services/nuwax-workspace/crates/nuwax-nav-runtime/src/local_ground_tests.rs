@@ -122,7 +122,6 @@ fn input(source: Arc<SurfaceSnapshot>) -> MapInput {
     MapInput {
         epoch: 1,
         source,
-        update: None,
         config,
         boundary: Arc::new(Vec::new()),
         pose: [0., 0., 0.4],

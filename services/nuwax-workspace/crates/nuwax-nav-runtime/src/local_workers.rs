@@ -19,7 +19,6 @@ pub type MapInitializer = fn(
 pub(crate) struct MapInput {
     pub epoch: u64,
     pub source: Arc<SurfaceSnapshot>,
-    pub update: Option<crate::surface_changes::SurfaceMapUpdate>,
     pub config: Config,
     pub boundary: Arc<Vec<[f64; 2]>>,
     pub pose: [f64; 3],
@@ -128,8 +127,7 @@ impl MapWorker {
         let mut owner: Option<MapOwner> = None;
         let mut previous: Option<MapInput> = None;
         let mut prepared: Option<PreparedMap> = None;
-        let mut dynamic_columns = std::collections::BTreeSet::new();
-        let mut static_view: Option<StaticSurfaceView> = None;
+        let mut static_view: Option<([f64; 2], crate::native_map::NativeMap)> = None;
         Ok(Self(Worker::new(
             "nav-map-maintenance",
             move |input: MapInput, reset| {
@@ -175,36 +173,36 @@ impl MapWorker {
                     let native = static_surface_view(&mut static_view, &input, same_static_geometry)?;
                     let (recent_ground, recent_obstacles) =
                         input.source.navigation_recent_samples();
-                    let ground = crate::native_map::collision_ground_view(
-                        native, recent_ground, &c, input.pose, input.yaw,
+                    let obstacles: Vec<_> = native
+                        .obstacles
+                        .iter().copied()
+                        .chain(recent_obstacles)
+                        .collect();
+                    let ground = crate::native_map::collision_ground(
+                        native.static_collision_ground.clone(),
+                        recent_ground,
+                        &c,
+                        input.pose,
+                        input.yaw,
                     );
                     let map = owner.as_mut().unwrap();
-                    let current_dynamic = ground.dynamic_columns();
                     if let Some(initialize) = initializer {
-                        let obstacles: Vec<_> = native.obstacles().chain(recent_obstacles).collect();
-                        let ground: Vec<_> = ground.points().collect();
-                        initialize(map, &obstacles, &ground, &input.boundary,
-                            &native.forbidden_columns, input.pose)?;
-                    } else if let Some(changes) = &native.changed {
-                        let mut keys: std::collections::BTreeSet<_> = dynamic_columns.union(&current_dynamic).copied().collect();
-                        let (old_ground, old_obstacles) = previous.as_ref().unwrap().source.navigation_recent_samples();
-                        if !old_ground.iter().map(|p| p.map(f64::to_bits)).eq(ground.recent.iter().map(|p| p.map(f64::to_bits)))
-                            || !old_obstacles.iter().map(|p| p.map(f64::to_bits)).eq(recent_obstacles.iter().map(|p| p.map(f64::to_bits))) {
-                            keys.extend(old_ground.iter().chain(&old_obstacles).chain(&ground.recent)
-                                .chain(&recent_obstacles).map(|p| [p[0], p[1]].map(|v| (v / c.resolution).floor() as i32)));
-                        }
-                        keys.extend(changes.iter().map(|xy| xy.map(|v|
-                            (((f64::from(v) + 0.5) * native.resolution) / c.resolution).floor() as i32)));
-                        let columns = ground.surface_columns(&keys, &recent_obstacles);
-                        let updates: Vec<_> = columns.iter().map(|(xy, obstacles, ground)|
-                            nuwax_nav_scan_native::SurfaceColumn { xy: *xy, obstacles, ground }).collect();
-                        map.update_surface_columns(&updates, &input.boundary, &native.forbidden_columns)?;
+                        initialize(
+                            map,
+                            &obstacles,
+                            &ground,
+                            &input.boundary,
+                            &native.forbidden_columns,
+                            input.pose,
+                        )?;
                     } else {
-                        let obstacles: Vec<_> = native.obstacles().chain(recent_obstacles).collect();
-                        let ground: Vec<_> = ground.points().collect();
-                        map.update_surface(&obstacles, &ground, &input.boundary, &native.forbidden_columns)?;
+                        map.update_surface(
+                            &obstacles,
+                            &ground,
+                            &input.boundary,
+                            &native.forbidden_columns,
+                        )?;
                     }
-                    dynamic_columns = current_dynamic;
                     if rebuilt || !same_frame {
                         if let Some(frame) = &input.frame {
                             map.ingest(
@@ -257,55 +255,25 @@ impl MapWorker {
         self.0.take()
     }
 }
-struct StaticSurfaceView {
-    anchor: [f64; 2],
-    radius: f64,
-    source: Arc<SurfaceSnapshot>,
-    columns: crate::native_map::NativeColumns,
-}
-
-/// 沿用原锚点；已知且对应缓存来源的差分只转换其变化列。
+/// 静态转换仅随来源几何或窗口锚点变化；机身相关处理仍留在原逐拍分支。
 fn static_surface_view<'a>(
-    cached: &'a mut Option<StaticSurfaceView>,
+    cached: &'a mut Option<([f64; 2], crate::native_map::NativeMap)>,
     input: &MapInput,
     same_geometry: bool,
-) -> Result<&'a crate::native_map::NativeColumns, String> {
-    use crate::surface_changes::SurfaceGeometryChanges;
+) -> Result<&'a crate::native_map::NativeMap, String> {
     let c = input.config;
-    if let Some(view) = cached.as_mut() { view.columns.changed = Some(Vec::new()); }
     let d = c.planning_horizon * 0.25;
-    let moved = cached.as_ref().is_none_or(|view|
-        (input.pose[0] - view.anchor[0]).hypot(input.pose[1] - view.anchor[1]) > d);
+    let moved = cached.as_ref().is_none_or(|(anchor, _)|
+        (input.pose[0] - anchor[0]).hypot(input.pose[1] - anchor[1]) > d);
     if !same_geometry || moved {
-        let anchor = if moved { [input.pose[0], input.pose[1]] } else { cached.as_ref().unwrap().anchor };
+        let anchor = if moved { [input.pose[0], input.pose[1]] } else { cached.as_ref().unwrap().0 };
         let radius = c.planning_horizon
             + (c.body_length * 0.5 + c.body_center_x.abs())
                 .hypot(c.body_width * 0.5 + c.body_center_y.abs())
             + c.resolution + d;
-        let changes = input.update.as_ref().filter(|update| !moved
-            && update.change_basis.as_ref().is_some_and(|basis|
-                cached.as_ref().is_some_and(|view| view.radius == radius
-                    && crate::native_map::same_source_geometry(basis, &view.source)))
-            && crate::native_map::same_source_geometry(&update.snapshot, &input.source))
-            .map(|update| update.changes.as_ref());
-        match changes {
-            Some(SurfaceGeometryChanges::Columns { fine_size, fine, coarse, .. }) => {
-                let view = cached.as_mut().unwrap();
-                let keys = if view.columns.resolution == f64::from(*fine_size) { fine } else { coarse };
-                view.columns.replace(&input.source, (anchor, radius), keys)?;
-                view.source = input.source.clone();
-            }
-            Some(SurfaceGeometryChanges::Empty) => {
-                cached.as_mut().unwrap().source = input.source.clone();
-            }
-            _ => {
-                *cached = Some(StaticSurfaceView { anchor, radius, source: input.source.clone(),
-                    columns: crate::native_map::NativeColumns::new(crate::native_map::from_surface_window(
-                        &input.source, Some((anchor, radius)))?, &input.source, (anchor, radius), c.resolution) });
-            }
-        }
+        *cached = Some((anchor, crate::native_map::from_surface_window(&input.source, Some((anchor, radius)))?));
     }
-    Ok(&cached.as_ref().unwrap().columns)
+    Ok(&cached.as_ref().unwrap().1)
 }
 
 fn map_geometry(c: &Config) -> [u64; 12] {
@@ -413,7 +381,6 @@ mod tests {
         let mut input = MapInput {
             epoch: 1,
             source,
-            update: None,
             config: config.scan,
             boundary: Arc::new(Vec::new()),
             pose: [0.55, 1.05, 0.5],
@@ -502,7 +469,7 @@ mod static_window_tests {
             .with_observations(Some(observations))
             .with_virtual_obstacles([-2.,-2.],0.2,20,20,&mask).unwrap());
         let mut config=configured.scan;config.resolution=f64::from(q);config.planning_horizon=0.6;
-        let mut input=MapInput {epoch:1,source,update:None,config,boundary:Arc::new(vec![]),pose:[-1.,0.,0.5],yaw:0.,
+        let mut input=MapInput {epoch:1,source,config,boundary:Arc::new(vec![]),pose:[-1.,0.,0.5],yaw:0.,
             frame:None,active:None,phase:0.,active_snapshot:None};
         let full=crate::native_map::from_surface(&input.source).unwrap();
         assert!(!full.ground.is_empty() && !full.obstacles.is_empty() && !full.cells.is_empty()
@@ -515,7 +482,7 @@ mod static_window_tests {
             // 原算法每拍以当前位姿转换；参照取原窗口，缓存取外扩锚点窗口。
             let old=crate::native_map::from_surface_window(&input.source,
                 Some(([input.pose[0],input.pose[1]],radius))).unwrap();
-            let view=static_surface_view(&mut cached,&input,i>0).unwrap().native_map();
+            let view=static_surface_view(&mut cached,&input,i>0).unwrap();
             let inside=|xy:[f64;2]| (xy[0]-input.pose[0]).abs()<=radius && (xy[1]-input.pose[1]).abs()<=radius;
             let points=|v:&[[f64;3]]| v.iter().filter(|p|inside([p[0],p[1]]))
                 .map(|p|p.map(f64::to_bits)).collect::<BTreeSet<_>>();
@@ -531,8 +498,8 @@ mod static_window_tests {
                 assert_eq!(points(&view.ground),points(&reference.ground));
                 assert_eq!(points(&view.static_collision_ground),points(&reference.static_collision_ground));
                 assert_eq!(points(&view.obstacles),points(&reference.obstacles));
-                assert_eq!(cells(&view),cells(reference));assert_eq!(bands(&view),bands(reference));
-                assert_eq!(forbidden(&view),forbidden(reference));
+                assert_eq!(cells(view),cells(reference));assert_eq!(bands(view),bands(reference));
+                assert_eq!(forbidden(view),forbidden(reference));
             }
         }
     }

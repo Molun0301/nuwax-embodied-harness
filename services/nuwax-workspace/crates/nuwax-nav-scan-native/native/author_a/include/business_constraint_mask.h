@@ -37,20 +37,6 @@ class BusinessConstraintMask {
     }
   }
 
-  bool matches(const double* boundary,size_t boundary_count,const int32_t* forbidden,size_t forbidden_count) const {
-    if(boundary_.size()!=boundary_count)return false;
-    for(size_t i=0;i<boundary_count;++i)
-      if(boundary_[i].x()!=boundary[2*i]||boundary_[i].y()!=boundary[2*i+1])return false;
-    size_t count=0;for(const auto& [_,list]:buckets_)count+=list.size();
-    if(count!=forbidden_count)return false;
-    for(size_t i=0;i<forbidden_count;++i) {
-      const int x=forbidden[2*i],y=forbidden[2*i+1];
-      const auto found=buckets_.find(bucketKey((x+.5)*resolution_,(y+.5)*resolution_));
-      if(found==buckets_.end()||!std::any_of(found->second.begin(),found->second.end(),
-          [x,y](const Eigen::Vector2i& p){return p.x()==x&&p.y()==y;}))return false;
-    }
-    return true;
-  }
   bool empty() const { return boundary_.size() < 3 && buckets_.empty(); }
 
   bool rejects(const Eigen::Vector3d& reference, double yaw) const {

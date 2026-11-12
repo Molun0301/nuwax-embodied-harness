@@ -278,11 +278,11 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     s.escape.observeClear(position,state->timestamp_ns);
     Vector3d target=position;double desired_yaw=yaw;
     if(std::isfinite(terminal_yaw)) {
-      const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;
-      s.raw={};s.raw.angular.z=std::copysign(std::min(c->max_yaw_rate,std::sqrt(step*step+2*c->max_yaw_acceleration*std::abs(diff))-step),diff);desired_yaw=terminal_yaw;
+      s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
+      const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw));
+      s.raw={};s.raw.angular.z=std::clamp(s.controller.kp_yaw*diff,-c->max_yaw_rate,c->max_yaw_rate);desired_yaw=terminal_yaw;
       if(terminal_position) {
         target=Eigen::Map<const Vector3d>(terminal_position);
-        s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
         Eigen::Vector2d velocity=(target-position).head<2>();
         const double distance=velocity.norm();
         const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));

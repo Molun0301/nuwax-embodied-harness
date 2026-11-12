@@ -1,4 +1,25 @@
 #[test]
+fn terminal_heading_uses_the_existing_proportional_gain_while_turning_or_translating() {
+    let mut c = config();
+    c.max_yaw_acceleration = 20.;
+    let state = MotionState {position:[0.,0.,0.4],measured_velocity:1,
+        measured_yaw_rate:1,timestamp_ns:1_000_000_000,..Default::default()};
+    let mut map = MapOwner::new(&c).unwrap();
+    map.seed_occupied(&[],state.position);
+    map.update_surface(&[],&[],&[],&[]).unwrap();
+    let snapshot = map.snapshot();
+    for position in [None, Some([0.1,0.,0.4])] {
+        for error in [-0.04, 0.04] {
+            let tracked = ScanTracker::default().track_terminal_position(
+                &c,&snapshot,&state,[0.;3],Some(error),position).unwrap();
+            assert!(!tracked.invalid(),"空图末段应有合法候选：{tracked:?}");
+            assert!((tracked.command[2]-1.5*error).abs()<1e-12,
+                "小误差采用现有kp_yaw=1.5，避免偏航加速度平方根给出过大期望：{tracked:?}");
+        }
+    }
+}
+
+#[test]
 fn pillar_terminal_points_leave_turning_room_and_require_the_actual_lateral_channel() {
     let mut c = config();
     c.resolution = 0.02;

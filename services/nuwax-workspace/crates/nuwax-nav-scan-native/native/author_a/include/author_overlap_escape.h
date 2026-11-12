@@ -138,7 +138,7 @@ class AuthorOverlapEscape {
 
   // 实测瞬时速度不能先向内再靠本拍平均位移抵消；在切向平台处允许数值零。
   static bool startsOutward(const Contact& contact,const ScanConfig& c,
-      const command_check_detail::State& state) {
+      const command_check_detail::State& state,double allowance=0.) {
     using namespace command_check_detail;
     const double co=std::cos(state.yaw),si=std::sin(state.yaw),w=state.angular;
     const auto abs_rate=[](double value,double rate) {
@@ -159,7 +159,7 @@ class AuthorOverlapEscape {
           :cell_rate-sign*local_rate[i-2];
       if(d<best){best=d;rate=r;}else if(d==best)rate=std::min(rate,r);
     }
-    return best<0.||rate<=64.*std::numeric_limits<double>::epsilon()*
+    return best<0.||rate<=allowance+64.*std::numeric_limits<double>::epsilon()*
         (1.+state.linear.norm()+std::abs(w)*(radius(c)+local.norm()));
   }
 
@@ -257,6 +257,7 @@ class AuthorOverlapEscape {
     ScanState measured{};std::copy(velocity,velocity+3,measured.velocity);measured.yaw_rate=angular;
     measured.measured_velocity=measured.measured_yaw_rate=1;
     const bool stopped=nuwax_scan_motion_stopped(&measured);
+    const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const bool rebuilding=waiting_for_stop_&&stopped;
     if(starting) {
       last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;failure_.clear();
@@ -299,16 +300,18 @@ class AuthorOverlapEscape {
         waiting_for_stop_|=latched_;
         throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
       }
-      if(latched_&&!rebuilding&&(now>contact.depth+1e-10
-          ||(contact.directed&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10))) {
+      const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
+      const double stopped_rate=.02+.02*(voxel-p.head<2>()).norm();
+      if(latched_&&!rebuilding&&!startsOutward(contact,c,actual,stopped_rate)) {
         waiting_for_stop_=true;
         if(stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
         check_budget();
         throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
       }
-      // 动作前的静止测量变化只更新基准，不结算或重发未确认运动预算。
+      // 动作前只更新基准；动作后未证实向内的数值增深也不触发等待停车。
       if(!latched_){contact.depth=now;contact.remaining=remaining;continue;}
       if(!rebuilding&&(now<contact.depth-1e-10||remaining<contact.remaining-1e-10))progress_observed=true;
+      contact.depth=now;contact.remaining=remaining;
     }
     // 只有新的实测采样证实退出进展，才结清未确认运动预算。
     if(stamp>last_stamp_&&progress_observed) {
@@ -316,7 +319,6 @@ class AuthorOverlapEscape {
     }
     if(latched_&&stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
     check_budget();
-    const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
     std::vector<Eigen::Vector2d> requests;Eigen::Vector2d sum=Eigen::Vector2d::Zero();
     for(const auto& contact:contacts_)sum+=contact.body_axis?world(contact.axis,yaw):contact.axis;

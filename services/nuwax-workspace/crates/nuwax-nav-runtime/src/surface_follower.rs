@@ -1166,8 +1166,8 @@ mod native_execution_tests {
         assert!(!follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap().recovery_samples.is_empty());
         motion.position[0] -= 0.001;
         motion.timestamp_ns += 50_000_000;
-        let fault = follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap_err();
-        assert!(fault.message.contains("penetration increased"));
+        let continued = follower.tracker.track_and_check(&c, &snapshot, &motion, [0.; 3], None).unwrap();
+        assert_ne!(continued.command,[0.;3],"无实测向内的定位增深不能锁止");
         follower.replace_execution_path(
             ExecutionPath::Surface(Path3D { poses: vec![pose(initial[0], initial[1], 0.), goal.clone()] }),
             None, goal.clone(),

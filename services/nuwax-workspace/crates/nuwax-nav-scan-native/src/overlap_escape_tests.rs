@@ -144,11 +144,31 @@ fn stopped_noise_starts_escape_then_depth_change_keeps_the_budget() {
     assert!(first.command_forward>0.,"停稳口径内的测速噪声按零速证明起步");
     req.start_position[0]-=0.003336350098702423;
     req.odometry_timestamp_ns+=100_000_000;
-    let changed=planner.step(&req).unwrap_err();
-    assert!(changed.contains("penetration increased"),"首拍已有动作，测量增深须本拍停车：{changed}");
+    let changed=planner.step(&req).unwrap();
+    assert!(changed.command_forward>0.,"测速噪声内的数值增深只更新基准，继续安全退出");
+    check_escape_sweep(&req.config,req.obstacles,&changed.samples);
     req.odometry_timestamp_ns=3_100_000_000;
     let expired=planner.step(&req).unwrap_err();
     assert!(expired.contains("budget exhausted"),"更新基准不能续领预算：{expired}");
+}
+
+#[test]
+fn issued_escape_measured_inward_motion_stops_then_rebuilds() {
+    let route=[[0.295,0.025,0.35],[1.,0.025,0.35]];
+    let obstacles=[[-0.025,0.025,0.35]];
+    let mut req=shallow_surface_request(&route,&obstacles);
+    req.config.body_length=0.6;req.config.body_width=0.32;req.config.sample_dt=0.05;
+    let mut planner=registered_fixture(&req);
+    assert!(planner.step(&req).unwrap().command_forward>0.);
+    req.odometry_timestamp_ns+=50_000_000;
+    req.start_velocity=Some([-0.03,0.,0.]);
+    let failure=planner.step(&req).unwrap_err();
+    assert!(failure.contains("measured escape penetration increased"),"实测真的向内必须当拍停：{failure}");
+    req.odometry_timestamp_ns+=50_000_000;
+    assert!(planner.step(&req).unwrap_err().contains("waiting for measured stop"));
+    req.odometry_timestamp_ns+=50_000_000;
+    req.start_velocity=Some([0.;3]);
+    assert!(planner.step(&req).unwrap().command_forward>0.);
 }
 
 #[test]

@@ -336,8 +336,9 @@ fn registered_surface_deeper_escape_rejects_increased_measured_penetration() {
     assert!(planner.step(&req).unwrap().command_forward > 0.);
     req.odometry_timestamp_ns += 50_000_000;
     req.start_position[0] -= 0.001;
-    let error = planner.step(&req).unwrap_err();
-    assert!(error.contains("measured escape penetration increased"));
+    let continued = planner.step(&req).unwrap();
+    assert!(continued.command_forward > 0., "没有实测向内的数值增深继续安全退出");
+    check_escape_sweep(&req.config,req.obstacles,&continued.samples);
     req.start_position = route[0];
     let repeated = planner.step(&req).unwrap();
     assert_eq!([repeated.command_forward, repeated.command_lateral, repeated.command_yaw_rate], [0.; 3],

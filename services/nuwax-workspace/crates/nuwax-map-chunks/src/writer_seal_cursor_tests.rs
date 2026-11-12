@@ -83,8 +83,8 @@ struct OldReaders {
 }
 impl OldReaders {
     fn capture(pair: &Pair) -> Self {
-        let actual = Arc::new(SealedMap { root: pair.actual.published.clone().unwrap(), repository: pair.actual.repository.clone() });
-        let oracle = Arc::new(SealedMap { root: pair.oracle.published.clone().unwrap(), repository: pair.oracle.repository.clone() });
+        let actual = Arc::new(SealedMap { root: pair.actual.published.clone().unwrap(), repository: pair.actual.repository.clone(), reader: pair.actual.reader.clone() });
+        let oracle = Arc::new(SealedMap { root: pair.oracle.published.clone().unwrap(), repository: pair.oracle.repository.clone(), reader: pair.oracle.reader.clone() });
         let before = (*actual.root).clone();
         let mut actual_reader = RegionReader::new(actual.repository.clone(), BUDGET);
         let mut oracle_reader = RegionReader::new(oracle.repository.clone(), BUDGET);
@@ -163,7 +163,7 @@ impl Writer {
         root.validate()?;
         self.blocks = blocks; self.published = Some(root.clone());
         self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
-        Ok(SealedMap { root, repository: self.repository.clone() })
+        Ok(SealedMap { root, repository: self.repository.clone(), reader: self.reader.clone() })
     }
 }
 

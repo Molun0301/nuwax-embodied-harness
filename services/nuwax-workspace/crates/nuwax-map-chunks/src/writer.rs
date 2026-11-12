@@ -558,6 +558,8 @@ impl Writer {
             let previous = self.blocks.get(key);
             let reference = BlockRef { key: *key, object: self.pending[key].object,
                 block_revision: previous.map_or(0, |b| b.block_revision), geometry_revision: previous.map_or(0, |b| b.geometry_revision), points: dirty.block.len() as u32 };
+            self.reader.cache_written(reference.object, dirty.block.clone(),
+                intrinsic_bytes(&self.pending[key].bytes, &dirty.block), dirty.layers.clone(), dirty.layer_bytes);
             self.blocks.insert(*key, reference);
         }
         self.dirty.clear(); self.pending.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; Ok(())
@@ -601,7 +603,7 @@ impl Writer {
         root.validate()?;
         self.blocks = blocks; self.published = Some(root.clone());
         self.touched.clear(); self.membership_touched.clear(); self.geometry_changes.clear(); self.source_watermarks_changed = false;
-        Ok(SealedMap { root, repository: self.repository.clone() })
+        Ok(SealedMap { root, repository: self.repository.clone(), reader: self.reader.clone() })
     }
     pub fn retained_objects(&self) -> BTreeSet<ObjectIdentity> {
         self.blocks.values().map(|b| b.object).chain(self.pending.values().map(|p| p.object))

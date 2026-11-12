@@ -158,17 +158,22 @@ impl ReadOnlyRepository {
     }
 }
 
-/// The cache stores only intrinsic metadata, so aliases can be shared across keys/owners.
+/// 写入器与同进程读者共用一份有界解码缓存；独立仓库读者保留自己的预算。
+#[derive(Clone)]
 pub struct RegionReader {
     repository: ReadOnlyRepository,
+    cache: Arc<std::sync::Mutex<DecodedCache>>,
+}
+struct DecodedCache {
     cache: BTreeMap<ObjectIdentity, (Arc<Block>, Intrinsic, u64, usize, GroundRecords)>,
     budget_bytes: usize, used_bytes: usize, clock: u64,
 }
 impl RegionReader {
     pub fn new(repository: impl Into<ReadOnlyRepository>, budget_bytes: usize) -> Self {
-        Self { repository: repository.into(), cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0 }
+        Self { repository: repository.into(), cache: Arc::new(std::sync::Mutex::new(DecodedCache {
+            cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0,
+        })) }
     }
-
     pub(crate) fn set_repository(&mut self, repository: ReadOnlyRepository) {
         self.repository = repository;
     }
@@ -182,12 +187,13 @@ impl RegionReader {
     pub(crate) fn read_count(&self) -> usize {
         self.repository.stats.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
-    pub fn cached_bytes(&self) -> usize { self.used_bytes }
+    pub fn cached_bytes(&self) -> usize { self.cache.lock().unwrap().used_bytes }
     #[cfg(test)]
-    pub(crate) fn cache_is_empty(&self) -> bool { self.cache.is_empty() }
+    pub(crate) fn cache_is_empty(&self) -> bool { self.cache.lock().unwrap().cache.is_empty() }
     pub(crate) fn retain_objects(&mut self, live: &BTreeSet<ObjectIdentity>) {
-        self.cache.retain(|id, _| live.contains(id));
-        self.used_bytes = self.cache.values().map(|entry| entry.3).sum();
+        let mut cache = self.cache.lock().unwrap();
+        cache.cache.retain(|id, _| live.contains(id));
+        cache.used_bytes = cache.cache.values().map(|entry| entry.3).sum();
     }
     pub fn block(&mut self, reference: &BlockRef) -> Result<Arc<Block>, String> {
         self.object(reference.object, reference.points)
@@ -195,31 +201,15 @@ impl RegionReader {
     pub(crate) fn object(&mut self, object: ObjectIdentity, points: u32) -> Result<Arc<Block>, String> {
         self.parts(object, points).map(|(block, _, _)| block)
     }
-    /// One decode even when a large block cannot stay in the bounded cache.
     pub(crate) fn parts(&mut self, object: ObjectIdentity, points: u32) -> Result<(Arc<Block>, Intrinsic, GroundRecords), String> {
-        self.clock = self.clock.wrapping_add(1);
-        if let Some((block, info, age, _, layers)) = self.cache.get_mut(&object) {
-            if info.points != points { return Err("cached object point count conflicts with root".into()); }
-            *age = self.clock; return Ok((block.clone(), *info, layers.clone()));
-        }
-        let bytes = self.repository.read_object(object, MAX_BLOCK_BYTES)?;
-        let (block, layers) = decode_block_parts(&bytes)?;
-        let block = Arc::new(block);
-        let info = intrinsic_bytes(&bytes, &block);
-        if info.points != points { return Err("object point count conflicts with root".into()); }
-        self.cache_decoded(object, block.clone(), info, layers.clone());
-        Ok((block, info, layers))
+        self.cache.lock().unwrap().parts(&self.repository, object, points)
     }
     pub(crate) fn cache_decoded(&mut self, object: ObjectIdentity, block: Arc<Block>, info: Intrinsic, layers: GroundRecords) {
-        if self.cache.contains_key(&object) { return; }
-        let bytes = block.len() * 64 + 128 + layers.bytes();
-        if bytes <= self.budget_bytes {
-            while self.used_bytes + bytes > self.budget_bytes {
-                let Some(key) = self.cache.iter().min_by_key(|(_, (_, _, age, _, _))| *age).map(|(key, _)| *key) else { break; };
-                self.used_bytes -= self.cache.remove(&key).unwrap().3;
-            }
-            self.cache.insert(object, (block, info, self.clock, bytes, layers)); self.used_bytes += bytes;
-        }
+        let layer_bytes = layers.bytes();
+        self.cache_written(object, block, info, layers, layer_bytes);
+    }
+    pub(crate) fn cache_written(&mut self, object: ObjectIdentity, block: Arc<Block>, info: Intrinsic, layers: GroundRecords, layer_bytes: usize) {
+        self.cache.lock().unwrap().cache_decoded(object, block, info, layers, layer_bytes);
     }
     pub fn region(&mut self, root: &Manifest, min: Key, max: Key, point_budget: usize) -> Result<Vec<(Key, Evidence)>, String> {
         root.validate()?;
@@ -237,5 +227,34 @@ impl RegionReader {
             }
         }
         Ok(out)
+    }
+}
+
+impl DecodedCache {
+    /// One decode even when a large block cannot stay in the bounded cache.
+    fn parts(&mut self, repository: &ReadOnlyRepository, object: ObjectIdentity, points: u32) -> Result<(Arc<Block>, Intrinsic, GroundRecords), String> {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some((block, info, age, _, layers)) = self.cache.get_mut(&object) {
+            if info.points != points { return Err("cached object point count conflicts with root".into()); }
+            *age = self.clock; return Ok((block.clone(), *info, layers.clone()));
+        }
+        let bytes = repository.read_object(object, MAX_BLOCK_BYTES)?;
+        let (block, layers) = decode_block_parts(&bytes)?;
+        let block = Arc::new(block);
+        let info = intrinsic_bytes(&bytes, &block);
+        if info.points != points { return Err("object point count conflicts with root".into()); }
+        self.cache_decoded(object, block.clone(), info, layers.clone(), layers.bytes());
+        Ok((block, info, layers))
+    }
+    fn cache_decoded(&mut self, object: ObjectIdentity, block: Arc<Block>, info: Intrinsic, layers: GroundRecords, layer_bytes: usize) {
+        if self.cache.contains_key(&object) { return; }
+        let bytes = block.len() * 64 + 128 + layer_bytes;
+        if bytes <= self.budget_bytes {
+            while self.used_bytes + bytes > self.budget_bytes {
+                let Some(key) = self.cache.iter().min_by_key(|(_, (_, _, age, _, _))| *age).map(|(key, _)| *key) else { break; };
+                self.used_bytes -= self.cache.remove(&key).unwrap().3;
+            }
+            self.cache.insert(object, (block, info, self.clock, bytes, layers)); self.used_bytes += bytes;
+        }
     }
 }

@@ -241,9 +241,13 @@ impl Manifest {
 }
 
 #[derive(Clone)]
-pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository }
+pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository, reader: RegionReader }
 impl SealedMap {
     pub fn manifest(&self) -> &Arc<Manifest> { &self.root }
+    /// 与写入器共用原解码缓存和预算，封图块仍是不可变的共享引用。
+    pub fn reader(&self) -> Receiver {
+        Receiver::with_reader(self.repository.read_only(), self.reader.clone())
+    }
 
 
 }
@@ -292,7 +296,10 @@ impl Receiver {
     /// 准入与后续读取共用同一有界解码缓存，仓库始终只读。
     pub fn with_cache_budget(repository: impl Into<ReadOnlyRepository>, budget_bytes: usize) -> Self {
         let repository = repository.into();
-        Self { current: None, reader: RegionReader::new(repository.clone(), budget_bytes), repository, verified: BTreeMap::new(), readers: Vec::new(), layer_bindings: BTreeMap::new() }
+        Self::with_reader(repository.clone(), RegionReader::new(repository, budget_bytes))
+    }
+    fn with_reader(repository: ReadOnlyRepository, reader: RegionReader) -> Self {
+        Self { current: None, reader, repository, verified: BTreeMap::new(), readers: Vec::new(), layer_bindings: BTreeMap::new() }
     }
     /// 复用已准入的不可变块；读取旧根时调用方仍须持有该根的 Arc。
     /// 返回原始证据不代表当前运动权限，根绑定与新鲜度仍由消费方检查。

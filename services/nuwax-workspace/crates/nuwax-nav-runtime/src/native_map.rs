@@ -77,18 +77,38 @@ pub fn from_surface_window(
     map: &SurfaceSnapshot,
     window: Option<([f64; 2], f64)>,
 ) -> Result<NativeMap, String> {
+    from_surface_selection(map, window, None)
+}
+
+fn from_surface_selection(
+    map: &SurfaceSnapshot,
+    window: Option<([f64; 2], f64)>,
+    selected: Option<&BTreeSet<[i32; 2]>>,
+) -> Result<NativeMap, String> {
     let measured_surface =
         map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::MeasuredSurface;
     let occupied_volume =
         map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume;
     let (resolution, columns) = map.navigation_source_columns(window);
-    let columns: Vec<_> = columns.collect();
+    let columns: Vec<_> = match selected {
+        Some(keys) => match map.observations().filter(|o|
+            o.is_complete_geometry_source() && f64::from(o.voxel_size_m()) == resolution) {
+            Some(observations) => keys.iter().filter_map(|&xy| {
+                observations.column_levels(xy[0], xy[1]).map(|levels|
+                    (xy, levels.iter().map(|&z|
+                        [f64::from(z) * resolution, f64::from(z + 1) * resolution]).collect()))
+            }).filter(|(xy, _)| window.is_none_or(|(center, radius)| (0..2).all(|i|
+                ((f64::from(xy[i]) + 0.5) * resolution - center[i]).abs() <= radius))).collect(),
+            None => columns.filter(|(xy, _)| keys.contains(xy)).collect(),
+        },
+        None => columns.collect(),
+    };
     let nearby = |point: &[f64; 3]| {
         window.is_none_or(|(center, radius)| {
             (point[0] - center[0]).abs() <= radius && (point[1] - center[1]).abs() <= radius
         })
     };
-    let forbidden_columns = map
+    let forbidden_columns = if selected.is_some() { Vec::new() } else { map
         .navigation_forbidden_columns(resolution)
         .into_iter()
         .filter(|column| {
@@ -99,7 +119,7 @@ pub fn from_surface_window(
             ];
             nearby(&p)
         })
-        .collect();
+        .collect() };
     let mut result = NativeMap {
         resolution,
         ground: Vec::new(),
@@ -116,8 +136,10 @@ pub fn from_surface_window(
         .navigation_measured_points()
         .filter(|_| measured_surface)
     {
-        let selected = window.map(|_| points.iter().copied().filter(nearby).collect::<Vec<_>>());
-        let points = selected.as_deref().unwrap_or(points);
+        let chosen = (window.is_some() || selected.is_some()).then(|| points.iter().copied()
+            .filter(nearby).filter(|p| selected.is_none_or(|keys|
+                keys.contains(&[p[0], p[1]].map(|v| (v / resolution).floor() as i32)))).collect::<Vec<_>>());
+        let points = chosen.as_deref().unwrap_or(points);
         let (cells, bands) = nuwax_nav_pct_native::classify_points(
             &Config {
                 resolution,
@@ -272,6 +294,75 @@ pub fn from_surface_window(
         }
     }
     Ok(result)
+}
+
+
+#[derive(Default)]
+pub(crate) struct NativeColumn {
+    #[cfg(test)]
+    pct_ground: Vec<[f64; 3]>,
+    #[cfg(test)]
+    cells: Vec<Cell>,
+    #[cfg(test)]
+    bands: Vec<Band>,
+    pub ground: Vec<[f64; 3]>,
+    pub obstacles: Vec<[f64; 3]>,
+}
+
+pub(crate) struct NativeColumns {
+    pub resolution: f64,
+    pub columns: BTreeMap<[i32; 2], NativeColumn>,
+    order: Vec<[i32; 2]>,
+    pub forbidden_columns: Vec<[i32; 2]>,
+}
+impl NativeColumns {
+    pub fn new(map: NativeMap, source: &SurfaceSnapshot, window: ([f64; 2], f64)) -> Self {
+        let order = source.navigation_source_columns(Some(window)).1.map(|(xy, _)| xy).collect();
+        let mut result = Self { resolution: map.resolution, columns: BTreeMap::new(), order,
+            forbidden_columns: map.forbidden_columns };
+        for p in map.static_collision_ground {
+            result.columns.entry([p[0], p[1]].map(|v| (v / result.resolution).floor() as i32))
+                .or_default().ground.push(p);
+        }
+        for p in map.obstacles {
+            result.columns.entry([p[0], p[1]].map(|v| (v / result.resolution).floor() as i32))
+                .or_default().obstacles.push(p);
+        }
+        #[cfg(test)] {
+            for p in map.ground {
+                result.columns.entry([p[0], p[1]].map(|v| (v / result.resolution).floor() as i32))
+                    .or_default().pct_ground.push(p);
+            }
+            for c in map.cells { result.columns.entry([c.x, c.y]).or_default().cells.push(c); }
+            for b in map.bands { result.columns.entry([b.x, b.y]).or_default().bands.push(b); }
+        }
+        result
+    }
+    #[cfg(test)]
+    pub fn native_map(&self) -> NativeMap {
+        NativeMap { resolution: self.resolution,
+            ground: self.columns.values().flat_map(|c| c.pct_ground.iter().copied()).collect(),
+            static_collision_ground: self.ground().collect(), obstacles: self.obstacles().collect(),
+            cells: self.columns.values().flat_map(|c| c.cells.iter().copied()).collect(),
+            bands: self.columns.values().flat_map(|c| c.bands.iter().copied()).collect(),
+            forbidden_columns: self.forbidden_columns.clone() }
+    }
+    pub fn replace(&mut self, map: &SurfaceSnapshot, window: ([f64; 2], f64),
+        keys: &[[i32; 2]]) -> Result<(), String> {
+        let keys: BTreeSet<_> = keys.iter().copied().collect();
+        let update = from_surface_selection(map, Some(window), Some(&keys))?;
+        let mut update = Self::new(update, map, window);
+        std::mem::swap(&mut self.order, &mut update.order);
+        for key in keys { self.columns.remove(&key); }
+        self.columns.extend(update.columns);
+        Ok(())
+    }
+    pub fn ground(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
+        self.order.iter().filter_map(|xy| self.columns.get(xy)).flat_map(|c| c.ground.iter().copied())
+    }
+    pub fn obstacles(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
+        self.order.iter().filter_map(|xy| self.columns.get(xy)).flat_map(|c| c.obstacles.iter().copied())
+    }
 }
 
 /// 一格余量及一个地图提交周期内机身角点的最大位移，复用现有运动与周期配置。

@@ -116,6 +116,7 @@ struct TerminalApproach {
 pub struct SurfaceFollower {
     config: SurfaceFollowerConfig,
     map: Option<Arc<SurfaceSnapshot>>,
+    map_update: Option<crate::surface_changes::SurfaceMapUpdate>,
     odometry: Option<PoseStamped>,
     goal: Option<PoseStamped>,
     path: Option<Path3D>,
@@ -166,6 +167,7 @@ impl SurfaceFollower {
         Ok(Self {
             config,
             map: None,
+            map_update: None,
             odometry: None,
             goal: None,
             path: None,
@@ -431,6 +433,7 @@ impl SurfaceFollower {
         self.map_worker.submit(MapInput {
             epoch: self.epoch,
             source: source.clone(),
+            update: self.map_update.clone(),
             config: self.native_config(source),
             boundary: self.boundary.clone(),
             pose: Self::position(pose),
@@ -800,8 +803,14 @@ impl NavPlanner for SurfaceFollower {
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
         self.map = Some(match map {
-            ExecutionMap::Surface(map) => map,
-            ExecutionMap::SurfaceUpdate(update) => update.snapshot,
+            ExecutionMap::Surface(map) => {
+                self.map_update = None;
+                map
+            }
+            ExecutionMap::SurfaceUpdate(update) => {
+                self.map_update = Some(update.clone());
+                update.snapshot
+            },
             ExecutionMap::Planar(_) => {
                 return Err(RuntimeError::InvalidInput {
                     field: "execution_map",
@@ -817,6 +826,7 @@ impl NavPlanner for SurfaceFollower {
         self.map_worker.retire(self.epoch, true);
         self.prepared = None;
         self.map = None;
+        self.map_update = None;
         self.registered_frame = None;
     }
     fn observe_applied_command(&mut self, command: Twist2) {

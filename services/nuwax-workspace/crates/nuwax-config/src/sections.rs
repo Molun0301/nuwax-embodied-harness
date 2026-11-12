@@ -136,6 +136,8 @@ pub struct MapCloud {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Derived {
     pub nav_profile: String,
+    pub min_executable_linear_mps: f64,
+    pub min_executable_angular_rps: f64,
     pub actuator_max_linear_mps: f64,
     pub actuator_max_yaw_rps: f64,
     pub actuator_motion_model: String,

@@ -17,6 +17,8 @@ class MotionLimits(_CalibrationModel):
     max_reverse_mps: float = Field(ge=0, le=5)
     max_lateral_mps: float = Field(ge=0, le=5)
     max_angular_rps: float = Field(gt=0, le=4 * math.pi)
+    min_executable_linear_mps: float
+    min_executable_angular_rps: float
     linear_acceleration_mps2: float = Field(gt=0, le=50)
     guaranteed_braking_mps2: float = Field(gt=0, le=50)
     angular_acceleration_rps2: float = Field(gt=0, le=100)

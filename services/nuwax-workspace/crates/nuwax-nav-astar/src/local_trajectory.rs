@@ -131,7 +131,7 @@ mod tests {
             max_forward_mps: 0.55,
             max_reverse_mps: 0.25,
             max_lateral_mps: 0.0,
-            max_angular_rps: 0.8,
+            max_angular_rps: 0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
             linear_acceleration_mps2: 0.5,
             guaranteed_braking_mps2: 0.5,
             angular_acceleration_rps2: 1.5,

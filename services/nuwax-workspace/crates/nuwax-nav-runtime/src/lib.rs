@@ -1848,7 +1848,7 @@ mod tests {
         config.basic_kinematics = Some(nuwax_nav_types_messages::MotionKinematics {
             model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
             max_forward_mps:0.35,max_reverse_mps:0.35,max_lateral_mps:0.35,
-            max_angular_rps:0.8,minimum_turning_radius_m:0.0,can_rotate_in_place:true,
+            max_angular_rps:0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,minimum_turning_radius_m:0.0,can_rotate_in_place:true,
         });
         assert!(config.motion_limits.is_none());
         let mut backend = production_surface_backend(config).unwrap();
@@ -1859,7 +1859,7 @@ mod tests {
     fn physical_omni_limits() -> nuwax_nav_types_messages::MotionLimits {
         nuwax_nav_types_messages::MotionLimits {
             model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
-            max_forward_mps:1.0,max_reverse_mps:1.0,max_lateral_mps:1.0,max_angular_rps:0.8,
+            max_forward_mps:1.0,max_reverse_mps:1.0,max_lateral_mps:1.0,max_angular_rps:0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
             linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,angular_acceleration_rps2:2.0,
             guaranteed_angular_braking_rps2:2.0,reaction_time_sec:0.05,minimum_turning_radius_m:0.0,
             can_rotate_in_place:true,
@@ -2733,6 +2733,8 @@ mod tests {
         let mut config = nuwax_config::test_support::defaults();
         config.set("derived","robot_geometry_json",r#"{"footprint_xy_m":[[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],"z_min_m":-0.4,"z_max_m":0.2}"#);
         config.set("derived","nav_profile","pct-scan-3d");
+        config.set("derived","min_executable_linear_mps",0.0);
+        config.set("derived","min_executable_angular_rps",0.0);
         config.set("derived","actuator_max_linear_mps",0.0);
         config.set("derived","actuator_max_yaw_rps",0.0);
         config.set("derived","actuator_motion_model","");

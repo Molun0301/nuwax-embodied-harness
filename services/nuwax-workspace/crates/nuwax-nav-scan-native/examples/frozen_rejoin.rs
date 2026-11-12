@@ -108,7 +108,7 @@ fn config() -> Config {
         max_yaw_acceleration: 2.0,
         max_reverse_velocity: 0.0,
         max_lateral_velocity: 0.0,
-        obstacle_clearance_m: 0.15,
+        obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
     }
 }
 fn run_case(

@@ -346,7 +346,7 @@ mod tests {
                         pose:Pose3 {position:Point3::new(body.0[0],body.0[1],body.0[2]),
                             orientation:Quaternion{x:body.1[0],y:body.1[1],z:body.1[2],w:body.1[3]}}};
                     let motion=MotionLimits {model:MotionModel::Omnidirectional,max_forward_mps:0.3,
-                        max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.8,
+                        max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
                         linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
                         angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
                         reaction_time_sec:0.05,minimum_turning_radius_m:0.0,can_rotate_in_place:true};

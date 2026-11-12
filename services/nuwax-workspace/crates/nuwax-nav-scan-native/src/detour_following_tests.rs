@@ -570,7 +570,7 @@ fn ninth_round_install_starts_at_measured_position_despite_finished_route_hint()
         max_yaw_acceleration: 20.,
         max_reverse_velocity: 0.,
         max_lateral_velocity: 0.17442999999999878,
-        obstacle_clearance_m: 0.15,
+        obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
     };
     let reference=[
         [0.9028784610209901,-2.1714499553001647,0.04518715826388903],

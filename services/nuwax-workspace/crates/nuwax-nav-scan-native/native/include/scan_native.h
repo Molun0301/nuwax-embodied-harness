@@ -12,6 +12,7 @@ typedef struct {
     double max_step_up, max_step_down, max_slope, max_yaw_acceleration;
     double max_reverse_velocity, max_lateral_velocity;
     double obstacle_clearance_m;
+    double min_executable_linear_mps, min_executable_angular_rps;
 } ScanConfig;
 typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
 typedef struct { double stop[3]; } ScanTerminalPoints;

@@ -28,6 +28,8 @@ pub struct Config {
     pub max_reverse_velocity: f64,
     pub max_lateral_velocity: f64,
     pub obstacle_clearance_m: f64,
+    pub min_executable_linear_mps: f64,
+    pub min_executable_angular_rps: f64,
 }
 
 #[repr(C)]
@@ -633,7 +635,7 @@ mod tests {
             max_yaw_acceleration: 2.0,
             max_reverse_velocity: 0.6,
             max_lateral_velocity: 0.6,
-            obstacle_clearance_m: 0.15,
+            obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
         }
     }
     fn request<'a>(reference: &'a [[f64; 3]], obstacles: &'a [[f64; 3]]) -> PlanRequest<'a> {

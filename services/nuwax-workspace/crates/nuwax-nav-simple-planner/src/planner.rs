@@ -741,7 +741,7 @@ mod tests {
                 }),
                 motion_limits: Some(MotionLimits {
                     model: MotionModel::Differential,
-                    max_forward_mps: 0.5, max_reverse_mps: 0.2, max_lateral_mps: 0.0, max_angular_rps: 1.0,
+                    max_forward_mps: 0.5, max_reverse_mps: 0.2, max_lateral_mps: 0.0, max_angular_rps: 1.0, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
                     linear_acceleration_mps2: 1.0, guaranteed_braking_mps2: 1.0,
                     angular_acceleration_rps2: 1.0, guaranteed_angular_braking_rps2: 1.0,
                     reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place,

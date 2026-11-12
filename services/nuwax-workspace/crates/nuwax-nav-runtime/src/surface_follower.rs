@@ -74,6 +74,8 @@ impl SurfaceFollowerConfig {
                 max_reverse_velocity: 0.,
                 max_lateral_velocity: 0.,
                 obstacle_clearance_m,
+                min_executable_linear_mps: 0.,
+                min_executable_angular_rps: 0.,
             },
             body_to_support_z_m,
             motion_limits: None,
@@ -378,6 +380,8 @@ impl SurfaceFollower {
         config.max_step_down = config.max_step_up;
         config.max_slope = f64::from(map.config().max_slope_deg).to_radians();
         if let Some(motion) = self.config.kinematics() {
+            config.min_executable_linear_mps = motion.min_executable_linear_mps;
+            config.min_executable_angular_rps = motion.min_executable_angular_rps;
             config.max_velocity = config.max_velocity.min(motion.max_forward_mps);
             config.max_reverse_velocity = if self.options.allow_reverse {
                 motion.max_reverse_mps.min(config.max_velocity)

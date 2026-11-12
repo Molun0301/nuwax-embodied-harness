@@ -67,7 +67,7 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
             "motion": {
                 "model": "differential", "max_forward_mps": 0.55,
                 "max_reverse_mps": 0.3, "max_lateral_mps": 0.0,
-                "max_angular_rps": 0.7, "linear_acceleration_mps2": 1.0,
+                "max_angular_rps": 0.7,"min_executable_linear_mps":0.0,"min_executable_angular_rps":0.0, "linear_acceleration_mps2": 1.0,
                 "guaranteed_braking_mps2": 1.0, "angular_acceleration_rps2": 2.0,
                 "guaranteed_angular_braking_rps2": 2.0, "reaction_time_sec": 0.1,
                 "minimum_turning_radius_m": 0.0, "can_rotate_in_place": True,

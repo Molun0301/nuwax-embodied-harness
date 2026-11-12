@@ -55,6 +55,10 @@ impl SurfaceNavigationConfig {
             n.obstacle_clearance_m,
         )?;
         config.apply_calibration(body, capabilities.clone())?;
+        if let Some(limits) = config.follower.motion_limits.as_mut() {
+            limits.min_executable_linear_mps = d.min_executable_linear_mps;
+            limits.min_executable_angular_rps = d.min_executable_angular_rps;
+        }
         config.apply_step_overrides(n.max_step_up_m, n.max_step_down_m, capabilities.as_ref())?;
         config.planner = std::sync::Arc::new(crate::surface_oriented::PctPlanner::new(
             nuwax_nav_runtime::native_map::PctTerrainSource::parse(&n.pct_terrain_source)
@@ -88,6 +92,8 @@ impl SurfaceNavigationConfig {
                 max_reverse_mps: speed,
                 max_lateral_mps: speed,
                 max_angular_rps: d.actuator_max_yaw_rps,
+                min_executable_linear_mps: d.min_executable_linear_mps,
+                min_executable_angular_rps: d.min_executable_angular_rps,
                 minimum_turning_radius_m: 0.0,
                 can_rotate_in_place: true,
             };
@@ -341,7 +347,7 @@ mod tests {
         nuwax_config::sections::Derived,
     ) {
         (nuwax_config::test_support::section("navigation"),nuwax_config::test_support::section("robot"),
-                    nuwax_config::sections::Derived {nav_profile:"pct-scan-3d".into(),actuator_max_linear_mps:0.0,
+                    nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,nav_profile:"pct-scan-3d".into(),actuator_max_linear_mps:0.0,
                         actuator_max_yaw_rps:0.0,actuator_motion_model:String::new(),robot_geometry_json:
                         r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#.into()})
     }
@@ -375,7 +381,7 @@ mod tests {
         let caps = NavigationCapabilities::from_json(r#"{
             "schema_version":1,"calibration_id":"台阶设置回归",
             "motion":{"model":"omnidirectional","max_forward_mps":1.0,"max_reverse_mps":0.0,
-                "max_lateral_mps":0.0,"max_angular_rps":1.0,"linear_acceleration_mps2":1.0,
+                "max_lateral_mps":0.0,"max_angular_rps":1.0,"min_executable_linear_mps":0.0,"min_executable_angular_rps":0.0,"linear_acceleration_mps2":1.0,
                 "guaranteed_braking_mps2":1.0,"angular_acceleration_rps2":2.0,
                 "guaranteed_angular_braking_rps2":2.0,"reaction_time_sec":0.1,
                 "minimum_turning_radius_m":0.0,"can_rotate_in_place":true},

@@ -149,6 +149,29 @@ extern "C" int nuwax_scan_map_surface(void* p,const double* obstacles,size_t cou
     o.map.setBusinessEnvelopeQuery([mask](const Vector3d& x,double yaw,double pad){return mask->rejectsEnvelope(x,yaw,pad);});return 0;
   }catch(...){return 1;}
 }
+extern "C" int nuwax_scan_map_surface_columns(void* p,const ScanSurfaceColumn* columns,size_t count,
+    const double* boundary,size_t boundary_count,const int32_t* forbidden,size_t forbidden_count) {
+  try {
+    auto& o=*static_cast<MapOwner*>(p);
+    if(count) {
+      if(!o.surface)o.surface=std::make_shared<SurfaceObstacleLayer>(o.config,nullptr,0,nullptr,0);
+      auto surface=std::make_shared<SurfaceObstacleLayer>(*o.surface,columns,count);o.surface=surface;
+      o.map.setSurfaceCollisionQuery([surface](const Vector3d& x,double yaw,double pad,
+          std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){
+        return surface->contacts(x,yaw,pad,hits,initial,planar);
+      });
+    }
+    if(!o.business||!o.business->matches(boundary,boundary_count,forbidden,forbidden_count)) {
+      std::vector<Eigen::Vector2d> polygon;for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
+      std::vector<Eigen::Vector2i> forbidden_columns;for(size_t i=0;i<forbidden_count;++i)forbidden_columns.emplace_back(forbidden[2*i],forbidden[2*i+1]);
+      const auto& c=o.config;auto mask=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),forbidden_columns);
+      o.business=mask;
+      o.map.setBusinessConstraintQuery([mask](const Vector3d& x,double yaw){return mask->rejects(x,yaw);});
+      o.map.setBusinessEnvelopeQuery([mask](const Vector3d& x,double yaw,double pad){return mask->rejectsEnvelope(x,yaw,pad);});
+    }
+    return 0;
+  }catch(...){return 1;}
+}
 extern "C" int nuwax_scan_map_ingest(void* p,const double* points,size_t count,const uint32_t* ground,size_t ground_count,const double origin[3],const double body[3]) {
   try {
     auto& map=static_cast<MapOwner*>(p)->map;std::vector<Vector3d> values;values.reserve(count);for(size_t i=0;i<count;++i)values.emplace_back(Eigen::Map<const Vector3d>(points+3*i));

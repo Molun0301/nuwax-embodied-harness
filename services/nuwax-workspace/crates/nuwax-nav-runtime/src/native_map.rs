@@ -299,6 +299,7 @@ fn from_surface_selection(
 
 #[derive(Default)]
 pub(crate) struct NativeColumn {
+    rank: usize,
     #[cfg(test)]
     pct_ground: Vec<[f64; 3]>,
     #[cfg(test)]
@@ -315,12 +316,13 @@ pub(crate) struct NativeColumns {
     pub order: Vec<[i32; 2]>,
     ground_resolution: f64,
     lowest_ground: BTreeMap<[i32; 2], f64>,
+    pub changed: Option<Vec<[i32; 2]>>,
     pub forbidden_columns: Vec<[i32; 2]>,
 }
 impl NativeColumns {
     pub fn new(map: NativeMap, source: &SurfaceSnapshot, window: ([f64; 2], f64), ground_resolution: f64) -> Self {
         let order = source.navigation_source_columns(Some(window)).1.map(|(xy, _)| xy).collect();
-        let mut result = Self { resolution: map.resolution, columns: BTreeMap::new(), order, ground_resolution, lowest_ground: BTreeMap::new(),
+        let mut result = Self { resolution: map.resolution, columns: BTreeMap::new(), order, ground_resolution, lowest_ground: BTreeMap::new(), changed: None,
             forbidden_columns: map.forbidden_columns };
         for p in map.static_collision_ground {
             result.columns.entry([p[0], p[1]].map(|v| (v / result.resolution).floor() as i32))
@@ -337,6 +339,9 @@ impl NativeColumns {
             }
             for c in map.cells { result.columns.entry([c.x, c.y]).or_default().cells.push(c); }
             for b in map.bands { result.columns.entry([b.x, b.y]).or_default().bands.push(b); }
+        }
+        for (rank, xy) in result.order.iter().enumerate() {
+            if let Some(column) = result.columns.get_mut(xy) { column.rank = rank; }
         }
         for column in result.columns.values() { for p in &column.ground {
             let key = [p[0], p[1]].map(|v| (v / ground_resolution).floor() as i32);
@@ -362,8 +367,12 @@ impl NativeColumns {
         std::mem::swap(&mut self.order, &mut update.order);
         let changed: BTreeSet<_> = keys.iter().map(|key| key.map(|v|
             (((f64::from(v) + 0.5) * self.resolution) / self.ground_resolution).floor() as i32)).collect();
+        self.changed = Some(keys.iter().copied().collect());
         for key in keys { self.columns.remove(&key); }
         self.columns.extend(update.columns);
+        for (rank, xy) in self.order.iter().enumerate() {
+            if let Some(column) = self.columns.get_mut(xy) { column.rank = rank; }
+        }
         for key in changed {
             let low = self.ground_columns(key).flat_map(|(_, c)| c.ground.iter())
                 .filter(|p| [p[0], p[1]].map(|v| (v / self.ground_resolution).floor() as i32) == key)
@@ -376,8 +385,8 @@ impl NativeColumns {
     fn ground_columns(&self, key: [i32; 2]) -> impl Iterator<Item = (&[i32; 2], &NativeColumn)> {
         let first = key.map(|v| (f64::from(v) * self.ground_resolution / self.resolution).floor() as i32 - 1);
         let last = key.map(|v| ((f64::from(v) + 1.) * self.ground_resolution / self.resolution).ceil() as i32);
-        self.columns.range([first[0], i32::MIN]..=[last[0], i32::MAX])
-            .filter(move |(xy, _)| xy[1] >= first[1] && xy[1] <= last[1])
+        (first[0]..=last[0]).flat_map(move |x|
+            self.columns.range([x, first[1]]..=[x, last[1]]))
     }
     pub fn ground(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
         self.order.iter().filter_map(|xy| self.columns.get(xy)).flat_map(|c| c.ground.iter().copied())
@@ -405,6 +414,41 @@ pub(crate) struct CollisionGround<'a> {
     pub recent: Vec<[f64; 3]>,
 }
 impl CollisionGround<'_> {
+    pub fn dynamic_columns(&self) -> BTreeSet<[i32; 2]> {
+        let recent: BTreeSet<_> = self.recent.iter().map(|p| [p[0], p[1]]
+            .map(|v| (v / self.native.ground_resolution).floor() as i32)).collect();
+        self.overrides.keys().map(|key| key.map(|v|
+            (((f64::from(v) + 0.5) * self.native.resolution) / self.native.ground_resolution).floor() as i32))
+            .filter(|key| !recent.contains(key)).collect()
+    }
+    pub fn surface_columns(&self, keys: &BTreeSet<[i32; 2]>, obstacles: &[[f64; 3]])
+        -> Vec<([i32; 2], Vec<[f64; 3]>, Vec<[f64; 3]>)> {
+        let group = |points: &[[f64; 3]]| {
+            let mut columns = BTreeMap::<[i32; 2], Vec<[f64; 3]>>::new();
+            for &p in points {
+                columns.entry([p[0], p[1]].map(|v| (v / self.native.ground_resolution).floor() as i32))
+                    .or_default().push(p);
+            }
+            columns
+        };
+        let recent_ground = group(&self.recent);
+        let recent_obstacles = group(obstacles);
+        keys.iter().map(|&key| {
+            let mut columns: Vec<_> = self.native.ground_columns(key).collect();
+            columns.sort_by_key(|(_, c)| c.rank);
+            let inside = |p: &&[f64; 3]| [p[0], p[1]]
+                .map(|v| (v / self.native.ground_resolution).floor() as i32) == key;
+            let mut ground = Vec::new(); let mut solid = Vec::new();
+            for (xy, column) in columns {
+                ground.extend(self.overrides.get(xy).map(Vec::as_slice).unwrap_or(&column.ground)
+                    .iter().filter(inside).copied());
+                solid.extend(column.obstacles.iter().filter(inside).copied());
+            }
+            if let Some(points) = recent_ground.get(&key) { ground.extend_from_slice(points); }
+            if let Some(points) = recent_obstacles.get(&key) { solid.extend_from_slice(points); }
+            (key, solid, ground)
+        }).collect()
+    }
     pub fn points(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
         self.native.order.iter().flat_map(|xy| self.overrides.get(xy).map(Vec::as_slice)
             .or_else(|| self.native.columns.get(xy).map(|c| c.ground.as_slice()))
@@ -461,7 +505,7 @@ pub(crate) fn collision_ground_view<'a>(
 pub(crate) fn collision_ground(persistent: Vec<[f64; 3]>, recent: Vec<[f64; 3]>,
     config: &nuwax_nav_scan_native::Config, position: [f64; 3], yaw: f64) -> Vec<[f64; 3]> {
     let mut native = NativeColumns { resolution: config.resolution, ground_resolution: config.resolution,
-        columns: BTreeMap::new(), order: Vec::new(), lowest_ground: BTreeMap::new(), forbidden_columns: Vec::new() };
+        columns: BTreeMap::new(), order: Vec::new(), lowest_ground: BTreeMap::new(), changed: None, forbidden_columns: Vec::new() };
     for p in persistent {
         let key = [p[0], p[1]].map(|v| (v / config.resolution).floor() as i32);
         if !native.columns.contains_key(&key) { native.order.push(key); }

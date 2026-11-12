@@ -40,11 +40,11 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
   BodyClearanceField field{width,height,(min_x+.5)*r,(min_y+.5)*r,r,std::vector<double>(size)};
   std::vector<std::vector<double>> ground_points(size);
   if(surface) {
-    const auto& points=surface->groundPoints();
-    for(size_t i=0;i<points.size();i+=3) {
-      const int x=int(std::floor(points[i]/r))-min_x,y=int(std::floor(points[i+1]/r))-min_y;
-      if(x>=0&&x<width&&y>=0&&y<height)ground_points[y*width+x].push_back(points[i+2]);
-    }
+    surface->eachColumn([&](int gx,int gy,const SurfaceObstacleLayer::Column& column) {
+      const int x=gx-min_x,y=gy-min_y;
+      if(x>=0&&x<width&&y>=0&&y<height)
+        for(size_t i=2;i<column.ground.size();i+=3)ground_points[y*width+x].push_back(column.ground[i]);
+    });
   }
   const auto& body=md_.sliding_map_frame_pos_;
   const int start_x=int(std::floor(body.x()/r))-min_x,start_y=int(std::floor(body.y()/r))-min_y;

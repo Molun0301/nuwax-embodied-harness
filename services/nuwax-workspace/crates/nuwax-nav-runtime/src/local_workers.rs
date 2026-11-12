@@ -128,6 +128,7 @@ impl MapWorker {
         let mut owner: Option<MapOwner> = None;
         let mut previous: Option<MapInput> = None;
         let mut prepared: Option<PreparedMap> = None;
+        let mut dynamic_columns = std::collections::BTreeSet::new();
         let mut static_view: Option<StaticSurfaceView> = None;
         Ok(Self(Worker::new(
             "nav-map-maintenance",
@@ -174,36 +175,36 @@ impl MapWorker {
                     let native = static_surface_view(&mut static_view, &input, same_static_geometry)?;
                     let (recent_ground, recent_obstacles) =
                         input.source.navigation_recent_samples();
-                    let obstacles: Vec<_> = native
-                        .obstacles()
-                        .chain(recent_obstacles)
-                        .collect();
                     let ground = crate::native_map::collision_ground_view(
-                        native,
-                        recent_ground,
-                        &c,
-                        input.pose,
-                        input.yaw,
+                        native, recent_ground, &c, input.pose, input.yaw,
                     );
-                    let ground: Vec<_> = ground.points().collect();
                     let map = owner.as_mut().unwrap();
+                    let current_dynamic = ground.dynamic_columns();
                     if let Some(initialize) = initializer {
-                        initialize(
-                            map,
-                            &obstacles,
-                            &ground,
-                            &input.boundary,
-                            &native.forbidden_columns,
-                            input.pose,
-                        )?;
+                        let obstacles: Vec<_> = native.obstacles().chain(recent_obstacles).collect();
+                        let ground: Vec<_> = ground.points().collect();
+                        initialize(map, &obstacles, &ground, &input.boundary,
+                            &native.forbidden_columns, input.pose)?;
+                    } else if let Some(changes) = &native.changed {
+                        let mut keys: std::collections::BTreeSet<_> = dynamic_columns.union(&current_dynamic).copied().collect();
+                        let (old_ground, old_obstacles) = previous.as_ref().unwrap().source.navigation_recent_samples();
+                        if !old_ground.iter().map(|p| p.map(f64::to_bits)).eq(ground.recent.iter().map(|p| p.map(f64::to_bits)))
+                            || !old_obstacles.iter().map(|p| p.map(f64::to_bits)).eq(recent_obstacles.iter().map(|p| p.map(f64::to_bits))) {
+                            keys.extend(old_ground.iter().chain(&old_obstacles).chain(&ground.recent)
+                                .chain(&recent_obstacles).map(|p| [p[0], p[1]].map(|v| (v / c.resolution).floor() as i32)));
+                        }
+                        keys.extend(changes.iter().map(|xy| xy.map(|v|
+                            (((f64::from(v) + 0.5) * native.resolution) / c.resolution).floor() as i32)));
+                        let columns = ground.surface_columns(&keys, &recent_obstacles);
+                        let updates: Vec<_> = columns.iter().map(|(xy, obstacles, ground)|
+                            nuwax_nav_scan_native::SurfaceColumn { xy: *xy, obstacles, ground }).collect();
+                        map.update_surface_columns(&updates, &input.boundary, &native.forbidden_columns)?;
                     } else {
-                        map.update_surface(
-                            &obstacles,
-                            &ground,
-                            &input.boundary,
-                            &native.forbidden_columns,
-                        )?;
+                        let obstacles: Vec<_> = native.obstacles().chain(recent_obstacles).collect();
+                        let ground: Vec<_> = ground.points().collect();
+                        map.update_surface(&obstacles, &ground, &input.boundary, &native.forbidden_columns)?;
                     }
+                    dynamic_columns = current_dynamic;
                     if rebuilt || !same_frame {
                         if let Some(frame) = &input.frame {
                             map.ingest(
@@ -271,6 +272,7 @@ fn static_surface_view<'a>(
 ) -> Result<&'a crate::native_map::NativeColumns, String> {
     use crate::surface_changes::SurfaceGeometryChanges;
     let c = input.config;
+    if let Some(view) = cached.as_mut() { view.columns.changed = Some(Vec::new()); }
     let d = c.planning_horizon * 0.25;
     let moved = cached.as_ref().is_none_or(|view|
         (input.pose[0] - view.anchor[0]).hypot(input.pose[1] - view.anchor[1]) > d);

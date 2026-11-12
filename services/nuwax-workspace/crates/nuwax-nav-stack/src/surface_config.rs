@@ -52,6 +52,7 @@ impl SurfaceNavigationConfig {
             n.traversability_max_step_height_m,
             n.traversability_max_slope_deg,
             n.min_stair_tread_m,
+            n.obstacle_clearance_m,
         )?;
         config.apply_calibration(body, capabilities.clone())?;
         config.apply_step_overrides(n.max_step_up_m, n.max_step_down_m, capabilities.as_ref())?;
@@ -141,6 +142,7 @@ impl SurfaceNavigationConfig {
         max_step_height_m: f64,
         max_slope_deg: f64,
         min_stair_tread_m: f64,
+        obstacle_clearance_m: f64,
     ) -> NavStackResult<Self> {
         if frame != "map"
             || [voxel_size_m, min_stair_tread_m]
@@ -192,7 +194,7 @@ impl SurfaceNavigationConfig {
                 "surface geometry exceeds float32 domain or tread is below two voxels".into(),
             ));
         }
-        let mut follower = SurfaceFollowerConfig::new(-body.z_min_m);
+        let mut follower = SurfaceFollowerConfig::new(-body.z_min_m, obstacle_clearance_m);
         // 三维生产调度为20赫兹，速度窗口的加减速时间必须采用同一控制周期。
         follower.controller.control_frequency =
             1.0 / nuwax_nav_runtime::DEFAULT_TICK_INTERVAL.as_secs_f64();
@@ -304,7 +306,7 @@ mod tests {
                     "rotation_row_major":[1,0,0,0,1,0,0,0,1],"radius_m":0.02,"length_m":0.08}]}}
         "#).unwrap();
         let shared = body.self_collision.as_ref().unwrap().clone();
-        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
         config.apply_calibration(body, None).unwrap();
         let envelope = &config.body_envelope;
         let fixed = envelope.fixed_collision.as_ref().unwrap();
@@ -328,7 +330,7 @@ mod tests {
     fn missing_fixed_collision_json_keeps_surface_compatibility_absent() {
         let body = RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],
             "z_min_m":-0.448,"z_max_m":0.057,"source":"manual"}"#).unwrap();
-        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
         config.apply_calibration(body, None).unwrap();
         assert!(config.body_envelope.fixed_collision.is_none());
     }
@@ -387,13 +389,13 @@ mod tests {
             z_min_m: -0.05, z_max_m: 0.2, source: "台阶设置回归".into(),
         };
         for (up, down, accepted) in [(0.2,0.1,true), (0.1,0.0,true), (0.21,0.1,false), (0.2,0.2,false)] {
-            let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+            let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
             config.apply_calibration(robot.clone(), Some(caps.clone())).unwrap();
             assert_eq!(config.apply_step_overrides(Some(up),Some(down),Some(&caps)).is_ok(),accepted);
         }
         let mut absent = caps;
         absent.terrain = None;
-        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+        let mut config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
         config.apply_calibration(robot, Some(absent.clone())).unwrap();
         assert!(config.apply_step_overrides(Some(0.2),None,Some(&absent)).is_err());
         assert!(config.apply_step_overrides(None,Some(0.2),Some(&absent)).is_err());
@@ -416,11 +418,11 @@ mod tests {
             ("map", 0.4, 0.1, 0.1, 0.2),
             ("map", 0.4, 0.1, 0.2, 1e300),
         ] {
-            assert!(SurfaceNavigationConfig::new(frame.into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(offset), z_max_m: (0.6)-(offset), source: "测试外形".into() }, voxel, step, 35.0, tread)
+            assert!(SurfaceNavigationConfig::new(frame.into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(offset), z_max_m: (0.6)-(offset), source: "测试外形".into() }, voxel, step, 35.0, tread, 0.15)
             .is_err());
         }
         let valid =
-            SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
+            SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2, 0.15).unwrap();
         assert_eq!(valid.geometry.wall_clearance_m, 0.0);
         assert_eq!(valid.follower.body_to_support_z_m, 0.4);
         assert_eq!(valid.geometry.surface_closing_radius, 0.0);

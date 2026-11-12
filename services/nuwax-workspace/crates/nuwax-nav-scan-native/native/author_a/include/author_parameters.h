@@ -18,10 +18,11 @@ inline ros::NodeHandle authorParameters(const ScanConfig& c) {
  n.setParam("optimization/lambda_smooth",1.0);n.setParam("optimization/lambda_collision",1.0);
  n.setParam("optimization/lambda_feasibility",.1);n.setParam("optimization/lambda_fitness",1.0);
  // 余量相对机体表面；两倍首选净空保留排斥梯度，窄处仍由原硬判定决定通行。
- n.setParam("optimization/dist0",2.*preferredClearance(c.resolution));n.setParam("optimization/max_vel",c.max_velocity);
+ n.setParam("optimization/dist0",2.*preferredClearance(c.resolution,c.obstacle_clearance_m));n.setParam("optimization/max_vel",c.max_velocity);
  n.setParam("optimization/max_acc",c.max_acceleration);n.setParam("optimization/order",3);
  n.setParam("optimization/vel_tolerance",1.0);n.setParam("optimization/acc_tolerance",1.0);
  n.setParam("grid_map/resolution",c.resolution);
+ n.setParam("grid_map/obstacle_clearance",c.obstacle_clearance_m);
  n.setParam("grid_map/sliding_map_size_x",10.0);n.setParam("grid_map/sliding_map_size_y",10.0);n.setParam("grid_map/sliding_map_size_z",5.0);
  n.setParam("grid_map/map_sliding_thresh",.2);n.setParam("grid_map/map_sliding_en",true);
  // Original two-cylinder covering approximation with unchanged actual dimensions.

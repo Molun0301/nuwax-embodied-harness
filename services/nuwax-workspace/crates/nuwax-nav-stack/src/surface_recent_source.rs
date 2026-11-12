@@ -105,7 +105,7 @@ mod tests {
     #[tokio::test]
     async fn recent_consumer_ignores_old_sequence_and_clears_on_session_change() {
         let authority=GuardedMapAuthority { session_id: "live-source-test".into(), revision: 1, frame_id: "map".into() };
-        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
+        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2, 0.15).unwrap();
         let points:Vec<_>=(0..40).flat_map(|x|(0..30).map(move|y|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();
@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn paired_registered_scan_preserves_world_points_pose_and_time_without_latest_pose() {
         let authority=GuardedMapAuthority { session_id: "live-source-test".into(), revision: 1, frame_id: "map".into() };
-        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
+        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2, 0.15).unwrap();
         let points:Vec<_>=(0..40).flat_map(|x|(0..30).map(move|y|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();

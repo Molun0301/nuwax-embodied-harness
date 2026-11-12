@@ -108,6 +108,7 @@ fn config() -> Config {
         max_yaw_acceleration: 2.0,
         max_reverse_velocity: 0.0,
         max_lateral_velocity: 0.0,
+        obstacle_clearance_m: 0.15,
     }
 }
 fn run_case(

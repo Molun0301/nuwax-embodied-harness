@@ -1948,6 +1948,17 @@ consumers = [
 ]
 apply = "restart"
 
+[navigation.obstacle_clearance_m]
+type = "float"
+min = 0.0
+min_exclusive = true
+default = 0.15
+description = "局部路线希望与障碍保持的距离，也是目标贴着障碍时停点要求的净空（米）"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.obstacle_clearance_m",
+]
+apply = "restart"
+
 [navigation.max_step_down_m]
 type = "float"
 min = 0.0

@@ -280,6 +280,7 @@ fn n6_20_r7_chain() -> (Config, Vec<MotionState>) {
         max_yaw_acceleration: 20.0,
         max_reverse_velocity: 0.0,
         max_lateral_velocity: 0.1744299999999988,
+        obstacle_clearance_m: 0.15,
     };
     let states = vec![
         MotionState { position: [4.72722390133869, 0.42264081558236116, 0.01171238755107227], velocity: [0.06811423959850842, 0.008768917491102436, 0.008467873319189185], yaw: -0.03328296349112102, yaw_rate: 0.010022572526697686, timestamp_ns: 1794298148785357237, measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() },

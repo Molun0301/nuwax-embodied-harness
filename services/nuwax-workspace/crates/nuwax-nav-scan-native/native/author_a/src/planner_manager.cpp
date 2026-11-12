@@ -279,7 +279,7 @@ namespace scan_planner
         if (farthest == first && last > first+1) {
           const double yaw=std::atan2(delta.y(),delta.x());
           const int steps=std::max(1,static_cast<int>(std::ceil(delta.norm()/(resolution*.25))));
-          const double margin=preferredClearance(resolution);
+          const double margin=map.preferredClearance();
           double reference_clearance=margin;
           // 宽处保留目标余量；已知窄段沿原硬可行规则简化，由最小净距软代价选择可留余量。
           for(int j=0;j<=steps;++j) {
@@ -504,7 +504,7 @@ namespace scan_planner
   {
 
     const double resolution = grid_map_->getResolution();
-    bspline_optimizer_rebound_->setInitialClearance(std::min(2.*preferredClearance(resolution),
+    bspline_optimizer_rebound_->setInitialClearance(std::min(2.*grid_map_->preferredClearance(),
         grid_map_->bodyFieldClearance(start_pt,start_yaw)));
     bool reference_detour = false;
     if (route_height_.ready()) {

@@ -39,7 +39,7 @@ fn unconfigured_cloud_age_adds_no_default_stop_gate() {
 
 #[test]
 fn mask_only_surface_update_changes_map_without_renewing_source_health() {
-    let follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3)).unwrap();
+    let follower=SurfaceFollower::new(SurfaceFollowerConfig::new(0.3, 0.15)).unwrap();
     let mut scheduler=NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
         follower,SchedulerConfig::default()).unwrap();
     let (status,_)=watch::channel(scheduler.status.clone());

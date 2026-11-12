@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn production_surface_accepts_reverse_authorization_as_an_upper_bound() {
-        let mut config = SurfaceFollowerConfig::new(0.4);
+        let mut config = SurfaceFollowerConfig::new(0.4, 0.15);
         config.basic_kinematics = Some(nuwax_nav_types_messages::MotionKinematics {
             model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
             max_forward_mps:0.35,max_reverse_mps:0.35,max_lateral_mps:0.35,
@@ -3594,7 +3594,7 @@ mod tests {
 
     #[tokio::test]
     async fn actual_surface_backend_zeroes_for_changed_map_and_replans_same_route() {
-        let mut local_config = SurfaceFollowerConfig::new(0.4);
+        let mut local_config = SurfaceFollowerConfig::new(0.4, 0.15);
         local_config.controller.speed = 0.2;
         local_config.controller.goal_tolerance = 0.12;
         let scheduler = NavScheduler::new(

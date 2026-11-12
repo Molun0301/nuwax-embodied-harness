@@ -9,7 +9,7 @@ const SOURCE_NS: i64 = 1_700_000_000_000_000_000;
 
 fn calibrated_config() -> SurfaceNavigationConfig {
     // Make a new owner: cloning this configuration would share the PCT cache.
-    let mut result = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+    let mut result = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
     result.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision: None,
         footprint_xy_m: vec![[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],

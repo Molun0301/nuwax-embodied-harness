@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn changed_measured_height_refreshes_cached_native_reference_inside_same_voxel() {
-        let config = crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+        let config = crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
         let points = |height| (-20..60).flat_map(|x| (-20..20).map(move |y|
             ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,height))).collect::<Vec<_>>();
         let mut builder = nuwax_nav_mls_planner::SurfaceMapBuilder::new(config.geometry);
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn route_end_takes_goal_xy_only_inside_the_bound_ground_cell() {
         // 0.1米格的实测平地覆盖x∈[-1,3)、y∈[-1,1)。
-        let config = crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap();
+        let config = crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15).unwrap();
         let points = (-20..60).flat_map(|x| (-20..20).map(move |y|
             ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,0.01))).collect::<Vec<_>>();
         let map = nuwax_nav_mls_planner::SurfaceMapBuilder::new(config.geometry).build(&points,0.05).unwrap().snapshot;

@@ -162,7 +162,7 @@ fn forbidden_mask_changes_surface_input_without_changing_physical_snapshot() {
                 0.15,
                 18.0,
                 0.2,
-            )
+             0.15)
             .unwrap()
             .geometry,
             0.1,
@@ -612,7 +612,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
         0.2,
         25.,
         0.3,
-    )
+     0.15)
     .unwrap();
     let points: Vec<_> = [0., 3.]
         .into_iter()

@@ -34,7 +34,7 @@ pub(crate) fn fixture() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>) {
             })
             .unwrap(),
     );
-    let mut config = SurfaceFollowerConfig::new(0.4);
+    let mut config = SurfaceFollowerConfig::new(0.4, 0.15);
     config.controller.simulation = false;
     config.controller.control_frequency = 20.;
     config.motion_limits = Some(MotionLimits {

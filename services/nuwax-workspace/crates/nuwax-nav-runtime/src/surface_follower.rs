@@ -49,7 +49,7 @@ pub struct SurfaceFollowerConfig {
 }
 impl SurfaceFollowerConfig {
     /// 创建物理标定明确的三维执行配置。
-    pub fn new(body_to_support_z_m: f64) -> Self {
+    pub fn new(body_to_support_z_m: f64, obstacle_clearance_m: f64) -> Self {
         Self {
             scan: nuwax_nav_scan_native::Config {
                 resolution: 0.1,
@@ -73,6 +73,7 @@ impl SurfaceFollowerConfig {
                 max_yaw_acceleration: 11.,
                 max_reverse_velocity: 0.,
                 max_lateral_velocity: 0.,
+                obstacle_clearance_m,
             },
             body_to_support_z_m,
             motion_limits: None,
@@ -1282,11 +1283,11 @@ mod native_execution_tests {
         follower.update_odometry(pose(2.5,1.,0.));
         assert!(follower.progress()>0.);
         assert_eq!(follower.reference,reference);
-        assert_eq!(SurfaceFollowerConfig::new(0.4).scan.planning_horizon,3.5);
+        assert_eq!(SurfaceFollowerConfig::new(0.4, 0.15).scan.planning_horizon,3.5);
     }
     #[test]
     fn profile_reverse_permission_never_invents_unknown_hardware_channels() {
-        let config = SurfaceFollowerConfig::new(0.5);
+        let config = SurfaceFollowerConfig::new(0.5, 0.15);
         assert!(config.kinematics().is_none());
         assert_eq!(config.scan.max_reverse_velocity, 0.);
         assert_eq!(config.scan.max_lateral_velocity, 0.);

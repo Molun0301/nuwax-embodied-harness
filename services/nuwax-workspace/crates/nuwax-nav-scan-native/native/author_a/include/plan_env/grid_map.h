@@ -53,7 +53,7 @@ struct CollisionParameters {
   Eigen::Vector3i map_voxel_num_;                        // map range in index
   Eigen::Vector3i map_bound_min_idx_, map_bound_max_idx_;
   Eigen::Vector3i map_origin_idx_;
-  double resolution_, resolution_inv_;
+  double resolution_, resolution_inv_, obstacle_clearance_;
   double obstacles_inflation_z_up, obstacles_inflation_z_down;
   double double_cylinder_radius_, double_cylinder_offset_;
   double body_length_, body_width_;
@@ -190,6 +190,7 @@ public:
   inline int bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
       std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr,
       bool planar = false);
+  double preferredClearance() const { return scan_planner::preferredClearance(mp_.resolution_,mp_.obstacle_clearance_); }
   inline double fieldDistance(double x, double y) const;
   double bodyFieldClearance(Eigen::Vector3d pos, double yaw) const;
   double bodyFieldClearance(Eigen::Vector3d pos, double yaw, double upper_bound) const;
@@ -598,14 +599,14 @@ inline double GridMap::fieldDistance(double x, double y) const {
 
 // 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
 inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
-  const double margin=scan_planner::preferredClearance(mp_.resolution_);
+  const double margin=preferredClearance();
   const double clearance=bodyFieldClearance(pos,yaw,range);
   const double deficit=range-clearance;
   return deficit*deficit/margin;
 }
 
 inline bool GridMap::bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw) {
-  const double margin=scan_planner::preferredClearance(mp_.resolution_);
+  const double margin=preferredClearance();
   if(bodyFieldClearance(pos,yaw)>=margin)return true;
   // 在参考方向横移一个余量即可留足空间时进入优化；两侧均受限的门洞保留原可行初值。
   const Eigen::Vector3d lateral(-std::sin(yaw)*margin,std::cos(yaw)*margin,0.);

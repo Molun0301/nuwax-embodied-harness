@@ -150,6 +150,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   /* get parameter */
   double x_size, y_size, z_size;
   node_.param("grid_map/resolution", mp_.resolution_, -1.0);
+    node_.param("grid_map/obstacle_clearance", mp_.obstacle_clearance_, -1.0);
   node_.param("grid_map/sliding_map_size_x", x_size, -1.0);
   node_.param("grid_map/sliding_map_size_y", y_size, -1.0);
   node_.param("grid_map/sliding_map_size_z", z_size, -1.0);

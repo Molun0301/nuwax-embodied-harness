@@ -90,6 +90,7 @@ pub struct Navigation {
     pub explore_pose_ttl_ms: i64,
     pub facility_providers_json: String,
     pub local_horizon_m: f64,
+    pub obstacle_clearance_m: f64,
     #[serde(deserialize_with = "crate::optional_number")]
     pub max_step_down_m: Option<f64>,
     #[serde(deserialize_with = "crate::optional_number")]

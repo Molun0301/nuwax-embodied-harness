@@ -358,7 +358,7 @@ mod tests {
                     // 显式串行驱动地图、规划、跟踪三接口；不把初始化耗时充当物理时间。
                     let native=nuwax_nav_runtime::native_map::from_surface(&map).unwrap();
                     let reference:Vec<_>=route.iter().map(|p|p.0).collect();
-                    let mut config=SurfaceFollowerConfig::new(0.4).scan;
+                    let mut config=SurfaceFollowerConfig::new(0.4, 0.15).scan;
                     config.resolution=map.navigation_source_columns(None).0;
                     config.body_length=0.6;config.body_width=width;config.body_height=0.3;
                     config.body_z_min=-0.15;config.body_z_max=0.15;

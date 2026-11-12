@@ -32,6 +32,7 @@ struct Trajectory {
   uint32_t sources[3]{2,2,3};
   Vector3d local_target=Vector3d::Zero();double reference_progress=0.,reference_duration=0.;
   scan_planner::HeadingPlan heading;
+  bool reaches_reference_end=false;
   double headingAt(double time) {
     const double total=duration();
     return heading.at(scan_planner::trajectoryHeading(velocity,total,time,.01,heading.yaw0),time,total);
@@ -205,6 +206,9 @@ extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void*
     s.produced.reset();s.fsm->requestPlan(active!=nullptr);s.fsm->tick();
     if(!s.produced)throw std::runtime_error(scan_native_diagnostic.empty()?"SCAN本次尚无可执行轨迹":scan_native_diagnostic);
     s.produced->local_target=s.fsm->localTarget();s.produced->reference_progress=s.fsm->manager().global_data_.last_progress_time_;s.produced->reference_duration=s.fsm->manager().global_data_.global_duration_;
+    const auto end=s.produced->position.evaluateDeBoorT(s.produced->duration());
+    s.produced->reaches_reference_end=std::hypot(end.x()-reference[3*(count-1)],
+        end.y()-reference[3*(count-1)+1])<=c->resolution;
     s.produced->sources[0]=s.fsm->startVelocitySource();s.produced->sources[1]=s.fsm->startAccelerationSource();s.produced->sources[2]=state->measured_yaw_rate?0:3;
     return new Curve(s.produced);
   }catch(const std::exception& e){errorText(error,capacity,e);return nullptr;}
@@ -313,7 +317,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
       if(turning)s.raw.linear={};
       s.raw.angular.z=std::clamp(s.controller.kp_yaw*scan_planner::headingDifference(desired_yaw,yaw),-c->max_yaw_rate,c->max_yaw_rate);
-      if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
+      if(out->remaining<=REPLAN_REMAINING_SECONDS&&!s.curve->reaches_reference_end)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }
     // 归档271次停车的滑行P95：≥0.5米/秒为0.105米，0.2—0.3为0.037米，<0.1为0.017米，另需留约0.03米定位抖动。

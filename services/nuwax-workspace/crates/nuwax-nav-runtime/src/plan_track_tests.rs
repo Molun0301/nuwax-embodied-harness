@@ -247,7 +247,7 @@ fn deviation_over_constant_threshold_requests_local_plan() {
     assert!(f.wait_reason.as_ref().unwrap().contains("偏离"));
 }
 #[test]
-fn remaining_two_point_five_seconds_requests_once_and_coalesces() {
+fn final_curve_remaining_two_point_five_seconds_keeps_tracking_without_replanning() {
     let mut f = ready_follower();
     delayed_planner(&mut f, Duration::from_millis(500));
     let samples = f.active.as_ref().unwrap().samples(0., 0.01);
@@ -262,19 +262,55 @@ fn remaining_two_point_five_seconds_requests_once_and_coalesces() {
         .unwrap();
     let position = at.position;
     next_pose(&mut f, position);
-    // 这个用例直接把位置置于曲线尾段；安装投影建立相同实测状态的时间锚，随后只测提前规划的合并语义。
+    // 保留原尾段位置与时间锚；曲线已接到参考末点时不再由剩余时长触发新规划。
     let config=f.native_config(f.map.as_ref().unwrap());
     let state=f.state();
     f.tracker.install(f.active.as_ref().unwrap());
     f.tracker.track_and_check(&config,&f.prepared.as_ref().unwrap().snapshot,&state,[0.;3],None).unwrap();
     f.needs_plan = false;
     assert!(matches!(f.step(), PlannerStep::Command(_)));
-    assert!(f.early_requested && f.planning);
+    assert!(!f.early_requested && !f.planning);
     let calls = f.local_planning_calls();
     for _ in 0..3 {
         f.step();
         assert_eq!(f.local_planning_calls(), calls);
     }
+}
+#[test]
+fn final_curve_keeps_its_clock_and_installation_across_source_ticks() {
+    let mut f = ready_follower();
+    let curve = f.active.as_ref().unwrap().clone();
+    let samples = curve.samples(0., 0.01);
+    let duration = samples.last().unwrap().time;
+    let initial = samples.iter().min_by(|a,b| {
+        (a.time-(duration-2.49)).abs().total_cmp(&(b.time-(duration-2.49)).abs())
+    }).unwrap();
+    assert!((samples.last().unwrap().position[0]-f.reference.last().unwrap()[0]).abs()
+        <=f.config.scan.resolution);
+    next_pose(&mut f,initial.position);
+    let config=f.native_config(f.map.as_ref().unwrap());
+    let state=f.state();
+    f.tracker.install(&curve);
+    f.tracker.track_and_check(&config,&f.prepared.as_ref().unwrap().snapshot,&state,[0.;3],None).unwrap();
+    f.needs_plan=false;
+    let calls=f.local_planning_calls();
+    let installed=f.plans;
+    let mut phase=initial.time;
+    for tick in 0..5 {
+        let at=samples.iter().min_by(|a,b| {
+            (a.time-(initial.time+tick as f64*0.05)).abs()
+                .total_cmp(&(b.time-(initial.time+tick as f64*0.05)).abs())
+        }).unwrap();
+        next_pose(&mut f,at.position);
+        assert!(matches!(f.step(),PlannerStep::Command(_)));
+        assert!(!f.early_requested&&!f.planning);
+        assert_eq!(f.local_planning_calls(),calls);
+        assert_eq!(f.plans,installed);
+        assert!(f.active.as_ref().unwrap().same(&curve));
+        assert!(f.phase>=phase-0.02);
+        phase=f.phase;
+    }
+    assert!(phase>initial.time+0.1,"原曲线时钟必须随新来源拍前进");
 }
 #[test]
 fn final_no_candidate_zeroes_and_requests_plan_from_raw_motion() {

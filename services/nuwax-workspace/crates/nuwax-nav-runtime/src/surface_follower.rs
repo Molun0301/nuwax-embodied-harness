@@ -153,6 +153,7 @@ pub struct SurfaceFollower {
     terminal_approach: Option<TerminalApproach>,
     terminal_heading: f64,
     terminal_translation_finished: bool,
+    terminal_translation_progress: Option<(f64, i64)>,
 }
 impl SurfaceFollower {
     /// 生产地图只接受注册原帧；地图维护线程独占概率图。
@@ -206,6 +207,7 @@ impl SurfaceFollower {
             terminal_approach: None,
             terminal_heading: 0.,
             terminal_translation_finished: false,
+            terminal_translation_progress: None,
         })
     }
     /// 在创建工作线程和连接运动端之前核对物理配置。
@@ -471,6 +473,7 @@ impl SurfaceFollower {
         self.terminal_approach = None;
         self.terminal_heading = 0.;
         self.terminal_translation_finished = false;
+        self.terminal_translation_progress = None;
     }
     fn prepare_terminal(&mut self, map: &PreparedMap, config: &nuwax_nav_scan_native::Config) {
         if self.terminal_phase != TerminalPhase::Travel || !self.options.requires_orientation()
@@ -533,6 +536,7 @@ impl SurfaceFollower {
         self.local_path.clear();
         self.local_body_path = None;
         self.terminal_translation_finished = false;
+        self.terminal_translation_progress = None;
         self.terminal_heading = if self.options.requires_orientation() {
             self.goal.as_ref().unwrap().pose.orientation.yaw()
         } else {
@@ -648,6 +652,12 @@ impl SurfaceFollower {
             .then_some(self.terminal_heading);
         let stop = self.terminal_approach.as_ref().map_or_else(
             || Self::position(self.goal.as_ref().unwrap()), |a| a.points.stop);
+        if self.terminal_phase == TerminalPhase::Translating && !self.terminal_translation_finished {
+            let distance = (state.position[0] - stop[0]).hypot(state.position[1] - stop[1]);
+            let progress = self.terminal_translation_progress.get_or_insert((distance, state.timestamp_ns));
+            if distance < progress.0 { *progress = (distance, state.timestamp_ns); }
+            self.terminal_translation_finished = distance <= 0.02 || state.timestamp_ns - progress.1 >= 1_000_000_000;
+        }
         let terminal_position = (self.terminal_phase == TerminalPhase::Translating
             && !self.terminal_translation_finished).then_some(stop);
         let mut tracking_failure = None;
@@ -712,11 +722,12 @@ impl SurfaceFollower {
             self.needs_plan = true;
         }
         if self.terminal_phase == TerminalPhase::Translating {
-            self.terminal_translation_finished |= (state.position[0] - stop[0]).hypot(state.position[1] - stop[1]) <= 0.02
-                || ((checked.no_candidate() || !checked.invalid()) && checked.command[0] == 0. && checked.command[1] == 0.);
+            self.terminal_translation_finished |= (checked.no_candidate() || !checked.invalid())
+                && checked.command[0] == 0. && checked.command[1] == 0.;
             if self.terminal_translation_finished && !self.position_reached() {
                 self.terminal_phase = TerminalPhase::Travel;
                 self.terminal_translation_finished = false;
+                self.terminal_translation_progress = None;
                 self.needs_plan = true;
             }
         } else if checked.no_candidate() {
@@ -1072,6 +1083,41 @@ mod native_execution_tests {
             }
             assert!(succeeded, "末段应完成平移与实测停车，朝向要求={requires_yaw}");
         }
+    }
+
+    #[test]
+    fn terminal_translation_finishes_after_one_source_second_without_a_new_minimum() {
+        let (config, source) = crate::native_test_helpers::fixture();
+        let mut follower = crate::native_test_helpers::author_static_map_follower(config);
+        let start = pose(1., 1., 0.);
+        let goal = pose(1.1, 1., 0.);
+        follower.configure_goal(&goal, GoalOptions {position_tolerance_m: 0.15,
+            yaw_tolerance_rad: std::f64::consts::PI, ..Default::default()}).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        follower.update_odometry(start.clone());
+        follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3], [0.;3])));
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses: vec![start.clone(),goal.clone()]}), None, goal.clone()).unwrap();
+        crate::native_test_helpers::prepare_terminal_map(&mut follower);
+        assert!(!follower.terminal_translation_finished);
+        // 刷新最小距离重置来源计时；同源调用不能积成1秒。
+        let mut closer = start;
+        closer.pose.position.x += 0.02;
+        closer.stamp.nanos += 500_000_000;
+        follower.update_odometry(closer.clone());
+        for _ in 0..30 {
+            assert_ne!(follower.step(), PlannerStep::Succeeded);
+            assert!(!follower.terminal_translation_finished);
+        }
+        closer.stamp.nanos += 999_999_999;
+        follower.update_odometry(closer.clone());
+        assert_ne!(follower.step(), PlannerStep::Succeeded);
+        assert!(!follower.terminal_translation_finished);
+        closer.stamp.nanos += 1;
+        follower.update_odometry(closer);
+        assert_eq!(follower.step(), PlannerStep::Succeeded, "距S仍8厘米但1来源秒无新最小值、在原容差内并实测停稳，应结束平移后完成");
+        assert!(follower.terminal_translation_finished);
+        follower.configure_goal(&goal, GoalOptions::default()).unwrap();
+        assert!(follower.terminal_translation_progress.is_none());
     }
 
     #[test]

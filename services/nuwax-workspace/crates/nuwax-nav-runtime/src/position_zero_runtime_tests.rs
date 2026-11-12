@@ -37,6 +37,7 @@ async fn zero_position_surface_scheduler() -> (
     scheduler.sample_input_status();
     assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
+    crate::native_test_helpers::prepare_terminal_map(&mut scheduler.planner);
     (scheduler, status, motion, goal)
 }
 #[tokio::test]

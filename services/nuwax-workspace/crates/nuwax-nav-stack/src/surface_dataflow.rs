@@ -2284,7 +2284,20 @@ goal: schema::PoseStamped {
         harness.wait_controlling().await;
         assert_eq!(harness.scheduler.status().last_terminal, None, "路线接纳不能替代实测到达");
         harness.feed.lock().unwrap().position = route.path.poses.last().unwrap().pose.position;
-        harness.terminal(TerminalOutcome::Succeeded).await;
+        // 夹具位置固定在距目标0.10米处；新到达规则须继续平移，不能只进容差就完成。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = harness.scheduler.status();
+                if status.surface_replan_feedback.as_ref().is_some_and(|feedback|
+                    feedback.terminal_phase == nuwax_nav_runtime::TerminalPhase::Translating)
+                    && status.last_applied_twist.is_some_and(|command| command.linear.x > 0.) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(harness.scheduler.status().last_terminal, None, "尚未平移到停点时不得提前到达");
+        assert_eq!(harness.scheduler.status().path_revision, route.path_revision as u64);
+        harness.cancel(&goal).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
         assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
         harness.shutdown().await;
     }

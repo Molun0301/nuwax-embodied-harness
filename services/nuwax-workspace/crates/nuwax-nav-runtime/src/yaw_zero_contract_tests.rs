@@ -61,6 +61,7 @@ async fn yaw_zero_surface_scheduler(
     scheduler.sample_input_status();
     assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
+    crate::native_test_helpers::prepare_terminal_map(&mut scheduler.planner);
     (scheduler, status, motion, actual)
 }
 async fn yaw_zero_observe_release(

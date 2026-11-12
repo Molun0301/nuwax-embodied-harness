@@ -2308,7 +2308,8 @@ mod tests {
             scheduler.start_session(&status, target).await.unwrap();
             scheduler.session_tick(&status).await.unwrap();
             if tolerance > 0.0336 {
-                assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
+                assert_eq!(scheduler.status.last_terminal, None, "进入容差后仍须完成到停点的平移");
+                scheduler.cancel(&status, "goal-1").await.unwrap();
             } else {
                 assert_eq!(scheduler.status.last_terminal, None, "选点位置超出原容差时不能判到达");
                 assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));

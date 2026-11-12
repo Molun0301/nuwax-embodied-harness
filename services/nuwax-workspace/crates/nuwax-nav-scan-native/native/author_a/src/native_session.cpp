@@ -257,9 +257,11 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(terminal_position) {
         target=Eigen::Map<const Vector3d>(terminal_position);
         s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
-        Eigen::Vector2d velocity=s.controller.kp_pos*(target-position).head<2>();
+        Eigen::Vector2d velocity=(target-position).head<2>();
+        const double distance=velocity.norm();
         const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));
-        if(velocity.norm()>cap)velocity*=cap/velocity.norm();
+        if(distance>.02)velocity*=std::min(cap,std::clamp(s.controller.kp_pos*distance,.03,.10))/distance;
+        else velocity.setZero();
         s.raw.linear.x=cs*velocity.x()+sn*velocity.y();s.raw.linear.y=-sn*velocity.x()+cs*velocity.y();
       }
     }else {

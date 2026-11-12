@@ -8,6 +8,17 @@ pub(crate) fn author_static_map_follower(config: SurfaceFollowerConfig) -> crate
     crate::SurfaceFollower::with_map_initializer(config,Some(static_map)).unwrap()
 }
 
+/// 末段到达现在需要先用静态地图检查平移；等待真实地图工作线程交付。
+pub(crate) fn prepare_terminal_map(follower: &mut crate::SurfaceFollower) {
+    use crate::NavPlanner;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while follower.terminal_phase() == crate::TerminalPhase::Travel {
+        follower.step();
+        assert!(std::time::Instant::now() < until, "静态地图未进入末段：{:?}", follower.execution_wait_reason());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 pub(crate) fn fixture() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>) {
     let source = Arc::new(
         crate::surface_follower::test_snapshot(0.0, false)

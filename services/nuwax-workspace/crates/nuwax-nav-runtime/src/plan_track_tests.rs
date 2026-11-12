@@ -72,7 +72,7 @@ fn business_tolerance_keeps_the_current_curve_running() {
     assert!(f.position_reached());
     let step=f.step();
     assert_ne!(step,PlannerStep::Succeeded,"进入业务容差不得跳过仍可执行的曲线");
-    assert!(f.active.is_some(),"应继续当前曲线而非切到原地朝向分支");
+    assert_eq!(f.terminal_phase(),TerminalPhase::Travel,"实测未停稳时不能提前进入末段");
 }
 
 #[test]
@@ -103,7 +103,9 @@ fn eighth_round_saved_arrivals_wait_for_measured_stop() {
         assert!(!f.reached(),"进入容差时仍在运动，不能提前成功");
         assert!(f.active.is_some());
         f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
-        assert!(f.reached(),"位置朝向合格、实测停稳即可完成");
+        assert!(!f.reached(),"停稳后仍须完成到停点的平移");
+        f.terminal_translation_finished=true;
+        assert!(f.reached(),"平移结束且原位置、朝向、实测停稳条件满足后完成");
     }
 }
 
@@ -122,6 +124,7 @@ fn ninth_round_stopped_arrival_succeeds_with_unfinished_curve() {
         [0.,0.,-5.7431892283567847e-05])));
     assert!(f.active.is_some());
     assert_eq!(f.step_at_goal(),Some(PlannerStep::Succeeded));
+    assert!(f.terminal_translation_finished,"检查后平移为零时，结束平移后按原位置、朝向和停稳条件完成");
     assert_eq!(f.step(),PlannerStep::Succeeded);
 }
 fn delayed_planner(
@@ -240,6 +243,11 @@ fn remaining_two_point_five_seconds_requests_once_and_coalesces() {
         .unwrap();
     let position = at.position;
     next_pose(&mut f, position);
+    // 这个用例直接把位置置于曲线尾段；安装投影建立相同实测状态的时间锚，随后只测提前规划的合并语义。
+    let config=f.native_config(f.map.as_ref().unwrap());
+    let state=f.state();
+    f.tracker.install(f.active.as_ref().unwrap());
+    f.tracker.track_and_check(&config,&f.prepared.as_ref().unwrap().snapshot,&state,[0.;3],None).unwrap();
     f.needs_plan = false;
     assert!(matches!(f.step(), PlannerStep::Command(_)));
     assert!(f.early_requested && f.planning);

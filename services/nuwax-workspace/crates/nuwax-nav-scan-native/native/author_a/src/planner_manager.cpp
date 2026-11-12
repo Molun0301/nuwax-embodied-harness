@@ -509,7 +509,6 @@ namespace scan_planner
     const double resolution = grid_map_->getResolution();
     heading_.yaw0=start_yaw;
     heading_.turn_first=false;
-    heading_.settle_time.reset();
     bspline_optimizer_rebound_->setInitialClearance(std::min(2.*grid_map_->preferredClearance(),
         grid_map_->bodyFieldClearance(start_pt,start_yaw)));
     bool reference_detour = false;
@@ -903,22 +902,8 @@ namespace scan_planner
     if(flag_step_2_success)arrangeHeadingTime(pos,heading_);
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos);
     if(accepted) {
-      auto timed=pos;
-      const double duration=timed.getTimeSum();
-      accepted=false;
-      for(bool use_start:{true,false}) {
-        const int candidates=heading_.goal?static_cast<int>(std::ceil(duration/.2)):0;
-        for(int i=0;i<=candidates;++i) {
-          pos=timed;
-          heading_.settle_time=heading_.goal?std::optional<double>(std::max(0.,duration-.2*i)):std::nullopt;
-          if(trajectoryCollisionFree(pos,use_start)) {
-            heading_.turn_first=!use_start;
-            accepted=true;
-            break;
-          }
-        }
-        if(accepted)break;
-      }
+      heading_.turn_first=!trajectoryCollisionFree(pos,true);
+      accepted=!heading_.turn_first||trajectoryCollisionFree(pos,false);
     }
     accepted=accepted&&strictDynamicScale(pos)<=1.;
     if (!accepted)
@@ -1169,7 +1154,7 @@ namespace scan_planner
       const double time = duration * i / samples;
       const Eigen::Vector3d point = trajectory.evaluateDeBoorT(time);
       const double yaw = plannedHeading(trajectoryHeading(velocity,duration,time,dt,heading_.yaw0),time,duration,
-          heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,use_start,heading_.settle_time);
+          heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,use_start);
       if (grid_map_->getInflateOccupancy(point, yaw) != 0) return false;
     }
     return true;

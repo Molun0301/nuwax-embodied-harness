@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 mod repository;
-pub use repository::{ObjectRangeRead, Repository, RegionReader};
+pub use repository::{ReadOnlyRepository, Repository, RegionReader};
 mod writer;
 pub use writer::{BlockWriteFailure, CachePolicy, Writer};
 /// Observation moments reused by the capture owner and bounded layer records.
@@ -39,8 +39,6 @@ pub const MAX_BLOCK_NUMERIC_BYTES: usize = 16 + 12 * 32768 + 13
     + 41 * MAX_LAYERS_PER_BLOCK + 66 * 32768 + 48 * MAX_LAYERS_PER_BLOCK * MAX_LAYER_SAMPLES;
 /// 每个合法BL6块均可容纳的完整上界：91979805字节，非经验倍增。
 pub const MAX_BLOCK_BYTES: usize = MAX_BLOCK_NUMERIC_BYTES + MAX_BLOCK_SOURCE_BYTES;
-/// 可靠补取单段上限保持256KiB；完整块按格式专属边界和结构校验约束。
-pub const MAX_BLOCK_TRANSFER_PART_BYTES: usize = 256 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 pub type Key = [i32; 3];
 
@@ -99,14 +97,7 @@ fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
     Ok((block, layers))
 }
 
-/// 完整校验块后返回体素数和最大观测时间；旧资产的全零证据返回零时间。
-/// 成功路径只累积栈上摘要，不物化块；格式错误仍返回原有错误字符串。
-/// 根的体素数和时间上界由调用方在本函数成功后另行校验。
-pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
-    let mut latest = 0;
-    let points = visit_block(bytes, |_, evidence| { latest = latest.max(evidence.observed_ns); })?;
-    Ok((points, latest))
-}
+
 
 /// BL2 retains Legacy-only observations; BL3 adds compact typed source groups.
 /// Occupancy and numeric sample records retain their original representation.
@@ -128,13 +119,7 @@ pub fn decode_ground_records(bytes: &[u8]) -> Result<GroundRecords, String> {
 
 
 
-fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") || bytes.starts_with(b"NUWAXBL6") {
-        let (block, _) = decode_block_parts(bytes)?;
-        for (&key, &evidence) in &block { visit(key, evidence); }
-        Ok(block.len() as u32)
-    } else { visit_block_records(bytes, visit) }
-}
+
 fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     if !bytes.starts_with(b"NUWAXBL6") && bytes.len() > MAX_V1_TO_V5_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
@@ -263,7 +248,7 @@ impl SealedMap {
 
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
+pub struct Transfer { pub root: Vec<u8>, pub repository_path: String }
 #[derive(Debug, Clone, Copy)]
 struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool, versioned: bool, source_budget_required: bool }
 fn intrinsic(block: &Block) -> Intrinsic {
@@ -298,15 +283,16 @@ fn admit_layer_spatial_binding(bindings: &mut BTreeMap<ObjectIdentity, (Key, u32
     Ok(())
 }
 pub struct Receiver {
-    current: Option<Arc<Manifest>>, repository: Repository, reader: RegionReader,
+    current: Option<Arc<Manifest>>, repository: ReadOnlyRepository, reader: RegionReader,
     verified: BTreeMap<ObjectIdentity, Intrinsic>, readers: Vec<std::sync::Weak<Manifest>>,
-    collection_error: Option<String>, layer_bindings: BTreeMap<ObjectIdentity, (Key, u32)>,
+    layer_bindings: BTreeMap<ObjectIdentity, (Key, u32)>,
 }
 impl Receiver {
-    pub fn new(repository: Repository) -> Self { Self::with_cache_budget(repository, 4 * 1024 * 1024) }
-    /// 准入与后续读取共用同一有界解码缓存。
-    pub fn with_cache_budget(repository: Repository, budget_bytes: usize) -> Self {
-        Self { current: None, reader: RegionReader::new(repository.clone(), budget_bytes), repository, verified: BTreeMap::new(), readers: Vec::new(), collection_error: None, layer_bindings: BTreeMap::new() }
+    pub fn new(repository: impl Into<ReadOnlyRepository>) -> Self { Self::with_cache_budget(repository, 4 * 1024 * 1024) }
+    /// 准入与后续读取共用同一有界解码缓存，仓库始终只读。
+    pub fn with_cache_budget(repository: impl Into<ReadOnlyRepository>, budget_bytes: usize) -> Self {
+        let repository = repository.into();
+        Self { current: None, reader: RegionReader::new(repository.clone(), budget_bytes), repository, verified: BTreeMap::new(), readers: Vec::new(), layer_bindings: BTreeMap::new() }
     }
     /// 复用已准入的不可变块；读取旧根时调用方仍须持有该根的 Arc。
     /// 返回原始证据不代表当前运动权限，根绑定与新鲜度仍由消费方检查。
@@ -322,33 +308,21 @@ impl Receiver {
         self.reader.ground_parts(reference)
     }
     pub fn current(&self) -> Option<Arc<Manifest>> { self.current.clone() }
-    pub fn collection_error(&self) -> Option<&str> { self.collection_error.as_deref() }
-    pub fn clear(&mut self) { self.current = None; self.verified.clear(); self.layer_bindings.clear(); }
-    pub fn receive(&mut self, transfer: &Transfer, expected: &Domain,
-        mut fetch: impl FnMut(&Manifest, &BlockRef) -> Result<Vec<u8>, String>) -> Result<Arc<Manifest>, String> {
+    pub fn clear(&mut self) {
+        self.current = None; self.verified.clear(); self.layer_bindings.clear(); self.readers.clear();
+        self.reader.retain_objects(&BTreeSet::new());
+    }
+    pub fn receive(&mut self, transfer: &Transfer, expected: &Domain) -> Result<Arc<Manifest>, String> {
         let candidate = Arc::new(Manifest::decode(&transfer.root)?);
         if &candidate.domain != expected { return Err("root belongs to another domain".into()); }
         let same = self.current.as_ref().is_some_and(|old| **old == *candidate);
         if !same && self.current.as_ref().is_some_and(|old| old.domain == candidate.domain && old.revision >= candidate.revision) {
             return Err("root revision did not advance".into());
         }
-        // A true duplicate with no payload does no object IO, membership read or GC scan.
-        if same && transfer.included.is_empty() { return Ok(self.current.as_ref().unwrap().clone()); }
+        self.repository = ReadOnlyRepository::open(&transfer.repository_path);
+        self.reader.set_repository(self.repository.clone());
+        if same { return Ok(self.current.as_ref().unwrap().clone()); }
         let result = (|| {
-            let required: BTreeMap<_, _> = candidate.blocks.iter().map(|b| (b.object, (b.points, b.key))).collect();
-            for (&object, bytes) in &transfer.included {
-                let (points, key) = *required.get(&object).ok_or("included object is outside root")?;
-                let (decoded, layers) = decode_block_parts(bytes)?;
-                let decoded = Arc::new(decoded); let info = intrinsic_bytes(bytes, &decoded);
-                admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
-                admit_format(info, &candidate)?;
-                ground_shared::admit(info, &layers, &candidate)?;
-                self.admit_layer_binding(object, &layers, &decoded, key, candidate.voxel_size_m)?;
-                self.repository.put_object(object, bytes)?;
-                self.reader.cache_decoded(object, decoded, info, layers);
-                self.verified.insert(object, info);
-            }
-            if same { return Ok(self.current.as_ref().unwrap().clone()); }
             for block in &candidate.blocks {
                 if let Some(&info) = self.verified.get(&block.object) {
                     admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
@@ -367,29 +341,14 @@ impl Receiver {
                     }
                     continue;
                 }
-                let bytes = match self.repository.read_object(block.object, MAX_BLOCK_BYTES) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        // Existing unreadable/corrupt paths cannot be replaced by a fetch.
-                        if self.repository.object_exists(block.object)? { return Err(error); }
-                        let bytes = fetch(&candidate, block)?;
-                        let (decoded, layers) = decode_block_parts(&bytes)?;
-                let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
-                        admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
-                        ground_shared::admit(info, &layers, &candidate)?;
-                        self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
-                        self.repository.put_object(block.object, &bytes)?;
-                        self.reader.cache_decoded(block.object, decoded, info, layers);
-                        self.verified.insert(block.object, info); continue;
-                    }
-                };
+                let bytes = self.repository.read_object(block.object, MAX_BLOCK_BYTES)?;
                 let (decoded, layers) = decode_block_parts(&bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                 admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
                 ground_shared::admit(info, &layers, &candidate)?;
                 self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
                 self.reader.cache_decoded(block.object, decoded, info, layers);
-                        self.verified.insert(block.object, info);
+                self.verified.insert(block.object, info);
             }
             for reference in &candidate.blocks {
                 if self.verified.get(&reference.object).is_some_and(|info| info.layered)
@@ -399,8 +358,6 @@ impl Receiver {
             }
             Ok(candidate.clone())
         })();
-        // Valid duplicate inclusions cannot create garbage outside the pinned current root.
-        if same { return result; }
         if let Ok(root) = &result {
             self.current = Some(root.clone());
             self.readers.push(Arc::downgrade(root));
@@ -412,9 +369,6 @@ impl Receiver {
         self.verified.retain(|id, _| objects.contains(id));
         self.layer_bindings.retain(|id, _| objects.contains(id));
         self.reader.retain_objects(&objects);
-        // Collection is maintenance after the complete candidate transaction. It
-        // must not report a failed receive after installing a successful root.
-        self.collection_error = self.repository.collect_objects(&objects).err();
         result
     }
     fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, block: &Block, key: Key, quantum: f32) -> Result<(), String> {
@@ -433,3 +387,8 @@ mod ground_records_tests;
 
 #[cfg(test)]
 mod source_provenance_tests;
+
+#[cfg(test)]
+fn decoded_block_stats(bytes: &[u8]) -> Result<(u32,u64),String> {
+    decode_block(bytes).map(|block| (block.len() as u32,block.values().map(|v|v.observed_ns).max().unwrap_or(0)))
+}

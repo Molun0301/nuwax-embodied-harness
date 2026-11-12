@@ -15,7 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 nuwax-config = { path = "../../nuwax-workspace/crates/nuwax-config" }
 nuwax-dufomap-native = { path = "../../nuwax-workspace/crates/nuwax-dufomap-native" }
-base64 = "0.22.1"
 nuwax-cloud-cleanup = { path = "../../nuwax-workspace/crates/nuwax-cloud-cleanup" }
 # 体素键只在进程内索引，使用工作区已有的带随机密钥快速散列。
 ahash = "0.8.12"
@@ -39,7 +38,6 @@ nuwax-lio-backends = { path = "../../nuwax-workspace/crates/nuwax-lio-backends" 
 nuwax-tf = { path = "../../nuwax-workspace/crates/nuwax-tf" }
 nuwax-lcm = { path = "../../nuwax-workspace/crates/nuwax-lcm", features = ["link-liblcm"] }
 nuwax-slam-2d-runtime = { path = "../../nuwax-workspace/crates/nuwax-slam-2d-runtime" }
-nuwax-rpc = { path = "../../nuwax-workspace/crates/nuwax-rpc", features = ["link-liblcm"] }
 
 # 本 binary 走 `default = ["real-lcm-bridge"]`，镜像必须安装
 # liblcm-dev 1.3~1.5。

@@ -49,12 +49,11 @@ fn bl6_three_four_and_maximum_layers_preserve_every_sample_and_original_shape() 
         assert!(bytes.len()>MAX_V1_TO_V5_BLOCK_BYTES && bytes.len()<=MAX_BLOCK_BYTES);
         let(decoded,actual)=decode_block_parts(&bytes).unwrap();
         assert_eq!(decoded,block);assert_eq!(actual,records);
-        assert_eq!(block_summary(&bytes).unwrap(),(block.len() as u32,STAMP));
+        assert_eq!(decoded_block_stats(&bytes).unwrap(),(block.len() as u32,STAMP));
         let repo=Repository::temporary().unwrap();let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
         let manifest=root(id,block.len(),vec![source]);
         let mut reader=Receiver::with_cache_budget(Repository::temporary().unwrap(),4*1024*1024);
-        let received=reader.receive(&Transfer{root:manifest.encode().unwrap(),included:BTreeMap::new()},&manifest.domain,
-            |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+        let received=reader.receive(&Transfer{root:manifest.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&manifest.domain).unwrap();
         assert_eq!(reader.ground_records(&received.blocks[0]).unwrap(),records);
         assert!(reader.reader.cached_bytes()<=4*1024*1024);
         if layers<32 {artifact(&format!("BL6-{layers}层.ar5"),&manifest,&repo);}
@@ -79,11 +78,9 @@ fn bl6_near_full_source_and_numeric_bounds_fit_and_removing_root_sources_revalid
     let repo=Repository::temporary().unwrap();let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
     let manifest=root(id,block.len(),vec![normal,declared]);assert!(manifest.encode().unwrap().len()<=MAX_MANIFEST_BYTES);
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),256*1024*1024);
-    receiver.receive(&Transfer{root:manifest.encode().unwrap(),included:BTreeMap::new()},&manifest.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+    receiver.receive(&Transfer{root:manifest.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&manifest.domain).unwrap();
     let mut bad=manifest.clone();bad.revision=2;bad.source_watermarks.clear();
-    let error=receiver.receive(&Transfer{root:bad.encode().unwrap(),included:BTreeMap::new()},&bad.domain,
-        |_,_|panic!("已缓存对象不应补取")).unwrap_err();
+    let error=receiver.receive(&Transfer{root:bad.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&bad.domain).unwrap_err();
     assert!(error.contains("unregistered source"),"{error}");
     assert_eq!(receiver.current().unwrap().revision,1);
     let mut small=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };small.retain(|&key,_|key==0);
@@ -127,8 +124,7 @@ fn failed_candidate_cannot_lend_its_source_declaration_to_a_later_root() {
     let old_id=ObjectId::random().unwrap().into();repo.put_object(old_id,&encode_block(&base).unwrap()).unwrap();
     let old=root(old_id,1,vec![]);
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),16*1024*1024);
-    receiver.receive(&Transfer{root:old.encode().unwrap(),included:BTreeMap::new()},&old.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+    receiver.receive(&Transfer{root:old.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&old.domain).unwrap();
     let(_,all,_)=dense(1);let mut records=match &all { GroundRecords::Versioned(values) => values.as_ref().clone() };records.retain(|&key,_|key==0);
     let source=Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(MAX_V1_TO_V5_BLOCK_BYTES+1),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
@@ -139,12 +135,10 @@ fn failed_candidate_cannot_lend_its_source_declaration_to_a_later_root() {
     let mut candidate=root(id,1,vec![source]);candidate.revision=2;candidate.geometry_revision=2;
     candidate.blocks[0].block_revision=2;candidate.blocks[0].geometry_revision=2;
     candidate.blocks.push(BlockRef{key:[1,0,0],object:ObjectId::random().unwrap().into(),points:1,block_revision:2,geometry_revision:2});
-    assert!(receiver.receive(&Transfer{root:candidate.encode().unwrap(),included:BTreeMap::new()},&candidate.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).is_err());
+    assert!(receiver.receive(&Transfer{root:candidate.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&candidate.domain).is_err());
     assert_eq!(receiver.current().unwrap().revision,1);
     candidate.blocks.pop();candidate.source_watermarks.clear();
-    let error=receiver.receive(&Transfer{root:candidate.encode().unwrap(),included:BTreeMap::new()},&candidate.domain,
-        |_,_|panic!("失败候选已留下对象，不应补取")).unwrap_err();
+    let error=receiver.receive(&Transfer{root:candidate.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&candidate.domain).unwrap_err();
     assert!(error.contains("unregistered source"),"{error}");
     assert_eq!(receiver.current().unwrap().revision,1);
 }

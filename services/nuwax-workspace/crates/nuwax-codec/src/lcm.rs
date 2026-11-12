@@ -62,7 +62,6 @@ pub mod planar;
 pub mod planar_navigation;
 /// Codecs generated from the locked DimOS LCM schemas.
 pub mod schema;
-pub mod map_block_part;
 pub mod input_ack;
 pub mod input_frame;
 /// Canonical sensor input wire codecs.

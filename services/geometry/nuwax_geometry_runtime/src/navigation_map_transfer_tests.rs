@@ -1,158 +1,34 @@
 use super::*;
-use nuwax_map_chunks::{Domain, Receiver, Repository, Writer};
-
-fn domain() -> Domain {
-    Domain {
-        session: "incremental-transfer".into(),
-        }
-}
-
-#[test]
-fn changed_tail_block_is_inline_and_cached_consumer_needs_no_rpc() {
-    let repository = Repository::temporary().unwrap();
-    let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    writer
-        .observe(
-            (0..12).flat_map(|block| {
-                (0..32).flat_map(move |x| (0..32).map(move |y| [block * 32 + x, y, 0]))
-            }),
-            1,
-        )
-        .unwrap();
-    let first = writer.seal(domain(), 1, 1).unwrap();
-    let initial = prepare(&first, None).unwrap();
-    assert_eq!(first.manifest().blocks.len(), 12);
-    assert_eq!(initial.included.len(), 10);
-    let mut receiver = Receiver::new(Repository::temporary().unwrap());
-    let mut initial_fetches = 0;
-    receiver
-        .receive(&initial, &domain(), |_, block| {
-            initial_fetches += 1;
-            repository.read_object(block.object, MAX_BLOCK_BYTES)
-        })
-        .unwrap();
-    assert_eq!(initial_fetches, 2);
-
-    // A real repeat observation changes only the final block's evidence.
-    // Geometry is intentionally unchanged, so geometry_revision is not a
-    // sufficient transfer key.
-    writer.observe([[11 * 32, 0, 0]], 2).unwrap();
-    let second = writer.seal(domain(), 2, 2).unwrap();
-    let tail = second.manifest().blocks.last().unwrap();
-    assert_eq!(
-        first.manifest().geometry_revision,
-        second.manifest().geometry_revision
-    );
-    assert_ne!(first.manifest().blocks.last().unwrap().object, tail.object);
-    // Supplying no baseline is precisely the former prefix-only selection
-    // for a different root. Exercise its unnecessary RPC as a comparison.
-    let former = prepare(&second, None).unwrap();
-    assert!(!former.included.contains_key(&tail.object));
-    let mut former_receiver = Receiver::new(Repository::temporary().unwrap());
-    former_receiver
-        .receive(&initial, &domain(), |_, block| {
-            repository.read_object(block.object, MAX_BLOCK_BYTES)
-        })
-        .unwrap();
-    let mut former_fetches = 0;
-    former_receiver
-        .receive(&former, &domain(), |_, block| {
-            former_fetches += 1;
-            repository.read_object(block.object, MAX_BLOCK_BYTES)
-        })
-        .unwrap();
-    assert_eq!(former.included.len(), 10);
-    assert_eq!(former_fetches, 1);
-    let incremental = prepare(&second, Some(first.manifest())).unwrap();
-    assert_eq!(incremental.included.len(), 1);
-    assert!(incremental.included.contains_key(&tail.object));
-    assert!(incremental.included.values().map(Vec::len).sum::<usize>() <= INLINE_BYTES);
-    let current = receiver
-        .receive(&incremental, &domain(), |_, _| {
-            panic!("retained consumer must already own every unchanged object")
-        })
-        .unwrap();
-    assert_eq!(&*current, &**second.manifest());
-    assert_eq!(
-        receiver.block(tail).unwrap().get(&0).unwrap().observed_ns,
-        2
-    );
-
-    // A late subscriber still receives a complete root and can fetch exact
-    // missing members. Inline delta is never treated as a full snapshot.
-    let mut late = Receiver::new(Repository::temporary().unwrap());
-    let mut late_fetches = 0;
-    let current = late
-        .receive(&incremental, &domain(), |_, block| {
-            late_fetches += 1;
-            repository.read_object(block.object, MAX_BLOCK_BYTES)
-        })
-        .unwrap();
-    assert_eq!(late_fetches, 11);
-    assert_eq!(&*current, &**second.manifest());
-    eprintln!("map_transfer blocks=12 initial_inline={} initial_rpc={} former_inline={} former_rpc={} delta_inline={} delta_bytes={} cached_rpc=0 late_rpc={}",
-            initial.included.len(), initial_fetches, former.included.len(), former_fetches, incremental.included.len(),
-            incremental.included.values().map(Vec::len).sum::<usize>(), late_fetches);
-}
+use nuwax_map_chunks::{Domain, Repository, Writer, Receiver};
+fn domain() -> Domain { Domain { session: "同机发布".into() } }
 
 #[test]
 fn unchanged_roots_do_not_read_objects_and_new_domains_bootstrap_normally() {
     let repository = Repository::temporary().unwrap();
-    let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    writer.observe([[0, 0, 0]], 1).unwrap();
-    let first = writer.seal(domain(), 1, 1).unwrap();
-    let moved = repository.path().with_extension("transfer-unavailable");
-    std::fs::rename(repository.path(), &moved).unwrap();
-    let repeated = prepare(&first, Some(first.manifest()));
-    std::fs::rename(&moved, repository.path()).unwrap();
-    assert!(repeated.unwrap().included.is_empty());
-    let rehomed = writer.seal(Domain { session: "下一会话".into() }, 1, 1).unwrap();
-    let transfer = prepare(&rehomed, Some(first.manifest())).unwrap();
-    assert_eq!(
-        transfer.included.len(),
-        1,
-        "新会话不复用旧的传输基线"
-    );
-    assert_eq!(
-        Manifest::decode(&transfer.root).unwrap(),
-        **rehomed.manifest()
-    );
+    let mut writer = Writer::new(repository.clone(), 0.05, 4*1024*1024).unwrap();
+    writer.observe([[0,0,0]], 1).unwrap();
+    let root = writer.seal(domain(),1,1).unwrap();
+    let reference = &root.manifest().blocks[0];
+    let file = repository.path().join(format!("id-{}", match reference.object { nuwax_map_chunks::ObjectIdentity::Assigned(id)=>id.0.iter().map(|v|format!("{v:02x}")).collect::<String>() }));
+    std::fs::remove_file(file).unwrap();
+    let transfer = prepare(&root).unwrap();
+    assert_eq!(transfer.root, root.manifest().encode().unwrap());
+    assert_eq!(transfer.repository_path, repository.path().to_string_lossy());
+    let mut other = domain(); other.session="新域".into();
+    let root = writer.seal(other,2,1).unwrap();
+    assert_eq!(nuwax_map_chunks::Manifest::decode(&prepare(&root).unwrap().root).unwrap().domain.session,"新域");
 }
 
 #[test]
 fn dropped_intermediate_publication_is_recovered_from_complete_root() {
     let repository = Repository::temporary().unwrap();
-    let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    writer.observe([[0, 0, 0], [32, 0, 0]], 1).unwrap();
-    let first = writer.seal(domain(), 1, 1).unwrap();
-    let mut receiver = Receiver::new(Repository::temporary().unwrap());
-    receiver
-        .receive(&prepare(&first, None).unwrap(), &domain(), |_, _| {
-            panic!("initial small map is fully inline")
-        })
-        .unwrap();
-    writer.observe([[0, 0, 0]], 2).unwrap();
-    let missed = writer.seal(domain(), 2, 2).unwrap();
-    writer.observe([[32, 0, 0]], 3).unwrap();
-    let latest = writer.seal(domain(), 3, 3).unwrap();
-    let transfer = prepare(&latest, Some(missed.manifest())).unwrap();
-    assert_eq!(transfer.included.len(), 1);
-    let mut fetched = 0;
-    let admitted = receiver
-        .receive(&transfer, &domain(), |root, block| {
-            assert_eq!(root.identity(), latest.manifest().identity());
-            fetched += 1;
-            repository.read_object(block.object, MAX_BLOCK_BYTES)
-        })
-        .unwrap();
-    assert_eq!(fetched, 1);
-    assert_eq!(&*admitted, &**latest.manifest());
-    assert_eq!(
-        receiver.block(&admitted.blocks[0]).unwrap()[&0].observed_ns,
-        2
-    );
-    assert_eq!(
-        receiver.block(&admitted.blocks[1]).unwrap()[&0].observed_ns,
-        3
-    );
+    let mut writer = Writer::new(repository.clone(),0.05,4*1024*1024).unwrap();
+    writer.observe([[0,0,0]],1).unwrap();let first=writer.seal(domain(),1,1).unwrap();
+    let mut receiver=Receiver::new(repository.read_only());
+    receiver.receive(&prepare(&first).unwrap(),&domain()).unwrap();
+    writer.observe([[32,0,0]],2).unwrap();writer.seal(domain(),2,2).unwrap();
+    writer.observe([[64,0,0]],3).unwrap();let latest=writer.seal(domain(),3,3).unwrap();
+    let root=receiver.receive(&prepare(&latest).unwrap(),&domain()).unwrap();
+    assert_eq!(root.blocks,latest.manifest().blocks);
+    assert_eq!(root.blocks.iter().map(|r|receiver.block(r).unwrap().len()).sum::<usize>(),3);
 }

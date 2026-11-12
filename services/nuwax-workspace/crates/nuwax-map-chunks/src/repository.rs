@@ -1,16 +1,9 @@
 use super::*;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-
-/// A range can exceed an existing object's length without the object being missing.
-#[derive(Debug)]
-pub enum ObjectRangeRead {
-    Data { bytes: Vec<u8>, total_bytes: usize },
-    OutOfBounds,
-}
 
 /// Typed immutable object directory; legacy filenames retain their exact namespace.
 #[derive(Clone)]
@@ -18,6 +11,21 @@ pub struct Repository {
     root: Arc<PathBuf>, _temporary: Option<Arc<tempfile::TempDir>>,
     #[cfg(test)]
     stats: Arc<Stats>,
+}
+/// 只读对象目录；打开入口不创建目录，也不持有写入方的临时目录所有权。
+#[derive(Clone)]
+pub struct ReadOnlyRepository {
+    root: Arc<PathBuf>,
+    #[cfg(test)]
+    stats: Arc<Stats>,
+}
+impl ReadOnlyRepository {
+    pub fn open(path: impl AsRef<Path>) -> Self {
+        Self { root: Arc::new(path.as_ref().to_path_buf()), #[cfg(test)] stats: Arc::default() }
+    }
+}
+impl From<Repository> for ReadOnlyRepository {
+    fn from(repository: Repository) -> Self { repository.read_only() }
 }
 #[cfg(test)]
 struct Stats { reads: std::sync::atomic::AtomicUsize, puts: std::sync::atomic::AtomicUsize, scans: std::sync::atomic::AtomicUsize, fail_after: std::sync::atomic::AtomicIsize }
@@ -35,47 +43,17 @@ impl Repository {
         Ok(Self { root: Arc::new(directory.path().to_path_buf()), _temporary: Some(Arc::new(directory)), #[cfg(test)] stats: Arc::default() })
     }
     pub fn path(&self) -> &Path { &self.root }
-    fn object_path(&self, object: ObjectIdentity) -> PathBuf {
-        let name = match object {
-            ObjectIdentity::Assigned(id) => format!("id-{}", hex(&id.0)),
-        };
-        self.root.join(name)
+    pub fn read_only(&self) -> ReadOnlyRepository {
+        ReadOnlyRepository { root: self.root.clone(), #[cfg(test)] stats: self.stats.clone() }
     }
+    fn object_path(&self, object: ObjectIdentity) -> PathBuf { self.read_only().object_path(object) }
     pub(crate) fn object_exists(&self, object: ObjectIdentity) -> Result<bool, String> {
-        match fs::symlink_metadata(self.object_path(object)) {
+        match fs::symlink_metadata(self.read_only().object_path(object)) {
             Ok(_) => Ok(true), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false), Err(e) => Err(e.to_string()),
         }
     }
-    fn open_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<(File, usize), String> {
-        object.validate()?;
-        #[cfg(test)] self.stats.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut options = OpenOptions::new(); options.read(true);
-        // Inspect the actual opened descriptor. Neither symlinks nor FIFOs may redirect/block IO.
-        #[cfg(unix)] options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let file = options.open(self.object_path(object)).map_err(|e| e.to_string())?;
-        let meta = file.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_file() || meta.len() > max_bytes as u64 { return Err("invalid object type or size".into()); }
-        Ok((file, meta.len() as usize))
-    }
     pub fn read_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<Vec<u8>, String> {
-        let (file, total) = self.open_object(object, max_bytes)?;
-        let mut bytes = Vec::with_capacity(total);
-        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() != total || bytes.len() > max_bytes { return Err("object length changed or exceeds budget".into()); }
-        Ok(bytes)
-    }
-    /// Read one bounded range of an immutable object, returning its complete length.
-    /// The caller retains the owning root and validates the transfer's part budget.
-    pub fn read_object_range(&self, object: ObjectIdentity, max_bytes: usize,
-        offset: usize, maximum: usize) -> Result<ObjectRangeRead, String> {
-        if maximum == 0 { return Ok(ObjectRangeRead::OutOfBounds); }
-        let (mut file, total) = self.open_object(object, max_bytes)?;
-        if offset >= total { return Ok(ObjectRangeRead::OutOfBounds); }
-        let count = maximum.min(total - offset);
-        file.seek(SeekFrom::Start(offset as u64)).map_err(|e| e.to_string())?;
-        let mut bytes = vec![0; count];
-        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
-        Ok(ObjectRangeRead::Data { bytes, total_bytes: total })
+        self.read_only().read_object(object, max_bytes)
     }
     /// Publish once using a no-replace hard link. Existing IDs must have exact equal bytes.
     pub fn put_object(&self, object: ObjectIdentity, bytes: &[u8]) -> Result<(), String> {
@@ -153,22 +131,56 @@ impl Repository {
 fn lowercase_hex(value: &str) -> bool { value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
 
+impl ReadOnlyRepository {
+    fn object_path(&self, object: ObjectIdentity) -> PathBuf {
+        let name = match object {
+            ObjectIdentity::Assigned(id) => format!("id-{}", hex(&id.0)),
+        };
+        self.root.join(name)
+    }
+    fn open_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<(File, usize), String> {
+        object.validate()?;
+        #[cfg(test)] self.stats.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut options = OpenOptions::new(); options.read(true);
+        // Inspect the actual opened descriptor. Neither symlinks nor FIFOs may redirect/block IO.
+        #[cfg(unix)] options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(self.object_path(object)).map_err(|e| e.to_string())?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > max_bytes as u64 { return Err("invalid object type or size".into()); }
+        Ok((file, meta.len() as usize))
+    }
+    pub fn read_object(&self, object: ObjectIdentity, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let (file, total) = self.open_object(object, max_bytes)?;
+        let mut bytes = Vec::with_capacity(total);
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() != total || bytes.len() > max_bytes { return Err("object length changed or exceeds budget".into()); }
+        Ok(bytes)
+    }
+}
+
 /// The cache stores only intrinsic metadata, so aliases can be shared across keys/owners.
 pub struct RegionReader {
-    repository: Repository,
+    repository: ReadOnlyRepository,
     cache: BTreeMap<ObjectIdentity, (Arc<Block>, Intrinsic, u64, usize, GroundRecords)>,
     budget_bytes: usize, used_bytes: usize, clock: u64,
 }
 impl RegionReader {
-    pub fn new(repository: Repository, budget_bytes: usize) -> Self {
-        Self { repository, cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0 }
+    pub fn new(repository: impl Into<ReadOnlyRepository>, budget_bytes: usize) -> Self {
+        Self { repository: repository.into(), cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0 }
     }
 
+    pub(crate) fn set_repository(&mut self, repository: ReadOnlyRepository) {
+        self.repository = repository;
+    }
     pub fn ground_records(&mut self, reference: &BlockRef) -> Result<GroundRecords, String> {
         self.parts(reference.object, reference.points).map(|(_, _, records)| records)
     }
     pub fn ground_parts(&mut self, reference: &BlockRef) -> Result<(Arc<Block>, GroundRecords), String> {
         self.parts(reference.object, reference.points).map(|(block, _, records)| (block, records))
+    }
+    #[cfg(test)]
+    pub(crate) fn read_count(&self) -> usize {
+        self.repository.stats.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn cached_bytes(&self) -> usize { self.used_bytes }
     #[cfg(test)]

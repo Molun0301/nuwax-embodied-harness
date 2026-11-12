@@ -428,14 +428,9 @@ mod tests {
             .receive(
                 &Transfer {
                     root: root.encode().unwrap(),
-                    included: BTreeMap::new(),
+                    repository_path: w.repository().path().to_string_lossy().into_owned(),
                 },
-                &root.domain,
-                |_, r| {
-                    w.repository()
-                        .read_object(r.object, nuwax_map_chunks::MAX_BLOCK_BYTES)
-                },
-            )
+                &root.domain)
             .unwrap();
         let mut source = SurfaceObservations::new(Q, 32).unwrap();
         let mut parts = Vec::new();

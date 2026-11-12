@@ -9,17 +9,15 @@ import struct
 
 import nav_msgs
 
-import nuwax_msgs
-
 import sensor_msgs
 
 class NavigationMap3D(object):
 
-    __slots__ = ["session_id", "revision", "frame_id", "source_timestamp_ns", "source_voxel_size", "cleared", "has_virtual_obstacles", "virtual_obstacles", "has_fine_map", "fine_manifest_length", "fine_manifest", "fine_blocks_length", "fine_blocks", "cloud"]
+    __slots__ = ["session_id", "revision", "frame_id", "source_timestamp_ns", "source_voxel_size", "cleared", "has_virtual_obstacles", "virtual_obstacles", "has_fine_map", "fine_manifest_length", "fine_manifest", "fine_repository_path", "cloud"]
 
-    __typenames__ = ["string", "int64_t", "string", "int64_t", "float", "int8_t", "int8_t", "nav_msgs.OccupancyGrid", "int8_t", "int32_t", "byte", "int32_t", "nuwax_msgs.NavigationMapBlock", "sensor_msgs.PointCloud2"]
+    __typenames__ = ["string", "int64_t", "string", "int64_t", "float", "int8_t", "int8_t", "nav_msgs.OccupancyGrid", "int8_t", "int32_t", "byte", "string", "sensor_msgs.PointCloud2"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, ["fine_manifest_length"], None, ["fine_blocks_length"], None]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, ["fine_manifest_length"], None, None]
 
     def __init__(self):
         self.session_id = ""
@@ -48,8 +46,7 @@ class NavigationMap3D(object):
         """ LCM Type: nav_msgs.OccupancyGrid """
         self.has_fine_map = 0
         """
-        Manifest v2 完整根清单加有界变动块；身份由域、修订和分配对象标识组成。
-        缺片只能携带完整根身份及精确块引用，通过可靠请求通道补取。
+        完整根清单及其所在的同机只读对象目录。
         LCM Type: int8_t
         """
 
@@ -57,10 +54,8 @@ class NavigationMap3D(object):
         """ LCM Type: int32_t """
         self.fine_manifest = b""
         """ LCM Type: byte[fine_manifest_length] """
-        self.fine_blocks_length = 0
-        """ LCM Type: int32_t """
-        self.fine_blocks = []
-        """ LCM Type: nuwax_msgs.NavigationMapBlock[fine_blocks_length] """
+        self.fine_repository_path = ""
+        """ LCM Type: string """
         self.cloud = sensor_msgs.PointCloud2()
         """ LCM Type: sensor_msgs.PointCloud2 """
 
@@ -85,10 +80,10 @@ class NavigationMap3D(object):
         self.virtual_obstacles._encode_one(buf)
         buf.write(struct.pack(">bi", self.has_fine_map, self.fine_manifest_length))
         buf.write(bytearray(self.fine_manifest[:self.fine_manifest_length]))
-        buf.write(struct.pack(">i", self.fine_blocks_length))
-        for i0 in range(self.fine_blocks_length):
-            assert self.fine_blocks[i0]._get_packed_fingerprint() == nuwax_msgs.NavigationMapBlock._get_packed_fingerprint()
-            self.fine_blocks[i0]._encode_one(buf)
+        __fine_repository_path_encoded = self.fine_repository_path.encode('utf-8')
+        buf.write(struct.pack('>I', len(__fine_repository_path_encoded)+1))
+        buf.write(__fine_repository_path_encoded)
+        buf.write(b"\0")
         assert self.cloud._get_packed_fingerprint() == sensor_msgs.PointCloud2._get_packed_fingerprint()
         self.cloud._encode_one(buf)
 
@@ -114,10 +109,8 @@ class NavigationMap3D(object):
         self.virtual_obstacles = nav_msgs.OccupancyGrid._decode_one(buf)
         self.has_fine_map, self.fine_manifest_length = struct.unpack(">bi", buf.read(5))
         self.fine_manifest = buf.read(self.fine_manifest_length)
-        self.fine_blocks_length = struct.unpack(">i", buf.read(4))[0]
-        self.fine_blocks = []
-        for i0 in range(self.fine_blocks_length):
-            self.fine_blocks.append(nuwax_msgs.NavigationMapBlock._decode_one(buf))
+        __fine_repository_path_len = struct.unpack('>I', buf.read(4))[0]
+        self.fine_repository_path = buf.read(__fine_repository_path_len)[:-1].decode('utf-8', 'replace')
         self.cloud = sensor_msgs.PointCloud2._decode_one(buf)
         return self
 
@@ -125,7 +118,7 @@ class NavigationMap3D(object):
     def _get_hash_recursive(parents):
         if NavigationMap3D in parents: return 0
         newparents = parents + [NavigationMap3D]
-        tmphash = (0xe54ec3305fbad7c1+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)+ nuwax_msgs.NavigationMapBlock._get_hash_recursive(newparents)+ sensor_msgs.PointCloud2._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x77c864e6e0226815+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)+ sensor_msgs.PointCloud2._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

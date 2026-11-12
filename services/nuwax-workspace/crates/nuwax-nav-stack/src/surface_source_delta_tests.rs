@@ -32,9 +32,7 @@ impl FineFixture {
         message.cloud.width=0;message.cloud.row_step=0;message.cloud.data.clear();
         let root=self.writer.snapshot(schema::navigation_map_3d_domain(&message),self.revision as u64,
             message.source_timestamp_ns as u64).unwrap();
-        let included=root.blocks.iter().map(|block|(block.object,self.repository
-            .read_object(block.object,nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap())).collect();
-        message.fine=Some(nuwax_map_chunks::Transfer {root:root.encode().unwrap(),included});
+        message.fine=Some(nuwax_map_chunks::Transfer {root:root.encode().unwrap(),repository_path:self.repository.path().to_string_lossy().into_owned()});
         self.previous=self.cells.clone();
         schema::validate_navigation_map_3d(&message).unwrap();
         message

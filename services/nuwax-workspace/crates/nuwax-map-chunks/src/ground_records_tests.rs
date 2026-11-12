@@ -19,8 +19,7 @@ fn install(w: &mut Writer, value: &ColumnGroundRecords, stamp: u64) {
     w.replace_ground_column(value.heightfields[0].column.xy(), value).unwrap();
 }
 fn receive(r: &mut Receiver, root: &Manifest, source: &Repository) -> Result<Arc<Manifest>, String> {
-    r.receive(&Transfer { root: root.encode()?, included: BTreeMap::new() }, &root.domain,
-        |_, b| source.read_object(b.object, MAX_BLOCK_BYTES))
+    r.receive(&Transfer { root: root.encode()?, repository_path: source.path().to_string_lossy().into_owned() }, &root.domain)
 }
 fn assembled(r: &mut Receiver, root: &Manifest, xy: [i32;2]) -> ColumnGroundRecords {
     let blocks: Vec<_> = root.blocks.iter().map(|b| (b.key,r.ground_records(b).unwrap())).collect();
@@ -109,16 +108,15 @@ fn compact_heightfield_preserves_logical_identity_and_float_bits() {
     // 两种字节表示使用独立接收库；同一清单、来源水位及完整逻辑记录相同。
     for (name, payload) in [("紧凑高度场.ar5", compact)] {
         let repository = Repository::temporary().unwrap();
-        let mut receiver = Receiver::new(repository.clone());
+        repository.put_object(root.blocks[0].object, &payload).unwrap();
+        let mut receiver = Receiver::new(repository.read_only());
         let received = receiver
             .receive(
                 &Transfer {
                     root: root.encode().unwrap(),
-                    included: BTreeMap::from([(root.blocks[0].object, payload)]),
+                    repository_path: repository.path().to_string_lossy().into_owned(),
                 },
-                &root.domain,
-                |_, _| Err("included fixture".into()),
-            )
+                &root.domain)
             .unwrap();
         assert_eq!(*received, *root);
         assert_eq!(assembled(&mut receiver, &received, [0, 0]), value);
@@ -181,7 +179,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
     let encoded = encode_ground_block(&block, &records).unwrap();
     assert!(encoded.len() < MAX_BLOCK_BYTES);
     assert_eq!(decode_ground_records(&encoded).unwrap(), records);
-    assert_eq!(block_summary(&encoded).unwrap(), (1024, stamp));
+    assert_eq!(decoded_block_stats(&encoded).unwrap(), (1024, stamp));
     eprintln!(
         "COMPACT full_columns=1024 samples_per_column=32 bytes={}",
         encoded.len()
@@ -330,8 +328,8 @@ fn heightfield_ground_parts_use_one_decode_and_incremental_roots_skip_untouched_
     let reads=repo.counts().0; let second=w.snapshot(domain(),2,20).unwrap();
     let seal_reads=repo.counts().0-reads;
     assert_eq!(seal_reads,0,"封图只比较已保留的原块和脏块，不回读");
-    let reads=target.counts().0; receive(&mut r,&second,&repo).unwrap(); let receive_reads=target.counts().0-reads;
-    assert_eq!(receive_reads,1,"只尝试读取缺失对象，接收不为校验回读");
+    receive(&mut r,&second,&repo).unwrap(); let receive_reads=r.reader.read_count();
+    assert_eq!(receive_reads,1,"只读仓库中的对象一次，不为校验回读");
     assert_eq!(second.geometry_revision,first.geometry_revision);
     eprintln!("H2 uncacheable_points=32768 seal_reads={seal_reads} receiver_zero_cache_reads={receive_reads}");
 }
@@ -358,7 +356,7 @@ fn heightfield_full_horizontal_block_and_existing_byte_budget_roundtrip() {
     w.replace_ground_columns(columns.iter().map(|(xy,column)|(*xy,column))).unwrap();
     let root=w.snapshot(domain(),1,20).unwrap(); assert_eq!(root.blocks.len(),1);
     let bytes=w.repository().read_object(root.blocks[0].object,MAX_BLOCK_BYTES).unwrap(); let records=decode_ground_records(&bytes).unwrap();
-    assert_eq!(records.iter().count(),1024); assert!(bytes.len()<MAX_BLOCK_BYTES); assert_eq!(block_summary(&bytes).unwrap(),(1024,20));
+    assert_eq!(records.iter().count(),1024); assert!(bytes.len()<MAX_BLOCK_BYTES); assert_eq!(decoded_block_stats(&bytes).unwrap(),(1024,20));
     let archive=archive_bytes(&root,w.repository()); artifact("full-1024.ar5",&archive);
     let repo=Repository::temporary().unwrap(); let restored=ArchiveReader::open(Cursor::new(archive)).unwrap().import(&repo).unwrap();
     let mut copy=Writer::new(repo,Q,BUDGET).unwrap(); copy.restore_archived(&restored).unwrap(); assert_eq!(copy.ground_column([31,31]).unwrap(),column(surface([31,31],&[0])));

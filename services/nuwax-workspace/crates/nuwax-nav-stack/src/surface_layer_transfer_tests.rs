@@ -5,7 +5,7 @@
 fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    let mut reader = FineMapReader::new(String::new()).unwrap();
+    let mut reader = FineMapReader::new("");
     let domain = Domain { session: "watermark-only".into(), };
     let source = Arc::new(LayerSource::Auxiliary { sensor_id: "depth-front".into(),
         clock_id: "camera-clock".into(), runtime_generation: 7, session_generation: 1 });
@@ -55,7 +55,7 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
 fn root_header_only_reuses_complete_observations() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    let mut reader = FineMapReader::new(String::new()).unwrap();
+    let mut reader = FineMapReader::new("");
     let domain = Domain { session: "header-only".into(), };
     writer.observe([[0, 0, 0]], 90).unwrap();
     let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
@@ -81,7 +81,7 @@ fn root_header_only_reuses_complete_observations() {
 fn root_header_no_block_mutation_still_completes_an_incomplete_baseline() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-    let mut reader = FineMapReader::new(String::new()).unwrap();
+    let mut reader = FineMapReader::new("");
     let domain = Domain { session: "empty-header-completeness".into(), };
     let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
     let first = reader.receive(&transfer_message(&repository, &first)).unwrap();
@@ -114,8 +114,7 @@ fn heightfield_reader_native_members_metadata_withdrawal_and_retirement() {
     for budget in [0,32*1024*1024] {
         let repo=Repository::temporary().unwrap();
         let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
-        let mut reader=FineMapReader {receiver:Receiver::with_cache_budget(Repository::temporary().unwrap(),budget),
-            client:None,lcm_url:String::new()};
+        let mut reader=FineMapReader {receiver:Receiver::with_cache_budget(Repository::temporary().unwrap(),budget)};
         let domain=Domain {session:"hf-reader".into(),};
         let mut previous:Option<(Arc<Manifest>,Arc<nuwax_nav_mls_planner::SurfaceObservations>)>=None;
         let mut pinned=None;
@@ -166,7 +165,7 @@ fn heightfield_reader_preserves_cross_block_height_and_reanchor() {
     let h=column.height();writer.replace_ground_column([0,0],&ColumnGroundRecords {classified_empty: false,
         heightfields:vec![HeightfieldSurface {column,samples:vec![]}]}).unwrap();
     let root=writer.snapshot(Domain {session:"mixed-reader".into(),},1,20).unwrap();
-    let mut reader=FineMapReader::new(String::new()).unwrap();let root=reader.receive(&transfer_message(&repo,&root)).unwrap();
+    let mut reader=FineMapReader::new("");let root=reader.receive(&transfer_message(&repo,&root)).unwrap();
     let source=reader.observations(&root,None).unwrap();
     let native=source.ground_record(GroundKey::HeightfieldV1([0,0,-1])).unwrap();
     assert_eq!(native.members().collect::<Vec<_>>(),vec![-1,32]);assert_eq!(native.height_at([0.025,0.025]),Some(h));
@@ -187,7 +186,7 @@ fn heightfield_reader_duplicate_and_header_only_keep_observation_owner() {
     writer.observe([[0,0,0],[0,0,32],[0,0,64]],20).unwrap();
     writer.replace_ground_column([0,0],&hf_test_column([0,0],[0.75,0.25,0.,0.,0.,0.,0.,0.],true)).unwrap();
     let domain=Domain {session:"hf-header".into(),};
-    let root=writer.snapshot(domain.clone(),1,20).unwrap();let mut reader=FineMapReader::new(String::new()).unwrap();
+    let root=writer.snapshot(domain.clone(),1,20).unwrap();let mut reader=FineMapReader::new("");
     let first=reader.receive(&transfer_message(&repo,&root)).unwrap();let source=reader.observations(&first,None).unwrap();
     let (same,delta)=reader.observations_with_changes(&first,Some((&first,&source))).unwrap();
     assert!(Arc::ptr_eq(&same,&source));assert_eq!(delta,Some(vec![]));
@@ -227,8 +226,9 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
     let mut split_root = root.as_ref().clone();
     split_root.blocks[0].object = object;
     let mut message = transfer_message(&repo, &root);
-    message.fine = Some(Transfer { root: split_root.encode().unwrap(), included: [(object, bytes)].into() });
-    let mut reader = FineMapReader::new(String::new()).unwrap();
+    repo.put_object(object, &bytes).unwrap();
+    message.fine = Some(Transfer { root: split_root.encode().unwrap(), repository_path: repo.path().to_string_lossy().into_owned() });
+    let mut reader = FineMapReader::new("");
     let admitted = reader.receive(&message).unwrap();
     let admitted_records = reader.receiver.ground_records(&admitted.blocks[0]).unwrap();
     assert_eq!(admitted_records.iter().count(), 2);
@@ -249,7 +249,7 @@ fn classified_empty_reader_delta_survives_last_claim_and_cold_restore() {
     writer.observe([[0,0,0],[1,0,0]],20).unwrap();
     let domain=Domain{session:"empty-column-reader".into(),};
     let root=writer.snapshot(domain.clone(),1,20).unwrap();
-    let mut reader=FineMapReader::new(String::new()).unwrap();
+    let mut reader=FineMapReader::new("");
     let before=reader.receive(&transfer_message(&repo,&root)).unwrap();
     let old=reader.observations(&before,None).unwrap();
     let empty=ColumnGroundRecords{classified_empty:true,heightfields:vec![]};
@@ -261,7 +261,7 @@ fn classified_empty_reader_delta_survives_last_claim_and_cold_restore() {
     assert!(next.classified_empty_ground([0,0]));assert_eq!(next.ground_records([0,0]).count(),0);
     assert!(!next.classified_empty_ground([1,0]));assert!(next.get([0,0,0]).is_some());
     assert!(!old.classified_empty_ground([0,0]));
-    let mut cold=FineMapReader::new(String::new()).unwrap();let admitted=cold.receive(&transfer_message(&repo,&root)).unwrap();
+    let mut cold=FineMapReader::new("");let admitted=cold.receive(&transfer_message(&repo,&root)).unwrap();
     let cold_source=cold.observations(&admitted,None).unwrap();
     assert!(cold_source.classified_empty_ground([0,0]));assert_eq!(cold_source.ground_records([0,0]).count(),0);
     writer.remove([[0,0,0]]).unwrap();let root=writer.snapshot(domain,3,20).unwrap();

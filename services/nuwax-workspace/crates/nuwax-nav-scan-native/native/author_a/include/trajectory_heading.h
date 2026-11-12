@@ -6,13 +6,15 @@
 
 namespace scan_planner {
 // 只等比放大结点间隔，控制点及曲线几何保持不变。
-inline void arrangeHeadingTime(UniformBspline& trajectory,const HeadingPlan& heading) {
+inline void arrangeHeadingTime(UniformBspline& trajectory,HeadingPlan& heading) {
   const double duration=trajectory.getTimeSum(),required=heading.duration(duration);
   if(required>duration) {
     auto knots=trajectory.getKnot();
     double begin,end;trajectory.getTimeSpan(begin,end);
     knots=((knots.array()-begin)*(required/duration)+begin).matrix();
     trajectory.setKnot(knots);
+    // 保留转好后到曲线末端的时间；增加的起步时间同时移到转好时刻之前。
+    if(heading.settle_time) *heading.settle_time+=required-duration;
   }
 }
 // 未来曲线减速时，微小但非零位移仍决定该处朝向，不能替换为当前机体或世界零角。

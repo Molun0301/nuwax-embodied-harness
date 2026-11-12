@@ -26,6 +26,16 @@ int main() {
   close(heading.duration(4.),4.);
   heading.turn_first=true;
   close(heading.at(.8,0.,3.),.8);
+  heading.turn_first=false;
+  heading.settle_time=3.;
+  close(heading.at(0.,2.5,4.),1.25);
+  close(heading.at(0.,3.,4.),1.5);
+  close(heading.at(0.,4.,4.),1.5);
+  heading.settle_time=4.;
+  for(double t=0.;t<=4.;t+=.1)
+    close(heading.at(.8,t,4.),plannedHeading(.8,t,4.,0.,1.5,1.,1.,.5));
+  heading.settle_time=1.;
+  close(heading.duration(4.),6.);
 }
 
 "#).unwrap();

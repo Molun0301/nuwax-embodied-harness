@@ -18,7 +18,7 @@ class AuthorOverlapEscape {
   double traveled_=0.;
   double admitted_=0.;
   double distance_limit_=0.,time_limit_=0.;
-  static constexpr double escape_speed_=.04;
+  static double escapeSpeed(const ScanConfig& c) {return std::max(.04,c.min_executable_linear_mps);}
   // 三格误差带覆盖定位偏差与占据量化；只用于恢复准入，不改变碰撞外包。
   static double penetrationLimit(const ScanConfig& c) {return 3.*c.resolution;}
   std::string failure_;
@@ -231,6 +231,7 @@ class AuthorOverlapEscape {
   void planImpl(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
       const double* velocity,double angular,int64_t stamp,bool recontact,ScanOutput& output) {
     using namespace command_check_detail;
+    const double escape_speed=escapeSpeed(c);
     // 每个新来源先按当前接触检查三格上限，优先于旧事件故障和动作后增深。
     std::vector<GridMap::BodyCell> cells;
     if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())
@@ -277,7 +278,7 @@ class AuthorOverlapEscape {
       // 时间由同一行程和既有低速推出。浅接触保留原一格、两秒未确认预算。
       distance_limit_=c.resolution;
       for(const auto& contact:contacts_)distance_limit_=std::max(distance_limit_,2.*contact.depth);
-      time_limit_=std::max(2.,distance_limit_/escape_speed_+c.sample_dt);
+      time_limit_=std::max(2.,distance_limit_/escape_speed+c.sample_dt);
     }
     if(stamp<last_stamp_)throw std::runtime_error("Current body pose is occupied; escape source clock regressed");
     const auto check_budget=[&]() {
@@ -322,22 +323,22 @@ class AuthorOverlapEscape {
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
     std::vector<Eigen::Vector2d> requests;Eigen::Vector2d sum=Eigen::Vector2d::Zero();
     for(const auto& contact:contacts_)sum+=contact.body_axis?world(contact.axis,yaw):contact.axis;
-    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed_,yaw));
-    for(const auto& contact:contacts_)requests.push_back(body((contact.body_axis?world(contact.axis,yaw):contact.axis)*escape_speed_,yaw));
+    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed,yaw));
+    for(const auto& contact:contacts_)requests.push_back(body((contact.body_axis?world(contact.axis,yaw):contact.axis)*escape_speed,yaw));
     // 机体系精确轴候选避免坐标往返舍入使严格单调条件失去本可执行的零切向量。
     for(int axis=0;axis<2;++axis)for(double sign:{-1.,1.})
-      requests.emplace_back(axis==0?sign*escape_speed_:0.,axis==1?sign*escape_speed_:0.);
-    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed_,yaw));
+      requests.emplace_back(axis==0?sign*escape_speed:0.,axis==1?sign*escape_speed:0.);
+    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed,yaw));
     // 先平移，再原地正反转向，最后小幅平移转向组合；请求仍按平台命令盒和实测加速度限幅。
     std::vector<std::pair<Eigen::Vector2d,double>> candidates;
     for(const auto& request:requests)candidates.emplace_back(request,0.);
-    const double turn_speed=escape_speed_/radius(c);
+    const double turn_speed=std::max(escape_speed/radius(c),c.min_executable_angular_rps);
     for(double sign:{-1.,1.})candidates.emplace_back(Eigen::Vector2d::Zero(),sign*turn_speed);
     for(double fraction:{.5,1.})for(double sign:{-1.,1.})for(const auto& request:requests)
-      candidates.emplace_back(request*.5,sign*fraction*turn_speed);
+      candidates.emplace_back(request*.5,sign*std::max(fraction*turn_speed,c.min_executable_angular_rps));
     bool exhausted=false,budget_exhausted=false;
     // 恢复允许既有低速倒退，普通导航的后退选项不限制退出证明。
-    ScanConfig escape_config=c;escape_config.max_reverse_velocity=escape_speed_;
+    ScanConfig escape_config=c;escape_config.max_reverse_velocity=escape_speed;
     for(const auto& requested:candidates) {
       if(Clock::now()>=deadline){exhausted=true;break;}
       const auto command=bounded(requested.first,requested.second,actual,escape_config,false);

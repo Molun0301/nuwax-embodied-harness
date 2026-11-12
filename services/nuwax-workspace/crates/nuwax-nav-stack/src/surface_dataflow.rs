@@ -640,7 +640,16 @@ async fn run_surface_planner_with_computer(
                 }
                 geometry_retired = false;
                 match result {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        if plan.kind == nuwax_nav_runtime::RouteKind::Approach {
+                            let end = plan.path.poses.last().expect("原生非空路线").pose.position;
+                            if nuwax_nav_runtime::surface_follower::position_within_tolerance(
+                                [end.x, end.y, end.z], planned_goal.goal.pose.position,
+                                planned_goal.options().position_tolerance_m,
+                                f64::from(input.source.config().step_threshold_m)) {
+                                plan.kind = nuwax_nav_runtime::RouteKind::Complete;
+                            }
+                        }
                         let is_approach=plan.kind==nuwax_nav_runtime::RouteKind::Approach;
                         if is_approach {
                             let end=plan.path.poses.last().expect("原生非空路线").pose.position;
@@ -2250,6 +2259,29 @@ goal: schema::PoseStamped {
         assert!(state.message.contains("无进展重规划3次"));
 
         assert_eq!(state.last_applied_twist,Some(Twist2::ZERO));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn approach_endpoint_inside_goal_tolerance_executes_as_complete_and_arrives() {
+        let computer: SurfacePathComputer = Arc::new(|map, pose, goal, config| {
+            let mut endpoint = goal.clone();
+            endpoint.goal.pose.position[0] -= 0.10;
+            endpoint.goal.pose.position[2] += 0.05;
+            Ok(SurfacePlan { path: body_path(map, pose, &endpoint, config)?,
+                kind: nuwax_nav_runtime::RouteKind::Approach, resolution: 0.1 })
+        });
+        let mut harness = Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [1.15, 1.55, 2.5]);
+        harness.goal(&goal).await;
+        let route = harness.path_for(&goal).await;
+        assert_eq!(route.route_kind, 0, "端点满足平面及高度容差时按完整路线交付");
+        harness.wait_controlling().await;
+        assert_eq!(harness.scheduler.status().last_terminal, None, "路线接纳不能替代实测到达");
+        harness.feed.lock().unwrap().position = route.path.poses.last().unwrap().pose.position;
+        harness.terminal(TerminalOutcome::Succeeded).await;
+        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
         harness.shutdown().await;
     }
 

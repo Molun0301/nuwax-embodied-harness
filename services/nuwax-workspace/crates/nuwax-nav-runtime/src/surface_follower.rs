@@ -6,6 +6,16 @@ use nuwax_nav_types_messages::{
 };
 use std::sync::Arc;
 
+/// 跟随器与全局路线消费共用的位置容差口径。
+pub fn position_within_tolerance(position: [f64; 3], goal: [f64; 3], tolerance: f64, step_height: f64) -> bool {
+    if tolerance == 0. {
+        nuwax_nav_types_messages::same_finite_position(position, goal)
+    } else {
+        (position[0] - goal[0]).hypot(position[1] - goal[1]) < tolerance
+            && (position[2] - goal[2]).abs() <= step_height.max(tolerance)
+    }
+}
+
 /// 旧二维后端的前向兼容策略；原生 SCAN 不调用此函数。
 pub fn forward_navigation_kinematics(mut motion: MotionKinematics) -> MotionKinematics {
     if motion.model == nuwax_nav_types_messages::MotionModel::Omnidirectional {
@@ -315,19 +325,9 @@ impl SurfaceFollower {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
             return false;
         };
-        if self.options.position_tolerance_m == 0. {
-            nuwax_nav_types_messages::same_finite_position(
-                Self::position(pose),
-                Self::position(goal),
-            )
-        } else {
-            let config = self.map.as_ref().map_or(self.config.scan, |map| self.native_config(map));
-            let tolerance = self.options.position_tolerance_m;
-            let p = pose.pose.position;
-            let g = goal.pose.position;
-            (p.x - g.x).hypot(p.y - g.y) < tolerance
-                && (p.z - g.z).abs() <= config.max_step_up.max(config.max_step_down).max(tolerance)
-        }
+        let config = self.map.as_ref().map_or(self.config.scan, |map| self.native_config(map));
+        position_within_tolerance(Self::position(pose), Self::position(goal),
+            self.options.position_tolerance_m, config.max_step_up.max(config.max_step_down))
     }
     fn reached(&self) -> bool {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {

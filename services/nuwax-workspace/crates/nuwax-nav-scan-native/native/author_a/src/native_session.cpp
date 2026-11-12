@@ -28,10 +28,9 @@ struct MapOwner {
 struct Trajectory {
   scan_planner::Bspline spline;
   scan_planner::UniformBspline position,velocity,acceleration;
-  scan_planner::RouteHeightReference route;
   uint32_t sources[3]{2,2,3};
   Vector3d local_target=Vector3d::Zero();double reference_progress=0.,reference_duration=0.;
-  explicit Trajectory(const scan_planner::Bspline& s,const scan_planner::RouteHeightReference& r):spline(s),route(r) {
+  explicit Trajectory(const scan_planner::Bspline& s):spline(s) {
     Eigen::MatrixXd points(3,s.pos_pts.size());Eigen::VectorXd knots(s.knots.size());
     for(size_t i=0;i<s.pos_pts.size();++i)points.col(i)=Vector3d(s.pos_pts[i].x,s.pos_pts[i].y,s.pos_pts[i].z);
     for(size_t i=0;i<s.knots.size();++i)knots[i]=s.knots[i];
@@ -39,37 +38,18 @@ struct Trajectory {
     velocity=position.getDerivative();acceleration=velocity.getDerivative();
   }
   double duration() {return position.getTimeSum();}
-  // 路线区段在生成时冻结；三维投影不能跨到另一层或另一条回头支路。
-  double routeArc(const Vector3d& p,double hint) const {
-    double best=std::numeric_limits<double>::infinity(),selected=route.begin_arc;
-    for(size_t i=1;i<route.points.size();++i) {
-      const auto delta=(route.points[i]-route.points[i-1]).eval();const double length=delta.norm();
-      if(length==0.)continue;
-      const double lo=std::max(route.arcs[i-1],route.begin_arc),hi=std::min(route.arcs[i],route.end_arc);
-      if(lo>hi)continue;
-      const double arc=std::clamp(route.arcs[i-1]+(p-route.points[i-1]).dot(delta)/length,lo,hi);
-      const double distance=(route.positionAtArc(arc)-p).squaredNorm();
-      if(distance<best || (distance==best && std::abs(arc-hint)<std::abs(selected-hint))) {best=distance;selected=arc;}
-    }
-    return selected;
-  }
-  std::pair<double,double> project(const Vector3d& p,double progress) {
-    const double hint=std::clamp(progress,route.begin_arc,route.end_arc);
-    auto edge=std::upper_bound(route.arcs.begin(),route.arcs.end(),hint);
-    const size_t index=std::min(route.arcs.size()-1,std::max(size_t(1),size_t(edge-route.arcs.begin())));
-    const double lo=std::max(route.begin_arc,route.arcs[index-1]),hi=std::min(route.end_arc,route.arcs[index]);
-    const double total=duration();const int count=std::max(1,int(std::ceil(total/.01)));
-    double best=std::numeric_limits<double>::infinity(),tau=0.;
+  // 跟踪只沿曲线自身时间连续搜索，不受全局路线提示跳段影响。
+  std::pair<double,double> project(const Vector3d& p,double previous,double period) {
+    const double left_bound=std::max(0.,previous-period),right_bound=std::min(duration(),previous+1.);
+    const double span=right_bound-left_bound;const int count=std::max(1,int(std::ceil(span/.01)));
+    double best=std::numeric_limits<double>::infinity(),tau=left_bound;
     for(int i=0;i<=count;++i) {
-      const double t=total*i/count;const auto point=position.evaluateDeBoorT(t);
-      const double arc=routeArc(point,hint);
-      if(arc<lo || arc>hi)continue;
-      const double distance=(point-p).squaredNorm();
+      const double t=left_bound+span*i/count;
+      const double distance=(position.evaluateDeBoorT(t)-p).squaredNorm();
       if(distance<best) {best=distance;tau=t;}
     }
-    if(!std::isfinite(best))return {0.,best};
     // 只细化已选样条位置，不修改结点、控制点或规划器的数值实现。
-    const double left=std::max(0.,tau-total/count),right=std::min(total,tau+total/count);
+    const double left=std::max(left_bound,tau-span/count),right=std::min(right_bound,tau+span/count);
     for(int i=0;i<16;++i) {
       const Vector3d delta=position.evaluateDeBoorT(tau)-p,v=velocity.evaluateDeBoorT(tau),a=acceleration.evaluateDeBoorT(tau);
       const double denominator=v.squaredNorm()+delta.dot(a);
@@ -111,7 +91,7 @@ struct PlannerSession {
   ScanConfig config{};
   void initialize(const ScanConfig& c) {
     auto p=scan_planner::authorParameters(c);fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(p,map);
-    fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s,fsm->manager().route_height_);});
+    fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s);});
     config=c;reference.clear();
   }
 };
@@ -285,7 +265,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     }else {
       if(!s.curve){out->reason|=SCAN_TRACK_NO_TRAJECTORY;return;}
       else {
-      const auto projection=out->installed?installed_projection:s.curve->project(position,state->route_progress);s.phase=projection.first;out->deviation=projection.second;
+      const auto projection=out->installed?installed_projection:s.curve->project(position,s.phase,c->sample_dt);s.phase=projection.first;out->deviation=projection.second;
       if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=SCAN_TRACK_DEVIATED;s.curve.reset();return;}
       out->remaining=std::max(0.,s.curve->duration()-s.phase);out->phase=s.phase;
       if(out->remaining<=0.) {

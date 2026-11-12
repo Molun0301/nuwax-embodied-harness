@@ -246,16 +246,13 @@ fn reference_time_waits_at_deviation_bound_and_restarts_at_installed_projection(
         }
         previous = tracked.command;
     }
-    // 实际位置前移后，参考不能落在实际投影之后；重装原轨也不能继承旧期望时间。
+    // 单拍跳到时间窗之外应判偏离；重装原轨不能继承旧投影或期望时间。
     state.position = samples.iter().find(|s| s.position[0] > 0.8).unwrap().position;
     state.route_progress = state.position[0];
     state.timestamp_ns += 50_000_000;
     let advanced = tracker.track_and_check(&cfg, &snapshot, &state, [0.1, 0., 0.], None).unwrap();
-    assert!(advanced.phase > bound.time && advanced.command[0] > 0.);
-    let actual = curve.samples(advanced.phase, cfg.sample_dt)[0];
-    let at_projection = actual.velocity[0] + 0.8 * (actual.position[0] - state.position[0]);
-    assert!((advanced.command[0] - at_projection).abs() < 1e-8,
-        "追平实际投影时不能再多前探一拍：{advanced:?}，投影处期望={at_projection}");
+    assert!(advanced.deviated() && advanced.deviation > 0.2,
+        "窗口外的位置不能跳到曲线远端：{advanced:?}");
     tracker.install(&curve);
     let mut fresh = ScanTracker::default();
     fresh.install(&curve);
@@ -632,4 +629,12 @@ fn ninth_round_install_starts_at_measured_position_despite_finished_route_hint()
     assert!(result.installed,"起点与实测位置相同的新曲线必须安装：{result:?}");
     assert!(result.phase<0.01,"安装不能跳到全局路线提示所选的后段：{result:?}");
     assert!(!result.rejected_trajectory());
+    // 沿用归档入口；安装后全局进度仍在末段，跟踪投影须留在当前曲线起点。
+    let mut next = state;
+    for _ in 0..20 {
+        next.timestamp_ns += 50_000_000;
+        let tracked = tracker.track_and_check(&cfg, &snapshot, &next, [0.; 3], None).unwrap();
+        assert!(!tracked.deviated(), "全局提示不能排除当前曲线段：{tracked:?}");
+        assert!(tracked.deviation < 1e-8 && tracked.phase < 0.01, "静止实测须保持起点投影：{tracked:?}");
+    }
 }

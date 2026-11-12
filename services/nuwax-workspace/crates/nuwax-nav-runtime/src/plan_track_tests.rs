@@ -64,20 +64,27 @@ fn next_pose(f: &mut SurfaceFollower, position: [f64; 3]) {
 }
 
 #[test]
-fn terminal_reference_joins_the_nearest_earliest_point_without_the_old_goal_detour() {
+fn terminal_reference_cuts_before_the_first_point_within_half_body_width() {
+    let half_width = 0.164;
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [2., 0., 0.]], [1.9, -0.05, 0.], half_width),
+        vec![[0., 0., 0.], [1.9, -0.05, 0.]]);
     let stop = [4.775, -0.125, 0.];
     let reference = [
+        [4.575, -0.075, 0.], [4.625, -0.075, 0.],
         [4.675, -0.075, 0.], [4.725, -0.075, 0.], [4.775, -0.025, 0.],
         [4.825, 0.025, 0.], [4.875, 0.075, 0.], [4.875, 0.025, 0.],
         [4.875, -0.025, 0.], [4.875, -0.075, 0.], [4.875, -0.125, 0.],
     ];
-    assert_eq!(SurfaceFollower::reference_to_stop(&reference, stop),
-        vec![reference[0], reference[1], stop]);
-    let goal = [1., 0., 0.];
-    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], goal, [2., 0., 0.], goal], goal),
-        vec![[0., 0., 0.], goal]);
-    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [2., 0., 0.]], goal),
-        vec![[0., 0., 0.], goal]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&reference, stop, half_width),
+        vec![reference[0], stop]);
+    let finding = [[4.575, -0.025, 0.], [4.625, -0.025, 0.], [4.785, -0.025, 0.]];
+    assert_eq!(SurfaceFollower::reference_to_stop(&finding, [4.76, -0.025, 0.], half_width),
+        vec![finding[0], [4.76, -0.025, 0.]]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&[], stop, half_width), Vec::<[f64; 3]>::new());
+    assert_eq!(SurfaceFollower::reference_to_stop(&reference, reference[0], half_width),
+        vec![reference[0], reference[0]]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [1., 0., 0.]], [2., 0., 0.], half_width),
+        vec![[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]]);
 }
 
 #[test]

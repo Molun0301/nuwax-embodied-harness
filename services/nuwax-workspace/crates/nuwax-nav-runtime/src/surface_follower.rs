@@ -473,14 +473,11 @@ impl SurfaceFollower {
         self.terminal_translation_finished = false;
         self.terminal_translation_progress = None;
     }
-    fn reference_to_stop(reference: &[[f64; 3]], stop: [f64; 3]) -> Vec<[f64; 3]> {
-        reference.iter().enumerate().min_by(|(ia, a), (ib, b)| {
-            (a[0] - stop[0]).hypot(a[1] - stop[1])
-                .total_cmp(&(b[0] - stop[0]).hypot(b[1] - stop[1]))
-                .then(ia.cmp(ib))
-        }).into_iter().flat_map(|(nearest, point)| {
-            reference[..=nearest].iter().copied().chain((*point != stop).then_some(stop))
-        }).collect()
+    fn reference_to_stop(reference: &[[f64; 3]], stop: [f64; 3], half_width: f64) -> Vec<[f64; 3]> {
+        let keep = reference.iter().position(|point|
+            (point[0] - stop[0]).hypot(point[1] - stop[1]) <= half_width
+        ).map_or(reference.len(), |index| index.max(1));
+        reference[..keep].iter().copied().chain((!reference.is_empty()).then_some(stop)).collect()
     }
     fn prepare_terminal(&mut self, map: &PreparedMap, config: &nuwax_nav_scan_native::Config) {
         if self.terminal_phase != TerminalPhase::Travel || !self.options.requires_orientation()
@@ -490,7 +487,7 @@ impl SurfaceFollower {
         let goal = self.goal.as_ref().unwrap();
         let points = map.snapshot.terminal_points(config, Self::position(goal),
             goal.pose.orientation.yaw(), self.options.position_tolerance_m);
-        let reference = Self::reference_to_stop(&self.reference, points.stop);
+        let reference = Self::reference_to_stop(&self.reference, points.stop, config.body_width / 2.);
         self.needs_plan |= self.terminal_approach.as_ref().is_some_and(|old| *old.reference != reference);
         self.terminal_approach = Some(TerminalApproach { points, snapshot: map.snapshot.clone(), reference: Arc::new(reference) });
     }

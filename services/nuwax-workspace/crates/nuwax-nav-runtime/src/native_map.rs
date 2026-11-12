@@ -312,13 +312,15 @@ pub(crate) struct NativeColumn {
 pub(crate) struct NativeColumns {
     pub resolution: f64,
     pub columns: BTreeMap<[i32; 2], NativeColumn>,
-    order: Vec<[i32; 2]>,
+    pub order: Vec<[i32; 2]>,
+    ground_resolution: f64,
+    lowest_ground: BTreeMap<[i32; 2], f64>,
     pub forbidden_columns: Vec<[i32; 2]>,
 }
 impl NativeColumns {
-    pub fn new(map: NativeMap, source: &SurfaceSnapshot, window: ([f64; 2], f64)) -> Self {
+    pub fn new(map: NativeMap, source: &SurfaceSnapshot, window: ([f64; 2], f64), ground_resolution: f64) -> Self {
         let order = source.navigation_source_columns(Some(window)).1.map(|(xy, _)| xy).collect();
-        let mut result = Self { resolution: map.resolution, columns: BTreeMap::new(), order,
+        let mut result = Self { resolution: map.resolution, columns: BTreeMap::new(), order, ground_resolution, lowest_ground: BTreeMap::new(),
             forbidden_columns: map.forbidden_columns };
         for p in map.static_collision_ground {
             result.columns.entry([p[0], p[1]].map(|v| (v / result.resolution).floor() as i32))
@@ -336,6 +338,11 @@ impl NativeColumns {
             for c in map.cells { result.columns.entry([c.x, c.y]).or_default().cells.push(c); }
             for b in map.bands { result.columns.entry([b.x, b.y]).or_default().bands.push(b); }
         }
+        for column in result.columns.values() { for p in &column.ground {
+            let key = [p[0], p[1]].map(|v| (v / ground_resolution).floor() as i32);
+            let low = result.lowest_ground.entry(key).or_insert(p[2]);
+            *low = low.min(p[2]);
+        }}
         result
     }
     #[cfg(test)]
@@ -351,11 +358,26 @@ impl NativeColumns {
         keys: &[[i32; 2]]) -> Result<(), String> {
         let keys: BTreeSet<_> = keys.iter().copied().collect();
         let update = from_surface_selection(map, Some(window), Some(&keys))?;
-        let mut update = Self::new(update, map, window);
+        let mut update = Self::new(update, map, window, self.ground_resolution);
         std::mem::swap(&mut self.order, &mut update.order);
+        let changed: BTreeSet<_> = keys.iter().map(|key| key.map(|v|
+            (((f64::from(v) + 0.5) * self.resolution) / self.ground_resolution).floor() as i32)).collect();
         for key in keys { self.columns.remove(&key); }
         self.columns.extend(update.columns);
+        for key in changed {
+            let low = self.ground_columns(key).flat_map(|(_, c)| c.ground.iter())
+                .filter(|p| [p[0], p[1]].map(|v| (v / self.ground_resolution).floor() as i32) == key)
+                .map(|p| p[2]).reduce(f64::min);
+            if let Some(low) = low { self.lowest_ground.insert(key, low); }
+            else { self.lowest_ground.remove(&key); }
+        }
         Ok(())
+    }
+    fn ground_columns(&self, key: [i32; 2]) -> impl Iterator<Item = (&[i32; 2], &NativeColumn)> {
+        let first = key.map(|v| (f64::from(v) * self.ground_resolution / self.resolution).floor() as i32 - 1);
+        let last = key.map(|v| ((f64::from(v) + 1.) * self.ground_resolution / self.resolution).ceil() as i32);
+        self.columns.range([first[0], i32::MIN]..=[last[0], i32::MAX])
+            .filter(move |(xy, _)| xy[1] >= first[1] && xy[1] <= last[1])
     }
     pub fn ground(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
         self.order.iter().filter_map(|xy| self.columns.get(xy)).flat_map(|c| c.ground.iter().copied())
@@ -376,58 +398,77 @@ pub(crate) fn collision_ground_padding(config: &nuwax_nav_scan_native::Config) -
     config.resolution + config.sample_dt * (translation + radius * config.max_yaw_rate)
 }
 
-/// 近期地面覆盖同列旧地面；外扩机身内，相对支撑或同列最低层可跨的高地面过时。
-pub(crate) fn collision_ground(
-    persistent: Vec<[f64; 3]>,
-    recent: Vec<[f64; 3]>,
-    config: &nuwax_nav_scan_native::Config,
-    position: [f64; 3],
-    yaw: f64,
-) -> Vec<[f64; 3]> {
+/// 每拍只保存机身及近期观测覆盖列的筛选结果，其余列直接借用静态视图。
+pub(crate) struct CollisionGround<'a> {
+    pub native: &'a NativeColumns,
+    pub overrides: BTreeMap<[i32; 2], Vec<[f64; 3]>>,
+    pub recent: Vec<[f64; 3]>,
+}
+impl CollisionGround<'_> {
+    pub fn points(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
+        self.native.order.iter().flat_map(|xy| self.overrides.get(xy).map(Vec::as_slice)
+            .or_else(|| self.native.columns.get(xy).map(|c| c.ground.as_slice()))
+            .unwrap_or(&[]).iter().copied()).chain(self.recent.iter().copied())
+    }
+}
+
+/// 近期地面覆盖同列旧地面；四轴相交和严格正高度差沿用原条件。
+pub(crate) fn collision_ground_view<'a>(
+    native: &'a NativeColumns, recent: Vec<[f64; 3]>,
+    config: &nuwax_nav_scan_native::Config, position: [f64; 3], yaw: f64,
+) -> CollisionGround<'a> {
     let r = config.resolution;
     let column = |p: &[f64; 3]| [p[0], p[1]].map(|v| (v / r).floor() as i32);
     let recent_columns: BTreeSet<_> = recent.iter().map(column).collect();
-    let mut lowest_ground = BTreeMap::<[i32; 2], f64>::new();
-    for p in &persistent {
-        let height = lowest_ground.entry(column(p)).or_insert(p[2]);
-        *height = height.min(p[2]);
-    }
     let (s, c) = yaw.sin_cos();
     let (ac, as_) = (c.abs(), s.abs());
-    let center = [
-        position[0] + c * config.body_center_x - s * config.body_center_y,
-        position[1] + s * config.body_center_x + c * config.body_center_y,
-    ];
+    let center = [position[0] + c * config.body_center_x - s * config.body_center_y,
+        position[1] + s * config.body_center_x + c * config.body_center_y];
     let padding = collision_ground_padding(config);
-    let (hx, hy) = (
-        config.body_length * 0.5 + padding,
-        config.body_width * 0.5 + padding,
-    );
+    let (hx, hy) = (config.body_length * 0.5 + padding, config.body_width * 0.5 + padding);
     let (ex, ey) = (ac * hx + as_ * hy, as_ * hx + ac * hy);
     let support = position[2] - config.body_to_ground;
-    persistent
-        .into_iter()
-        .filter(|p| {
+    let mut affected = recent_columns.clone();
+    for x in ((center[0] - ex) / r).floor() as i32 - 1..=((center[0] + ex) / r).floor() as i32 {
+        for y in ((center[1] - ey) / r).floor() as i32 - 1..=((center[1] + ey) / r).floor() as i32 {
+            affected.insert([x, y]);
+        }
+    }
+    let candidates: BTreeSet<_> = affected.into_iter().flat_map(|key|
+        native.ground_columns(key).map(|(xy, _)| *xy)).collect();
+    let mut overrides = BTreeMap::new();
+    for xy in candidates {
+        let ground = &native.columns[&xy].ground;
+        let filtered: Vec<_> = ground.iter().copied().filter(|p| {
             let key = column(p);
-            if recent_columns.contains(&key) {
-                return false;
-            }
-            // 四轴矩形/格子相交，机身外扩覆盖异步快照后一周期内平移和转向新触及的列。
+            if recent_columns.contains(&key) { return false; }
             let [dx, dy] = [0, 1].map(|i| (f64::from(key[i]) + 0.5) * r - center[i]);
-            let under_body = dx.abs() <= ex + r * 0.5
-                && dy.abs() <= ey + r * 0.5
+            let under_body = dx.abs() <= ex + r * 0.5 && dy.abs() <= ey + r * 0.5
                 && (c * dx + s * dy).abs() <= hx + r * 0.5 * (ac + as_)
                 && (-s * dx + c * dy).abs() <= hy + r * 0.5 * (ac + as_);
-            // 当前支撑或同列最低地面提供高度基准，避免叠加机身高度估计误差。
             let height_above_support = p[2] - support;
-            let height_above_lowest = p[2] - lowest_ground[&key];
-            let stale_ground = (height_above_support > 0.
-                && height_above_support <= config.max_step_up)
+            let height_above_lowest = p[2] - native.lowest_ground[&key];
+            let stale_ground = (height_above_support > 0. && height_above_support <= config.max_step_up)
                 || (height_above_lowest > 0. && height_above_lowest <= config.max_step_up);
             !(under_body && stale_ground)
-        })
-        .chain(recent)
-        .collect()
+        }).collect();
+        if filtered.len() != ground.len() { overrides.insert(xy, filtered); }
+    }
+    CollisionGround { native, overrides, recent }
+}
+
+#[cfg(test)]
+pub(crate) fn collision_ground(persistent: Vec<[f64; 3]>, recent: Vec<[f64; 3]>,
+    config: &nuwax_nav_scan_native::Config, position: [f64; 3], yaw: f64) -> Vec<[f64; 3]> {
+    let mut native = NativeColumns { resolution: config.resolution, ground_resolution: config.resolution,
+        columns: BTreeMap::new(), order: Vec::new(), lowest_ground: BTreeMap::new(), forbidden_columns: Vec::new() };
+    for p in persistent {
+        let key = [p[0], p[1]].map(|v| (v / config.resolution).floor() as i32);
+        if !native.columns.contains_key(&key) { native.order.push(key); }
+        native.columns.entry(key).or_default().ground.push(p);
+        let low = native.lowest_ground.entry(key).or_insert(p[2]); *low = low.min(p[2]);
+    }
+    collision_ground_view(&native, recent, config, position, yaw).points().collect()
 }
 
 /// 加入原感知来源已经区分的近期地面与障碍，不重新猜测标签。

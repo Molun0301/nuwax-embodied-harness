@@ -178,13 +178,14 @@ impl MapWorker {
                         .obstacles()
                         .chain(recent_obstacles)
                         .collect();
-                    let ground = crate::native_map::collision_ground(
-                        native.ground().collect(),
+                    let ground = crate::native_map::collision_ground_view(
+                        native,
                         recent_ground,
                         &c,
                         input.pose,
                         input.yaw,
                     );
+                    let ground: Vec<_> = ground.points().collect();
                     let map = owner.as_mut().unwrap();
                     if let Some(initialize) = initializer {
                         initialize(
@@ -298,7 +299,7 @@ fn static_surface_view<'a>(
             _ => {
                 *cached = Some(StaticSurfaceView { anchor, radius, source: input.source.clone(),
                     columns: crate::native_map::NativeColumns::new(crate::native_map::from_surface_window(
-                        &input.source, Some((anchor, radius)))?, &input.source, (anchor, radius)) });
+                        &input.source, Some((anchor, radius)))?, &input.source, (anchor, radius), c.resolution) });
             }
         }
     }

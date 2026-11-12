@@ -456,3 +456,34 @@ fn classified_empty_column_roundtrips_moves_carrier_and_replaces_atomically() {
     assert_eq!(assembled(&mut receiver,&pinned,xy),empty);
     eprintln!("EMPTY_COLUMN persisted=true carrier=0,32,64 real_claim_replaced=true all_occupancy_deleted_clears=true old_neighbor_legacy=true");
 }
+
+
+#[test]
+fn sealed_reader_shares_writer_arcs_across_threads_and_keeps_old_values() {
+    let repo = Repository::temporary().unwrap();
+    let mut writer = Writer::new(repo.clone(), Q, 4 * 1024 * 1024).unwrap();
+    let xy = [0, 0];
+    let value = column(surface(xy, &[0]));
+    install(&mut writer, &value, 20);
+    let sealed = writer.seal(domain(), 1, 20).unwrap();
+    let reference = sealed.manifest().blocks[0].clone();
+    let expected = sealed.reader().ground_parts(&reference).unwrap();
+    let reads = repo.counts().0;
+    let ObjectIdentity::Assigned(id) = reference.object;
+    let name = format!("id-{}", id.0.iter().map(|v| format!("{v:02x}")).collect::<String>());
+    std::fs::remove_file(repo.path().join(name)).unwrap();
+    // 缓存命中必须共享原对象；源文件已删除，不能靠重读得到相同内容。
+    let observed = std::thread::spawn(move || sealed.reader().ground_parts(&reference).unwrap())
+        .join().unwrap();
+    assert!(Arc::ptr_eq(&expected.0, &observed.0));
+    let (GroundRecords::Versioned(a), GroundRecords::Versioned(b)) = (&expected.1, &observed.1);
+    assert!(Arc::ptr_eq(a, b));
+    assert_eq!(repo.counts().0, reads);
+    writer.observe([[0, 0, 0]], 21).unwrap();
+    let next = writer.seal(domain(), 2, 21).unwrap();
+    let new = next.reader().ground_parts(&next.manifest().blocks[0]).unwrap();
+    assert_eq!(expected.0[&local_key([0, 0, 0])].observed_ns, 20);
+    assert_eq!(new.0[&local_key([0, 0, 0])].observed_ns, 21);
+    assert_eq!(new.1, expected.1);
+    assert!(next.reader().reader.cached_bytes() <= 2 * 1024 * 1024);
+}

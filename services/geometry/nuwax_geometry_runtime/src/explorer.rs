@@ -949,7 +949,7 @@ impl SurfaceInputBuilder {
         let previous = self.previous.as_ref().filter(|(old, _)| {
             old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
         });
-        let mut reader = nuwax_map_chunks::Receiver::new(map.repository.clone());
+        let mut reader = map.reader();
         let (observations, changes) = nuwax_nav_mls_planner::surface_chunks::observations_with_changes(
             &mut reader, root, previous.map(|(old, grid)| (old.as_ref(), grid)),
         )?;

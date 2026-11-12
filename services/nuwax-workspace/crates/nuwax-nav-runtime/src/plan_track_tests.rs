@@ -64,6 +64,23 @@ fn next_pose(f: &mut SurfaceFollower, position: [f64; 3]) {
 }
 
 #[test]
+fn terminal_reference_joins_the_nearest_earliest_point_without_the_old_goal_detour() {
+    let stop = [4.775, -0.125, 0.];
+    let reference = [
+        [4.675, -0.075, 0.], [4.725, -0.075, 0.], [4.775, -0.025, 0.],
+        [4.825, 0.025, 0.], [4.875, 0.075, 0.], [4.875, 0.025, 0.],
+        [4.875, -0.025, 0.], [4.875, -0.075, 0.], [4.875, -0.125, 0.],
+    ];
+    assert_eq!(SurfaceFollower::reference_to_stop(&reference, stop),
+        vec![reference[0], reference[1], stop]);
+    let goal = [1., 0., 0.];
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], goal, [2., 0., 0.], goal], goal),
+        vec![[0., 0., 0.], goal]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [2., 0., 0.]], goal),
+        vec![[0., 0., 0.], goal]);
+}
+
+#[test]
 fn business_tolerance_keeps_the_current_curve_running() {
     let mut f=ready_follower();
     f.options.position_tolerance_m=0.15;

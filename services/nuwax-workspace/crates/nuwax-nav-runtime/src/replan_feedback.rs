@@ -17,6 +17,8 @@ pub struct ActualExecutionContext {
 /// 对应原路径身份的执行失败与实际上下文。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceReplanFeedback {
+    /// 当拍实际末段阶段，逼近无进展只在行进阶段计数。
+    pub terminal_phase: crate::TerminalPhase,
     /// 原路径身份。
     pub path_identity: Arc<PathExecutionIdentity>,
     /// 失败计算消费的输入。

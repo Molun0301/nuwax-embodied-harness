@@ -523,6 +523,8 @@ pub trait NavPlanner: Send + 'static {
     fn execution_cycle_complete(&self) -> bool { false }
     /// 等待轨迹或当拍命令受阻的原因；速度回执不覆盖该原因。
     fn execution_wait_reason(&self) -> Option<String> { None }
+    /// 跟随器实际末段阶段；普通后端始终处于行进。
+    fn terminal_phase(&self) -> TerminalPhase { TerminalPhase::Travel }
     /// 当前原生轨迹的只读显示副本。
     fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
     /// Produce one controller step without waiting for a background computation.
@@ -1118,7 +1120,7 @@ where
 
             self.planner.step()
         };
-        if self.current_route_kind == RouteKind::Approach {
+        if self.current_route_kind == RouteKind::Approach && self.planner.terminal_phase() == TerminalPhase::Travel {
             let near_endpoint = match (&self.current_path,&self.latest_pose) {
                 (Some((ExecutionPath::Surface(path),_)),Some(pose)) => path.poses.last()
                     .is_some_and(|end|pose.pose.position.distance(end.pose.position)<=0.15),
@@ -1132,6 +1134,7 @@ where
         let intent = self.wrap_local_intent(step)?;
         // 当拍同步跟踪与当前路线对应，实际上下文只供全局反馈复用。
         self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
+            terminal_phase: self.planner.terminal_phase(),
             path_identity: Arc::clone(&intent.identity),
             rejected_context: None,
             current_context: intent.execution_context.clone(),
@@ -1166,6 +1169,7 @@ where
                 self.planner.stop();
                 self.status.phase = SchedulerPhase::AwaitingPath;
                 self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
+                    terminal_phase: self.planner.terminal_phase(),
                     path_identity: Arc::clone(&intent.identity),
                     rejected_context: intent.execution_context,
                     current_context: zero_sent_context,
@@ -1996,6 +2000,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FakePlannerState {
+        terminal_phase: TerminalPhase,
         step: PlannerStep,
         wait_reason: Option<String>,
         costmap_updates: usize,
@@ -2007,6 +2012,7 @@ mod tests {
         fn commanding() -> Self {
             Self {
                 state: Arc::new(Mutex::new(FakePlannerState {
+                    terminal_phase: TerminalPhase::Travel,
                     step: PlannerStep::Command(Twist2 {
                         linear: Point2::new(0.2, 0.0),
                         angular_z: 0.1,
@@ -2021,6 +2027,9 @@ mod tests {
     }
 
     impl NavPlanner for FakePlanner {
+        fn terminal_phase(&self) -> TerminalPhase {
+            self.state.lock().unwrap().terminal_phase
+        }
         fn replace_path(&mut self, _path: Path2D) {}
 
         fn update_odometry(&mut self, _odometry: PoseStamped) {
@@ -2079,6 +2088,27 @@ mod tests {
         scheduler.submit_path(&status, path()).await.unwrap();
         scheduler.session_tick(&status).await.unwrap();
         (scheduler, status, motion)
+    }
+
+    #[tokio::test]
+    async fn approach_near_endpoint_keeps_terminal_turn_and_translation_commands() {
+        for phase in [TerminalPhase::Travel, TerminalPhase::Turning, TerminalPhase::Translating] {
+            let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+            scheduler.current_route_kind = RouteKind::Approach;
+            scheduler.current_path = Some((ExecutionPath::Surface(Path3D { poses: vec![map_pose()] }), None));
+            scheduler.planner.state.lock().unwrap().terminal_phase = phase;
+            scheduler.control_tick(&status).await.unwrap();
+            if phase == TerminalPhase::Travel {
+                assert_eq!(scheduler.status.phase, SchedulerPhase::AwaitingPath);
+                assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+            } else {
+                assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
+                assert_eq!(scheduler.status.last_applied_twist, Some(Twist2 { linear: Point2::new(0.2, 0.), angular_z: 0.1 }));
+            }
+            let feedback = scheduler.status.surface_replan_feedback.as_ref().unwrap();
+            assert_eq!(feedback.terminal_phase, phase);
+            assert_eq!(feedback.zero_sent_rejection, phase == TerminalPhase::Travel);
+        }
     }
 
     #[tokio::test]

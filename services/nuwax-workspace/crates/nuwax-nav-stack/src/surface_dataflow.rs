@@ -662,7 +662,11 @@ async fn run_surface_planner_with_computer(
                                 // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
                                 let at_end=pose.as_ref().is_some_and(|current|
                                     current.pose.position.distance(state.endpoint)<=0.15);
-                                if at_end {
+                                let terminal = execution_feedback.as_ref().is_some_and(|feedback|
+                                    feedback.path_identity.session_id == planned_goal.session_id
+                                        && feedback.path_identity.goal_key == planned_goal.goal_key()
+                                        && feedback.terminal_phase != nuwax_nav_runtime::TerminalPhase::Travel);
+                                if at_end && !terminal {
                                     state.stagnant+=1;
                                     if state.stagnant>=3 {
                                         let reason=approach_failure(end,target,state.stagnant);

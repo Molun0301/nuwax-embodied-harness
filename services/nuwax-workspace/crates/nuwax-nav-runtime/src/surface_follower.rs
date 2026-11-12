@@ -858,6 +858,9 @@ impl NavPlanner for SurfaceFollower {
     fn execution_wait_reason(&self) -> Option<String> {
         self.wait_reason.clone()
     }
+    fn terminal_phase(&self) -> TerminalPhase {
+        self.terminal_phase
+    }
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
         self.local_path.clone()
     }

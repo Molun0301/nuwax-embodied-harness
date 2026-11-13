@@ -988,7 +988,8 @@ class Go2DirectDdsBridge:
             from drivers.go2.sensor_process import Go2SensorProcess
             worker = Go2SensorProcess(self.config,
                 calibration_profile=self._calibration_profile,
-                forward_samples=True,
+                # 三维输入在子进程内直接交给Geometry；未启动建图时没有标准帧消费者。
+                forward_samples=False,
                 on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
                 on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),
                 on_error=lambda message, stamp: self._fail_sensor_process(message, stamp, generation))
@@ -1169,6 +1170,7 @@ class Go2DirectDdsBridge:
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
+
             stop_event = self._direct_dds_stop_event
             threads = tuple(self._direct_dds_threads)
             pose_subscriber = self._direct_pose_subscriber
@@ -1203,6 +1205,15 @@ class Go2DirectDdsBridge:
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
+
+    def get_sensor_input_executor(self):
+        """新建图请求重新启动已经失败的采集拥有方，不复用死亡进程。"""
+        with self._lifecycle_lock:
+            worker = self._sensor_process
+            if worker is not None and worker.input_delivery_status().get("runtime_unavailable"):
+                self.stop()
+                self.start()
+            return self._sensor_process
 
     def _fail_sensor_process(self, message: str, stamp: int, generation: int) -> None:
         from contracts.sensors import SensorStreamFailure
@@ -2346,7 +2357,7 @@ class Go2DeviceDataPlane:
 
     def get_sensor_input_executor(self):
         """仅返回当前代际已启动的采集进程。"""
-        return self.runtime.bridge._sensor_process
+        return self.runtime.bridge.get_sensor_input_executor()
 
     def start(self) -> None:
         self.runtime.start()

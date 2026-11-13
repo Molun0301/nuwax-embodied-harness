@@ -19,6 +19,8 @@ STOP_TIMEOUT = 15
 RESTART_DELAY = 3
 RESTART_MAX = 30
 STABLE_SECONDS = 60
+# 组件状态的中文由监督者给出；未启用的组件不会被启动，单独说明。
+STATE_TITLES = {"stopped": "已停止", "starting": "启动中", "running": "运行中", "exited": "已退出"}
 LIBC = ctypes.CDLL(None)
 
 
@@ -68,6 +70,7 @@ def gateway_ready(port):
 @dataclass
 class Component:
     command: list
+    title: str
     environment: dict = field(default_factory=dict)
     dependencies: tuple = ()
     ready: object = None
@@ -90,19 +93,19 @@ def component_table(root, config):
     geometry_ready = home / "runtime_data/geometry/nuwax_geometry_runtime.ready.runtime"
     follow_ready = home / "runtime_data/person-follow/nuwax_person_follow.ready.runtime"
     return {
-        "motion_guard": Component([sys.executable, "-m", "services.navigation.motion_safety_guard"],
+        "motion_guard": Component([sys.executable, "-m", "services.navigation.motion_safety_guard"], "运动安全守卫",
             ready=lambda: socket_ready(motion_guard_socket(home)), enabled=bool(config["motion_guard"]["backend"])),
-        "nav_stack": Component([binary_path("nuwax-nav-stack"), "--profile=" + config["derived"]["nav_profile"]],
+        "nav_stack": Component([binary_path("nuwax-nav-stack"), "--profile=" + config["derived"]["nav_profile"]], "导航规划与执行",
             dependencies=("motion_guard",), ready=nav_ready, enabled=config["navigation"]["autostart"]),
-        "geometry": Component([binary_path("nuwax-geometry-runtime")], ready=geometry_ready,
+        "geometry": Component([binary_path("nuwax-geometry-runtime")], "定位与建图", ready=geometry_ready,
             enabled=config["geometry"]["external_enabled"]),
-        "person_follow": Component([binary_path("nuwax-person-follow")], dependencies=("nav_stack", "geometry"),
+        "person_follow": Component([binary_path("nuwax-person-follow")], "人物跟随", dependencies=("nav_stack", "geometry"),
             ready=follow_ready, enabled=config["person_follow"]["autostart"]),
         "gateway": Component([sys.executable, "-m", "uvicorn", "gateways.app:create_gateway_app_from_env", "--factory",
             "--host", config["gateway"]["host"], "--port", str(config["gateway"]["port"]),
-            "--ws-per-message-deflate", "false", "--timeout-graceful-shutdown", "5"],
+            "--ws-per-message-deflate", "false", "--timeout-graceful-shutdown", "5"], "网关",
             ready=lambda: gateway_ready(config["gateway"]["port"]), automatic=True),
-        "video": Component([sys.executable, "-m", "drivers.go2.video_streamer"], automatic=True,
+        "video": Component([sys.executable, "-m", "drivers.go2.video_streamer"], "摄像头视频推流", automatic=True,
             enabled=config["robot"]["driver"] == "go2" and config["go2"]["video_stream_enabled"]),
     }
 
@@ -127,7 +130,8 @@ class Supervisor:
         for name in names:
             item = self.components[name]
             if self.stopping.is_set() or not item.enabled:
-                return {"ok": False, "component": name, "error": "业务正在停止" if self.stopping.is_set() else "组件未启用"}
+                return {"ok": False, "component": name, "title": item.title,
+                        "error": "业务正在停止" if self.stopping.is_set() else "组件未启用"}
             result = await self.ensure(item.dependencies)
             if not result["ok"]:
                 return result
@@ -170,7 +174,7 @@ class Supervisor:
             item.error = str(error)
             if item.process is None or item.process.returncode is not None:
                 item.state = "exited"
-            return {"ok": False, "component": name, "error": item.error}
+            return {"ok": False, "component": name, "title": item.title, "error": item.error}
 
     async def watch(self, item, process):
         code = await process.wait()
@@ -179,7 +183,9 @@ class Supervisor:
 
     def status(self):
         return {"pid": os.getpid(), "components": {
-            name: {"state": item.state, "pid": item.process.pid if item.process else None,
+            name: {"title": item.title, "state": item.state,
+                   "state_title": STATE_TITLES[item.state] if item.enabled else "未启用",
+                   "pid": item.process.pid if item.process else None,
                    "exit_code": item.exit_code, "error": item.error,
                    "log_file": str(item.log_file) if item.log_file is not None else None}
             for name, item in self.components.items()}}

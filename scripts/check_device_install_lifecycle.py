@@ -276,7 +276,7 @@ class ComponentDiagnosticChecks(Checks):
         config = ConfigStore(self.engine.home).install("诊断", {"logging.dir": str(directory)})
 
         async def exited_gateway():
-            component = Component([sys.executable, "-c", "raise AttributeError('current gateway fixture failure')"])
+            component = Component([sys.executable, "-c", "raise AttributeError('current gateway fixture failure')"], "网关")
             owner = Supervisor(ROOT, {"NUWAX_INSTALL_HOME": str(self.engine.home)}, components={"gateway": component})
             await owner.start_component("gateway", component)
             await component.process.wait()

@@ -22,9 +22,10 @@ def ensure(names: Sequence[str], timeout_sec: float) -> None:
     try:
         result = request({"op": "ensure", "components": list(names)}, timeout_sec)
     except OSError as error:
-        result = {"component": ",".join(names), "error": str(error), "ok": False}
+        # 连不上的是监督者本身。
+        result = {"component": ",".join(names), "title": "业务监督者", "error": str(error), "ok": False}
     if not result["ok"]:
-        raise GatewayError("组件不可用：%s：%s" % (result["component"], result["error"]),
+        raise GatewayError("组件不可用：%s：%s" % (result["title"], result["error"]),
             error_code="component_unavailable", http_status=503,
             details={"component": result["component"], "reason": result["error"]})
 

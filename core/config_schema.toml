@@ -205,8 +205,8 @@ apply = "hot"
 [gateway.telemetry_process_keywords]
 type = "array"
 items = "string"
-default = ["gateway", "nuwax-geometry-runtime", "nuwax-nav-stack", "nuwax-go2-video-streamer"]
-description = "性能采集时用于匹配相关进程命令行的关键词列表。"
+default = ["gateway", "nuwax-geometry-runtime", "nuwax-nav-stack", "nuwax-person-follow", "motion_safety_guard", "drivers.go2.video_streamer"]
+description = "性能采集时用于匹配相关进程命令行的关键词列表。网关及其子进程另按进程树采集。"
 consumers = [
     "core/settings.py:load_config",
 ]

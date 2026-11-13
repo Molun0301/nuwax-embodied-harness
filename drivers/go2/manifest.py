@@ -70,7 +70,9 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
                 "gateway",
                 "nuwax_geometry_runtime",
                 "robot_bridge",
-                "nuwax-go2-video-streamer",
+                "nuwax-person-follow",
+                "motion_safety_guard",
+                "drivers.go2.video_streamer",
             ),
         ),
     )

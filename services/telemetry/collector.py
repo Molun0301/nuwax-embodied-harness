@@ -41,7 +41,7 @@ _DEFAULT_PROCESS_KEYWORDS = (
     "nuwax-log-query",
     "nuwax-geometry-runtime",
     "nuwax-nav-stack",
-    "nuwax-go2-video-streamer",
+    "drivers.go2.video_streamer",
 )
 _CMDLINE_SENSITIVE_KEY_RE = re.compile(
     r"(?i)(--?(?:token|api[_-]?key|secret|password|access[_-]?key|authorization|cookie)(?:=|\s+))(?:Bearer\s+)?([^\s]+)"
@@ -59,6 +59,9 @@ class ProcessIdentity:
 
 _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("log_query", "日志历史查询", "nuwax-log-query"),
+    # 网关以 spawn 派生的 Go2 采集子进程在入口自设进程名（Linux 短名上限15字节）。
+    ("go2_sensor_input", "Go2 传感器采集", "nuwax-go2-input"),
+    ("multiprocessing_tracker", "多进程资源回收", "multiprocessing.resource_tracker"),
     ("gateway_web", "网关 Web 服务", "nuwax-gateway-web"),
     ("gateway_supervisor", "业务监督者", "scripts.supervisor"),
     ("slam_2d_worker", "二维激光建图", "nuwax-slam-2d-worker"),
@@ -66,7 +69,7 @@ _PROCESS_PATTERNS: Sequence[tuple[str, str, str]] = (
     ("geometry_external", "统一几何服务", "nuwax-geometry-external"),
     ("nav_stack", "Native 导航栈", "nuwax-nav-stack"),
     ("static_tf", "静态 TF", "nuwax-static-tf"),
-    ("go2_video_streamer", "Go2 视频推流", "nuwax-go2-video-streamer"),
+    ("go2_video_streamer", "Go2 视频推流", "drivers.go2.video_streamer"),
     ("gateway_web", "网关 Web 服务", "uvicorn gateways.app:create_gateway_app_from_env"),
     ("geometry_runtime", "Native geometry runtime", "nuwax_geometry_runtime"),
 )

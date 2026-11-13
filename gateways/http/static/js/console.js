@@ -581,9 +581,10 @@
         renderServiceStatus();
       }
       // 服务状态页：监督者的每个组件一行，样式同任务状态页；中文名与状态中文都由监督者给出，
-      // 这里只按状态选颜色。有性能采集时按进程号附上该进程的 CPU 与内存。
+      // 这里只按状态选颜色。有性能采集时按进程号附上该进程的 CPU 与内存；采集按进程树
+      // 收进来的子进程（如网关派生的 Go2 传感器采集）列在其根进程所在行下，名称取自采集端。
       const SERVICE_STATE_CLASSES = { running: "available", starting: "stale", stopped: "idle", exited: "error" };
-      function serviceRow(title, key, pillClass, pillText, detail) {
+      function serviceRow(title, key, pillClass, pillText, detail, children = []) {
         const row = document.createElement("article");
         row.className = "service-row";
         const left = document.createElement("div");
@@ -606,6 +607,12 @@
         meta.className = "meta";
         meta.textContent = detail;
         left.append(heading, meta);
+        for (const text of children) {
+          const child = document.createElement("div");
+          child.className = "meta service-sub";
+          child.textContent = text;
+          left.append(child);
+        }
         row.append(left);
         return row;
       }
@@ -625,13 +632,18 @@
           return;
         }
         const sampled = new Map((metrics?.processes || []).map(proc => [proc.pid, proc]));
+        const tree = (metrics?.processes || []).filter(proc => proc.matched_keyword === "process_tree");
         for (const [name, item] of Object.entries(processes)) {
           const parts = [`PID ${item.pid ?? "--"}`];
           const proc = sampled.get(item.pid);
           if (proc) parts.push(`CPU ${fmt(proc.cpu_percent, "%")}`, `内存 ${formatGB(proc.rss_bytes)}`);
           if (item.error) parts.push(item.error);
           else if (item.exit_code != null) parts.push(`退出码 ${item.exit_code}`);
-          nodes.push(serviceRow(item.title, name, SERVICE_STATE_CLASSES[item.state], item.state_title, parts.join(" · ")));
+          const children = tree.some(child => child.pid === item.pid)
+            ? tree.filter(child => child.pid !== item.pid).sort((a, b) => b.cpu_percent - a.cpu_percent)
+              .map(child => `${child.display_name} · PID ${child.pid} · CPU ${fmt(child.cpu_percent, "%")} · 内存 ${formatGB(child.rss_bytes)}`)
+            : [];
+          nodes.push(serviceRow(item.title, name, SERVICE_STATE_CLASSES[item.state], item.state_title, parts.join(" · "), children));
         }
         els.governanceMeta.replaceChildren(...nodes);
       }

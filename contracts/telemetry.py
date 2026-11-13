@@ -15,6 +15,8 @@ class TelemetryStatus(StrEnum):
     STALE = "stale"
     ERROR = "error"
     UNSUPPORTED = "unsupported"
+    # 设置里关闭了性能采集（gateway.telemetry_enabled），不是采集故障。
+    DISABLED = "disabled"
 
 
 class CpuMetric(ContractModel):

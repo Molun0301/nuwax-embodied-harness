@@ -275,9 +275,12 @@ async function fetchConfigSchema({ afterSave = false } = {}) {
     const query = new URLSearchParams();
     if (configState.robot) query.set('robot', configState.robot);
     if (configState.profile) query.set('profile', configState.profile);
-    const session = await fetch('/api/manager/session').then(response => response.json());
+    // 读取配置不依赖会话；会话只为之后的写请求取校验值，两者并行发出。
+    const [session, resp] = await Promise.all([
+      fetch('/api/manager/session').then(response => response.json()),
+      fetch("/api/manager/config?" + query),
+    ]);
     configState.csrf = session.csrf_token;
-    const resp = await fetch("/api/manager/config?" + query);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const schema = await resp.json();
     if (request !== configState.schemaRequest) return false;
@@ -332,9 +335,8 @@ function renderConfigSchema(schema) {
     ? schema.application?.hot_apply_pending || [] : []);
   let sectionIndex = 0;
   for (const section of schema.sections || []) {
+    // 段与键的先后来自模式文件，这里不另行排序。
     const fields = (section.fields || []).filter(match);
-    // 模式放在预算上限之前，其余设置继续沿用目录顺序。
-    fields.sort((a, b) => Number(b.key === FINE_CLOUD_CACHE_KEY) - Number(a.key === FINE_CLOUD_CACHE_KEY));
     if (!fields.length) continue;
     const normal = fields.filter((f) => !f.advanced);
     const advanced = fields.filter((f) => f.advanced);

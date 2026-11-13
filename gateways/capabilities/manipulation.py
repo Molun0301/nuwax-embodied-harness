@@ -15,7 +15,7 @@ def execute_manipulation_task(platform, ctx, args):
             http_status=503 if error.code == "manipulation_unavailable" else 409) from error
 
 
-CAPABILITIES = [Capability("execute_manipulation_task", "把操作指令交给配置的设备并跟踪真实物理结果；取消转发设备取消，不等待停稳证明。",
+CAPABILITIES = [Capability("execute_manipulation_task", "执行操作任务", "把操作指令交给配置的设备并跟踪真实物理结果；取消转发设备取消，不等待停稳证明。",
     {"type": "object", "properties": {
         "instruction": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": r"\S"},
         "timeout_sec": {"type": "number", "minimum": 1, "maximum": 1800, "default": 120},

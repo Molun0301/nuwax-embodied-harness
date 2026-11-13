@@ -144,7 +144,6 @@
         latestHealth: null,
         latestSystemMetrics: null,
         latestGovernance: null,
-        latestServiceHealth: null,
         latestTasks: { active_tasks: [], history_tasks: [] },
         taskActiveById: new Map(),
         taskHistoryById: new Map(),
@@ -199,11 +198,11 @@
       const els = {
         robotName: document.getElementById("robotName"),
         robotModel: document.getElementById("robotModel"),
-        connectionText: document.getElementById("connectionText"),
         runtimeMode: document.getElementById("runtimeMode"),
         batteryMetric: document.getElementById("batteryMetric"),
         networkLatency: document.getElementById("networkLatency"),
         resourceMetric: document.getElementById("resourceMetric"),
+        telemetryHint: document.getElementById("telemetryHint"),
         clockNow: document.getElementById("clockNow"),
         motionStatus: document.getElementById("motionStatus"),
         missionStatus: document.getElementById("missionStatus"),
@@ -244,7 +243,6 @@
         navigationPathLegend: null,
         navigationPathStatus: null,
         frontierNotice: document.getElementById("frontierNotice"),
-        governanceStatus: document.getElementById("governanceStatus"),
         governanceMeta: document.getElementById("governanceMeta"),
         videoStatus: document.getElementById("videoStatus"),
         videoFrame: document.getElementById("videoFrame"),
@@ -271,7 +269,6 @@
         videoMeta: document.getElementById("videoMeta"),
         visionModelStatus: document.getElementById("visionModelStatus"),
         videoFpsStatus: document.getElementById("videoFpsStatus"),
-        servicesStatus: document.getElementById("servicesStatus"),
         serviceMatrix: document.getElementById("serviceMatrix"),
         logsStatus: document.getElementById("logsStatus"),
         logsMeta: document.getElementById("logsMeta"),
@@ -317,11 +314,18 @@
       }
       initTabPanels();
 
+      // 三维视图只在监控页、3D 模式且标签页可见时运行；机器人模型与完整点云的轮询随之启停。
+      function sync3dVisibility() {
+        window.pointcloud3d?.setVisible(state.mapViewMode === "3d" && !document.hidden
+          && document.getElementById("monitor-view").classList.contains("active"));
+      }
+      document.addEventListener("visibilitychange", sync3dVisibility);
       function openConsoleView(targetId) {
         const buttons = Array.from(document.querySelectorAll(".view-switch-btn"));
         const panes = Array.from(document.querySelectorAll("#view-host > .view-pane"));
         for (const item of buttons) item.classList.toggle("active", item.dataset.viewTarget === targetId);
         for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
+        sync3dVisibility();
         if (targetId === "config-view") window.nuwaxConsoleSettings?.open();
         if (targetId === "logs-view") window.nuwaxConsoleLogs?.open();
         if (targetId === "monitor-view") redrawMapAfterResize();
@@ -398,17 +402,6 @@
         idle: "空闲",
       };
       const BOOL_LABELS = { true: "是", false: "否" };
-      const SOURCE_KIND_LABELS = {
-        live: "实时",
-        stream: "流式",
-        stream_bus: "流总线",
-        cache: "缓存",
-        offline: "离线",
-        unavailable: "不可用",
-        pointcloud_provider: "点云服务",
-        gateway: "网关",
-        psutil: "系统采集",
-      };
       const COMMON_FIELD_LABELS = {
         latency: "延迟",
         frame: "坐标系",
@@ -473,18 +466,6 @@
         if (value === true || value === "true") return BOOL_LABELS.true;
         if (value === false || value === "false") return BOOL_LABELS.false;
         return "未上报";
-      }
-      function displaySource(value) {
-        const key = String(value === null || value === undefined || value === "" ? "missing" : value).toLowerCase();
-        return SOURCE_KIND_LABELS[key] || safeText(value);
-      }
-      function displayValue(value, kind) {
-        if (kind === "status") return displayStatus(value);
-        if (kind === "bool") return displayBool(value);
-        if (kind === "source") return displaySource(value);
-        if (kind === "task_state") return TASK_STATE_LABELS[normalizeTaskState(value)] || displayStatus(value);
-        if (value === true || value === false) return displayBool(value);
-        return safeText(value);
       }
       function statusOf(envelope) { return envelope && envelope.status ? String(envelope.status) : "missing"; }
       function statusClass(status) {
@@ -606,449 +587,72 @@
         state.latestOverview = data || {};
         renderServiceStatus();
       }
-      function serviceAdvice(status, fallback) {
-        const cls = statusClass(status);
-        if (cls === "available") return fallback || "无需处理";
-        if (cls === "stale" || cls === "idle") return fallback || "等待服务刷新，必要时查看运行日志";
-        if (cls === "error") return fallback || "查看运行日志定位错误";
-        if (String(status || "").toLowerCase() === "unsupported") return "当前环境不支持该服务";
-        return fallback || "检查服务是否启用并查看运行日志";
-      }
-      const SERVICE_SOURCE_LABELS = {
-        gateway_runtime: "网关运行时",
-        stream_bus: "实时流总线",
-        task_manager: "任务管理器",
-        mapping_service: "地图服务",
-        localization_service: "定位服务",
-        navigation_service: "导航服务",
-        perception_video_runtime: "感知视频运行时",
-        artifact_service: "制品服务",
-        platform_geometry_runtime: "统一几何运行时",
-        robot_assembly: "机器人数据面",
-        "system.metrics": "系统进程采集",
-        frontend_request: "网页请求",
-      };
-      // 常显实际连接与运行组件，其余能力状态按需查看；不改变后端健康结论。
-      const SERVICE_PRIMARY_IDS = new Set(["gateway_web", "robot_data_plane", "geometry_runtime"]);
-      const SERVICE_DISPLAY_NAMES = {
-        gateway_web: "网页网关",
-        robot_data_plane: "机器人数据接入", geometry_runtime: "几何运行进程",
-        person_follow: "人物跟随", artifacts: "记忆与文件存储",
-      };
-      const SERVICE_ATTENTION_STATUSES = new Set(["error", "missing", "degraded", "stale"]);
-      function displayServiceSource(value) {
-        const key = String(value || "").trim();
-        return SERVICE_SOURCE_LABELS[key] || displaySource(value);
-      }
-      function normalizeServiceHealthSummary(raw, sourceLabel) {
-        if (!raw || typeof raw !== "object") return null;
-        const entries = Array.isArray(raw.entries) ? raw.entries : (Array.isArray(raw.services) ? raw.services : []);
-        if (!entries.length) return null;
-        const normalizedEntries = entries
-          .filter(Boolean)
-          .map((entry, index) => ({
-            ...entry,
-            service_id: entry.service_id || entry.id || `service-${index}`,
-            display_name: entry.display_name || entry.name || entry.service_id || `服务 ${index + 1}`,
-            status: String(entry.status || "missing").toLowerCase(),
-            order: Number.isFinite(Number(entry.order)) ? Number(entry.order) : index,
-            source: entry.source || sourceLabel || raw.source || "service_health",
-          }))
-          .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
-        return {
-          ...raw,
-          entries: normalizedEntries,
-          status: String(raw.status || worstStatus(normalizedEntries)).toLowerCase(),
-          source: raw.source || sourceLabel || "service_health",
-          authoritative: raw.authoritative !== false,
-        };
-      }
-      function mergeServiceHealth(raw, sourceLabel, mode = "replace") {
-        // 任务 4.1：mode 参数；默认 "replace"（向后兼容任务 4.8）
-        if (mode === "replace") return mergeServiceHealthReplace(raw, sourceLabel);
-        if (mode === "patch") return mergeServiceHealthPatch(raw, sourceLabel);
-        return false;
-      }
-      function mergeServiceHealthReplace(raw, sourceLabel) {
-        const normalized = normalizeServiceHealthSummary(raw, sourceLabel);
-        if (!normalized) return false;
-        state.latestServiceHealth = normalized;
-        // replace 模式同时刷一次进程证据（后端 snapshot 已包含 process_evidence，但前端 frame 未带）
-        patchServiceHealthProcessEvidence();
-        renderServiceStatus();
-        return true;
-      }
-      function mergeServiceHealthPatch(raw, sourceLabel) {
-        // 任务 4.3：patch 模式 —— 仅更新 process_evidence/process_sampled_at/process_source
-        // 禁止覆盖 status/summary/evidence/reason/advice 主字段
-        if (!state.latestServiceHealth || !Array.isArray(state.latestServiceHealth.entries)) return false;
-        const snap = state.latestSystemMetrics || {};
-        const processes = Array.isArray(snap.processes) ? snap.processes : [];
-        if (!processes.length) return false;
-        const byRole = new Map();
-        for (const proc of processes) {
-          const role = proc && proc.role;
-          if (!role) continue;
-          if (!byRole.has(role)) byRole.set(role, []);
-          byRole.get(role).push(proc);
-        }
-        let changed = false;
-        const frameSampledAt = snap.sampled_at;
-        const entries = state.latestServiceHealth.entries.map((entry) => {
-          const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
-          if (!roles.length) return entry;
-          const processEvidence = [];
-          for (const role of roles) {
-            for (const proc of byRole.get(role) || []) {
-              processEvidence.push({
-                role,
-                display_name: proc.display_name || proc.name || role,
-                pid: proc.pid,
-                cpu_percent: proc.cpu_percent,
-                rss_bytes: proc.rss_bytes,
-                sampled_at: frameSampledAt,
-                source: "system.metrics",
-              });
-            }
-          }
-          if (!processEvidence.length) return entry;
-          changed = true;
-          const updated = {
-            ...entry,
-            process_evidence: processEvidence,
-            process_sampled_at: frameSampledAt,
-            process_source: "system.metrics",
-          };
-          // 任务 4.6a：patch 必须使用 frame 自身 sampled_at（dev 模式断言；生产可注释）
-          if (typeof console !== "undefined" && console.assert) {
-            console.assert(updated.process_sampled_at === frameSampledAt, "process_sampled_at drift between frame and patched entry");
-          }
-          return updated;
-        });
-        if (changed) {
-          state.latestServiceHealth = { ...state.latestServiceHealth, entries };
-          renderServiceStatus();
-        }
-        return changed;
-      }
-      function patchServiceHealthProcessEvidence() {
-        // 兼容旧调用方（replace 模式内部仍用）；统一走 patch 实现，数据源固定为 state.latestSystemMetrics
-        return mergeServiceHealthPatch();
-      }
-      function serviceHealthAttentionCount(summary) {
-        const fromBackend = summary && summary.metadata && Number(summary.metadata.attention_count);
-        if (Number.isFinite(fromBackend)) return fromBackend;
-        const entries = summary && Array.isArray(summary.entries) ? summary.entries : [];
-        return entries.filter((entry) => SERVICE_ATTENTION_STATUSES.has(String(entry.status || "").toLowerCase())).length;
-      }
-      function serviceProcessText(entry) {
-        const evidence = Array.isArray(entry.process_evidence) ? entry.process_evidence : [];
-        if (evidence.length) {
-          // 任务 6.1.3：命中时显示 ✓ PID xxx 已匹配
-          return evidence.slice(0, 2).map((proc) => {
-            const name = proc.display_name || proc.role || "进程";
-            const pid = proc.pid === undefined || proc.pid === null ? "--" : proc.pid;
-            return `✓ PID ${pid} ${name}`;
-          }).join(" / ");
-        }
-        const roles = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [];
-        return roles.length ? "暂无匹配进程证据" : "";
-      }
-      // 服务与进程合并：用 process_evidence 的角色与 PID 把实时资源数据挂到对应服务上。
-      function liveProcessesForService(entry) {
-        const processes = Array.isArray(state.latestSystemMetrics?.processes) ? state.latestSystemMetrics.processes : [];
-        if (!processes.length) return [];
-        const roles = new Set();
-        const pids = new Set();
-        for (const proc of (Array.isArray(entry.process_evidence) ? entry.process_evidence : [])) {
-          if (!proc) continue;
-          if (proc.role) roles.add(String(proc.role).replaceAll("-", "_"));
-          if (proc.pid !== undefined && proc.pid !== null) pids.add(String(proc.pid));
-        }
-        for (const role of (Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles : [])) {
-          if (role) roles.add(String(role).replaceAll("-", "_"));
-        }
-        if (entry.service_id) roles.add(String(entry.service_id).replaceAll("-", "_"));
-        return processes.filter((proc) => {
-          if (!proc) return false;
-          if (pids.has(String(proc.pid))) return true;
-          return roles.has(String(proc.role || "").replaceAll("-", "_"))
-            || roles.has(String(proc.name || "").replaceAll("-", "_"));
-        });
-      }
-      function hasProcessTelemetry() {
-        const telemetry = state.latestSystemMetrics;
-        return Boolean(telemetry && Array.isArray(telemetry.processes) && telemetry.processes.length);
-      }
-      function serviceTelemetryHintNode() {
-        if (!state.serviceTelemetryHint) {
-          const hint = document.createElement("p");
-          hint.className = "service-health-hint";
-          hint.textContent = "未收到性能遥测，进程与资源占用暂不可见。";
-          state.serviceTelemetryHint = hint;
-        }
-        state.serviceTelemetryHint.hidden = hasProcessTelemetry();
-        return state.serviceTelemetryHint;
-      }
-      function buildServiceProcessRow(entry) {
-        const matched = liveProcessesForService(entry);
-        const expects = Array.isArray(entry.expected_process_roles) ? entry.expected_process_roles.length : 0;
-        const row = document.createElement("div");
-        row.className = "service-health-process";
-        if (!matched.length) {
-          // 没有进程证据时保留同一列结构，便于纵向扫读；不臆造数值。
-          // 期望存在却未匹配按警告呈现，本就不依赖本地进程的服务按次要信息呈现。
-          const hasTelemetry = hasProcessTelemetry();
-          row.dataset.state = hasTelemetry && expects ? "missing" : "none";
-          // 完全没有遥测时由列表顶部统一说明，各行不再重复显示占位。
-          row.hidden = !hasTelemetry;
-          const emptyPid = document.createElement("span");
-          emptyPid.className = "shp-pid";
-          emptyPid.textContent = "PID --";
-          const emptyCpu = document.createElement("span");
-          emptyCpu.className = "shp-metric";
-          emptyCpu.append("CPU");
-          const emptyCpuValue = document.createElement("b");
-          emptyCpuValue.textContent = "--";
-          emptyCpu.appendChild(emptyCpuValue);
-          const emptyMem = document.createElement("span");
-          emptyMem.className = "shp-metric";
-          emptyMem.append("内存");
-          const emptyMemValue = document.createElement("b");
-          emptyMemValue.textContent = "--";
-          emptyMem.appendChild(emptyMemValue);
-          row.append(emptyPid, emptyCpu, emptyMem);
-          return row;
-        }
-        row.dataset.state = "running";
-        const proc = matched[0];
-        const pid = document.createElement("span");
-        pid.className = "shp-pid";
-        pid.textContent = `PID ${proc.pid === undefined || proc.pid === null ? "--" : proc.pid}`;
-        const cpu = document.createElement("span");
-        cpu.className = "shp-metric";
-        cpu.append("CPU");
-        const cpuValue = document.createElement("b");
-        cpuValue.textContent = fmt(proc.cpu_percent, "%");
-        cpu.appendChild(cpuValue);
-        const mem = document.createElement("span");
-        mem.className = "shp-metric";
-        mem.append("内存");
-        const memValue = document.createElement("b");
-        memValue.textContent = formatGB(proc.rss_bytes);
-        mem.appendChild(memValue);
-        row.append(pid, cpu, mem);
-        if (matched.length > 1) {
-          const more = document.createElement("span");
-          more.className = "shp-metric";
-          more.textContent = `等 ${matched.length} 个进程`;
-          row.appendChild(more);
-        }
-        return row;
-      }
-      // 未关联到任何服务的进程仍要可见，收进「其它进程」，避免进程矩阵信息丢失。
-      function serviceOthersNode(entries) {
-        if (!state.serviceOthersNode) {
-          const node = document.createElement("details");
-          node.className = "service-health-more service-others";
-          const label = document.createElement("summary");
-          const list = document.createElement("div");
-          list.className = "service-health-list";
-          node.append(label, list);
-          state.serviceOthersNode = node;
-        }
-        const node = state.serviceOthersNode;
-        const metrics = state.latestSystemMetrics;
-        const processes = Array.isArray(metrics?.processes) ? metrics.processes : [];
-        const claimed = new Set();
-        for (const entry of entries) {
-          for (const proc of liveProcessesForService(entry)) {
-            if (proc && proc.pid !== undefined && proc.pid !== null) claimed.add(String(proc.pid));
-          }
-        }
-        const rest = processes.filter((proc) => proc && !claimed.has(String(proc.pid)));
-        const degraded = metrics && metrics.psutil_available === false;
-        setText(node.firstElementChild, degraded ? "进程与性能采集不可用（已降级）" : `其它进程（${rest.length}）`);
-        node.hidden = !rest.length && !degraded;
-        node.lastElementChild.replaceChildren(...rest.map(buildProcessSummaryRow));
-        return node;
-      }
-      function buildProcessSummaryRow(proc) {
+      // 服务状态页：监督者的每个组件一行，样式同任务状态页；中文名与状态中文都由监督者给出，
+      // 这里只按状态选颜色。有性能采集时按进程号附上该进程的 CPU 与内存；采集按进程树
+      // 收进来的子进程（如网关派生的 Go2 传感器采集）列在其根进程所在行下，名称取自采集端。
+      const SERVICE_STATE_CLASSES = { running: "available", starting: "stale", stopped: "idle", exited: "error" };
+      function serviceRow(title, key, pillClass, pillText, detail, children = []) {
         const row = document.createElement("article");
         row.className = "service-row";
         const left = document.createElement("div");
-        const title = document.createElement("div");
-        title.className = "mono";
-        title.textContent = `${processPurposeName(proc)} · 进程号 ${safeText(proc.pid)}`;
+        const heading = document.createElement("div");
+        heading.className = "task-row-heading";
+        const name = document.createElement("div");
+        name.className = "mono";
+        name.textContent = title;
+        if (key) {
+          const id = document.createElement("span");
+          id.className = "meta";
+          id.textContent = ` ${key}`;
+          name.append(id);
+        }
+        const pill = document.createElement("span");
+        pill.className = `pill ${pillClass}`;
+        pill.textContent = pillText;
+        heading.append(name, pill);
         const meta = document.createElement("div");
         meta.className = "meta";
-        meta.textContent = `内存 ${formatGB(proc.rss_bytes)} · 处理器 ${fmt(proc.cpu_percent, "%")}`;
-        left.append(title, meta);
-        const pill = document.createElement("span");
-        pill.className = "pill mono";
-        pill.textContent = `${Math.round(Number(proc.cpu_percent) || 0)}%`;
-        row.append(left, pill);
+        meta.textContent = detail;
+        left.append(heading, meta);
+        for (const text of children) {
+          const child = document.createElement("div");
+          child.className = "meta service-sub";
+          child.textContent = text;
+          left.append(child);
+        }
+        row.append(left);
         return row;
       }
-      function serviceHealthChip(label, value, title) {
-        const chip = document.createElement("span");
-        chip.className = "service-health-chip";
-        chip.textContent = `${label}：${safeText(value)}`;
-        if (title) chip.title = title;
-        return chip;
-      }
-      function appendServiceHealthCard(entry, options) {
-        const status = String(entry.status || "missing").toLowerCase();
-        const cls = statusClass(status);
-        const card = document.createElement("details");
-        card.dataset.serviceId = entry.service_id;
-        card.open = Boolean(options && options.openServices && options.openServices.has(entry.service_id));
-        card.className = `service-health-card ${cls} ${status}`;
-        if (entry.reason) card.title = `原因：${entry.reason}`;
-
-        const top = document.createElement("summary");
-        top.className = "service-health-top";
-        const title = document.createElement("div");
-        title.className = "service-health-title";
-        title.textContent = SERVICE_DISPLAY_NAMES[entry.service_id] || safeText(entry.display_name || entry.service_id);
-        title.title = safeText(entry.display_name || entry.service_id);
-        const pill = document.createElement("span");
-        setPill(pill, status);
-        top.append(title, pill);
-        // 进程与性能放在常显行：不展开也能看到该服务对应的进程和资源占用。
-        top.appendChild(buildServiceProcessRow(entry));
-        if (SERVICE_ATTENTION_STATUSES.has(status)) {
-          const brief = document.createElement("span");
-          brief.className = "service-health-brief";
-          brief.textContent = safeText(entry.summary || entry.evidence || displayReasonLabel(entry.reason) || "请展开查看诊断");
-          top.appendChild(brief);
-        }
-
-        const evidence = document.createElement("div");
-        evidence.className = "service-health-evidence";
-        evidence.textContent = safeText(entry.evidence || entry.reason || entry.advice || "暂无详细证据");
-
-        // 卡片只保留诊断正文；来源、更新、建议、原因等字段不再占位。
-        const details = document.createElement("div");
-        details.className = "service-health-details";
-        details.append(evidence);
-        card.append(top, details);
-        state.serviceCardNodes ||= new Map();
-        const current = state.serviceCardNodes.get(entry.service_id);
-        const result = current || card;
-        if (current) patchServiceNode(current, card);
-        else state.serviceCardNodes.set(entry.service_id, card);
-        if (!options?.deferAppend) ((options && options.target) || els.governanceMeta).appendChild(result);
-        return result;
-      }
-      function patchServiceNode(current, next) {
-        // 保留实际点击目标、焦点和文本节点；原生展开状态只由用户操作改变。
-        if (current.nodeType === 3) {
-          if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
-          return;
-        }
-        for (const attribute of [...current.attributes]) {
-          if (attribute.name !== "open" && !next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
-        }
-        for (const attribute of [...next.attributes]) {
-          if (attribute.name !== "open" && current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
-        }
-        const nextChildren = [...next.childNodes];
-        nextChildren.forEach((child, index) => {
-          const existing = current.childNodes[index];
-          if (existing && existing.nodeType === child.nodeType && existing.nodeName === child.nodeName) patchServiceNode(existing, child);
-          else if (existing) current.replaceChild(child, existing);
-          else current.appendChild(child);
-        });
-        while (current.childNodes.length > nextChildren.length) current.lastChild.remove();
-      }
-      function reconcileServiceNodes(parent, wanted) {
-        const keep = new Set(wanted);
-        for (const child of [...parent.children]) if (!keep.has(child)) child.remove();
-        wanted.forEach((node, index) => {
-          if (parent.children[index] !== node) parent.insertBefore(node, parent.children[index] || null);
-        });
-      }
-      function displayReasonLabel(reason) {
-        // 任务 6.1.1：reason 字段为机器可读 token 时映射为中文短标签
-        const map = {
-          expected_process_absent: "进程未匹配",
-          process_evidence_drift: "进程证据漂移",
-          no_signal_in_window: "窗口内无信号",
-          upstream_disabled: "上游已禁用",
-        };
-        return map[reason] || String(reason);
-      }
       function renderServiceStatus() {
-        if (!els.governanceMeta) return;
+        const metrics = state.latestSystemMetrics;
+        const nodes = [];
+        if (metrics?.status === "disabled") {
+          const hint = document.createElement("div");
+          hint.className = "meta";
+          hint.textContent = "性能采集未开启，各服务的 CPU、内存不显示；在“设置 → 网关”中把 gateway.telemetry_enabled 设为“是”即可开启。";
+          nodes.push(hint);
+        }
         const processes = state.latestHealth?.processes;
-        if (processes) {
-          setText(els.connectionText, "网关已连接");
-          setPill(els.governanceStatus, "available", "进程");
-          setKv(els.governanceMeta, Object.entries(processes).map(([name, value]) =>
-            [name, `${value.state}${value.pid ? ` · PID ${value.pid}` : ""}${value.error ? ` · ${value.error}` : ""}`]));
+        if (!processes) {
+          nodes.push(serviceRow("正在读取服务状态", "", "idle", "读取中", "等待网关返回各组件状态。"));
+          els.governanceMeta.replaceChildren(...nodes);
           return;
         }
-        state.serviceCardNodes ||= new Map();
-        const scrollHost = els.governanceMeta.parentElement;
-        const scrollTop = scrollHost.scrollTop;
-        const focused = document.activeElement;
-        const summary = state.latestServiceHealth;
-        if (!summary) {
-          state.serviceCardNodes.clear();
-          state.serviceGroupLabels?.clear();
-          setText(els.connectionText, "正在读取服务状态");
-          setPill(els.governanceStatus, "idle", "读取中");
-          setKv(els.governanceMeta, [["服务状态", "正在读取服务状态"]]);
-          return;
+        const sampled = new Map((metrics?.processes || []).map(proc => [proc.pid, proc]));
+        const tree = (metrics?.processes || []).filter(proc => proc.matched_keyword === "process_tree");
+        for (const [name, item] of Object.entries(processes)) {
+          const parts = [`PID ${item.pid ?? "--"}`];
+          const proc = sampled.get(item.pid);
+          if (proc) parts.push(`CPU ${fmt(proc.cpu_percent, "%")}`, `内存 ${formatGB(proc.rss_bytes)}`);
+          if (item.error) parts.push(item.error);
+          else if (item.exit_code != null) parts.push(`退出码 ${item.exit_code}`);
+          const children = tree.some(child => child.pid === item.pid)
+            ? tree.filter(child => child.pid !== item.pid).sort((a, b) => b.cpu_percent - a.cpu_percent)
+              .map(child => `${child.display_name} · PID ${child.pid} · CPU ${fmt(child.cpu_percent, "%")} · 内存 ${formatGB(child.rss_bytes)}`)
+            : [];
+          nodes.push(serviceRow(item.title, name, SERVICE_STATE_CLASSES[item.state], item.state_title, parts.join(" · "), children));
         }
-        const entries = Array.isArray(summary.entries) ? summary.entries : [];
-        const status = summary.status || worstStatus(entries);
-        const attention = serviceHealthAttentionCount(summary);
-        const gatewayService = entries.find((entry) => entry.service_id === "gateway_web");
-        setText(els.connectionText, displayStatus(gatewayService ? gatewayService.status : "missing"));
-        setPill(els.governanceStatus, status, attention ? `${attention} 项需处理` : "服务");
-        // 只剔除没有独立诊断价值的重复项，其余全部展示：
-        // - 实时流总线的状态在后端恒为「可用」，永远不会报出问题；
-        // - 任务调度服务只反映任务数量，任务状态页签已经覆盖；
-        // - Native geometry runtime 与「统一几何服务」是同一件事的两层，
-        //   后者的 metadata 与期望进程角色都已包含前者。
-        const REDUNDANT_SERVICE_IDS = new Set(["stream_bus", "task_manager", "geometry_runtime"]);
-        const visible = entries.filter((entry) => !REDUNDANT_SERVICE_IDS.has(String(entry.service_id)));
-        // 按后端自带的分组呈现，组内沿用后端顺序，组间按各组最靠前的 order 排列。
-        const grouped = new Map();
-        for (const entry of visible) {
-          const name = String(entry.group || "其他");
-          if (!grouped.has(name)) grouped.set(name, []);
-          grouped.get(name).push(entry);
-        }
-        state.serviceGroupLabels ||= new Map();
-        const options = {
-          source: summary.source,
-          generated_at: summary.generated_at,
-          timestamp: summary.timestamp,
-          deferAppend: true,
-        };
-        const ordered = [];
-        const orderedGroups = [...grouped.entries()].sort(
-          (a, b) => Number(a[1][0]?.order ?? 0) - Number(b[1][0]?.order ?? 0),
-        );
-        for (const [name, list] of orderedGroups) {
-          if (!state.serviceGroupLabels.has(name)) {
-            const label = document.createElement("div");
-            label.className = "service-health-group";
-            state.serviceGroupLabels.set(name, label);
-          }
-          const label = state.serviceGroupLabels.get(name);
-          setText(label, name);
-          ordered.push(label, ...list.map((entry) => appendServiceHealthCard(entry, options)));
-        }
-        for (const [name, node] of state.serviceGroupLabels) if (!grouped.has(name)) node.remove();
-        reconcileServiceNodes(els.governanceMeta, [serviceTelemetryHintNode(), ...ordered, serviceOthersNode(entries)]);
-        const ids = new Set(entries.map((entry) => entry.service_id));
-        for (const id of state.serviceCardNodes.keys()) if (!ids.has(id)) state.serviceCardNodes.delete(id);
-        if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
-        scrollHost.scrollTop = scrollTop;
+        els.governanceMeta.replaceChildren(...nodes);
       }
       function formatGB(bytes) {
         const n = Number(bytes);
@@ -1059,45 +663,18 @@
         const snap = payload || {};
         state.latestSystemMetrics = snap;
         const available = snap.psutil_available === true;
+        // 设置里关闭了性能采集：数值处写“未开启”，旁边给出打开位置。
+        const disabled = snap.status === "disabled";
+        els.telemetryHint.hidden = !disabled;
         // 顶栏 CPU 块（复用 #networkLatency）
         const cpu = snap.cpu || {};
-        setText(els.networkLatency, available && cpu.percent !== undefined ? `${Math.round(cpu.percent)}%` : "N/A");
+        setText(els.networkLatency, disabled ? "未开启" : available && cpu.percent !== undefined ? `${Math.round(cpu.percent)}%` : "N/A");
         // 顶栏 运存块（复用 #resourceMetric）
         const mem = snap.memory || {};
-        setText(els.resourceMetric, available && mem.percent !== undefined
+        setText(els.resourceMetric, disabled ? "未开启" : available && mem.percent !== undefined
           ? `${Math.round(mem.percent)}% · ${formatGB(mem.used_bytes)}/${formatGB(mem.total_bytes)}`
           : "N/A");
-        renderProcessMatrix(snap);
-        // 任务 4.6：system.metrics 改走 patch 模式（仅刷 process_evidence，不覆盖主字段）
-        // state.latestServiceHealth 缺失时（即 bootstrap 与流式都未到）则跳过
-        if (state.latestServiceHealth) {
-          mergeServiceHealth(state.latestServiceHealth, "system.metrics", "patch");
-        }
-      }
-      function renderProcessMatrix(snap) {
-        // 进程与性能并入服务状态卡片，不再单独成栏；此处只记录采集状态并触发重绘。
-        const status = snap && snap.status ? snap.status : "missing";
-        setPill(els.servicesStatus, status);
         renderServiceStatus();
-      }
-      function processPurposeName(proc) {
-        if (String(proc.cmdline_preview || "").split(/\s+/).includes("--nuwax-video-relay-helper-v1")) return "视频帧中转";
-        const names = {
-          gateway_web: "网页与能力接口", gateway_supervisor: "网关启动与进程守护",
-          geometry_runtime: "定位建图与几何计算", geometry_external: "几何服务接口",
-          slam_2d_worker: "二维激光建图", nuwax_slam_2d_worker: "二维激光建图",
-          nav_stack: "路径规划与导航执行", static_tf: "固定坐标变换",
-          go2_video_streamer: "摄像头采集与视频推流", go2_data_plane: "机器人状态与传感器接入",
-          motion_safety_guard: "运动安全守卫", nuwax_motion_safety_guard: "运动安全守卫",
-          pointlio_native: "逐点激光惯性定位", fastlio2_native: "快速激光惯性定位",
-          nuwax_lcm_runtime: "机器人数据通信", lcm_runtime: "机器人数据通信",
-        };
-        const known = names[proc.role] || names[String(proc.name || "").replaceAll("-", "_")];
-        if (known) return known;
-        const provided = String(proc.display_name || "").trim();
-        if (/[\u3400-\u9fff]/.test(provided) && !/[A-Za-z_]/.test(provided)
-            && !["项目相关进程", "项目子进程", "未知进程"].includes(provided)) return provided;
-        return "用途未识别的项目进程";
       }
       function updateHealth(payload) {
         // 闸门：bootstrap 未完成时入队，避免流式帧抢在 /api/health 之前写入 state
@@ -1133,11 +710,7 @@
         );
         setText(els.motionStatus, canMove === true ? "运动可用" : canMove === false ? "运动不可用" : "运动状态未确认");
         if (els.motionStatus) els.motionStatus.title = safety.warning_message || (canMove == null ? "设备尚未提供运动状态确认。" : "");
-        if (changes.service_health) {
-          mergeServiceHealth(changes.service_health, "/api/health", "replace");
-        } else {
-          renderServiceStatus();
-        }
+        renderServiceStatus();
         renderMapSummary();
       }
       function normalizeTaskState(value) {
@@ -1237,12 +810,15 @@
           const title = left.querySelector(".mono") || document.createElement("div");
           title.className = "mono";
           const taskId = safeText(task.task_id || task.id);
-          title.textContent = task.feedback?.source?.display_name || task.capability || taskId;
+          // 中文标题来自能力定义，能力标识作小字。
+          const capabilityId = document.createElement("span");
+          capabilityId.className = "meta";
+          capabilityId.textContent = ` ${task.capability}`;
+          title.replaceChildren(task.title, capabilityId);
           title.title = taskId;
           const meta = left.querySelector(":scope > .meta") || document.createElement("div");
           meta.className = "meta";
           const taskState = normalizeTaskState(task.state || task.status);
-          const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timed_out", "cancelled"].includes(taskState) ? "未上报原因" : "");
           const progressNumber = Number(task.progress);
           const progressPercent = Number.isFinite(Number(task.progress_percent))
             ? Math.round(Number(task.progress_percent))
@@ -1251,9 +827,9 @@
               : null;
           const progressText = progressPercent === null ? "进度未上报" : `进度 ${progressPercent}%`;
           const timeText = taskUpdatedMs(task) ? `更新 ${shortTime(new Date(taskUpdatedMs(task)).toISOString())}` : "时间未上报";
-          const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
-          const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timed_out"].includes(taskState) ? " · 不建议原样重试" : "";
-          meta.textContent = task.feedback?.message || task.summary || `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
+          // 阶段的中文说明由任务处理器随每次进度写在 message（ctx.progress 的第三个参数），阶段标识放悬停提示。
+          meta.textContent = `${task.message} · ${progressText} · ${timeText}`;
+          meta.title = `阶段标识：${task.stage}`;
           if (!heading.parentElement) left.prepend(heading);
           if (title.parentElement !== heading) heading.append(title);
           if (!meta.parentElement) left.append(meta);
@@ -1264,7 +840,7 @@
           }
           const pill = heading.querySelector(".pill") || row.querySelector(":scope > .pill") || document.createElement("span");
           pill.className = `pill ${taskState === "failed" || taskState === "timed_out" ? "error" : taskState === "running" || taskState === "cancelling" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
-          pill.textContent = displayValue(taskState, "task_state");
+          pill.textContent = task.state_title;
           pill.title = taskState;
           if (!left.parentElement) row.append(left);
           if (pill.parentElement !== heading) heading.append(pill);
@@ -1306,16 +882,15 @@
           }
         }
       }
-      async function loadInitialHealth() {
+      async function loadHealth() {
         try {
           const response = await fetch("/api/health");
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           updateHealth(await response.json());
         } catch (err) {
-          showPanelError("governance", `服务健康初始化失败：${err.message || err}`);
+          showPanelError("governance", `读取 /api/health 失败：${err.message || err}`);
         } finally {
-          // 风险 4 不变量：bootstrapComplete 必须在 resolve/catch 后无条件写 true，
-          // 让 flush 队列中后续 runtime.governance 帧能继续触发 merge。
+          // bootstrapComplete 必须在 resolve/catch 后无条件写 true，排队的状态流帧随后继续应用。
           flushHealthQueue();
           state.bootstrapComplete.health = true;
         }
@@ -1385,18 +960,7 @@
       // 轮询 replaceTaskStore 会反复擦除流式期间累积的增量。
       function showPanelError(kind, message) {
         if (kind === "governance") {
-          setPill(els.governanceStatus, "error");
-          els.governanceMeta.replaceChildren();
-          appendServiceHealthCard({
-            service_id: "service_health_error",
-            display_name: "服务健康链路",
-            status: "error",
-            summary: "服务健康数据读取失败",
-            evidence: message,
-            source: "frontend_request",
-            advice: "检查 /api/health、runtime.governance 和网关运行日志",
-            updated_at: new Date().toISOString(),
-          }, { source: "frontend_request" });
+          els.governanceMeta.replaceChildren(serviceRow("服务状态读取失败", "", "error", "错误", message));
         } else if (kind === "map") {
           setPill(els.mapStatus, "error", "地图");
           els.mapEmpty.hidden = false;
@@ -3764,11 +3328,7 @@
         }
         state.latestGovernance = data;
         data.status = data.status || (envelope.status ? statusOf(envelope) : undefined);
-        if (data.service_health) {
-          mergeServiceHealth(data.service_health, "runtime.governance", "replace");
-        } else {
-          renderServiceStatus();
-        }
+        renderServiceStatus();
         reevaluateCachedMapDisplay();
         renderMapSummary();
       }
@@ -5463,7 +5023,7 @@
       }
       buildOverview();
       updateClock();
-      loadInitialHealth();
+      loadHealth();
       loadInitialTasks();
       loadPerceptionRuntimeStatus();
       els.perceptionRuntimeStart.addEventListener("click", () => setManualPerception(true));
@@ -5471,6 +5031,11 @@
       window.setInterval(() => {
         if (videoPanelVisible()) void loadPerceptionRuntimeStatus();
       }, 3000);
+      // 组件按需启动、退出后状态会变；服务状态页可见时重读健康汇总，切到该页时立即读一次。
+      document.getElementById("rail-tab-service").addEventListener("click", () => void loadHealth());
+      window.setInterval(() => {
+        if (!document.hidden && els.governanceMeta.closest(".rail-pane").classList.contains("is-active")) void loadHealth();
+      }, 5000);
       // 任务 4.0：已删除 startTaskPolling 调用 —— tasks.state WebSocket 流为单一来源
       syncMapCanvasSize();
       if (window.ResizeObserver) {
@@ -5785,7 +5350,7 @@
         updateMapStreamChip();
         if (nextMode === "3d") resetMapInteraction(true);
         syncMapViewControls();
-        window.pointcloud3d?.setVisible(nextMode === "3d");
+        sync3dVisibility();
         if (nextMode === "3d") {
           if (!window.pointcloud3d || !els.map3dContainer) {
             updateMapStreamChip();

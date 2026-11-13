@@ -20,6 +20,7 @@
       <div class="vstat"><div class="v" id="batteryMetric">--</div><div class="l">电池</div></div>
       <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
       <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">内存</div></div>
+      <div class="vstat" id="telemetryHint" hidden><div class="v warn">性能采集未开启</div><div class="l">在“设置 → 网关”中把 gateway.telemetry_enabled 设为“是”</div></div>
       <div class="vstat" title="浏览器与网关实时连接的一次往返耗时；尚未收到回应时显示已等待的时间。"><div class="v mono" id="lastReceive">--</div><div class="l">连接往返</div></div>
     </div>
     <div class="seg">
@@ -367,7 +368,7 @@
               <div class="dscroll"><div id="taskSummary" class="rows"></div></div>
             </div>
             <div id="rail-pane-service" class="rail-pane" role="tabpanel" data-rail-pane="service" aria-labelledby="rail-tab-service">
-              <div class="dscroll"><div id="governanceMeta" class="service-health-list"></div></div>
+              <div class="dscroll"><div id="governanceMeta" class="rows"></div></div>
             </div>
           </section>
         </div>

@@ -141,7 +141,7 @@ def test_bound_old_device_generation_is_rejected_without_start(device, runtime):
     binding = runtime.manipulation.bind()
     device.epoch += 1
     from core.capability import Capability
-    cap = Capability("设备绑定验证", "测试已绑定设备", {"type": "object"}, "task",
+    cap = Capability("设备绑定验证", "测试已绑定设备", "测试已绑定设备", {"type": "object"}, "task",
         lambda p, ctx, args: p.manipulation.run(ctx, binding,
             {"instruction": "苹果入盘", "timeout_sec": 1, "max_steps": 1440}), timeout_sec=2)
     runtime.capabilities.register(cap)

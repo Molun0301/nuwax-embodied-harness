@@ -3,8 +3,6 @@
   'use strict';
   const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
   const capabilities = new Set(['navigate_to_floor', 'explore_building']);
-  const states = {running: '任务运行中', cancelling: '正在取消任务', succeeded: '任务已完成',
-    failed: '任务失败', cancelled: '任务已取消', timed_out: '任务已超时'};
   let panel, elements, buildings = [], task = null, busy = false;
 
   async function request(url, body) {
@@ -56,14 +54,14 @@
   function renderTask() {
     if (!task) { elements.detail.textContent = ''; status('当前进程没有楼层任务记录。'); updateButtons(); return; }
     const data = task.data;
-    const lines = ['任务：' + task.task_id, '功能：' + task.capability, '阶段：' + task.stage,
-      '进度：' + Math.round(task.progress * 100) + '%', task.message];
+    const lines = ['任务：' + task.task_id, '功能：' + task.title + '（' + task.capability + '）', '阶段：' + task.message,
+      '进度：' + Math.round(task.progress * 100) + '%'];
     if (data.floor_id) lines.push('楼层：' + data.floor_id);
     if (data.completed_floors) lines.push('已保存楼层：' + data.completed_floors.join('、'));
     if (task.error_code) lines.push('错误码：' + task.error_code);
     if (task.result) lines.push(JSON.stringify(task.result, null, 2));
     elements.detail.textContent = lines.join('\n');
-    status(states[task.state], ['failed', 'timed_out'].includes(task.state) ? 'error' : '');
+    status('任务' + task.state_title, ['failed', 'timed_out'].includes(task.state) ? 'error' : '');
     updateButtons();
   }
   async function refreshTasks() {

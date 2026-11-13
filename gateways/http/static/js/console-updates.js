@@ -128,12 +128,15 @@
     }
     act('/settings', {auto_check: $('updateAutoCheck').checked, auto_install: $('updateAutoInstall').checked, interval_minutes: interval});
   });
+  // 打开更新面板时立即取一次；其余时间每30秒取一次，顶栏“New!”标记也靠它更新。
+  $('updatePaneToggle').addEventListener('click', refresh);
   $('updateNewBadge').addEventListener('click', () => {
+    refresh();
     $('viewSwitchConfig').click();
     $('updatePanel').scrollIntoView({behavior: 'smooth', block: 'center'});
     $('updateCheck').focus();
   });
   document.addEventListener('visibilitychange', () => {if (!document.hidden) refresh();});
   refresh();
-  setInterval(() => {if (!document.hidden) refresh();}, 5000);
+  setInterval(() => {if (!document.hidden) refresh();}, 30000);
 })();

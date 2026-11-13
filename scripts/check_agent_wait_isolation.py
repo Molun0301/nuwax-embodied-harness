@@ -20,7 +20,7 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
                 while not release.is_set():
                     ctx.wait(.01)
                 return {"value": "真实处理结果"}
-            platform.capabilities.register(Capability("wait_example", "等待", {"type":"object"}, "task", handler))
+            platform.capabilities.register(Capability("wait_example", "等待", "等待", {"type":"object"}, "task", handler))
             service = AgentToolService(platform)
             task = service.invoke("wait_example", {})["task"]
             work = asyncio.create_task(service.wait_task_async(task["task_id"], 2))
@@ -35,7 +35,7 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_timeout_does_not_cancel_the_task(self):
         with task_platform() as platform:
-            platform.capabilities.register(Capability("wait_example", "等待", {"type":"object"}, "task",
+            platform.capabilities.register(Capability("wait_example", "等待", "等待", {"type":"object"}, "task",
                 lambda p,c,a: c.wait(10)))
             task_id = invoke(platform,"wait_example",{},"check")["task"]["task_id"]
             service = AgentToolService(platform)
@@ -50,7 +50,7 @@ class AgentWaitIsolationTests(unittest.IsolatedAsyncioTestCase):
             def handler(p,ctx,args):
                 try:ctx.wait(10)
                 finally:cleaning.set(); release.wait(2)
-            platform.capabilities.register(Capability("wait_example","等待",{"type":"object"},"task",handler))
+            platform.capabilities.register(Capability("wait_example","等待", "等待",{"type":"object"},"task",handler))
             task_id=invoke(platform,"wait_example",{},"check")["task"]["task_id"]
             await asyncio.sleep(.01)
             platform.tasks.cancel(task_id)

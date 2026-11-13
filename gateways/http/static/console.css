@@ -234,53 +234,21 @@ button{font-family:inherit;cursor:pointer}
 .recent-log-entry .console-log-details{padding:6px 0 0;margin:0}
 .recent-log-entry .console-log-details pre{margin:6px 0}
 
-/* 任务状态 */
+/* 任务状态与服务状态 */
 .rows{display:grid;gap:6px;padding:10px 12px}
 .task-row,.service-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;background:var(--inset);border-radius:var(--r-sm);transition:background .16s}
 .task-row:hover,.service-row:hover{background:var(--inset-2)}
-.task-row>div:first-child{min-width:0;flex:1}
-.service-row>div:first-child{min-width:0}
+.task-row>div:first-child,.service-row>div:first-child{min-width:0;flex:1}
 .task-row .mono,.service-row .mono{font-size:var(--fs);font-weight:600}
 .task-row-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 .task-row-heading>.mono{min-width:0;overflow-wrap:anywhere}
 .task-row-heading>.pill{flex-shrink:0}
+.service-row .service-sub{padding-left:12px}
 .task-feedback-details{margin-top:8px;font-size:var(--fs);min-width:0}
 .task-feedback-details summary{cursor:pointer;line-height:1.7}
 .task-feedback-fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
 .task-feedback-fields dt{opacity:.6}.task-feedback-fields dd{margin:0;overflow-wrap:anywhere}
 .task-feedback-data{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;font-size:var(--fs-sm);line-height:1.6}
-
-/* 服务状态：发丝线分隔的列表，常显进程、CPU 与内存 */
-.service-health-list{display:block;padding:2px 12px 10px}
-.service-health-hint{margin:10px 0 2px;padding:8px 10px;border-radius:var(--r-sm);background:var(--inset);color:var(--muted);font-size:var(--fs-sm)}
-.service-health-group{padding:14px 2px 4px;font-size:var(--fs-sm);font-weight:600;color:var(--faint)}
-.service-health-hint+.service-health-group,.service-health-list>.service-health-group:first-child{padding-top:8px}
-.service-health-card+.service-health-group{border-top:1px solid var(--line-2);margin-top:2px}
-.service-health-card{min-width:0;border-bottom:1px solid var(--line-2)}
-.service-health-card:last-child{border-bottom:0}
-.service-health-top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 10px;padding:10px 2px;cursor:pointer;list-style:none}
-.service-health-top::-webkit-details-marker{display:none}
-.service-health-title{font-size:var(--fs-md);font-weight:640;color:var(--ink);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.service-health-title::before{content:"›";display:inline-block;width:14px;color:var(--faint);font-weight:400}
-.service-health-card[open]>.service-health-top .service-health-title::before{content:"⌄"}
-.service-health-process{grid-column:1/-1;display:flex;align-items:baseline;flex-wrap:wrap;padding-left:14px;margin-top:2px;
-  font-size:var(--fs-sm);color:var(--muted);font-variant-numeric:tabular-nums}
-.service-health-process>span+span::before{content:"·";margin:0 8px;color:var(--faint)}
-.service-health-process .shp-pid{font-family:var(--mono);color:var(--strong)}
-.service-health-process .shp-metric b{font-family:var(--mono);font-weight:600;color:var(--strong);margin-left:5px}
-.service-health-process[data-state="missing"]{color:var(--warn)}
-.service-health-process[data-state="none"],.service-health-process[data-state="none"] :is(.shp-pid,b){color:var(--faint)}
-.service-health-brief{grid-column:1/-1;padding-left:14px;color:var(--muted);font-size:var(--fs-sm);line-height:1.45;overflow-wrap:anywhere}
-.service-health-card.error .service-health-brief{color:var(--bad)}
-.service-health-card.stale .service-health-brief{color:var(--warn)}
-.service-health-details{display:grid;gap:6px;padding:2px 0 12px 14px}
-.service-health-evidence{color:var(--muted);font-size:var(--fs-sm);line-height:1.5;overflow-wrap:anywhere}
-.service-health-chip{font-size:var(--fs-xs);color:var(--faint);background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r-xs);
-  padding:2px 7px;max-width:100%;white-space:normal;overflow-wrap:anywhere}
-.service-health-more>summary{cursor:pointer;color:var(--muted);font-size:var(--fs-sm);padding:8px 2px}
-.service-health-more>.service-health-list{margin-top:4px;padding:0}
-.service-others{border-top:1px solid var(--line-2);margin-top:2px}
-.service-others .service-row{margin-top:6px}
 
 /* ===== 地图面板 ===== */
 .glass{background:color-mix(in srgb,var(--surface) 82%,transparent);backdrop-filter:blur(16px) saturate(1.5);border:1px solid var(--line);box-shadow:var(--sh-sm)}

@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 
+from core.process_title import set_process_title
+
 
 _MAX_QUEUE_BYTES = 8 * 1024 * 1024
 _MAX_QUEUE_SAMPLES = 512
@@ -28,6 +30,8 @@ def _default_source(config, *, calibration_profile=None):
 
 def _sensor_process_main(config, data, status, commands, stop, source_factory, forward_samples):
     """此进程只拥有传感器，不创建运动客户端或网关业务。"""
+    # spawn 子进程的命令行不含入口信息，自设进程名供性能采集与 top 识别。
+    set_process_title("nuwax-go2-input")
     source = None
     pending = deque()
     condition = threading.Condition()

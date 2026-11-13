@@ -222,7 +222,8 @@ export class DensePointCloudLayer {
     const controller = new AbortController();
     this._abort = controller;
     const timeout = setTimeout(() => controller.abort(), 15000);
-    let delay = 500;
+    // 已读完时每秒查一次新点（页面常驻轮询上限）；有待读数据时立即续读。
+    let delay = 1000;
     const expectedDisplaySource = this.displaySource;
     try {
       const query = new URLSearchParams({ epoch: this.epoch || '', offset: String(this.count), delta: expectedDisplaySource.assigned_source ? '0' : '1',
@@ -232,7 +233,7 @@ export class DensePointCloudLayer {
       if (response.status === 409) {
         this.clear();
         this.onChange({ count: 0, total: 0, loading: true });
-        delay = expectedDisplaySource.assigned_source ? 500 : 0;
+        delay = expectedDisplaySource.assigned_source ? 1000 : 0;
       } else if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         if (!this._active || serial !== this._serial) return;
@@ -243,7 +244,7 @@ export class DensePointCloudLayer {
         const buffer = await response.arrayBuffer();
         if (!this._active || serial !== this._serial) return;
         this.append(decodeDenseChunk(metadata, buffer, this.epoch, this.count));
-        delay = this.count < this.total ? 0 : 500;
+        delay = this.count < this.total ? 0 : 1000;
       }
     } catch (error) {
       if (!this._active || serial !== this._serial) return;

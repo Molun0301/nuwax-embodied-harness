@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import struct
 import threading
@@ -17,6 +18,24 @@ _PAGES_PER_PACKET = 4
 _MAX_POINTS = (32 * 1024 * 1024) // 12
 _MAX_U64 = (1 << 64) - 1
 _IDENTITY_FIELDS = ('source', 'source_epoch', 'stream_generation', 'layout_generation', 'frame_id')
+
+
+@asynccontextmanager
+async def point_cloud_usage(runtime, *, enabled=True):
+    """阻塞的采集命令在线程池登记，取消也等待登记收尾后释放。"""
+    if not enabled:
+        yield
+        return
+    consumer = runtime.perception.point_cloud_consumer()
+    loop = asyncio.get_running_loop()
+    acquired = asyncio.ensure_future(loop.run_in_executor(None, consumer.__enter__))
+    try:
+        await asyncio.shield(acquired)
+        yield
+    finally:
+        result = await asyncio.gather(acquired, return_exceptions=True)
+        if not isinstance(result[0], BaseException):
+            await loop.run_in_executor(None, lambda: consumer.__exit__(None, None, None))
 
 
 def _u64(value):
@@ -176,6 +195,10 @@ class _LatestWake:
 def install_pointcloud_stream(router, runtime):
     @router.websocket('/streams/pointcloud/ws')
     async def pointcloud_pages(websocket: WebSocket):
+        async with point_cloud_usage(runtime):
+            await stream_pages(websocket)
+
+    async def stream_pages(websocket: WebSocket):
         # 此 router 与现有 WS 共用应用鉴权中间件，不另创设备/账号检查。
         await websocket.accept()
         await websocket.send_json({'type': 'pointcloud.ready', 'version': 2})

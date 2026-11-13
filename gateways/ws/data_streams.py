@@ -870,7 +870,7 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 60.0) if requested_fps else 0.0
 
         async def frame_generator():
-            from services.perception.video_demand import video_consumer
+            from core.video_demand import video_consumer
             with video_consumer():
                 shm_path = "/tmp/nuwax_video.shm"
                 attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)

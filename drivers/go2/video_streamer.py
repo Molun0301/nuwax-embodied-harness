@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional, Tuple, TypeVar
 
 from drivers.common.video_shm_writer import VideoShmWriter
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
-from services.perception.video_demand import VideoDemandMonitor
+from core.video_demand import VideoDemandMonitor
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.video_streamer")

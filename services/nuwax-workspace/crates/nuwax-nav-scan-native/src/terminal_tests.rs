@@ -131,3 +131,31 @@ fn pillar_stop_uses_the_configured_clearance_without_a_turn_point() {
     c.max_lateral_velocity = 0.;
     assert_eq!(snapshot.terminal_points(&c,goal,yaw,0.15),selected);
 }
+
+#[test]
+fn terminal_translation_alone_uses_the_escape_reverse_limit() {
+    let state = MotionState { position: [0., 0., 0.4], measured_velocity: 1,
+        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..Default::default() };
+    for (reverse, minimum, expected) in [(0., 0., 0.04), (0., 0.10, 0.10),
+        (0.02, 0.10, 0.02), (0.20, 0.10, 0.10)] {
+        let mut c = config();
+        c.max_reverse_velocity = reverse;
+        c.min_executable_linear_mps = minimum;
+        c.max_acceleration = 20.;
+        let mut map = MapOwner::new(&c).unwrap();
+        map.seed_occupied(&[], state.position);
+        map.update_surface(&[], &[], &[], &[]).unwrap();
+        let snapshot = map.snapshot();
+        let mut tracker = ScanTracker::default();
+        let tracked = tracker.track_terminal_position(&c, &snapshot, &state, [0.; 3],
+            Some(0.), Some([-1., 0., 0.4])).unwrap();
+        assert!(!tracked.invalid(), "末段倒退仍须通过原命令与制动检查：{tracked:?}");
+        assert!((tracked.command[0] + expected).abs() < 1e-12, "{tracked:?}");
+        assert_eq!(&tracked.command[1..], &[0., 0.]);
+        let turning = tracker.track_and_check(&c, &snapshot, &state, [0.; 3], Some(0.1)).unwrap();
+        assert_eq!(&turning.command[..2], &[0., 0.], "末段转向没有平移请求");
+        let travel = tracker.track_and_check(&c, &snapshot, &state, [0.; 3], None).unwrap();
+        assert_eq!(travel.command, [0.; 3], "没有曲线不能沿用末段倒退命令");
+        assert_eq!(c.max_reverse_velocity, reverse, "阶段限值不修改原设备配置");
+    }
+}

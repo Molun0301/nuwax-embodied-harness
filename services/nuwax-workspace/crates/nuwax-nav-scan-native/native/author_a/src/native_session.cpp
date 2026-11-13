@@ -263,6 +263,10 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
     }
     s.escape.observeClear(position,state->timestamp_ns);
+    ScanConfig terminal_config;
+    if(std::isfinite(terminal_yaw)&&terminal_position&&c->max_reverse_velocity==0.) {
+      terminal_config=*c;terminal_config.max_reverse_velocity=std::max(.04,c->min_executable_linear_mps);c=&terminal_config;
+    }
     Vector3d target=position;double desired_yaw=yaw;
     if(std::isfinite(terminal_yaw)) {
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);

@@ -939,7 +939,7 @@ class PerceptionService:
     def video_consumer(self):
         if self._video_frame_source_status().get("source") != "video_shared_memory":
             return nullcontext()
-        from services.perception.video_demand import video_consumer
+        from core.video_demand import video_consumer
         return video_consumer()
 
     def point_cloud_consumer(self):

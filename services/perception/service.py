@@ -4,9 +4,10 @@ import json
 import logging
 import threading
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timezone
 from time import perf_counter
+import time
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -560,7 +561,7 @@ class PerceptionService:
 
     def _detect_current_frame_fast(self, *, camera_id, requested_by, detector_backend_name,
                                    detection_metadata, open_vocabulary_classes):
-        image_frame = self._read_latest_pushed_image(camera_id)
+        image_frame = self._read_latest_pushed_image(camera_id, wait_for_frame=requested_by != "perception_video_runtime")
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
             required_source = "video_ingest_receiver"
@@ -915,16 +916,30 @@ class PerceptionService:
     def _read_latest_pushed_image(
         self,
         camera_id: Optional[str],
+        *, wait_for_frame=True,
     ) -> Optional["ImageFrame"]:
         from contracts.image import ImageFrame
 
         video_frame_source = self._video_frame_source
         if video_frame_source is None:
             return None
-        image_frame = video_frame_source.get_latest_image(camera_id)
+        with self.video_consumer():
+            image_frame = video_frame_source.get_latest_image(camera_id)
+            # 单次视觉请求也要给按需推流的拥有方送达首帧的机会。
+            if wait_for_frame and self._video_frame_source_status().get("source") == "video_shared_memory":
+                deadline = time.monotonic() + 15.0
+                while image_frame is None and not self._closing and time.monotonic() < deadline:
+                    time.sleep(.02)
+                    image_frame = video_frame_source.get_latest_image(camera_id)
         if image_frame is not None and not isinstance(image_frame, ImageFrame):
             raise TypeError("视频推流抽帧源必须返回标准 ImageFrame。")
         return image_frame
+
+    def video_consumer(self):
+        if self._video_frame_source_status().get("source") != "video_shared_memory":
+            return nullcontext()
+        from services.perception.video_demand import video_consumer
+        return video_consumer()
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""

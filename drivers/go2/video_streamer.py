@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Tuple, TypeVar
 
 from drivers.common.video_shm_writer import VideoShmWriter
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
+from services.perception.video_demand import VideoDemandMonitor
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.video_streamer")
@@ -151,12 +152,19 @@ def _encode_and_write_frame(
     frame: Any,
     shm_writer: VideoShmWriter,
     cancel_requested: threading.Event,
+    demand: VideoDemandMonitor,
 ) -> Optional[bool]:
     """在线程池中连续完成单帧编码和写入，避免两次 executor 边界。"""
 
+    if cancel_requested.is_set():
+        return None
+    if not demand.has_consumers():
+        return False
     payload, width, height = _encode_jpeg_frame(frame)
     if cancel_requested.is_set():
         return None
+    if not demand.has_consumers():
+        return False
     if len(payload) > _MAX_JPEG_PAYLOAD_BYTES:
         raise RuntimeError("JPEG 帧超过 512 KiB 共享内存帧上限。")
     shm_writer.write_frame(payload, width, height)
@@ -168,6 +176,7 @@ async def _consume_video_track(
     shm_writer: VideoShmWriter,
     first_frame: asyncio.Event,
     cancel_requested: threading.Event,
+    demand: VideoDemandMonitor,
 ) -> None:
     frames = asyncio.Queue(maxsize=1)
 
@@ -196,10 +205,12 @@ async def _consume_video_track(
                 frame,
                 shm_writer,
                 cancel_requested,
+                demand,
             )
             if sent is None:
                 raise asyncio.CancelledError
-            first_frame.set()
+            if sent:
+                first_frame.set()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -233,20 +244,21 @@ async def _cancel_and_wait_consumer(
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
     shm_path = "/tmp/nuwax_video.shm"
-    shm_writer = VideoShmWriter(shm_path)
+    demand = VideoDemandMonitor(shm_path)
+    shm_writer = None
     connection = None
     video_channel = None
     channel_enabled = False
     accepting_track = True
     consumer_task: Optional[asyncio.Task] = None
     consumer_cancel_requested = threading.Event()
-    track_registered_waiter: Optional[asyncio.Task] = None
-    first_frame_waiter: Optional[asyncio.Task] = None
-
     try:
+        # 无人使用时连重型视频接收链也不创建；有过消费者后保留信令连接。
+        while not demand.has_consumers():
+            await asyncio.sleep(.05)
+        shm_writer = VideoShmWriter(shm_path)
         connection, fatal_auth_errors = _create_webrtc_connection(config)
         LOGGER.info("视频推流直接写共享内存: %s", shm_path)
-
         try:
             await connection.connect()
         except fatal_auth_errors as exc:
@@ -257,106 +269,66 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
                 raise Go2VideoStreamerConfigError(_AES_KEY_REJECTED_TEXT) from None
             raise Go2VideoStreamerConfigError(_AES_KEY_REJECTED_TEXT) from None
 
-        video_channel = getattr(connection, "video", None)
-        add_track_callback = getattr(video_channel, "add_track_callback", None)
-        switch_video_channel = getattr(video_channel, "switchVideoChannel", None)
-        if not callable(add_track_callback) or not callable(switch_video_channel):
-            raise Go2VideoStreamerConfigError(
-                "unitree-webrtc-connect 视频 API 不兼容：缺少 "
-                "video.add_track_callback 或 video.switchVideoChannel。"
-            )
-
+        video_channel = connection.video
         loop = asyncio.get_running_loop()
         first_frame = asyncio.Event()
-        track_registered = asyncio.Event()
-        first_frame_deadline = loop.time() + _FIRST_FRAME_TIMEOUT_SEC
 
         async def receive_track(track: Any) -> None:
             nonlocal consumer_task
             if not accepting_track or consumer_task is not None:
                 return
             consumer_task = asyncio.create_task(
-                _consume_video_track(
-                    track,
-                    shm_writer,
-                    first_frame,
-                    consumer_cancel_requested,
-                ),
+                _consume_video_track(track, shm_writer, first_frame, consumer_cancel_requested, demand),
                 name="go2-video-track-consumer",
             )
-            track_registered.set()
 
-        add_track_callback(receive_track)
-        switch_video_channel(True)
+        video_channel.add_track_callback(receive_track)
+        video_channel.switchVideoChannel(True)
         channel_enabled = True
-
-        track_registered_waiter = asyncio.create_task(
-            track_registered.wait(), name="go2-video-track-registration",
-        )
-        # 显式等待任务：部分Python版本的wait_for会在事件已完成时吞掉外层取消。
-        # 这里保留原有首帧期限，并让取消直接进入统一清理路径。
-        done, _ = await asyncio.wait(
-            (track_registered_waiter,),
-            timeout=max(0.0, first_frame_deadline - loop.time()),
-        )
-        if track_registered_waiter not in done:
-            raise RuntimeError(
-                f"Go2 WebRTC 已连接，但 {_FIRST_FRAME_TIMEOUT_SEC:.0f} 秒内未收到视频轨道。"
-            )
-        await track_registered_waiter
-        if consumer_task is None:
-            raise RuntimeError("Go2 WebRTC 视频轨道未登记 consumer Task。")
-
-        first_frame_waiter = asyncio.create_task(first_frame.wait())
-        done, _ = await asyncio.wait(
-            (first_frame_waiter, consumer_task),
-            timeout=max(0.0, first_frame_deadline - loop.time()),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if consumer_task in done:
-            await consumer_task
-        if first_frame_waiter not in done:
-            raise RuntimeError(
-                f"Go2 WebRTC 已连接，但 {_FIRST_FRAME_TIMEOUT_SEC:.0f} 秒内未收到视频帧。"
-            )
-        await first_frame_waiter
-        LOGGER.info("Go2 WebRTC 视频轨道已开始持续推流: robot_ip=%s", stream_config.robot_ip)
-        await consumer_task
+        active = None
+        first_frame_deadline = None
+        while True:
+            requested = demand.has_consumers()
+            if requested != active:
+                active = requested
+                # aiortc==1.9.0在_enabled为假时于RTP包进入解码队列之前丢弃。
+                # 仅停track.recv仍会在其后台线程解码，不能满足空闲要求。
+                for receiver in connection.pc.getReceivers():
+                    if receiver.track is not None and receiver.track.kind == "video":
+                        receiver._enabled = requested
+                first_frame.clear()
+                first_frame_deadline = loop.time() + _FIRST_FRAME_TIMEOUT_SEC if requested else None
+            if consumer_task is not None and consumer_task.done():
+                await consumer_task
+                return
+            if active and not first_frame.is_set() and loop.time() >= first_frame_deadline:
+                kind = "视频轨道" if consumer_task is None else "视频帧"
+                raise RuntimeError(f"Go2 WebRTC 已连接，但 {_FIRST_FRAME_TIMEOUT_SEC:.0f} 秒内未收到{kind}。")
+            await asyncio.sleep(.05)
     finally:
         accepting_track = False
-        for waiter in (track_registered_waiter, first_frame_waiter):
-            if waiter is not None:
-                if not waiter.done():
-                    waiter.cancel()
-                await asyncio.gather(waiter, return_exceptions=True)
         consumer_stopped = True
         if consumer_task is not None:
-            consumer_stopped = await _cancel_and_wait_consumer(
-                consumer_task,
-                consumer_cancel_requested,
-            )
-        if channel_enabled and video_channel is not None:
+            consumer_stopped = await _cancel_and_wait_consumer(consumer_task, consumer_cancel_requested)
+        if channel_enabled:
             try:
                 video_channel.switchVideoChannel(False)
             except Exception:
                 LOGGER.warning("关闭 Go2 WebRTC 视频通道失败。", exc_info=True)
         if connection is not None:
-            disconnect = getattr(connection, "disconnect", None)
-            if callable(disconnect):
-                try:
-                    await disconnect()
-                except Exception:
-                    LOGGER.warning("断开 Go2 WebRTC 连接失败。", exc_info=True)
-        shm_writer.close()
-        if not consumer_stopped and consumer_task is not None:
-            done, _ = await asyncio.wait(
-                (consumer_task,),
-                timeout=_CONSUMER_SHUTDOWN_TIMEOUT_SEC,
-            )
+            try:
+                await connection.disconnect()
+            except Exception:
+                LOGGER.warning("断开 Go2 WebRTC 连接失败。", exc_info=True)
+        if shm_writer is not None:
+            shm_writer.close()
+        if not consumer_stopped:
+            done, _ = await asyncio.wait((consumer_task,), timeout=_CONSUMER_SHUTDOWN_TIMEOUT_SEC)
             if consumer_task in done:
                 await asyncio.gather(consumer_task, return_exceptions=True)
             else:
                 LOGGER.error("关闭共享内存写端后 Go2 WebRTC consumer Task 仍未停止。")
+        demand.close()
 
 
 async def run_forever(config: Go2DataPlaneConfig) -> None:

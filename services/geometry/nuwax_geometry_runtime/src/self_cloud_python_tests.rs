@@ -30,11 +30,12 @@ fn check_case(case: &Value) {
     let parsed = RobotSelfFilter::from_config(Some(json)).unwrap();
     if expected_links.is_empty() {
         assert_eq!(case["expected_source"], "manual");
-        assert!(parsed.is_none(), "手填尺寸不得回退导航外包");
+        assert!(parsed.is_none(), "手填尺寸没有固定碰撞实体");
         for alias in ["base_link", "go2_base_link"] {
-            assert!(RobotSelfFilter::from_runtime_geometry(alias, json)
-                .unwrap()
-                .is_none());
+            let filter = RobotSelfFilter::from_runtime_geometry(alias, json).unwrap().unwrap();
+            assert_eq!(filter.primitives.len(), 1, "手填外形同样提供活动包络盒");
+            assert!(filter.contains_body(&Point3::origin()));
+            assert!(!filter.contains_body(&Point3::new(0.0, 0.0, -0.5)));
         }
         return;
     }
@@ -45,7 +46,7 @@ fn check_case(case: &Value) {
             .unwrap()
             .unwrap();
         assert_eq!(filter.model_base_link, parsed.model_base_link);
-        assert_eq!(filter.primitives.len(), parsed.primitives.len());
+        assert_eq!(filter.primitives.len(), parsed.primitives.len() + 1);
         for (a, b) in filter.primitives.iter().zip(&parsed.primitives) {
             assert_eq!(
                 a.shape_from_body, b.shape_from_body,
@@ -82,7 +83,7 @@ fn check_case(case: &Value) {
             );
             let is_self = point["is_self"].as_bool().unwrap();
             assert_eq!(
-                filter.contains_body(&body),
+                parsed.contains_body(&body),
                 is_self,
                 "{} / {} / {}",
                 case["name"],
@@ -95,8 +96,9 @@ fn check_case(case: &Value) {
                 expected.push(transformed);
             }
         }
-        filter.retain_external(&mut registered, &pose);
-        assert_eq!(registered, expected, "完整位姿下仍按实体分类");
+        // 原始夹具继续核对固定实体；活动盒的新增语义由具名包络回归独立覆盖。
+        parsed.retain_external(&mut registered, &pose);
+        assert_eq!(registered, expected, "完整位姿下固定实体分类保持原义");
     }
 }
 

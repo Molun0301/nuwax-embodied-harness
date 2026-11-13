@@ -1,9 +1,13 @@
-//! 规范注册之前只删除与机体刚性相连的碰撞实体，不把导航凸包当实心机器人。
+//! 固定实体和机身活动包络盒共用自体标记，地面附近的真实回波保留。
 
 use nalgebra::{Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion};
 use serde::Deserialize;
 
 pub(crate) const SELF_MASK_FIELD: &str = "nuwax_self_mask";
+// 外包矩形四边各扩 10 厘米，覆盖腿部外摆与迈步。
+const ACTIVITY_HORIZONTAL_MARGIN_M: f64 = 0.10;
+// 活动盒从站立支撑面上方 5 厘米开始，保留脚下地面观测。
+const ACTIVITY_GROUND_CLEARANCE_M: f64 = 0.05;
 
 #[cfg(test)]
 #[path = "self_cloud_python_tests.rs"]
@@ -49,15 +53,50 @@ impl RobotSelfFilter {
         runtime_body_frame: &str,
         geometry: &str,
     ) -> Result<Option<Self>, String> {
-        let result = Self::from_config(Some(geometry))?;
-        if let Some(filter) = &result {
-            // 配置已声明选定模型连杆是机体基准；名称绑定不是物理标定验证。
-            eprintln!("固定自体过滤：模型基准 {} 按几何配置对应运行时 body {}，实体 {}，排除活动几何 {}，未支持 {}；动态腿足未覆盖",
-                            filter.model_base_link, runtime_body_frame, filter.primitives.len(), filter.excluded_moving, filter.unsupported);
-        } else {
-            eprintln!("固定自体过滤未启用：配置没有可用固定碰撞实体；不使用导航外包替代");
+        #[derive(Deserialize)]
+        struct ActivityGeometry {
+            footprint_xy_m: Vec<[f64; 2]>,
+            z_min_m: f64,
+            z_max_m: f64,
         }
-        Ok(result)
+        let activity: ActivityGeometry =
+            serde_json::from_str(geometry).map_err(|e| e.to_string())?;
+        // 与导航相同，站立支撑偏移为外形最低点到机体参考点的距离。
+        let body_to_support_z_m = -activity.z_min_m;
+        let mut lower = [f64::INFINITY, f64::INFINITY,
+            -body_to_support_z_m + ACTIVITY_GROUND_CLEARANCE_M];
+        let mut upper = [f64::NEG_INFINITY, f64::NEG_INFINITY, activity.z_max_m];
+        for point in activity.footprint_xy_m {
+            for axis in 0..2 {
+                lower[axis] = lower[axis].min(point[axis]);
+                upper[axis] = upper[axis].max(point[axis]);
+            }
+        }
+        for axis in 0..2 {
+            lower[axis] -= ACTIVITY_HORIZONTAL_MARGIN_M;
+            upper[axis] += ACTIVITY_HORIZONTAL_MARGIN_M;
+        }
+        let mut filter = Self::from_config(Some(geometry))?.unwrap_or(Self {
+            primitives: Vec::new(),
+            body_bounds: ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
+            model_base_link: String::new(),
+            excluded_moving: 0,
+            unsupported: 0,
+        });
+        let fixed_count = filter.primitives.len();
+        let center: [f64; 3] = std::array::from_fn(|axis| (lower[axis] + upper[axis]) / 2.0);
+        filter.primitives.push(Primitive {
+            shape_from_body: Isometry3::translation(-center[0], -center[1], -center[2]),
+            shape: Shape::Box { size_m: std::array::from_fn(|axis| upper[axis] - lower[axis]) },
+        });
+        for axis in 0..3 {
+            filter.body_bounds.0[axis] = filter.body_bounds.0[axis].min(lower[axis]);
+            filter.body_bounds.1[axis] = filter.body_bounds.1[axis].max(upper[axis]);
+        }
+        eprintln!("自体过滤：模型基准 {} 对应运行时 body {}，固定实体 {}，活动实体 {} 未逐实体过滤，未支持 {}；机身活动包络盒下界 {:?}、上界 {:?} 米",
+            filter.model_base_link, runtime_body_frame, fixed_count, filter.excluded_moving,
+            filter.unsupported, lower, upper);
+        Ok(Some(filter))
     }
 
     pub(crate) fn from_config(geometry: Option<&str>) -> Result<Option<Self>, String> {

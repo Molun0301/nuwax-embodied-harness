@@ -1,6 +1,61 @@
 use super::*;
 use nalgebra::{Translation3, UnitQuaternion};
 
+fn activity_filter() -> RobotSelfFilter {
+    RobotSelfFilter::from_runtime_geometry("base_link", r#"{
+        "footprint_xy_m":[[-0.2,-0.4],[0.6,-0.4],[0.6,0.2],[-0.2,0.2]],
+        "z_min_m":-0.4,"z_max_m":0.15,
+        "self_collision":{"primitives":[{"shape":"box","size_m":[0.04,0.04,0.04],
+            "translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}]}
+    }"#).unwrap().unwrap()
+}
+
+#[test]
+fn activity_box_masks_swing_space_and_preserves_ground_and_external_returns() {
+    let filter = activity_filter();
+    // 偏心外形的活动范围为 X[-0.3,0.7]、Y[-0.5,0.3]、Z[-0.35,0.15]。
+    for point in [[-0.29,-0.49,-0.34], [0.69,0.29,0.14], [0.4,0.1,-0.2]] {
+        assert!(filter.contains_body(&Point3::from(point)), "活动盒内 {point:?}");
+    }
+    let external = [
+        [-0.31,0.0,-0.2], [0.71,0.0,-0.2], [0.0,-0.51,-0.2], [0.0,0.31,-0.2],
+        [0.0,0.0,0.16], [0.0,0.0,-0.351], [0.0,0.0,-0.39], [0.0,0.0,-0.4],
+    ];
+    for point in external {
+        assert!(!filter.contains_body(&Point3::from(point)), "外部或支撑面附近 {point:?}");
+    }
+    let pose = Isometry3::from_parts(Translation3::new(2.0,-3.0,0.7),
+        UnitQuaternion::from_euler_angles(0.2,-0.15,1.7));
+    let retained: Vec<_> = external.iter().map(|p|pose*Point3::from(*p)).collect();
+    let mut points = retained.clone();
+    points.push(pose*Point3::new(0.4,0.1,-0.2));
+    filter.retain_external(&mut points,&pose);
+    assert_eq!(points,retained, "建图和近期点云只收到保留的外部点");
+}
+
+#[test]
+fn activity_box_uses_existing_native_self_marker_without_changing_payload() {
+    let mut filter = native_filter();
+    filter.filter = activity_filter();
+    let body_points = [[0.4_f32,0.1,-0.2],[-0.25,-0.45,-0.2],
+        [0.71,0.0,-0.2],[0.0,0.31,-0.2],[0.0,0.0,-0.39],[0.0,0.0,-0.351],[0.0,0.0,0.16]];
+    let mut request = crate::proto::PublishPointCloudRequest {
+        point_step:12,point_count:body_points.len() as u32,..Default::default()
+    };
+    for [x,y,z] in body_points {
+        // 复用既有非平凡外参：传感器点 [y,0.1-x,z] 对应机体点 [x,y,z]。
+        for value in [y,0.1-x,z] {request.points.extend_from_slice(&value.to_le_bytes());}
+    }
+    let masked = filter.mask_request(&request).unwrap();
+    assert_eq!(masked.points.chunks_exact(13).map(|p|p[12]).collect::<Vec<_>>(),
+        vec![1,1,0,0,0,0,0]);
+    assert_eq!(masked.point_count,request.point_count);
+    assert_eq!(masked.fields.last().unwrap().name,SELF_MASK_FIELD);
+    for (before,after) in request.points.chunks_exact(12).zip(masked.points.chunks_exact(13)) {
+        assert_eq!(before,&after[..12], "自体标记保留每个原始采样");
+    }
+}
+
 pub(crate) fn filter() -> RobotSelfFilter {
     RobotSelfFilter::from_config(Some(r#"{"self_collision":{"primitives":[{"shape":"box","size_m":[0.58,0.328,0.357],"translation_m":[0.05,0,-0.1215],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}]}}"#)).unwrap().unwrap()
 }

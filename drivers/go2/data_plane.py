@@ -8,6 +8,7 @@ IMU/点云观测与只读 RobotState 服务状态。
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
@@ -415,6 +416,12 @@ class Go2DirectDdsBridge:
         self._sensor_process = None
         self._sensor_process_status = {}
         self._sensor_process_failure = None
+        self._point_cloud_demand = False
+        self._point_cloud_users = 0
+        self._input_delivery_active = False
+        self._point_cloud_subscription_lock = threading.RLock()
+        self._point_cloud_subscriber_factory = None
+        self._point_cloud_thread = None
         # 原生定位两类样本共用创建时标定；设备自带模式不消费或验证定位覆盖。
         self._calibration_owner = None
         if calibration_profile is not None:
@@ -656,6 +663,9 @@ class Go2DirectDdsBridge:
             callback_id = self._next_subscription_id()
             self._sensor_sample_callbacks[callback_id] = callback
             failure = self._sensor_process_failure
+            direct_delivery = self._isolate_native_input and self._sensor_process is None
+        if direct_delivery:
+            self.set_input_delivery_active(True)
         if failure is not None:
             callback(failure)
         return callback_id
@@ -663,6 +673,10 @@ class Go2DirectDdsBridge:
     def unsubscribe_sensor_sample(self, callback_id: int) -> None:
         with self._lock:
             self._sensor_sample_callbacks.pop(int(callback_id), None)
+            direct_delivery = self._isolate_native_input and self._sensor_process is None
+            active = bool(self._sensor_sample_callbacks)
+        if direct_delivery:
+            self.set_input_delivery_active(active)
 
     def _publish_sensor_sample(self, sample: SensorSample, generation: int) -> None:
         """标准输入先于显示回调；沿原同步回调代际与外层交付围栏收尾。"""
@@ -988,7 +1002,9 @@ class Go2DirectDdsBridge:
             from drivers.go2.sensor_process import Go2SensorProcess
             worker = Go2SensorProcess(self.config,
                 calibration_profile=self._calibration_profile,
-                forward_samples=True,
+                point_cloud_demand=self._point_cloud_demand,
+                # 三维输入在子进程内直接交给Geometry；未启动建图时没有标准帧消费者。
+                forward_samples=False,
                 on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
                 on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),
                 on_error=lambda message, stamp: self._fail_sensor_process(message, stamp, generation))
@@ -1028,6 +1044,7 @@ class Go2DirectDdsBridge:
         joint_subscriber = None
         point_cloud_subscriber = None
         point_cloud_type = None
+        point_cloud_factory = None
         try:
             subscriber_class = modules["ChannelSubscriber"]
             native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
@@ -1086,17 +1103,16 @@ class Go2DirectDdsBridge:
                     LOGGER.warning(message)
                     self._record_point_cloud_bridge_error(message)
                     raise RuntimeError(message)
-                point_cloud_subscriber = make_subscriber(
-                    self.config.direct_dds.point_cloud_topic,
-                    point_cloud_type,
-                    _NATIVE_CLOUD_READER_HISTORY_DEPTH,
-                    latest_cloud=True,
-                )
-                point_cloud_subscriber.Init()
-                LOGGER.info(
-                    "Go2 DirectDDS 点云订阅已启动：topic=%s",
-                    self.config.direct_dds.point_cloud_topic,
-                )
+                def point_cloud_factory():
+                    return make_subscriber(
+                        self.config.direct_dds.point_cloud_topic,
+                        point_cloud_type,
+                        _NATIVE_CLOUD_READER_HISTORY_DEPTH,
+                        latest_cloud=True,
+                    )
+                if self._point_cloud_demand or self._input_delivery_active:
+                    point_cloud_subscriber = point_cloud_factory()
+                    point_cloud_subscriber.Init()
             else:
                 self._record_point_cloud_bridge_error("Go2 DirectDDS 点云订阅未启用")
                 LOGGER.info(
@@ -1126,6 +1142,7 @@ class Go2DirectDdsBridge:
             self._direct_joint_subscriber = joint_subscriber
             self._direct_point_cloud_subscriber = point_cloud_subscriber
             self._direct_point_cloud_msg_type = point_cloud_type
+            self._point_cloud_subscriber_factory = point_cloud_factory
         self._direct_dds_threads = [
             threading.Thread(
                 target=self._direct_pose_reader_loop,
@@ -1140,14 +1157,13 @@ class Go2DirectDdsBridge:
                 name=f"go2_direct_joint_reader_g{generation}", daemon=True,
             ))
         if self._direct_point_cloud_subscriber is not None:
-            self._direct_dds_threads.append(
-                threading.Thread(
+            self._point_cloud_thread = threading.Thread(
                     target=self._direct_point_cloud_reader_loop,
                     args=(generation, stop_event, point_cloud_subscriber),
                     name=f"go2_direct_point_cloud_reader_g{generation}",
                     daemon=True,
                 )
-            )
+            self._direct_dds_threads.append(self._point_cloud_thread)
         with self._lock:
             if generation != self._active_generation or stop_event is not self._direct_dds_stop_event:
                 raise RuntimeError("Go2 DirectDDS 启动代际在订阅初始化期间失效")
@@ -1169,6 +1185,7 @@ class Go2DirectDdsBridge:
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
+
             stop_event = self._direct_dds_stop_event
             threads = tuple(self._direct_dds_threads)
             pose_subscriber = self._direct_pose_subscriber
@@ -1179,6 +1196,8 @@ class Go2DirectDdsBridge:
             self._direct_joint_subscriber = None
             self._direct_point_cloud_subscriber = None
             self._direct_point_cloud_msg_type = None
+            self._point_cloud_subscriber_factory = None
+            self._point_cloud_thread = None
         if stop_event is not None:
             stop_event.set()
         self._close_direct_dds_subscriber(joint_subscriber, "关节订阅器")
@@ -1203,6 +1222,129 @@ class Go2DirectDdsBridge:
         with self._lock:
             self._direct_dds_started = False
             self._invalidate_observations_locked("Go2 DirectDDS 后端已停止")
+
+    def set_point_cloud_demand(self, active):
+        """显示和感知需求只控制雷达，内部搬运订阅不算使用者。"""
+        with self._point_cloud_subscription_lock:
+            with self._lock:
+                previous = self._point_cloud_demand
+                self._point_cloud_demand = active
+                worker = self._sensor_process
+            if worker is not None:
+                # 已退出的拥有方不再接收命令；父需求保留，下一代启动时直接采纳。
+                if not worker.input_delivery_status().get("runtime_unavailable"):
+                    worker.set_point_cloud_demand(active)
+            else:
+                try:
+                    self._update_point_cloud_subscription()
+                except BaseException:
+                    if active:
+                        with self._lock:
+                            self._point_cloud_demand = previous
+                    raise
+
+    @contextmanager
+    def point_cloud_consumer(self):
+        """父拥有方保留真实使用需求，采集重建不撤销仍存活的使用者。"""
+        with self._point_cloud_subscription_lock:
+            self._point_cloud_users += 1
+            try:
+                if self._point_cloud_users == 1:
+                    self.set_point_cloud_demand(True)
+            except BaseException:
+                self._point_cloud_users -= 1
+                self._point_cloud_demand = self._point_cloud_users > 0
+                raise
+        try:
+            yield
+        finally:
+            with self._point_cloud_subscription_lock:
+                self._point_cloud_users -= 1
+                if self._point_cloud_users == 0:
+                    self.set_point_cloud_demand(False)
+
+    def set_input_delivery_active(self, active):
+        """输入桥就绪后才允许雷达产生原生输入。"""
+        with self._point_cloud_subscription_lock:
+            with self._lock:
+                previous = self._input_delivery_active
+                self._input_delivery_active = active
+            try:
+                self._update_point_cloud_subscription()
+            except BaseException:
+                if active:
+                    with self._lock:
+                        self._input_delivery_active = previous
+                raise
+
+    def _update_point_cloud_subscription(self):
+        with self._lock:
+            factory = self._point_cloud_subscriber_factory
+            active = (self._point_cloud_demand or self._input_delivery_active)
+            if not self._is_generation_active_locked(self._active_generation) or factory is None:
+                return
+            subscriber, thread = self._direct_point_cloud_subscriber, self._point_cloud_thread
+            if active and subscriber is not None:
+                return
+            generation, stop = self._active_generation, self._direct_dds_stop_event
+            if not active:
+                self._direct_point_cloud_subscriber = None
+                self._point_cloud_thread = None
+                self._invalidate_point_cloud_locked("")
+        if not active:
+            if subscriber is not None:
+                subscriber.Close()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(max(1.0, self.config.direct_dds.read_timeout_sec + .5))
+                if thread.is_alive():
+                    raise RuntimeError("Go2雷达读取线程未能停止")
+            with self._lock:
+                if thread in self._direct_dds_threads:
+                    self._direct_dds_threads.remove(thread)
+            return
+        subscriber = factory()
+        try:
+            subscriber.Init()
+            thread = threading.Thread(target=self._direct_point_cloud_reader_loop,
+                args=(generation, stop, subscriber), name=f"go2_direct_point_cloud_reader_g{generation}", daemon=True)
+            with self._lock:
+                if (not self._is_generation_active_locked(generation, stop)
+                        or not (self._point_cloud_demand or self._input_delivery_active)):
+                    subscriber.Close()
+                    return
+                self._direct_point_cloud_subscriber = subscriber
+                self._point_cloud_thread = thread
+                self._direct_dds_threads.append(thread)
+            thread.start()
+        except BaseException:
+            subscriber.Close()
+            with self._lock:
+                self._direct_point_cloud_subscriber = None
+                self._point_cloud_thread = None
+                if thread in self._direct_dds_threads:
+                    self._direct_dds_threads.remove(thread)
+            raise
+
+    def get_sensor_input_executor(self):
+        """新建图请求重新启动已经失败的采集拥有方，不复用死亡进程。"""
+        with self._point_cloud_subscription_lock, self._lifecycle_lock:
+            worker = self._sensor_process
+            if worker is not None and worker.input_delivery_status().get("runtime_unavailable"):
+                with self._lock:
+                    self._lifecycle_generation += 1
+                    generation = self._active_generation = self._lifecycle_generation
+                    self._sensor_process_failure = None
+                    self._direct_dds_started = True
+                    self._invalidate_observations_locked("Go2采集进程正在重建")
+                try:
+                    worker.rebuild(point_cloud_demand=self._point_cloud_demand,
+                        on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
+                        on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),
+                        on_error=lambda message, stamp: self._fail_sensor_process(message, stamp, generation))
+                except BaseException as error:
+                    self._fail_sensor_process("Go2采集重建失败：%s" % error, 0, generation)
+                    raise
+            return self._sensor_process
 
     def _fail_sensor_process(self, message: str, stamp: int, generation: int) -> None:
         from contracts.sensors import SensorStreamFailure
@@ -1240,6 +1382,8 @@ class Go2DirectDdsBridge:
                 self._last_accepted_point_cloud_source_timestamp_ns = cloud.metadata.get("source_timestamp_ns")
                 self._latest_point_cloud_source_topic = cloud.metadata.get("source_topic", "")
                 self._point_cloud_bridge_last_error = None
+            elif not snapshot["point_cloud_active"]:
+                self._invalidate_point_cloud_locked("")
             pose_callbacks = tuple(self._localization_callbacks.values()) if pose is not None else ()
             cloud_callbacks = tuple(self._point_cloud_callbacks.values()) if cloud is not None else ()
         for callback in pose_callbacks:
@@ -1313,7 +1457,7 @@ class Go2DirectDdsBridge:
             return
         native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
         canonical_imu_sample = None
-        if native_input:
+        if native_input and self._input_delivery_active:
             # 原生估计器只需要每条原始惯性；完整设备状态不参与算法输入。
             stamp = message.stamp
             source_timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
@@ -1332,6 +1476,8 @@ class Go2DirectDdsBridge:
                 _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2 IMU canonical 映射失败。', key='Go2 IMU canonical 映射失败。', interval_sec=30.0, exc_info=True)
             if canonical_imu_sample is not None:
                 self._publish_sensor_sample(canonical_imu_sample, generation)
+        if native_input or not self._input_delivery_active:
+            # 空闲只保留原有展示节流，标准输入已经在节流之前完整交付。
             now = time.monotonic()
             state_key = (generation, getattr(message, "mode", None), getattr(message, "gait_type", None))
             with self._lock:
@@ -1357,7 +1503,7 @@ class Go2DirectDdsBridge:
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
         )
-        if not native_input and imu_state is not None:
+        if not native_input and self._input_delivery_active and imu_state is not None:
             try:
                 canonical_imu_sample = adapt_go2_l2_imu(
                     calibration_profile=self._calibration_profile,
@@ -1558,12 +1704,16 @@ class Go2DirectDdsBridge:
         if stop_event is None or subscriber is None:
             return
         while not stop_event.is_set():
+            with self._lock:
+                if subscriber is not self._direct_point_cloud_subscriber:
+                    return
             read_started = time.monotonic()
             try:
                 sample = subscriber.Read(timeout_sec)
             except Exception as exc:
                 with self._lock:
-                    if not self._is_generation_active_locked(generation, stop_event):
+                    if (subscriber is not self._direct_point_cloud_subscriber
+                            or not self._is_generation_active_locked(generation, stop_event)):
                         return
                 _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '读取 Go2 官方 DDS 点云失败。', key='读取 Go2 官方 DDS 点云失败。', interval_sec=30.0, exc_info=True)
                 self._record_point_cloud_bridge_error(
@@ -1576,7 +1726,8 @@ class Go2DirectDdsBridge:
                 continue
             read_returned, received_wall_ns = time.monotonic(), time.time_ns()
             with self._lock:
-                if not self._is_generation_active_locked(generation, stop_event):
+                if (subscriber is not self._direct_point_cloud_subscriber
+                        or not self._is_generation_active_locked(generation, stop_event)):
                     return
             try:
                 self._on_point_cloud_message(
@@ -1608,6 +1759,9 @@ class Go2DirectDdsBridge:
             generation = self._active_generation_snapshot()
         if generation is None:
             return
+        with self._lock:
+            if not (self._point_cloud_demand or self._input_delivery_active):
+                return
 
         def reject(message_text: str) -> None:
             self._record_point_cloud_bridge_error(message_text, generation=generation)
@@ -1672,7 +1826,7 @@ class Go2DirectDdsBridge:
                         else RegistrationState.BODY
                     ),
                 )
-                if source_frame == _GO2_UTLIDAR_FRAME
+                if source_frame == _GO2_UTLIDAR_FRAME and self._input_delivery_active
                 else None
             )
         except (Go2L2DecodeError, ValueError) as exc:
@@ -1831,6 +1985,7 @@ class Go2DirectDdsBridge:
                     "source_xyz_array": source_xyz_array,
                     "intensity_array": intensity_array,
                     "offset_ns_array": offset_ns_array,
+                    "source_id": "go2_l2" if source_frame == _GO2_UTLIDAR_FRAME else None,
                     "canonical_lidar_frame": canonical_lidar_frame,
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
                     "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
@@ -1855,8 +2010,8 @@ class Go2DirectDdsBridge:
                         else []
                     ),
                     "calibration_ref": (
-                        canonical_lidar_frame.calibration_ref
-                        if canonical_lidar_frame is not None
+                        self._calibration_profile.calibration_ref
+                        if source_frame == _GO2_UTLIDAR_FRAME
                         else None
                     ),
                     "yaw_stabilization_applied": yaw_stabilization_applied,
@@ -1874,7 +2029,8 @@ class Go2DirectDdsBridge:
         with self._lifecycle_lock:
             with self._lock:
                 last_accepted_timestamp_ns = self._last_accepted_point_cloud_source_timestamp_ns
-                if not self._is_generation_active_locked(generation):
+                if (not self._is_generation_active_locked(generation)
+                        or not (self._point_cloud_demand or self._input_delivery_active)):
                     return
                 if last_accepted_timestamp_ns is not None and source_timestamp_ns <= last_accepted_timestamp_ns:
                     rejection_error = (
@@ -2344,9 +2500,12 @@ class Go2DeviceDataPlane:
 
     runtime: Go2DataPlaneRuntime
 
+    def point_cloud_consumer(self):
+        return self.runtime.bridge.point_cloud_consumer()
+
     def get_sensor_input_executor(self):
         """仅返回当前代际已启动的采集进程。"""
-        return self.runtime.bridge._sensor_process
+        return self.runtime.bridge.get_sensor_input_executor()
 
     def start(self) -> None:
         self.runtime.start()

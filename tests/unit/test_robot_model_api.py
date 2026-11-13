@@ -278,10 +278,10 @@ def test_go2_process_snapshot_preserves_joint_time():
     bridge._on_low_state(low_state(), generation=1)
     sample = bridge.get_joint_snapshot()
     parent = make_go2_bridge()
-    parent._install_process_snapshot({"pose": None, "imu": None, "cloud": None, "status": {},
+    parent._install_process_snapshot({"pose": None, "imu": None, "cloud": None, "point_cloud_active": False, "status": {},
                                      "joint_snapshot": sample}, generation=1)
     assert parent.get_joint_snapshot() == sample
-    parent._install_process_snapshot({"pose": None, "imu": None, "cloud": None, "status": {},
+    parent._install_process_snapshot({"pose": None, "imu": None, "cloud": None, "point_cloud_active": False, "status": {},
                                      "joint_snapshot": None}, generation=1)
     assert parent.get_joint_snapshot() is None
 
@@ -293,6 +293,12 @@ class _JointSource:
 
     def subscribe_sensor_sample(self, callback):
         return 1
+
+    def set_point_cloud_demand(self, active):
+        self.point_cloud_active = active
+
+    def set_input_delivery_active(self, active):
+        self.input_delivery_active = active
 
     def start(self):
         pass

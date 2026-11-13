@@ -28,7 +28,7 @@ def _default_source(config, *, calibration_profile=None):
     return Go2DirectDdsBridge(config, calibration_profile=calibration_profile)
 
 
-def _sensor_process_main(config, data, status, commands, stop, source_factory, forward_samples):
+def _sensor_process_main(config, data, status, commands, stop, source_factory, forward_samples, point_cloud_demand):
     """此进程只拥有传感器，不创建运动客户端或网关业务。"""
     # spawn 子进程的命令行不含入口信息，自设进程名供性能采集与 top 识别。
     set_process_title("nuwax-go2-input")
@@ -47,6 +47,8 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
     latest_snapshot = None
     latest_pose_metadata = {}
     status_send_lock = threading.Lock()
+    stop_request = stop
+    stop = threading.Event()
 
     def send_status(kind, payload):
         with status_send_lock:
@@ -132,6 +134,7 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
         subscribe_pose = getattr(source, "subscribe_localization", None)
         if callable(subscribe_pose):
             subscribe_pose(observe_pose)
+        source.set_point_cloud_demand(point_cloud_demand)
         sender = threading.Thread(target=send_samples, name="go2-input-send", daemon=True)
         sender.start()
         source.start()
@@ -139,6 +142,8 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
         threading.Thread(target=send_snapshots, name="go2-snapshot-send", daemon=True).start()
         previous_pose = previous_cloud = None
         while not stop.wait(.05):
+            if stop_request.value:
+                break
             if commands.poll():
                 command_id, operation, arguments = commands.recv()
                 try:
@@ -149,12 +154,18 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                                 raise RuntimeError("输入交付已启动")
                         # 连接期间尚未订阅输入，不能持锁阻塞DDS读取并积累旧样本。
                         candidate = factory(spec, record, source)
+                        try:
+                            source.set_input_delivery_active(True)
+                        except BaseException:
+                            candidate.stop()
+                            raise
                         with delivery_lock:
                             delivery = candidate
                             local_delivery_selected = True
                         result = delivery.status()
                         delivery_sequence = command_id
                     elif operation == "stop":
+                        source.set_input_delivery_active(False)
                         with delivery_lock:
                             if delivery is not None:
                                 delivery.stop()
@@ -168,6 +179,10 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                         with condition:
                             pending.append((("drained", command_id), time.monotonic(), 0))
                             condition.notify()
+                    elif operation == "point_cloud":
+                        source.set_point_cloud_demand(arguments)
+                        point_cloud_demand = arguments
+                        result = source.get_status()
                     else:
                         raise ValueError("未知采集进程命令")
                     commands.send((command_id, True, result))
@@ -180,7 +195,8 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                 send_status("error", problem)
                 return
             pose, imu = source.get_current_pose(), source.get_imu_state()
-            cloud = source.get_latest_local_point_cloud()
+            point_cloud_active = point_cloud_demand or delivery is not None
+            cloud = source.get_latest_local_point_cloud() if point_cloud_active else None
             pose_stamp = pose.timestamp if pose is not None else None
             cloud_stamp = cloud.timestamp if cloud is not None else None
             joint_getter = getattr(source, "get_joint_snapshot", None)
@@ -195,11 +211,12 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                 "input_delivery": delivery.status() if delivery is not None else None,
                 "delivery_sequence": delivery_sequence,
                 "recording_dropped": recording_dropped,
+                "point_cloud_active": point_cloud_active,
             }
             with snapshot_condition:
                 previous = latest_snapshot or {}
                 for key in ("pose", "imu", "cloud"):
-                    if snapshot[key] is None:
+                    if snapshot[key] is None and (key != "cloud" or point_cloud_active):
                         snapshot[key] = previous.get(key)
                 latest_snapshot = snapshot
                 snapshot_condition.notify()
@@ -228,27 +245,33 @@ class Go2SensorProcess:
     """父进程拥有子进程及交付线程，停止时撤销代际并回收真实进程。"""
 
     def __init__(self, config, *, on_sample, on_snapshot, on_error, source_factory=_default_source,
-                 forward_samples=True, calibration_profile=None):
+                 forward_samples=True, calibration_profile=None, point_cloud_demand=False):
         self.config = config
         self.on_sample, self.on_snapshot, self.on_error = on_sample, on_snapshot, on_error
         # 不注入标定时保持既有自定义工厂的单config参数合同。
         self.source_factory = (partial(source_factory, calibration_profile=calibration_profile)
                                if calibration_profile is not None else source_factory)
         self.forward_samples = forward_samples
+        self._point_cloud_demand = point_cloud_demand
         self._context = mp.get_context("spawn")
-        self._stop = self._context.Event()
+        self._command_lock = threading.RLock()
+        self._reset_transport()
+
+    def _reset_transport(self):
+        """旧代回收后创建新通信资源，父拥有方及其命令锁保持。"""
+        self._stop = self._context.RawValue("b", False)
         self._closing = threading.Event()
         self._process = None
         self._threads = []
         self._data = self._status = None
         self._commands = None
-        self._command_lock = threading.Lock()
         self._command_sequence = 0
         self._drain_condition = threading.Condition()
         self._drained_sequence = 0
         self._delivery_status = None
         self._delivery_sequence = 0
         self._recording_sink = None
+        self._delivery_request = None
         self.recording_dropped = 0
         self._snapshot_condition = threading.Condition()
         self._latest_snapshot = None
@@ -264,7 +287,7 @@ class Go2SensorProcess:
         self._status, child_status = self._context.Pipe(duplex=False)
         self._commands, child_commands = self._context.Pipe()
         self._process = self._context.Process(target=_sensor_process_main,
-            args=(self.config, child_data, child_status, child_commands, self._stop, self.source_factory, self.forward_samples), name="go2-sensor-input", daemon=True)
+            args=(self.config, child_data, child_status, child_commands, self._stop, self.source_factory, self.forward_samples, self._point_cloud_demand), name="go2-sensor-input", daemon=True)
         try:
             self._process.start()
             child_data.close(); child_status.close()
@@ -293,7 +316,7 @@ class Go2SensorProcess:
             if self._failed or self._closing.is_set():
                 return
             self._failed = True
-        self._stop.set()
+        self._stop.value = True
         self.on_error(message, timestamp_ns)
 
     def _receive_data(self):
@@ -350,7 +373,7 @@ class Go2SensorProcess:
                         # 同一通道的快照已是完整的最近状态，慢显示只保留最近一份。
                         previous = self._latest_snapshot or {}
                         for key in ("pose", "imu", "cloud"):
-                            if payload[key] is None:
+                            if payload[key] is None and (key != "cloud" or payload["point_cloud_active"]):
                                 payload[key] = previous.get(key)
                         self._latest_snapshot = payload
                         self._snapshot_condition.notify()
@@ -373,11 +396,36 @@ class Go2SensorProcess:
                     logging.getLogger(__name__).exception("Go2显示快照交付失败")
 
     def start_input_delivery(self, factory, spec, recording_sink=None):
-        self._recording_sink = recording_sink
-        self._delivery_status = {"ready": False, "started": False}
-        self._delivery_status = self._command("start", (factory, spec))
-        self._delivery_sequence = self._command_sequence
-        return self._delivery_status
+        with self._command_lock:
+            self._recording_sink = recording_sink
+            self._delivery_status = {"ready": False, "started": False}
+            self._delivery_status = self._command("start", (factory, spec))
+            self._delivery_request = (factory, spec)
+            self._delivery_sequence = self._command_sequence
+            return self._delivery_status
+
+    def rebuild(self, *, point_cloud_demand, on_sample, on_snapshot, on_error):
+        """保留父执行者及其仍在使用的输入请求，只重建真实进程和通信资源。"""
+        with self._command_lock:
+            request, recording = self._delivery_request, self._recording_sink
+            self.close()
+            self._reset_transport()
+            self.on_sample, self.on_snapshot, self.on_error = on_sample, on_snapshot, on_error
+            self._point_cloud_demand = point_cloud_demand
+            self._delivery_request = request
+            self._recording_sink = recording if request is not None else None
+            try:
+                self.start()
+                if request is not None:
+                    self.start_input_delivery(*request, recording_sink=recording)
+            except BaseException:
+                self.close()
+                raise
+
+    def set_point_cloud_demand(self, active):
+        with self._command_lock:
+            self._command("point_cloud", active)
+            self._point_cloud_demand = active
 
     def _report_recording_dropped(self, dropped):
         with self._recording_loss_lock:
@@ -392,16 +440,20 @@ class Go2SensorProcess:
                 self.recording_dropped = dropped
 
     def stop_input_delivery(self):
-        if self._process is not None and not self._process.is_alive():
-            self._process.join()
-            self._delivery_status = {"started": False, "ready": False}
-            return
-        self._delivery_status = self._command("stop", None)
-        self._delivery_sequence = self._command_sequence
-        self._report_recording_dropped(self._delivery_status.get("recording_transport_dropped", 0))
-        with self._drain_condition:
-            if not self._drain_condition.wait_for(lambda: self._drained_sequence >= self._command_sequence, timeout=10):
-                raise RuntimeError("独立输入记录尚未排空")
+        with self._command_lock:
+            self._delivery_request = None
+            if self._process is not None and not self._process.is_alive():
+                self._process.join()
+                self._delivery_status = {"started": False, "ready": False}
+                self._recording_sink = None
+                return
+            self._delivery_status = self._command("stop", None)
+            self._delivery_sequence = self._command_sequence
+            self._report_recording_dropped(self._delivery_status.get("recording_transport_dropped", 0))
+            with self._drain_condition:
+                if not self._drain_condition.wait_for(lambda: self._drained_sequence >= self._command_sequence, timeout=10):
+                    raise RuntimeError("独立输入记录尚未排空")
+            self._recording_sink = None
 
     def input_delivery_status(self):
         result = dict(self._delivery_status or {})
@@ -434,7 +486,7 @@ class Go2SensorProcess:
         with self._snapshot_condition:
             self._latest_snapshot = None
             self._snapshot_condition.notify_all()
-        self._stop.set()
+        self._stop.value = True
         process = self._process
         if process is not None and process.pid is not None:
             process.join(timeout=3)

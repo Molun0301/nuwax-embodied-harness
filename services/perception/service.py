@@ -4,9 +4,10 @@ import json
 import logging
 import threading
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timezone
 from time import perf_counter
+import time
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -33,6 +34,7 @@ from core.logging_utils import LogRateLimiter
 from core.event_bus import PreparedEventPublication
 from core.stream_bus import PreparedStreamPublication
 from providers import CalibrationProvider, PointCloudProvider
+from providers.pointcloud import DemandPointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
     DetectionBundle,
@@ -191,7 +193,7 @@ class PerceptionService:
 
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
-        with self._operation():
+        with self._operation(), self.point_cloud_consumer():
             return self._run_full_pipeline(
                 image_frame, camera_info, image_artifact=image_artifact,
                 requested_by=requested_by, detector_backend_name=detector_backend_name,
@@ -487,7 +489,7 @@ class PerceptionService:
     ) -> PerceptionContext:
         """从平台已接收的端侧推流抽取最新帧并完成完整感知。"""
 
-        with self._operation():
+        with self._operation(), self.point_cloud_consumer():
             return self._perceive_current_scene(
                 camera_id=camera_id, requested_by=requested_by,
                 detector_backend_name=detector_backend_name, store_artifact=store_artifact,
@@ -560,7 +562,7 @@ class PerceptionService:
 
     def _detect_current_frame_fast(self, *, camera_id, requested_by, detector_backend_name,
                                    detection_metadata, open_vocabulary_classes):
-        image_frame = self._read_latest_pushed_image(camera_id)
+        image_frame = self._read_latest_pushed_image(camera_id, wait_for_frame=requested_by != "perception_video_runtime")
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
             required_source = "video_ingest_receiver"
@@ -809,7 +811,7 @@ class PerceptionService:
     def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
                                       stop_event=None):
         """完成同帧几何与关键帧抓图，返回结果后结束感知操作。"""
-        with self._operation():
+        with self._operation(), self.point_cloud_consumer():
             return self._complete_observation_geometry(
                 context, inputs, store_artifact=store_artifact,
                 stop_event=stop_event)
@@ -915,16 +917,36 @@ class PerceptionService:
     def _read_latest_pushed_image(
         self,
         camera_id: Optional[str],
+        *, wait_for_frame=True,
     ) -> Optional["ImageFrame"]:
         from contracts.image import ImageFrame
 
         video_frame_source = self._video_frame_source
         if video_frame_source is None:
             return None
-        image_frame = video_frame_source.get_latest_image(camera_id)
+        with self.video_consumer():
+            image_frame = video_frame_source.get_latest_image(camera_id)
+            # 单次视觉请求也要给按需推流的拥有方送达首帧的机会。
+            if wait_for_frame and self._video_frame_source_status().get("source") == "video_shared_memory":
+                deadline = time.monotonic() + 15.0
+                while image_frame is None and not self._closing and time.monotonic() < deadline:
+                    time.sleep(.02)
+                    image_frame = video_frame_source.get_latest_image(camera_id)
         if image_frame is not None and not isinstance(image_frame, ImageFrame):
             raise TypeError("视频推流抽帧源必须返回标准 ImageFrame。")
         return image_frame
+
+    def video_consumer(self):
+        if self._video_frame_source_status().get("source") != "video_shared_memory":
+            return nullcontext()
+        from services.perception.video_demand import video_consumer
+        return video_consumer()
+
+    def point_cloud_consumer(self):
+        providers = getattr(self._provider_owner, "providers", None)
+        if isinstance(providers, DemandPointCloudProvider):
+            return providers.point_cloud_consumer()
+        return nullcontext()
 
     def get_latest_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
         """返回最新感知结果。"""

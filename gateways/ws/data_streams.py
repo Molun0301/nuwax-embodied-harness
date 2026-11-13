@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 from gateways.ws.console_projection import console_payload, field_value, selected_fields
 from gateways.ws.instance_encoding import InstanceSnapshotEncoder
 from gateways.ws.pointcloud_encoding import CanonicalPointCloudEncoder
-from gateways.ws.pointcloud_stream import install_pointcloud_stream
+from gateways.ws.pointcloud_stream import install_pointcloud_stream, point_cloud_usage
 
 try:
     from services.geometry.video_shm_reader import VideoShmReader
@@ -862,22 +862,7 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
                 "camera_id": camera_id,
                 "available_camera_id": source_camera_id,
             })
-        video_available = False
-        if VideoShmReader is not None:
-            _shm_path = "/tmp/nuwax_video.shm"
-            _probe = VideoShmReader(_shm_path)
-            video_available = _probe.has_new_frame()
-            _probe.close()
-        if not video_available:
-            request.state.error_category = "not_ready"
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "video_stream_not_available",
-                    "reason": "rust_bridge_no_frames",
-                    "message": "Rust 视频中转尚未收到帧数据。",
-                },
-            )
+        # 首帧及写者重启由共享读取拥有方等待，瞬时空发布头不结束网页视频连接。
         # 默认随输入到达交付；显式请求的帧率仅作为发送上限。
         requested_fps = float(fps) if fps is not None else 0.0
         if not math.isfinite(requested_fps) or requested_fps < 0:
@@ -885,29 +870,31 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 60.0) if requested_fps else 0.0
 
         async def frame_generator():
-            shm_path = "/tmp/nuwax_video.shm"
-            attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
-            last_sent_sequence = -1
-            next_frame_at = 0.0
-            try:
-                if not attached:
-                    return
-                while True:
-                    multipart, sequence = await _SHARED_MJPEG_SOURCE.wait_for_frame(last_sent_sequence)
-                    if multipart is None:
+            from services.perception.video_demand import video_consumer
+            with video_consumer():
+                shm_path = "/tmp/nuwax_video.shm"
+                attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
+                last_sent_sequence = -1
+                next_frame_at = 0.0
+                try:
+                    if not attached:
                         return
-                    remaining = next_frame_at - time.monotonic()
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        # 等待发送限额时只领取最新帧，不补发已经过时的候选。
-                        multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
-                    last_sent_sequence = sequence
-                    next_frame_at = time.monotonic() + frame_interval_sec
-                    yield multipart
-            finally:
-                if attached:
-                    # 读者退出由拥有方等待，不能阻塞网页事件循环。
-                    await _run_blocking(_SHARED_MJPEG_SOURCE.release)
+                    while True:
+                        multipart, sequence = await _SHARED_MJPEG_SOURCE.wait_for_frame(last_sent_sequence)
+                        if multipart is None:
+                            return
+                        remaining = next_frame_at - time.monotonic()
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                            # 等待发送限额时只领取最新帧，不补发已经过时的候选。
+                            multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
+                        last_sent_sequence = sequence
+                        next_frame_at = time.monotonic() + frame_interval_sec
+                        yield multipart
+                finally:
+                    if attached:
+                        # 读者退出由拥有方等待，不能阻塞网页事件循环。
+                        await _run_blocking(_SHARED_MJPEG_SOURCE.release)
 
         return StreamingResponse(
             frame_generator(),
@@ -926,6 +913,11 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
             await websocket.close(code=4403, reason=error.message)
             return
 
+        cloud_topics = {"pointcloud.frame", "pointcloud_map.snapshot", "pointcloud_map.meta"}
+        async with point_cloud_usage(runtime, enabled=topic_filter is None or bool(cloud_topics.intersection(topic_filter))):
+            await stream_websocket(websocket, topic_filter, after_cursor, map_binary_version)
+
+    async def stream_websocket(websocket, topic_filter, after_cursor, map_binary_version):
         await websocket.accept()
         loop = asyncio.get_running_loop()
         queue = _ClientStreamQueue(

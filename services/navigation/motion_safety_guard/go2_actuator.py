@@ -240,10 +240,7 @@ class Go2Actuator:
         self._motion_controller = None
         self._feedback_frame = value('robot.base_frame').strip() or "base_link"
         self._feedback_source_id = "unitree_sdk2py:" + value('go2.direct_dds_pose_topic')
-        self._motion_state_subscriber = (
-            factories.motion_state_subscriber(self._observe_motion_state)
-            if factories.motion_state_subscriber is not None else None
-        )
+        self._motion_state_subscriber = None
         try:
             self._sport = factories.sport_client()
             self._obstacle = factories.obstacle_client()
@@ -271,6 +268,8 @@ class Go2Actuator:
                 # mcf模式可真实行走，但传统运动状态的速度/足端字段仍为零。
                 # 仅已知提供有效速度的控制器使用测量停车，未知模式不作此声明。
                 self._feedback_supported = self._feedback_supported and self._motion_controller in {"normal", "advanced"}
+            if self._feedback_supported:
+                self._motion_state_subscriber = factories.motion_state_subscriber(self._observe_motion_state)
         except BaseException:
             self.close()
             raise

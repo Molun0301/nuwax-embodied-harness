@@ -153,8 +153,13 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
     _, source_cloud, points, key, sample, map_cloud = selected
     batch_count = 0
     if not map_cloud:
-        offsets = (np.frombuffer(sample.time_offset_ns_le, dtype="<u8").astype(np.int64)
-                   if sample is not None and sample.time_offset_ns_le is not None else np.zeros(len(points), dtype=np.int64))
+        if sample is not None and sample.time_offset_ns_le is not None:
+            offsets = np.frombuffer(sample.time_offset_ns_le, dtype="<u8").astype(np.int64)
+        elif source_cloud.metadata.get("offset_ns_array") is not None:
+            # 显示/感知原始数组保留逐点时间，不为几何配对创建标准字节载荷。
+            offsets = np.asarray(source_cloud.metadata["offset_ns_array"], dtype=np.int64)
+        else:
+            offsets = np.zeros(len(points), dtype=np.int64)
         scan_stamp = int(sample.timestamp_ns) if sample is not None else key[1]
         mapped = np.empty((len(points), 3), dtype=np.float64)
         for offset in np.unique(offsets):

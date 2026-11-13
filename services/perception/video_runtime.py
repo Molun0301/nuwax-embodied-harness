@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import ExitStack
 import logging
 import threading
 import time
@@ -51,10 +52,13 @@ class PerceptionVideoRuntime:
             yaw_threshold_deg=keyframe_yaw_threshold_deg)
         self._condition = threading.Condition(threading.RLock())
         self._reasons = {}
+        self._video_consumers = {}
         self._samples = {}
         self._bursts = []
         self._seen_frames = {}
         self._thread = None
+        self._processing = False
+        self._releasing = 0
         self._closed = False
         self._stop = threading.Event()
         self._processed_frames = 0
@@ -67,23 +71,67 @@ class PerceptionVideoRuntime:
     def acquire(self, reason, *, interval_sec=None, camera_id=None,
                 detector_backend_name=None, open_vocabulary_classes=()):
         with self._condition:
+            self._condition.wait_for(lambda: not self._releasing or self._closed)
             if self._closed:
                 raise GatewayError("感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
-            self._reasons[reason] = (self._interval_sec if interval_sec is None else interval_sec,
-                camera_id or self._camera_id,
-                detector_backend_name or self._detector_backend_name or None,
-                tuple(open_vocabulary_classes))
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="perception-runtime", daemon=True)
-                self._thread.start()
-            self._condition.notify_all()
+            new_reason = reason not in self._reasons
+            self._releasing += 1
+        consumer = None
+        try:
+            if new_reason:
+                consumer = ExitStack()
+                consumer.enter_context(self._perception_service.video_consumer())
+                if self._remember_keyframes:
+                    consumer.enter_context(self._perception_service.point_cloud_consumer())
+            with self._condition:
+                if self._closed:
+                    raise GatewayError("感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
+                if self._thread is None:
+                    thread = threading.Thread(target=self._run, name="perception-runtime", daemon=True)
+                    thread.start()
+                    self._thread = thread
+                self._reasons[reason] = (self._interval_sec if interval_sec is None else interval_sec,
+                    camera_id or self._camera_id,
+                    detector_backend_name or self._detector_backend_name or None,
+                    tuple(open_vocabulary_classes))
+                if new_reason:
+                    self._video_consumers[reason] = consumer
+                    consumer = None
+        finally:
+            try:
+                if consumer is not None:
+                    consumer.close()
+            finally:
+                with self._condition:
+                    self._releasing -= 1
+                    self._condition.notify_all()
         self._write_status()
         return self.get_status()
 
     def release(self, reason):
         with self._condition:
-            self._reasons.pop(reason, None)
+            self._condition.wait_for(lambda: not self._releasing or self._closed)
+            settings = self._reasons.pop(reason, None)
+            if settings is None:
+                return self.get_status()
+            consumer = self._video_consumers.pop(reason)
+            self._releasing += 1
             self._condition.notify_all()
+            self._condition.wait_for(lambda: not self._processing)
+            backend = settings[2] or self._perception_service.detector_pipeline.default_backend_name
+            used = any((value[2] or self._perception_service.detector_pipeline.default_backend_name) == backend
+                       for value in self._reasons.values())
+        try:
+            if not used:
+                # 写线程可能还在补完本轮关键帧；先交付记忆，再撤销模型资源。
+                if self._memory_service is not None:
+                    self._memory_service.flush_observations()
+                self._perception_service.detector_pipeline.unload(backend)
+        finally:
+            consumer.__exit__(None, None, None)
+            with self._condition:
+                self._releasing -= 1
+                self._condition.notify_all()
         self._write_status()
         return self.get_status()
 
@@ -121,6 +169,10 @@ class PerceptionVideoRuntime:
             inputs=inputs, complete=True)
 
     def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
+        with self._perception_service.point_cloud_consumer():
+            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec)
+
+    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
         burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count)
         with self._condition:
             settings = self._reasons[reason]
@@ -147,11 +199,12 @@ class PerceptionVideoRuntime:
     def _run(self):
         while True:
             with self._condition:
-                while not self._reasons and not self._closed:
+                while (not self._reasons or self._releasing) and not self._closed:
                     self._condition.wait()
                 if self._closed:
                     return
                 settings = dict(self._reasons)
+                self._processing = True
             groups = {}
             interval = min(value[0] for value in settings.values())
             for reason, (_, camera, backend, classes) in settings.items():
@@ -160,17 +213,22 @@ class PerceptionVideoRuntime:
                 group["classes"].update(classes)
             started = time.monotonic()
             failed = False
-            for (camera, backend), group in groups.items():
-                try:
-                    self._process(camera, backend, group)
-                except Exception as error:
-                    if isinstance(error, GatewayError) and error.error_code == "video_ingest_not_ready":
-                        continue
-                    failed = True
-                    with self._condition:
-                        self._failure_count += 1
-                        self._last_error = str(error)
-                    LOGGER.exception("连续感知处理失败")
+            try:
+                for (camera, backend), group in groups.items():
+                    try:
+                        self._process(camera, backend, group)
+                    except Exception as error:
+                        if isinstance(error, GatewayError) and error.error_code == "video_ingest_not_ready":
+                            continue
+                        failed = True
+                        with self._condition:
+                            self._failure_count += 1
+                            self._last_error = str(error)
+                        LOGGER.exception("连续感知处理失败")
+            finally:
+                with self._condition:
+                    self._processing = False
+                    self._condition.notify_all()
             self._write_status()
             delay = self._failure_backoff_sec if failed else interval
             with self._condition:
@@ -277,6 +335,10 @@ class PerceptionVideoRuntime:
         with self._condition:
             self._samples.clear()
             self._seen_frames.clear()
+            consumers = tuple(self._video_consumers.values())
+            self._video_consumers.clear()
+        for consumer in consumers:
+            consumer.__exit__(None, None, None)
         self._write_status()
 
     def _write_status(self):

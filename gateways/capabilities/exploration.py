@@ -114,6 +114,8 @@ def _pause_and_save(platform, ctx, args, run):
 
 @rpc_errors
 def explore_area(platform, ctx, args):
+    if not platform.config.perception.yolo_world.enabled:
+        return _explore_area(platform, ctx, args)
     reason = f"exploration:{ctx.task_id}"
     runtime = platform.perception.video_runtime
     runtime.acquire(reason)

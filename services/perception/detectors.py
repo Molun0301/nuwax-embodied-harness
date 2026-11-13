@@ -518,8 +518,27 @@ class _YoloWorldRuntimeBackend(DetectorBackend):
     def close(self, timeout=5.0) -> bool:
         with self._inference_worker_lock:
             self._worker_closed = True
-            owner = self._inference_worker
-        return owner is None or owner.close(timeout)
+        return self.unload(timeout)
+
+    def unload(self, timeout=5.0) -> bool:
+        """等待检测退出后释放模型，下一次使用仍可按需加载。"""
+        import gc
+        import sys
+
+        with self._detection_lock:
+            with self._inference_worker_lock:
+                owner = self._inference_worker
+            if owner is not None and not owner.close(timeout):
+                return False
+            with self._inference_worker_lock:
+                self._inference_worker = None
+            self._model = None
+            self._resolved_model_source = ""
+            gc.collect()
+            torch = sys.modules.get("torch")
+            if torch is not None and torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+        return True
 
     def _get_model(self):
         if self._model is not None:
@@ -1030,6 +1049,14 @@ class YoloWorldDetectorBackend(_YoloWorldRuntimeBackend):
                 },
             )
 
+    def unload(self, timeout=5.0) -> bool:
+        with self._detection_lock:
+            if not super().unload(timeout):
+                return False
+            self._last_class_names = ()
+            self._default_model_class_names = None
+            return True
+
     @property
     def supports_worker_process(self) -> bool:
         """动态词表在当前进程设置；仅固定引擎使用既有工作进程协议。"""
@@ -1253,6 +1280,11 @@ class DetectorPipeline:
             if callable(close) and not close(timeout=max(0.0, deadline - time.monotonic())):
                 complete = False
         return complete
+
+    def unload(self, backend_name=None) -> None:
+        backend = self.get_backend(backend_name)
+        if backend is not None and not backend.unload():
+            raise GatewayError("检测模型未能退出。", error_code="perception_unload_failed", http_status=503)
 
     def list_backends(self) -> Tuple[DetectorBackendSpec, ...]:
         """返回当前所有已注册检测后端规范。"""

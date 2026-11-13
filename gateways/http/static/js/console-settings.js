@@ -332,9 +332,8 @@ function renderConfigSchema(schema) {
     ? schema.application?.hot_apply_pending || [] : []);
   let sectionIndex = 0;
   for (const section of schema.sections || []) {
+    // 段与键的先后来自模式文件，这里不另行排序。
     const fields = (section.fields || []).filter(match);
-    // 模式放在预算上限之前，其余设置继续沿用目录顺序。
-    fields.sort((a, b) => Number(b.key === FINE_CLOUD_CACHE_KEY) - Number(a.key === FINE_CLOUD_CACHE_KEY));
     if (!fields.length) continue;
     const normal = fields.filter((f) => !f.advanced);
     const advanced = fields.filter((f) => f.advanced);

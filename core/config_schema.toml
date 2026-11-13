@@ -7,223 +7,16 @@
 # sensitive 标记敏感值。设置读取与页面展示沿用现有脱敏要求。
 # hot 表示网关内立即生效。外部进程的特殊生效范围写在相应说明中。
 # 相对持久路径以部署的数据布局解析，按 D0 对照表保留受管安装的存储位置。
+# 段与键在本文件中的先后即两个设置页的显示次序：含功能开关的常用段在前，段内功能开关在前。
 
-[robot.actuator_max_linear_mps]
-type = "float"
-min = 0.0
-min_exclusive = true
-max = 5.0
-special_values = [""]
-default = ""
-description = "显式声明执行器平面速度上限（米/秒）。须与偏航上限和运动形式同时填写。三项留空时，Go2 使用官方速度上限。"
-consumers = [
-    "core/config.py:derived_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_linear_mps",
-]
-apply = "restart"
-
-[robot.actuator_max_yaw_rps]
-type = "float"
-min = 0.0
-min_exclusive = true
-max = 12.566370614359172
-special_values = [""]
-default = ""
-description = "显式声明执行器偏航上限（弧度/秒），最大为 4π。须与平面上限和运动形式同时填写。"
-consumers = [
-    "core/config.py:derived_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_yaw_rps",
-]
-apply = "restart"
-
-[robot.actuator_motion_model]
-type = "string"
-choices = ["", "omnidirectional"]
-default = ""
-description = "执行器的基本运动方式，目前只支持 omnidirectional（可前后左右平移和原地转向）。须与两项速度上限同时填写，供三维导航使用。"
-consumers = [
-    "core/config.py:derived_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_motion_model",
-]
-apply = "restart"
-
-[robot.base_frame]
-type = "string"
-default = "base_link"
-description = "机体基准坐标系名，运动守卫用作命令和执行反馈的参考帧。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/navigation/motion_safety_guard/execution_feedback.py:ExecutionFeedback.from_environment",
-    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.__init__",
-    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.base_frame",
-]
-apply = "restart"
-
-[robot.center_x_m]
-type = "float"
-special_values = [""]
-default = ""
-description = "机体外包中心相对基准坐标系的前后偏移（米）。留空时按模型或驱动计算。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_x_m",
-]
-apply = "restart"
-
-[robot.center_y_m]
-type = "float"
-special_values = [""]
-default = ""
-description = "机体外包中心相对基准坐标系的左右偏移（米）。留空时按模型或驱动计算。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_y_m",
-]
-apply = "restart"
-
-[robot.center_z_m]
-type = "float"
-special_values = [""]
-default = ""
-description = "机体外包中心相对基准坐标系的上下偏移（米）。留空时按模型或驱动计算。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_z_m",
-]
-apply = "restart"
-
-[robot.driver]
-type = "string"
-choices = ["customrobot", "go2", "g1", "raspi_lidar_robot", "unitree_sim"]
-default = "customrobot"
-description = "活动方案的机器人驱动。安装或导入时保留实际机器人型号。"
-consumers = [
-    "core/config.py:derived_values",
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.driver",
-]
-apply = "restart"
-
-[robot.height_m]
-type = "float"
-min = 0.0
-min_exclusive = true
-special_values = [""]
-default = ""
-description = "手填机体上下高度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.height_m",
-]
-apply = "restart"
-
-[robot.length_m]
-type = "float"
-min = 0.0
-min_exclusive = true
-special_values = [""]
-default = ""
-description = "手填机体前后长度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.length_m",
-]
-apply = "restart"
-
-[robot.lidar_frame]
-type = "string"
-default = "utlidar_lidar"
-description = "雷达坐标系名，几何运行时用它标识雷达输入。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.lidar_frame",
-]
-apply = "restart"
-
-[robot.map_frame]
-type = "string"
-default = "map"
-description = "地图坐标系名。三维曲面导航要求 map。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.map_frame",
-]
-apply = "restart"
-
-[robot.model_base_link]
-type = "string"
-default = ""
-description = "机器人描述模型中的机体基准连杆名。留空时由现行模型规则确定。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_base_link",
-]
-apply = "restart"
-
-[robot.model_joint_positions_json]
-type = "string"
-default = ""
-description = "关节名到参考关节位置的 JSON（结构化文本）对象。留空时按模型默认参考姿态计算外形。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_joint_positions_json",
-]
-apply = "restart"
-
-[robot.model_path]
-type = "string"
-default = ""
-description = "机器人描述模型（URDF）路径。留空时采用驱动提供的模型或手填外形。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_path",
-]
-apply = "restart"
-
-[robot.odom_frame]
-type = "string"
-default = "odom"
-description = "里程计坐标系名，供几何帧路由、导航输入与设备数据面使用。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.odom_frame",
-]
-apply = "restart"
-
-[robot.width_m]
-type = "float"
-min = 0.0
-min_exclusive = true
-special_values = [""]
-default = ""
-description = "手填机体左右宽度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
-consumers = [
-    "core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.width_m",
-]
-apply = "restart"
-
-[transport.lcm_url]
-type = "string"
-default = "udpm://239.255.76.67:7667?ttl=0"
-description = "轻量通信与编组（LCM）的统一传输地址。默认组播仅本机回环，进程和管理程序网络准备共用。"
-consumers = [
-    "core/settings.py:load_config",
-    "gateways/person_follow.py:GatewayPersonFollowBridge.__init__",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.lcm_url",
-]
-apply = "restart"
-
-[transport.real_lcm_required]
+[gateway.telemetry_enabled]
 type = "boolean"
-default = false
-description = "是否要求设备管理程序在启动监督者前准备真实的轻量通信与编组（LCM）网络。"
+default = true
+description = "定时采集整机CPU、内存以及项目相关进程的资源占用，在控制台性能监控中显示。"
 consumers = [
     "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.real_lcm_required",
 ]
-apply = "restart"
+apply = "hot"
 
 [gateway.artifact_cleanup_batch_size]
 type = "integer"
@@ -390,15 +183,6 @@ consumers = [
 ]
 apply = "restart"
 
-[gateway.telemetry_enabled]
-type = "boolean"
-default = true
-description = "定时采集整机CPU、内存以及项目相关进程的资源占用，在控制台性能监控中显示。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "hot"
-
 [gateway.telemetry_include_process_tree]
 type = "boolean"
 default = true
@@ -432,6 +216,60 @@ apply = "hot"
 type = "float"
 default = 15.0
 description = "网页双向消息连接的心跳间隔（秒）。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[perception.keyframe_remember_enabled]
+type = "boolean"
+default = true
+description = "启用关键帧记忆"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "hot"
+
+[perception.openai_enabled]
+type = "boolean"
+default = false
+description = "启用兼容 OpenAI 接口的云端视觉模型分析画面。需同时配置服务地址、密钥和模型。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[perception.postprocess_nms_enabled]
+type = "boolean"
+default = true
+description = "是否对目标检测结果执行跨类别非极大值抑制。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[perception.segmentation_enabled]
+type = "boolean"
+default = false
+description = "启用现有分割路由。网关当前可复用检测属性的分割结果，或按设置返回检测框。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[perception.self_filter_enabled]
+type = "boolean"
+default = true
+description = "是否启用机器人自体检测过滤。过滤器根据机器人模型、关节状态和相机配置判定自体并公开过滤状态。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[perception.yolo_world_enabled]
+type = "boolean"
+default = true
+description = "启用 YOLO-World（开放词汇目标检测模型）识别画面中的物品。"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -576,15 +414,6 @@ consumers = [
 ]
 apply = "hot"
 
-[perception.keyframe_remember_enabled]
-type = "boolean"
-default = true
-description = "启用关键帧记忆"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "hot"
-
 [perception.keyframe_translation_m]
 type = "float"
 min = 0.0
@@ -643,15 +472,6 @@ consumers = [
 ]
 apply = "restart"
 
-[perception.openai_enabled]
-type = "boolean"
-default = false
-description = "启用兼容 OpenAI 接口的云端视觉模型分析画面。需同时配置服务地址、密钥和模型。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
 [perception.openai_max_tokens]
 type = "integer"
 min = 128
@@ -686,15 +506,6 @@ type = "float"
 min = 1.0
 default = 20.0
 description = "OpenAI 请求超时（秒）"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[perception.postprocess_nms_enabled]
-type = "boolean"
-default = true
-description = "是否对目标检测结果执行跨类别非极大值抑制。"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -780,15 +591,6 @@ apply = "restart"
 type = "boolean"
 default = true
 description = "运行摘要输出选项，当前由感知工厂写入分割提供者元数据。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[perception.segmentation_enabled]
-type = "boolean"
-default = false
-description = "启用现有分割路由。网关当前可复用检测属性的分割结果，或按设置返回检测框。"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -912,15 +714,6 @@ type = "float"
 min = 0.0
 default = 6.0
 description = "运动学投影区域向外扩展的像素数，用于补偿投影和标定误差。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[perception.self_filter_enabled]
-type = "boolean"
-default = true
-description = "是否启用机器人自体检测过滤。过滤器根据机器人模型、关节状态和相机配置判定自体并公开过滤状态。"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1081,15 +874,6 @@ consumers = [
 ]
 apply = "restart"
 
-[perception.yolo_world_enabled]
-type = "boolean"
-default = true
-description = "启用 YOLO-World（开放词汇目标检测模型）识别画面中的物品。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
 [perception.yolo_world_image_size]
 type = "integer"
 min = 32
@@ -1139,164 +923,6 @@ consumers = [
 ]
 apply = "restart"
 
-[memory.association_confirm_min_observations]
-type = "integer"
-min = 1
-default = 3
-description = "确认物体需要的不同源观察标识数量。同帧重放、同帧精化和同源多相机不会重复确认。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_confirm_window_sec]
-type = "float"
-min = 1.0
-default = 60.0
-description = "自动感知新物体需在此秒数内积累指定次数的独立源观察，否则丢弃。显式记忆直接确认。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_cross_label_overlap]
-type = "float"
-min = 0.0
-max = 1.0
-default = 0.5
-description = "标签不同时，较小一方落在较大一方中的比例至少达到此值。有双方体素时按体素数确定小方，否则按实测范围体积。另须通过逐轴尺寸比及历史同帧共现否决。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_cross_label_size_ratio]
-type = "float"
-min = 1.0
-default = 3.0
-description = "跨标签关联或合并时允许的最大逐轴尺寸比，避免把桌上的书与桌子归为一物。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_gate_sigma]
-type = "float"
-min = 0.5
-default = 3.0
-description = "空间关联门限为尺寸半宽加此倍数的合成测量标准差。双方标准差平方和开方，不按类别设置米数。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_max_voxels]
-type = "integer"
-min = 16
-default = 1024
-description = "每个实例累积的支持体素数量上限，超限按稳定散列保留有界证据。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_min_support_points]
-type = "integer"
-min = 1
-default = 5
-description = "主体簇点数不足时不新建实例、不更新物体位置或尺寸。仅按回退观察规则更新最近观察。完整三维检测尺寸与三角化不按点云簇点数拒绝。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.association_voxel_size_m]
-type = "float"
-min = 0.005
-default = 0.03
-description = "跨视角支持点累积体素的边长，单位米。显示尺寸取累积体素的5%至95%分位范围。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.embedding_api_key]
-type = "string"
-default = ""
-description = "阿里云 DashScope（模型服务）的在线向量服务密钥，留空表示未配置。"
-sensitive = true
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.embedding_base_url]
-type = "string"
-default = "https://dashscope.aliyuncs.com/api/v1"
-description = "记忆嵌入服务基础地址"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.embedding_timeout_sec]
-type = "float"
-min = 1.0
-default = 20.0
-description = "记忆嵌入超时（秒）"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.image_embedding_dim]
-type = "integer"
-min = 8
-default = 512
-description = "图像向量维数，须与图像模型输出匹配。受管安装本地默认模型的输出为 512 维。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.image_embedding_model]
-type = "string"
-default = "runtime_data/models/openai__clip-vit-base-patch32"
-description = "记忆图像向量模型路径或后端标识。受管安装选装记忆时使用本地 clip-vit-base-patch32。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.text_embedding_dim]
-type = "integer"
-min = 8
-default = 512
-description = "文本向量维数，须与文本模型输出匹配。受管安装本地默认模型的输出为 512 维。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[memory.text_embedding_model]
-type = "string"
-default = "runtime_data/models/BAAI__bge-small-zh-v1.5"
-description = "记忆文本向量模型路径或后端标识。受管安装选装记忆时使用本地 bge-small-zh-v1.5。"
-consumers = [
-    "core/settings.py:load_config",
-]
-apply = "restart"
-
-[semantic_map.NUWAX_SCENE_MAPPING_API_KEY]
-type = "string"
-default = ""
-description = "Jev 远程接口的访问密钥，本地后端不需要。页面不显示已保存的值，留空保存会保留原值。"
-sensitive = true
-consumers = [
-    "core/settings.py:_load_scene_mapping_config",
-]
-apply = "restart"
-
 [semantic_map.NUWAX_SCENE_MAPPING_AUTO_APPLY]
 type = "boolean"
 default = true
@@ -1310,6 +936,25 @@ apply = "restart"
 type = "boolean"
 default = false
 description = "网关启动后自动开始后台语义处理。需同时开启语义地图。"
+consumers = [
+    "core/settings.py:_load_scene_mapping_config",
+]
+apply = "restart"
+
+[semantic_map.NUWAX_SCENE_MAPPING_ENABLED]
+type = "boolean"
+default = false
+description = "开启语义地图（区域划分与命名）。保存设置不会启动模型服务。"
+consumers = [
+    "core/settings.py:_load_scene_mapping_config",
+]
+apply = "restart"
+
+[semantic_map.NUWAX_SCENE_MAPPING_API_KEY]
+type = "string"
+default = ""
+description = "Jev 远程接口的访问密钥，本地后端不需要。页面不显示已保存的值，留空保存会保留原值。"
+sensitive = true
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1340,15 +985,6 @@ min = 0.05
 max = 20.0
 default = 1.2
 description = "宽度小于此值的通道视为门口，用来把相连空间分成不同房间（米）。"
-consumers = [
-    "core/settings.py:_load_scene_mapping_config",
-]
-apply = "restart"
-
-[semantic_map.NUWAX_SCENE_MAPPING_ENABLED]
-type = "boolean"
-default = false
-description = "开启语义地图（区域划分与命名）。保存设置不会启动模型服务。"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1473,17 +1109,6 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.correction_backend]
-type = "string"
-choices = ["none", "library_pgo", "native_pgo", "relocalization"]
-default = "none"
-description = "三维地图位姿校正策略，选项为关闭、库内位姿图优化、原生位姿图优化、重定位。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.correction_backend",
-]
-apply = "restart"
-
 [geometry.enabled]
 type = "boolean"
 default = true
@@ -1504,14 +1129,24 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.fine_cloud_cache_auto_max_mib]
-type = "integer"
-min = 32
-max = 4096
-default = 256
-description = "自动模式下单个精细点云写入器的缓存上限（MiB，二进制兆字节）。在线建图和位姿图优化重放的缓存各自受限。"
+[geometry.mapping_recording_enabled]
+type = "boolean"
+default = true
+description = "是否在网关记录建图诊断输入。"
 consumers = [
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_auto_max_mib",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_enabled",
+]
+apply = "restart"
+
+[geometry.correction_backend]
+type = "string"
+choices = ["none", "library_pgo", "native_pgo", "relocalization"]
+default = "none"
+description = "三维地图位姿校正策略，选项为关闭、库内位姿图优化、原生位姿图优化、重定位。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.correction_backend",
 ]
 apply = "restart"
 
@@ -1524,6 +1159,17 @@ default = "auto"
 description = "精细点云写入器的缓存预算（MiB，二进制兆字节）。选择 auto 时按需增大，到自动上限后按固定预算处理。在线建图和位姿图优化重放各使用独立缓存。"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_mib",
+]
+apply = "restart"
+
+[geometry.fine_cloud_cache_auto_max_mib]
+type = "integer"
+min = 32
+max = 4096
+default = 256
+description = "自动模式下单个精细点云写入器的缓存上限（MiB，二进制兆字节）。在线建图和位姿图优化重放的缓存各自受限。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_auto_max_mib",
 ]
 apply = "restart"
 
@@ -1728,16 +1374,6 @@ description = "网关建图诊断录制目录。留空时使用地图目录同�
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_dir",
-]
-apply = "restart"
-
-[geometry.mapping_recording_enabled]
-type = "boolean"
-default = true
-description = "是否在网关记录建图诊断输入。"
-consumers = [
-    "core/settings.py:load_config",
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_enabled",
 ]
 apply = "restart"
 
@@ -2047,32 +1683,57 @@ consumers = [
 ]
 apply = "restart"
 
-[motion_guard.backend]
-type = "string"
-choices = ["", "unitree_sdk2py", "motion_control"]
-default = ""
-description = "运动守卫执行端。留空时不启用守卫。Go2 安装使用 unitree_sdk2py，标准接入可选 motion_control。"
-consumers = [
-    "services/navigation/motion_safety_guard/__main__.py:run",
-    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
-]
-apply = "restart"
-
-[motion_guard.control_factory]
-type = "string"
-default = ""
-description = "标准运动控制工厂入口，格式为 Python 模块名:函数名。选择标准守卫后端时必须提供。"
-consumers = [
-    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
-]
-apply = "restart"
-
 [person_follow.autostart]
 type = "boolean"
 default = true
 description = "允许按需启动人物跟随进程，并允许几何运行时发布供跟随使用的地图点云。"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:PersonFollow.autostart",
+]
+apply = "restart"
+
+[go2.data_plane_enabled]
+type = "boolean"
+default = true
+description = "是否启用 Go2 数据面，当前安装器为 Go2 方案开启。"
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
+apply = "restart"
+
+[go2.direct_dds_enabled]
+type = "boolean"
+default = true
+description = "Go2 数据面是否直接订阅设备的 DDS（数据分发服务）输入。"
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
+apply = "restart"
+
+[go2.direct_dds_point_cloud_enabled]
+type = "boolean"
+default = true
+description = "是否直接订阅 Go2 雷达点云。Go2 安装选中几何模块时开启。"
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
+apply = "restart"
+
+[go2.official_backend_enabled]
+type = "boolean"
+default = true
+description = "是否启用 Go2 厂商官方状态连接。"
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
+apply = "restart"
+
+[go2.video_stream_enabled]
+type = "boolean"
+default = true
+description = "允许监督者在 Go2 方案中启动视频进程。未安装感知模块时按安装结果关闭。"
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
 
@@ -2086,15 +1747,6 @@ consumers = [
 ]
 apply = "restart"
 
-[go2.data_plane_enabled]
-type = "boolean"
-default = true
-description = "是否启用 Go2 数据面，当前安装器为 Go2 方案开启。"
-consumers = [
-    "drivers/go2/settings.py:load_go2_data_plane_config",
-]
-apply = "restart"
-
 [go2.dds_iface]
 type = "string"
 default = ""
@@ -2105,28 +1757,10 @@ consumers = [
 ]
 apply = "restart"
 
-[go2.direct_dds_enabled]
-type = "boolean"
-default = true
-description = "Go2 数据面是否直接订阅设备的 DDS（数据分发服务）输入。"
-consumers = [
-    "drivers/go2/settings.py:load_go2_data_plane_config",
-]
-apply = "restart"
-
 [go2.direct_dds_low_state_topic]
 type = "string"
 default = "rt/lowstate"
 description = "Go2 厂商低层状态的 DDS（数据分发服务）话题名，含关节和惯性状态。"
-consumers = [
-    "drivers/go2/settings.py:load_go2_data_plane_config",
-]
-apply = "restart"
-
-[go2.direct_dds_point_cloud_enabled]
-type = "boolean"
-default = true
-description = "是否直接订阅 Go2 雷达点云。Go2 安装选中几何模块时开启。"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -2226,15 +1860,6 @@ consumers = [
 ]
 apply = "restart"
 
-[go2.official_backend_enabled]
-type = "boolean"
-default = true
-description = "是否启用 Go2 厂商官方状态连接。"
-consumers = [
-    "drivers/go2/settings.py:load_go2_data_plane_config",
-]
-apply = "restart"
-
 [go2.official_client_timeout_sec]
 type = "float"
 min = 0.0
@@ -2295,15 +1920,6 @@ consumers = [
 ]
 apply = "restart"
 
-[go2.video_stream_enabled]
-type = "boolean"
-default = true
-description = "允许监督者在 Go2 方案中启动视频进程。未安装感知模块时按安装结果关闭。"
-consumers = [
-    "drivers/go2/settings.py:load_go2_data_plane_config",
-]
-apply = "restart"
-
 [go2.video_stream_reconnect_sec]
 type = "float"
 min = 0.1
@@ -2348,6 +1964,391 @@ description = "Go2 视频连接的 AES-128（128 位对称加密）密钥，允�
 sensitive = true
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
+]
+apply = "restart"
+
+[robot.actuator_max_linear_mps]
+type = "float"
+min = 0.0
+min_exclusive = true
+max = 5.0
+special_values = [""]
+default = ""
+description = "显式声明执行器平面速度上限（米/秒）。须与偏航上限和运动形式同时填写。三项留空时，Go2 使用官方速度上限。"
+consumers = [
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_linear_mps",
+]
+apply = "restart"
+
+[robot.actuator_max_yaw_rps]
+type = "float"
+min = 0.0
+min_exclusive = true
+max = 12.566370614359172
+special_values = [""]
+default = ""
+description = "显式声明执行器偏航上限（弧度/秒），最大为 4π。须与平面上限和运动形式同时填写。"
+consumers = [
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_yaw_rps",
+]
+apply = "restart"
+
+[robot.actuator_motion_model]
+type = "string"
+choices = ["", "omnidirectional"]
+default = ""
+description = "执行器的基本运动方式，目前只支持 omnidirectional（可前后左右平移和原地转向）。须与两项速度上限同时填写，供三维导航使用。"
+consumers = [
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_motion_model",
+]
+apply = "restart"
+
+[robot.base_frame]
+type = "string"
+default = "base_link"
+description = "机体基准坐标系名，运动守卫用作命令和执行反馈的参考帧。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/navigation/motion_safety_guard/execution_feedback.py:ExecutionFeedback.from_environment",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.__init__",
+    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.base_frame",
+]
+apply = "restart"
+
+[robot.center_x_m]
+type = "float"
+special_values = [""]
+default = ""
+description = "机体外包中心相对基准坐标系的前后偏移（米）。留空时按模型或驱动计算。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_x_m",
+]
+apply = "restart"
+
+[robot.center_y_m]
+type = "float"
+special_values = [""]
+default = ""
+description = "机体外包中心相对基准坐标系的左右偏移（米）。留空时按模型或驱动计算。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_y_m",
+]
+apply = "restart"
+
+[robot.center_z_m]
+type = "float"
+special_values = [""]
+default = ""
+description = "机体外包中心相对基准坐标系的上下偏移（米）。留空时按模型或驱动计算。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_z_m",
+]
+apply = "restart"
+
+[robot.driver]
+type = "string"
+choices = ["customrobot", "go2", "g1", "raspi_lidar_robot", "unitree_sim"]
+default = "customrobot"
+description = "活动方案的机器人驱动。安装或导入时保留实际机器人型号。"
+consumers = [
+    "core/config.py:derived_values",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.driver",
+]
+apply = "restart"
+
+[robot.height_m]
+type = "float"
+min = 0.0
+min_exclusive = true
+special_values = [""]
+default = ""
+description = "手填机体上下高度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.height_m",
+]
+apply = "restart"
+
+[robot.length_m]
+type = "float"
+min = 0.0
+min_exclusive = true
+special_values = [""]
+default = ""
+description = "手填机体前后长度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.length_m",
+]
+apply = "restart"
+
+[robot.lidar_frame]
+type = "string"
+default = "utlidar_lidar"
+description = "雷达坐标系名，几何运行时用它标识雷达输入。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.lidar_frame",
+]
+apply = "restart"
+
+[robot.map_frame]
+type = "string"
+default = "map"
+description = "地图坐标系名。三维曲面导航要求 map。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.map_frame",
+]
+apply = "restart"
+
+[robot.model_base_link]
+type = "string"
+default = ""
+description = "机器人描述模型中的机体基准连杆名。留空时由现行模型规则确定。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_base_link",
+]
+apply = "restart"
+
+[robot.model_joint_positions_json]
+type = "string"
+default = ""
+description = "关节名到参考关节位置的 JSON（结构化文本）对象。留空时按模型默认参考姿态计算外形。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_joint_positions_json",
+]
+apply = "restart"
+
+[robot.model_path]
+type = "string"
+default = ""
+description = "机器人描述模型（URDF）路径。留空时采用驱动提供的模型或手填外形。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_path",
+]
+apply = "restart"
+
+[robot.odom_frame]
+type = "string"
+default = "odom"
+description = "里程计坐标系名，供几何帧路由、导航输入与设备数据面使用。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.odom_frame",
+]
+apply = "restart"
+
+[robot.width_m]
+type = "float"
+min = 0.0
+min_exclusive = true
+special_values = [""]
+default = ""
+description = "手填机体左右宽度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+consumers = [
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.width_m",
+]
+apply = "restart"
+
+[transport.lcm_url]
+type = "string"
+default = "udpm://239.255.76.67:7667?ttl=0"
+description = "轻量通信与编组（LCM）的统一传输地址。默认组播仅本机回环，进程和管理程序网络准备共用。"
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/person_follow.py:GatewayPersonFollowBridge.__init__",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.lcm_url",
+]
+apply = "restart"
+
+[transport.real_lcm_required]
+type = "boolean"
+default = false
+description = "是否要求设备管理程序在启动监督者前准备真实的轻量通信与编组（LCM）网络。"
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.real_lcm_required",
+]
+apply = "restart"
+
+[memory.association_confirm_min_observations]
+type = "integer"
+min = 1
+default = 3
+description = "确认物体需要的不同源观察标识数量。同帧重放、同帧精化和同源多相机不会重复确认。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_confirm_window_sec]
+type = "float"
+min = 1.0
+default = 60.0
+description = "自动感知新物体需在此秒数内积累指定次数的独立源观察，否则丢弃。显式记忆直接确认。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_cross_label_overlap]
+type = "float"
+min = 0.0
+max = 1.0
+default = 0.5
+description = "标签不同时，较小一方落在较大一方中的比例至少达到此值。有双方体素时按体素数确定小方，否则按实测范围体积。另须通过逐轴尺寸比及历史同帧共现否决。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_cross_label_size_ratio]
+type = "float"
+min = 1.0
+default = 3.0
+description = "跨标签关联或合并时允许的最大逐轴尺寸比，避免把桌上的书与桌子归为一物。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_gate_sigma]
+type = "float"
+min = 0.5
+default = 3.0
+description = "空间关联门限为尺寸半宽加此倍数的合成测量标准差。双方标准差平方和开方，不按类别设置米数。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_max_voxels]
+type = "integer"
+min = 16
+default = 1024
+description = "每个实例累积的支持体素数量上限，超限按稳定散列保留有界证据。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_min_support_points]
+type = "integer"
+min = 1
+default = 5
+description = "主体簇点数不足时不新建实例、不更新物体位置或尺寸。仅按回退观察规则更新最近观察。完整三维检测尺寸与三角化不按点云簇点数拒绝。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.association_voxel_size_m]
+type = "float"
+min = 0.005
+default = 0.03
+description = "跨视角支持点累积体素的边长，单位米。显示尺寸取累积体素的5%至95%分位范围。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.embedding_api_key]
+type = "string"
+default = ""
+description = "阿里云 DashScope（模型服务）的在线向量服务密钥，留空表示未配置。"
+sensitive = true
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.embedding_base_url]
+type = "string"
+default = "https://dashscope.aliyuncs.com/api/v1"
+description = "记忆嵌入服务基础地址"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.embedding_timeout_sec]
+type = "float"
+min = 1.0
+default = 20.0
+description = "记忆嵌入超时（秒）"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.image_embedding_dim]
+type = "integer"
+min = 8
+default = 512
+description = "图像向量维数，须与图像模型输出匹配。受管安装本地默认模型的输出为 512 维。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.image_embedding_model]
+type = "string"
+default = "runtime_data/models/openai__clip-vit-base-patch32"
+description = "记忆图像向量模型路径或后端标识。受管安装选装记忆时使用本地 clip-vit-base-patch32。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.text_embedding_dim]
+type = "integer"
+min = 8
+default = 512
+description = "文本向量维数，须与文本模型输出匹配。受管安装本地默认模型的输出为 512 维。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[memory.text_embedding_model]
+type = "string"
+default = "runtime_data/models/BAAI__bge-small-zh-v1.5"
+description = "记忆文本向量模型路径或后端标识。受管安装选装记忆时使用本地 bge-small-zh-v1.5。"
+consumers = [
+    "core/settings.py:load_config",
+]
+apply = "restart"
+
+[motion_guard.backend]
+type = "string"
+choices = ["", "unitree_sdk2py", "motion_control"]
+default = ""
+description = "运动守卫执行端。留空时不启用守卫。Go2 安装使用 unitree_sdk2py，标准接入可选 motion_control。"
+consumers = [
+    "services/navigation/motion_safety_guard/__main__.py:run",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
+]
+apply = "restart"
+
+[motion_guard.control_factory]
+type = "string"
+default = ""
+description = "标准运动控制工厂入口，格式为 Python 模块名:函数名。选择标准守卫后端时必须提供。"
+consumers = [
+    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
 ]
 apply = "restart"
 
@@ -2565,19 +2566,19 @@ consumers = [
 ]
 apply = "restart"
 
-[manipulation.base_url]
-type = "string"
-default = ""
-description = "外部操作设备的基础地址。启用外部操作时填写服务地址。"
+[manipulation.enabled]
+type = "boolean"
+default = false
+description = "显式启用配置的外部操作设备。未发现实际任务能力时不公开工具。"
 consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
 
-[manipulation.enabled]
-type = "boolean"
-default = false
-description = "显式启用配置的外部操作设备。未发现实际任务能力时不公开工具。"
+[manipulation.base_url]
+type = "string"
+default = ""
+description = "外部操作设备的基础地址。启用外部操作时填写服务地址。"
 consumers = [
     "core/settings.py:load_config",
 ]

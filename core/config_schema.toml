@@ -392,7 +392,7 @@ apply = "restart"
 
 [gateway.telemetry_enabled]
 type = "boolean"
-default = false
+default = true
 description = "定时采集整机CPU、内存以及项目相关进程的资源占用，在控制台性能监控中显示。"
 consumers = [
     "core/settings.py:load_config",

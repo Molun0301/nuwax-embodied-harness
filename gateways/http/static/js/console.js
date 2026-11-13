@@ -204,6 +204,7 @@
         batteryMetric: document.getElementById("batteryMetric"),
         networkLatency: document.getElementById("networkLatency"),
         resourceMetric: document.getElementById("resourceMetric"),
+        telemetryHint: document.getElementById("telemetryHint"),
         clockNow: document.getElementById("clockNow"),
         motionStatus: document.getElementById("motionStatus"),
         missionStatus: document.getElementById("missionStatus"),
@@ -1059,12 +1060,15 @@
         const snap = payload || {};
         state.latestSystemMetrics = snap;
         const available = snap.psutil_available === true;
+        // 设置里关闭了性能采集：数值处写“未开启”，旁边给出打开位置。
+        const disabled = snap.status === "disabled";
+        els.telemetryHint.hidden = !disabled;
         // 顶栏 CPU 块（复用 #networkLatency）
         const cpu = snap.cpu || {};
-        setText(els.networkLatency, available && cpu.percent !== undefined ? `${Math.round(cpu.percent)}%` : "N/A");
+        setText(els.networkLatency, disabled ? "未开启" : available && cpu.percent !== undefined ? `${Math.round(cpu.percent)}%` : "N/A");
         // 顶栏 运存块（复用 #resourceMetric）
         const mem = snap.memory || {};
-        setText(els.resourceMetric, available && mem.percent !== undefined
+        setText(els.resourceMetric, disabled ? "未开启" : available && mem.percent !== undefined
           ? `${Math.round(mem.percent)}% · ${formatGB(mem.used_bytes)}/${formatGB(mem.total_bytes)}`
           : "N/A");
         renderProcessMatrix(snap);

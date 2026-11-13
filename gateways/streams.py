@@ -3,6 +3,7 @@ from dataclasses import asdict
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -182,6 +183,10 @@ class Streams:
     def _start_telemetry(self):
         config = self.platform.config.gateway
         if not config.telemetry_enabled:
+            # 关闭时也发一帧，网页据此说明“未开启”和打开位置，而不是一直显示空值。
+            from contracts.telemetry import SystemMetricsSnapshot, TelemetryStatus
+            self.stream_bus.publish("system.metrics", source="telemetry", payload=SystemMetricsSnapshot(
+                status=TelemetryStatus.DISABLED, sample_interval_sec=config.telemetry_interval_sec, sampled_at=time.time()))
             return
         from services.telemetry import SystemMetricsCollector
         collector = SystemMetricsCollector(keywords=config.telemetry_process_keywords,

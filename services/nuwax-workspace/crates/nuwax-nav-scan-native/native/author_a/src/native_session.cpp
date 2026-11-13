@@ -340,6 +340,8 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
     const double requested_speed=std::hypot(vx,vy);
     if(requested_speed>speed_cap){vx*=speed_cap/requested_speed;vy*=speed_cap/requested_speed;}
+    const double executable_speed=std::hypot(vx,vy);
+    if(executable_speed>0.&&executable_speed<c->min_executable_linear_mps){vx*=c->min_executable_linear_mps/executable_speed;vy*=c->min_executable_linear_mps/executable_speed;}
     const double requested_w=std::clamp(s.raw.angular.z,-speed_cap/radius,speed_cap/radius);
     Eigen::Vector2d preferred_world(cs*vx-sn*vy,sn*vx+cs*vy),delta=preferred_world-command_world;const double step=c->max_acceleration*c->sample_dt;
     if(delta.norm()>step)delta*=step/delta.norm();const auto chosen=(command_world+delta).eval();

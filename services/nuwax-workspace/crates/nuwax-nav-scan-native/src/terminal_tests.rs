@@ -131,3 +131,26 @@ fn pillar_stop_uses_the_configured_clearance_without_a_turn_point() {
     c.max_lateral_velocity = 0.;
     assert_eq!(snapshot.terminal_points(&c,goal,yaw,0.15),selected);
 }
+
+#[test]
+fn terminal_translation_uses_the_executable_floor_without_moving_a_zero_request() {
+    let mut c = config();
+    c.max_acceleration = 2.;
+    c.min_executable_linear_mps = 0.15;
+    let state = MotionState {position:[0.,0.,0.4], measured_velocity:1,
+        measured_yaw_rate:1,timestamp_ns:1_000_000_000,..Default::default()};
+    let mut map = MapOwner::new(&c).unwrap();
+    map.seed_occupied(&[], state.position);
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    let snapshot = map.snapshot();
+    for stop in [[0.04,0.03,0.4],state.position] {
+        let tracked=ScanTracker::default().track_terminal_position(
+            &c,&snapshot,&state,[0.;3],Some(0.),Some(stop)).unwrap();
+        assert!(!tracked.invalid());
+        if stop==state.position {assert_eq!(tracked.command,[0.;3]);}
+        else {
+            assert!((tracked.command[0].hypot(tracked.command[1])-0.15).abs()<1e-10);
+            assert!((tracked.command[0]*0.03-tracked.command[1]*0.04).abs()<1e-10);
+        }
+    }
+}

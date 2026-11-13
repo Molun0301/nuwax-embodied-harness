@@ -66,6 +66,14 @@ impl ObservedGroundLayer {
     }
 }
 
+/// 同一原始块的占据证据和地面记录；两个载荷均与原解码结果共享。
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+struct ObservationBlock {
+    values: Arc<AHashMap<[i32; 3], SurfaceObservation>>,
+    ground: nuwax_map_chunks::GroundRecords,
+}
+
 /// 按固定空间块共享的精细观察，业务来源身份由外层提交票据约束。
 #[derive(Clone, Debug)]
 pub struct SurfaceObservations {
@@ -74,7 +82,7 @@ pub struct SurfaceObservations {
     source_timestamp_ns: u64,
     complete_geometry_source: bool,
     block_edge: i32,
-    blocks: im::HashMap<[i32; 3], Arc<AHashMap<[i32; 3], SurfaceObservation>>, ahash::RandomState>,
+    blocks: im::HashMap<[i32; 3], Arc<ObservationBlock>, ahash::RandomState>,
     // 按XY维护真实占据层号，局部地形查询不扫描整图或所有竖直块。
     columns: im::HashMap<[i32; 2], Arc<Vec<i32>>, ahash::RandomState>,
     #[cfg(test)]
@@ -146,11 +154,21 @@ impl SurfaceObservations {
         block: [i32; 3],
         values: BTreeMap<[i32; 3], SurfaceObservation>,
     ) -> Result<Vec<[i32; 2]>, SurfaceError> {
+        self.replace_block_with_ground_changes(block, values, Default::default())
+    }
+
+    /// 完整根把一次解码得到的占据和原地面记录一起安装到原观测块。
+    pub fn replace_block_with_ground_changes(
+        &mut self,
+        block: [i32; 3],
+        values: BTreeMap<[i32; 3], SurfaceObservation>,
+        ground: nuwax_map_chunks::GroundRecords,
+    ) -> Result<Vec<[i32; 2]>, SurfaceError> {
         let mut changed = Vec::new();
         if values.len() > (self.block_edge as usize).pow(3) {
             return Err(SurfaceError::InvalidConfig("观察块坐标或容量无效".into()));
         }
-        let previous = self.blocks.get(&block);
+        let previous = self.blocks.get(&block).map(|block| &block.values);
         let mut same_membership = previous.map_or(values.is_empty(), |previous| previous.len() == values.len());
         // Check exact membership during the mandatory coordinate-validation walk.
         // Stop probing after the first mismatch; no content/identity digest is needed.
@@ -170,7 +188,7 @@ impl SurfaceObservations {
             for key in values.keys() {replacement.entry([key[0],key[1]]).or_default().push(key[2]);}
             let mut affected:AHashSet<[i32;2]>=replacement.keys().copied().collect();
             if let Some(previous)=self.blocks.get(&block) {
-                affected.extend(previous.keys().map(|key|[key[0],key[1]]));
+                affected.extend(previous.values.keys().map(|key|[key[0],key[1]]));
             }
             for column in affected {
                 let mut levels=self.columns.get(&column).map_or_else(Vec::new,|levels|levels.as_ref().clone());
@@ -189,7 +207,7 @@ impl SurfaceObservations {
         if values.is_empty() {
             self.blocks.remove(&block);
         } else {
-            self.blocks.insert(block, Arc::new(values.into_iter().collect()));
+            self.blocks.insert(block, Arc::new(ObservationBlock { values: Arc::new(values.into_iter().collect()), ground }));
         }
         let columns = &self.columns;
         if self.native_ground.retire_missing_members(&changed, |key| {
@@ -301,8 +319,86 @@ impl SurfaceObservations {
     pub fn replace_heightfield_columns(&mut self,block_xy:[i32;2],
         blocks:&[(nuwax_map_chunks::Key,nuwax_map_chunks::GroundRecords)]) -> Vec<[i32;2]> {
         let changed=self.native_ground.replace_block_xy(block_xy,blocks);
+        for (key, records) in blocks {
+            if let Some(block) = self.blocks.get_mut(key) { Arc::make_mut(block).ground = records.clone(); }
+        }
         if !changed.is_empty() {self.layer_geometry=Arc::new(());self.complete_geometry_source=false;}
         changed
+    }
+
+    /// 完整根的变化块更新：从上次已提交索引保留未变化片段，不回读未变块。
+    pub fn replace_heightfield_blocks(
+        &mut self,
+        previous: &Self,
+        blocks: &[(nuwax_map_chunks::Key, nuwax_map_chunks::GroundRecords)],
+        removed: &[nuwax_map_chunks::Key],
+    ) -> Vec<[i32; 2]> {
+        use nuwax_map_chunks::GroundRecordRef;
+        let mut dirty = std::collections::BTreeSet::new();
+        let mut mark = |block: [i32; 3], local: u16, record: GroundRecordRef<'_>| {
+            dirty.insert(match record {
+                GroundRecordRef::HeightfieldV1(record) => [record.anchor[0], record.anchor[1]],
+                GroundRecordRef::ClassifiedEmptyColumn => [block[0] * 32 + i32::from(local % 32), block[1] * 32 + i32::from(local / 32)],
+            });
+        };
+        for (block, records) in blocks {
+            let mut old = previous.blocks.get(block).into_iter().flat_map(|old| old.ground.iter()).peekable();
+            let mut next = records.iter().peekable();
+            loop {
+                match (old.peek().copied(), next.peek().copied()) {
+                    (None, None) => break,
+                    (Some((a, va)), Some((b, vb))) if a == b => {
+                        if !va.geometry_eq(vb) { mark(*block, a, va); mark(*block, b, vb); }
+                        old.next(); next.next();
+                    }
+                    (Some((a, va)), Some((b, _))) if a < b => { mark(*block, a, va); old.next(); }
+                    (Some((a, va)), None) => { mark(*block, a, va); old.next(); }
+                    (_, Some((b, vb))) => { mark(*block, b, vb); next.next(); }
+                }
+            }
+        }
+        for block in removed {
+            if let Some(old) = previous.blocks.get(block) {
+                for (local, record) in old.ground.iter() { mark(*block, local, record); }
+            }
+        }
+        self.native_ground = previous.native_ground.clone();
+        let changed = self.native_ground.replace_blocks(blocks, removed, &dirty);
+        if !changed.is_empty() { self.layer_geometry = Arc::new(()); self.complete_geometry_source = false; }
+        changed
+    }
+
+    /// 由实际变化细列生成完整规划列，复用已有占据索引和原浮点量化规则。
+    pub fn planner_column_updates(
+        &self,
+        changes: Option<&[[i32; 2]]>,
+        planner_size: f32,
+    ) -> Vec<crate::SurfaceColumnUpdate> {
+        let convert = |v: i32| {
+            let centre = ((f64::from(v) + 0.5) * f64::from(self.size_m)) as f32;
+            (centre / planner_size).floor() as i32
+        };
+        let dirty: std::collections::BTreeSet<_> = match changes {
+            Some(changes) => changes.iter().map(|c| c.map(convert)).collect(),
+            None => self.columns.keys().map(|c| c.map(convert)).collect(),
+        };
+        dirty.into_iter().map(|column| {
+            let mut cells = BTreeMap::<i32, [f32; 2]>::new();
+            for x in fine_axis_range(column[0], self.size_m, planner_size) {
+                for y in fine_axis_range(column[1], self.size_m, planner_size) {
+                    for &z in self.column_levels(x as i32, y as i32).unwrap_or(&[]) {
+                        let centre = ((f64::from(z) + 0.5) * f64::from(self.size_m)) as f32;
+                        let cell = (centre / planner_size).floor() as i32;
+                        let fine = (f64::from(centre) / f64::from(self.size_m)).floor();
+                        let low = (fine * f64::from(self.size_m)) as f32;
+                        let high = ((fine + 1.0) * f64::from(self.size_m)) as f32;
+                        cells.entry(cell).and_modify(|b| { b[0] = b[0].min(low); b[1] = b[1].max(high); })
+                            .or_insert([low, high]);
+                    }
+                }
+            }
+            crate::SurfaceColumnUpdate { column, cells: cells.into_iter().collect() }
+        }).collect()
     }
 
     pub(super) fn ground_member(&self,key:[i32;3])->bool {
@@ -354,11 +450,34 @@ impl SurfaceObservations {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))
     }
 
+    /// 局部输入只展开与窗口相交的原观测块，同一细列只交付一次。
+    pub(super) fn navigation_window_columns(&self, window: Option<([f64; 2], f64)>)
+        -> Box<dyn Iterator<Item=([i32; 2], &[i32])> + '_> {
+        let Some((center, radius)) = window else {
+            return Box::new(self.navigation_columns());
+        };
+        let size = f64::from(self.size_m);
+        let edge = f64::from(self.block_edge) * size;
+        let mut seen = AHashSet::new();
+        Box::new(self.blocks.iter().filter(move |(block, _)| {
+            (0..2).all(|axis| {
+                let low = f64::from(block[axis]) * edge;
+                low <= center[axis] + radius && low + edge >= center[axis] - radius
+            })
+        }).flat_map(|(_, block)| block.values.keys()).filter_map(move |key| {
+            let xy = [key[0], key[1]];
+            let inside = (0..2).all(|axis|
+                ((f64::from(xy[axis]) + 0.5) * size - center[axis]).abs() <= radius);
+            (inside && seen.insert(xy)).then(||
+                (xy, self.columns[&xy].as_slice()))
+        }))
+    }
+
     /// 查询实际位置的证据，不修改时间或命中次数。
     pub fn get(&self, key: [i32; 3]) -> Option<SurfaceObservation> {
         self.blocks
             .get(&key.map(|v| v.div_euclid(self.block_edge)))?
-            .get(&key)
+            .values.get(&key)
             .copied()
     }
 
@@ -433,7 +552,7 @@ impl<'a> ObservationBlockLookup<'a> {
         let block=key.map(|v|v.div_euclid(self.owner.block_edge));
         if self.last.as_ref().is_none_or(|(old,_)|*old!=block) {
             #[cfg(any(test,feature="body-query-profile"))] {self.roots+=1;}
-            self.last=Some((block,self.owner.blocks.get(&block).map(|values|values.as_ref())));
+            self.last=Some((block,self.owner.blocks.get(&block).map(|block|block.values.as_ref())));
         }
         self.last.as_ref().and_then(|(_,values)|*values).and_then(|values|values.get(&key)).copied()
     }
@@ -456,12 +575,12 @@ mod tests {
         let mut original=SurfaceObservations::new(0.01,32).unwrap();
         for key in [[-33,-1,-1],[-32,0,0],[-1,31,31],[0,0,0],[0,0,1],[32,32,32]] {
             let block=key.map(|v:i32|v.div_euclid(32));
-            let mut values=original.blocks.get(&block).map_or_else(BTreeMap::new,|old|old.iter().map(|(&k,&v)|(k,v)).collect());
+            let mut values=original.blocks.get(&block).map_or_else(BTreeMap::new,|old|old.values.iter().map(|(&k,&v)|(k,v)).collect());
             values.insert(key,SurfaceObservation{observed_ns:(key[2]+40)as u64,hits:2});original.replace_block(block,values).unwrap();
         }
         let retained=original.clone();
         let mut metadata_only=retained.clone();
-        let refreshed:BTreeMap<_,_>=retained.blocks.get(&[0,0,0]).unwrap().iter().map(|(&key,&evidence)|
+        let refreshed:BTreeMap<_,_>=retained.blocks.get(&[0,0,0]).unwrap().values.iter().map(|(&key,&evidence)|
             (key,SurfaceObservation{observed_ns:evidence.observed_ns+1000,hits:evidence.hits+1})).collect();
         metadata_only.replace_block([0,0,0],refreshed).unwrap();
         original.replace_block([0,0,0],BTreeMap::from([([0,0,0],SurfaceObservation{observed_ns:999,hits:7})])).unwrap();
@@ -473,7 +592,7 @@ mod tests {
             }}
         }
         assert_ne!(retained.get([0,0,0]),metadata_only.get([0,0,0]));
-        assert_eq!(retained.blocks.get(&[0,0,0]).unwrap().len(),metadata_only.blocks.get(&[0,0,0]).unwrap().len());
+        assert_eq!(retained.blocks.get(&[0,0,0]).unwrap().values.len(),metadata_only.blocks.get(&[0,0,0]).unwrap().values.len());
         assert_ne!(retained.get([0,0,0]),original.get([0,0,0]));
         assert!(retained.get([-33,-1,-1]).is_some());assert!(original.get([-33,-1,-1]).is_none());
     }
@@ -535,7 +654,7 @@ mod tests {
                         let block=black_box(*key).map(|v|v.div_euclid(owner.block_edge));
                         assert_eq!(black_box(owner.blocks.get(&block)).is_some(),expected_presence[i]);
                     }else {
-                        let actual=black_box(preborrowed[i]).and_then(|block|block.get(black_box(key))).copied();
+                        let actual=black_box(preborrowed[i]).and_then(|block|block.values.get(black_box(key))).copied();
                         assert_eq!(black_box(actual),expected[i]);
                     }
                 }}
@@ -577,7 +696,7 @@ mod tests {
         }
         let mut affected: AHashSet<[i32; 2]> = replacement.keys().copied().collect();
         if let Some(previous) = grid.blocks.get(&block) {
-            affected.extend(previous.keys().map(|key| [key[0], key[1]]));
+            affected.extend(previous.values.keys().map(|key| [key[0], key[1]]));
         }
         let rebuilt = affected.len();
         for column in affected {
@@ -592,7 +711,7 @@ mod tests {
             }
         }
         if values.is_empty() { grid.blocks.remove(&block); }
-        else { grid.blocks.insert(block, Arc::new(values.into_iter().collect())); }
+        else { grid.blocks.insert(block, Arc::new(ObservationBlock { values: Arc::new(values.into_iter().collect()), ground: Default::default() })); }
         grid.obstacle_cache = Default::default();
         Ok(rebuilt)
     }
@@ -905,6 +1024,21 @@ impl SurfaceSnapshot {
     pub fn observations(&self) -> Option<&Arc<SurfaceObservations>> {
         self.observations.as_ref()
     }
+}
+
+fn fine_axis_range(column: i32, source: f32, planner: f32) -> std::ops::Range<i64> {
+    let bound = |target: i64| {
+        let mut low = i64::from(i32::MIN);
+        let mut high = i64::from(i32::MAX) + 1;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let centre = ((mid as f64 + 0.5) * f64::from(source)) as f32;
+            if i64::from((centre / planner).floor() as i32) < target { low = mid + 1; }
+            else { high = mid; }
+        }
+        low
+    };
+    bound(i64::from(column))..bound(i64::from(column) + 1)
 }
 
 #[cfg(test)]

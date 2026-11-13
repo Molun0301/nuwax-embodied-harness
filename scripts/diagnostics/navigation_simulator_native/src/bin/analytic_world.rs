@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_forward_mps: 0.5,
         max_reverse_mps: 0.5,
         max_lateral_mps: 0.5,
-        max_angular_rps: 0.8,
+        max_angular_rps: 0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
         minimum_turning_radius_m: 0.,
         can_rotate_in_place: true,
     });
@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_forward_mps: 0.5,
         max_reverse_mps: 0.5,
         max_lateral_mps: 0.5,
-        max_angular_rps: 0.8,
+        max_angular_rps: 0.8, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
         linear_acceleration_mps2: 1.,
         guaranteed_braking_mps2: 1.,
         angular_acceleration_rps2: 2.,

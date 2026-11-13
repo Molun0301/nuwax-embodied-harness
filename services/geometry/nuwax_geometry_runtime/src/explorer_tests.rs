@@ -8,7 +8,7 @@ fn make_explorer(
 ) -> Result<Explorer, Status> {
     let n = nuwax_config::test_support::section("navigation");
     let r = nuwax_config::test_support::section("robot");
-    let d = nuwax_config::sections::Derived {
+    let d = nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,
         nav_profile: "pct-scan-3d".into(),
         actuator_max_linear_mps: 0.0,
         actuator_max_yaw_rps: 0.0,
@@ -162,7 +162,7 @@ fn forbidden_mask_changes_surface_input_without_changing_physical_snapshot() {
                 0.15,
                 18.0,
                 0.2,
-            )
+             0.15)
             .unwrap()
             .geometry,
             0.1,
@@ -612,7 +612,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
         0.2,
         25.,
         0.3,
-    )
+     0.15)
     .unwrap();
     let points: Vec<_> = [0., 3.]
         .into_iter()

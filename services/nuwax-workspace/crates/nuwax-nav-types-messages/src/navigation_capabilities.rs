@@ -25,6 +25,10 @@ pub struct MotionKinematics {
     pub max_lateral_mps: f64,
     /// 角速度上限，弧度/秒。
     pub max_angular_rps: f64,
+    /// 低于此幅值的非零平移命令不执行，米/秒。
+    pub min_executable_linear_mps: f64,
+    /// 低于此幅值的非零转向命令不执行，弧度/秒。
+    pub min_executable_angular_rps: f64,
     /// 最小转弯半径，米。
     pub minimum_turning_radius_m: f64,
     /// 执行器是否支持原地转向。
@@ -64,6 +68,10 @@ pub struct MotionLimits {
     pub max_lateral_mps: f64,
     /// 最大角速度。
     pub max_angular_rps: f64,
+    /// 低于此幅值的非零平移命令不执行，米/秒。
+    pub min_executable_linear_mps: f64,
+    /// 低于此幅值的非零转向命令不执行，弧度/秒。
+    pub min_executable_angular_rps: f64,
     /// 最大平移加速度。
     pub linear_acceleration_mps2: f64,
     /// 实测可保证的平移减速度。
@@ -160,6 +168,8 @@ impl MotionLimits {
             max_reverse_mps: self.max_reverse_mps,
             max_lateral_mps: self.max_lateral_mps,
             max_angular_rps: self.max_angular_rps,
+            min_executable_linear_mps: self.min_executable_linear_mps,
+            min_executable_angular_rps: self.min_executable_angular_rps,
             minimum_turning_radius_m: self.minimum_turning_radius_m,
             can_rotate_in_place: self.can_rotate_in_place,
         }

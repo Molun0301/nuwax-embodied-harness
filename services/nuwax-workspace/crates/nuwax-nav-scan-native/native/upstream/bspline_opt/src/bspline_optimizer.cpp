@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <trajectory_heading.h>
 // using namespace std;
 
 namespace scan_planner
@@ -35,6 +36,14 @@ namespace scan_planner
     return std::atan2(diff(1), diff(0));
   }
 
+  double BsplineOptimizer::controlHeading(double tangent,double time,int count) const
+  {
+    const double duration=count*bspline_interval_;
+    const double scale=heading_.duration(duration)/duration;
+    return plannedHeading(tangent,std::max(0.,time)*scale,duration*scale,
+        heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false);
+  }
+
   double BsplineOptimizer::estimateControlPointYaw(const Eigen::MatrixXd &q, int id) const
   {
     if (q.cols() <= 1)
@@ -42,7 +51,8 @@ namespace scan_planner
 
     int prev_id = std::max(0, id - 1);
     int next_id = std::min(static_cast<int>(q.cols()) - 1, id + 1);
-    return estimateSegmentYaw(q.col(prev_id), q.col(next_id));
+    return controlHeading(estimateSegmentYaw(q.col(prev_id), q.col(next_id)),
+        std::max(0,id-order_+1)*bspline_interval_,q.cols());
   }
 
   bool BsplineOptimizer::resolvePoseGuide(const std::vector<Eigen::Vector3d>& path,
@@ -99,7 +109,8 @@ namespace scan_planner
       for (double a = 1.0; a >= 0.0; a -= step_size)
       {
         Eigen::Vector3d sample_pt = a * init_points.col(i - 1) + (1 - a) * init_points.col(i);
-        double sample_yaw = estimateSegmentYaw(init_points.col(i - 1), init_points.col(i));
+        double sample_yaw = controlHeading(estimateSegmentYaw(init_points.col(i - 1), init_points.col(i)),
+            (i-order_+1-a)*bspline_interval_,init_points.cols());
         occ = grid_map_->getInflateOccupancy(sample_pt, sample_yaw);
         // std::cerr << setprecision(5);
         // std::cerr << (a * init_points.col(i-1) + (1-a) * init_points.col(i)).transpose() << " occ1=" << occ << endl;
@@ -503,7 +514,8 @@ namespace scan_planner
       };
       const Eigen::Vector3d point=(q.col(i-1)+4.*q.col(i)+q.col(i+1))/6.;
       const Eigen::Vector3d tangent=q.col(i+1)-q.col(i-1);
-      const double yaw=estimateSegmentYaw(q.col(i-1),q.col(i+1));
+      const double tangent_yaw=estimateSegmentYaw(q.col(i-1),q.col(i+1));
+      const double yaw=controlHeading(tangent_yaw,time,q.cols());
       cost+=penalty(point,yaw);
       Eigen::Vector3d position_gradient=Eigen::Vector3d::Zero();
       for(int axis=0;axis<2;++axis) {
@@ -516,7 +528,8 @@ namespace scan_planner
       const double length2=tangent.head<2>().squaredNorm();
       // 与estimateSegmentYaw的静止阈值一致，固定为零的朝向不能产生atan2梯度。
       if(length2>=1e-8) {
-        const double turn=(penalty(point,yaw+angle)-penalty(point,yaw-angle))/(2.*angle);
+        const double turn=(penalty(point,controlHeading(tangent_yaw+angle,time,q.cols()))
+            -penalty(point,controlHeading(tangent_yaw-angle,time,q.cols())))/(2.*angle);
         const Eigen::Vector3d direction(-tangent.y()/length2,tangent.x()/length2,0.);
         gradient.col(i-1)-=turn*direction;
         gradient.col(i+1)+=turn*direction;
@@ -1058,6 +1071,7 @@ namespace scan_planner
         flag_force_return = false;
 
         UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
+        arrangeHeadingTime(traj,heading_);
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
@@ -1065,7 +1079,8 @@ namespace scan_planner
         {
           Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
           Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-          flag_occ = grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next));
+          flag_occ = grid_map_->getInflateOccupancy(pos, plannedHeading(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum(),
+              heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false));
           if (flag_occ)
           {
             //std::cerr << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
@@ -1153,6 +1168,7 @@ namespace scan_planner
       }
 
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
+        arrangeHeadingTime(traj,heading_);
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
       double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes through every grid.
@@ -1160,7 +1176,8 @@ namespace scan_planner
       {
         Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
         Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-        if (grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next)))
+        if (grid_map_->getInflateOccupancy(pos, plannedHeading(estimateSegmentYaw(pos,pos_next),t,traj.getTimeSum(),
+            heading_.yaw0,heading_.goal,heading_.reverse,heading_.lateral,heading_.omega,false)))
         {
           // std::cerr << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
 

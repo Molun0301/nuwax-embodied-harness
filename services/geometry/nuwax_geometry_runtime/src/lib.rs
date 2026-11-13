@@ -25,7 +25,6 @@ mod outputs;
 mod persistent_occupancy;
 mod planar_navigation;
 mod pointcloud;
-mod rpc_runtime;
 mod self_cloud;
 pub mod session;
 mod slam2d_owner;
@@ -51,7 +50,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ready = ReadyFile(ready_path.clone());
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let session = session::SessionHandle::start().await?;
-    let rpc = rpc_runtime::start(session.clone()).await?;
     let outputs = outputs::Outputs::start(session.clone())?;
     let api = api::GeometryApi::new(session.clone());
     let incoming = futures::stream::unfold(
@@ -84,7 +82,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
     outputs.shutdown().await;
-    rpc.stop().await?;
     session.shutdown().await;
     result?;
     Ok(())

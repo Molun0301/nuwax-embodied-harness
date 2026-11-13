@@ -7,7 +7,7 @@ mod input_capture {
 
     fn archive_objects(
         root: &Manifest,
-        source: &Repository,
+        source: &nuwax_map_chunks::ReadOnlyRepository,
         archive: &Repository,
         seen: &mut BTreeSet<ObjectIdentity>,
         bytes: &std::sync::atomic::AtomicU64,
@@ -74,12 +74,12 @@ mod input_capture {
         let bytes = std::sync::atomic::AtomicU64::new(0);
         let mut seen = BTreeSet::new();
         assert_eq!(
-            archive_objects(&root, &source, &archive, &mut seen, &bytes).unwrap(),
+            archive_objects(&root, &source.read_only(), &archive, &mut seen, &bytes).unwrap(),
             root.blocks.len()
         );
         let initial = bytes.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            archive_objects(&root, &source, &archive, &mut seen, &bytes).unwrap(),
+            archive_objects(&root, &source.read_only(), &archive, &mut seen, &bytes).unwrap(),
             0
         );
         assert_eq!(initial, bytes.load(std::sync::atomic::Ordering::Relaxed));
@@ -96,12 +96,10 @@ mod input_capture {
         let mut receiver = Receiver::new(Repository::temporary().unwrap());
         let transfer = Transfer {
             root: root.encode().unwrap(),
-            included: Default::default(),
+            repository_path: archive.path().to_string_lossy().into_owned(),
         };
         let loaded = receiver
-            .receive(&transfer, &root.domain, |_, reference| {
-                archive.read_object(reference.object, MAX_BLOCK_BYTES)
-            })
+            .receive(&transfer, &root.domain)
             .unwrap();
         assert_eq!(*loaded, root);
     }
@@ -147,15 +145,9 @@ mod input_capture {
             tokio::sync::mpsc::channel::<(usize, Arc<schema::NavigationMap3D>)>(8);
         let fetch_directory = directory.clone();
         let fetch_total = total.clone();
-        let fetch_url = url.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            let local = Repository::temporary().unwrap();
             let archive = Repository::open(fetch_directory.join("objects")).unwrap();
-            let mut reader = FineMapReader {
-                receiver: Receiver::with_cache_budget(local.clone(), 32 * 1024 * 1024),
-                client: None,
-                lcm_url: fetch_url,
-            };
+            let mut reader = FineMapReader::new("");
             let mut seen = BTreeSet::new();
             let mut complete_active = 0;
             let mut log = std::io::BufWriter::new(
@@ -170,7 +162,7 @@ mod input_capture {
                     Ok(serde_json::json!({"inline_cloud_only":true,"blocks":0}))
                 } else {
                     reader.receive(&message).map_err(|error|error.to_string()).and_then(|root| {
-                    let copied=archive_objects(&root,&local,&archive,&mut seen,&fetch_total)?;
+                    let copied=archive_objects(&root,&nuwax_map_chunks::ReadOnlyRepository::open(&message.fine.as_ref().unwrap().repository_path),&archive,&mut seen,&fetch_total)?;
                     save_bytes(&fetch_directory,&format!("根_{ordinal:06}.bin"),&message.fine.as_ref().unwrap().root,&fetch_total)?;
                     Ok(serde_json::json!({"root":root.identity(),"blocks":root.blocks.len(),"copied":copied}))
                 })

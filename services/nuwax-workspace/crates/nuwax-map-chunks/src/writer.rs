@@ -2,17 +2,22 @@ use super::*;
 use rayon::prelude::*;
 
 /// `layer_bytes` 始终等于 `layers.bytes()`，在每次替换记录时同步更新，免去整块重算。
-struct Dirty { block: Arc<Block>, layers: GroundRecords, layer_bytes: usize, changed: bool }
+struct Dirty { block: Arc<Block>, layers: GroundRecords, layer_bytes: usize, changed: bool, original: Original }
+
+/// 脏化时取得的原发布载荷；刷写完成后释放，不跨刷写保留整张旧图。
+#[derive(Clone)]
+struct Original { block: Arc<Block>, layers: GroundRecords, bytes: usize }
+struct Prepared { block: Arc<Block>, layers: GroundRecords, layer_bytes: usize, original: Original }
 
 fn watermark_bytes(source: &LayerSource) -> usize { source.resident_bytes() + 80 }
 struct Pending { object: ObjectIdentity, bytes: Vec<u8>, installed: bool }
 /// 最近一次块编码或写入失败；拥有方据此隔离数据故障，不靠错误文本分类。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockWriteFailure { pub key: Key, pub reason: String }
-/// Dirty payload is bounded; membership baselines retain references, never copied member lists.
+/// 脏载荷保留原发布数据供内存比较；刷写后仅保留净几何变化集合。
 pub struct Writer {
     repository: Repository, blocks: BTreeMap<Key, BlockRef>, dirty: BTreeMap<Key, Dirty>,
-    pending: BTreeMap<Key, Pending>, touched: BTreeSet<Key>, membership_touched: BTreeSet<Key>,
+    pending: BTreeMap<Key, Pending>, touched: BTreeSet<Key>, membership_touched: BTreeSet<Key>, geometry_changes: BTreeSet<Key>,
     source_watermarks: BTreeMap<Arc<LayerSource>, (u64, u64)>,
     source_watermark_bytes: usize, source_watermarks_changed: bool,
     published: Option<Arc<Manifest>>, reader: RegionReader,
@@ -23,6 +28,9 @@ pub struct Writer {
     // 自动模式的预算上限（字节）；`None` 为固定预算。首次超过上限时记下所需与上限。
     cache_limit_bytes: Option<usize>, cache_warning: Option<(usize, usize)>,
     block_write_failure: Option<BlockWriteFailure>,
+    // 只保留最近一次分类读取范围内的完整列；块记录仍是提交来源。
+    retained_ground_columns: BTreeMap<[i32; 2], ColumnGroundRecords>,
+    ground_read_rows: Vec<(i32, i32, i32)>,
     #[cfg(test)] pub(crate) cache_warnings: usize,
 }
 /// 写入器缓存策略。固定：始终使用构造时的预算；自动：即将压力刷写时，若把预算扩到
@@ -40,9 +48,9 @@ impl Writer {
             return Err("invalid writer resolution or cache budget".into());
         }
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
-            blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
+            blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(), geometry_changes: BTreeSet::new(),
             source_watermarks: BTreeMap::new(), source_watermark_bytes: 0, source_watermarks_changed: false, published: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, write_format: 4, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0,
-            cache_limit_bytes: None, cache_warning: None, block_write_failure: None, #[cfg(test)] cache_warnings: 0 })
+            cache_limit_bytes: None, cache_warning: None, block_write_failure: None, retained_ground_columns: BTreeMap::new(), ground_read_rows: Vec::new(), #[cfg(test)] cache_warnings: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
     pub fn block_write_failure(&self) -> Option<&BlockWriteFailure> { self.block_write_failure.as_ref() }
@@ -104,7 +112,7 @@ impl Writer {
         self.source_watermarks_changed || !self.touched.is_empty() || !self.membership_touched.is_empty() || !self.pending.is_empty()
     }
     pub fn voxel_size_m(&self) -> f32 { self.voxel_size_m }
-    pub fn resident_bytes(&self) -> usize { self.source_watermark_bytes + self.dirty_layer_bytes() + self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() }
+    pub fn resident_bytes(&self) -> usize { self.source_watermark_bytes + self.dirty_layer_bytes() + self.dirty_points * 64 + self.reader.cached_bytes() + self.pending.values().map(|p| p.bytes.len()).sum::<usize>() + self.dirty.values().map(|d| d.original.bytes).sum::<usize>() }
     pub fn block_count(&self) -> usize {
         self.blocks.len()
             + self.dirty.iter().filter(|(key, dirty)| !dirty.block.is_empty() && !self.blocks.contains_key(*key)).count()
@@ -128,13 +136,6 @@ impl Writer {
             (mark.source.clone(), (mark.source_timestamp_ns, mark.source_sequence))).collect();
         let source_watermark_bytes = source_watermarks.keys().map(|source| watermark_bytes(source)).sum::<usize>();
         if source_watermark_bytes > MAX_MANIFEST_BYTES { return Err("source watermarks exceed resident budget".into()); }
-        if root.version >= 5 {
-            let mut columns = BTreeSet::new();
-            for reference in &root.blocks {
-                ground_records::heightfield_columns(reference.key, &self.reader.ground_records(reference)?, &mut columns)?;
-            }
-            ground_records::validate_root_columns(root, &mut self.reader, &columns)?;
-        }
         self.source_watermarks = source_watermarks; self.source_watermark_bytes = source_watermark_bytes;
         self.write_format = root.version;
         self.blocks = root.blocks.iter().map(|b| (b.key, b.clone())).collect();
@@ -146,7 +147,25 @@ impl Writer {
         match root { ArchivedRoot::Current(root) => self.restore(root) }
     }
     fn reset_pending(&mut self) {
-        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; self.source_watermarks_changed = false;
+        self.retained_ground_columns.clear(); self.ground_read_rows.clear();
+        self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.geometry_changes.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; self.source_watermarks_changed = false;
+    }
+    fn original(&mut self, key: Key, block: &Arc<Block>, layers: &GroundRecords, layer_bytes: usize) -> Result<Original, String> {
+        let reference = self.published.as_ref().and_then(|root|
+            root.blocks.binary_search_by_key(&key, |r| r.key).ok().map(|i| root.blocks[i].clone()));
+        let (block, layers, layer_bytes) = match reference {
+            Some(reference) if self.blocks.get(&key).is_some_and(|current| current.object == reference.object) =>
+                (block.clone(), layers.clone(), layer_bytes),
+            Some(reference) => {
+                // 压力刷写后再次脏化时，在加载阶段取得原发布基线。
+                let (block, layers) = self.reader.ground_parts(&reference)?;
+                let bytes = layers.bytes();
+                (block, layers, bytes)
+            }
+            None => (Arc::new(Block::new()), GroundRecords::empty(), 0),
+        };
+        let bytes = block.len() * 64 + layer_bytes;
+        Ok(Original { block, layers, bytes })
     }
     fn load_dirty(&mut self, key: Key) -> Result<&mut Dirty, String> {
         if !self.dirty.contains_key(&key) {
@@ -160,8 +179,9 @@ impl Writer {
                 None => (Arc::new(Block::new()), GroundRecords::empty()),
             };
             let layer_bytes = layers.bytes();
+            let original = self.original(key, &block, &layers, layer_bytes)?;
             self.dirty_layer_bytes += layer_bytes;
-            self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, layers, layer_bytes, changed: false });
+            self.dirty_points += block.len(); self.dirty.insert(key, Dirty { block, layers, layer_bytes, changed: false, original });
         }
         Ok(self.dirty.get_mut(&key).unwrap())
     }
@@ -214,12 +234,10 @@ impl Writer {
         }
         Ok(result)
     }
-    /// 与对同一列集合调用 `ground_columns` 的结果和首个错误相同，只是 `samples` 判为假
-    /// 的列不带高度场诊断样本。列集合以 `(x, y最小, y最大)` 行区间给出：先按原顺序读取
-    /// 同一组块，再只组装块内实际带地面记录的列；无记录的列组装结果必为空且不会出错，
-    /// 因此不再逐列查找。
-    pub fn ground_columns_in_rows(&mut self, rows: &[(i32, i32, i32)], samples: impl Fn([i32; 2]) -> bool + Sync)
-        -> Result<BTreeMap<[i32; 2], ColumnGroundRecords>, String> {
+    /// 保留本次读取范围内的完整地面列；已保留列直接借用，缺少的列从原块记录组装。
+    /// 范围以 `(x, y最小, y最大)` 行区间给出；诊断样本随完整列保留，供后续回波合并。
+    pub fn ground_columns_in_rows(&mut self, rows: &[(i32, i32, i32)])
+        -> Result<&BTreeMap<[i32; 2], ColumnGroundRecords>, String> {
         let mut merged: Vec<(i32, i32, i32)> = rows.iter().copied().filter(|row| row.1 <= row.2).collect();
         merged.sort_unstable();
         merged.dedup_by(|next, last| {
@@ -231,6 +249,8 @@ impl Writer {
             let index = merged.partition_point(|row| (row.0, row.1) <= (xy[0], xy[1]));
             index > 0 && merged[index - 1].0 == xy[0] && xy[1] <= merged[index - 1].2
         };
+        self.retained_ground_columns.retain(|xy, _| contains(*xy));
+        self.ground_read_rows = merged.clone();
         // 每个块列取一个代表列，块集合与原入口逐列换算出的集合相同。
         let block_xys: BTreeSet<_> = merged.iter().flat_map(|&(x, low, high)|
             (low.div_euclid(32)..=high.div_euclid(32)).map(move |by| [x.div_euclid(32), by])).collect();
@@ -247,21 +267,24 @@ impl Writer {
                 for (local, record) in records.iter().filter(|(local, _)| local / 1024 < 32) {
                     let local_xy = i32::from(local % 1024);
                     let xy = [bxy[0] * 32 + local_xy % 32, bxy[1] * 32 + local_xy / 32];
-                    if contains(xy) { columns.entry(xy).or_default().push((*key, record)); }
+                    if contains(xy) && !self.retained_ground_columns.contains_key(&xy) { columns.entry(xy).or_default().push((*key, record)); }
                 }
             }
         }
         // 各列组装互不依赖：并行组装后按列升序取结果，返回列序上的第一个错误。
         let columns: Vec<_> = columns.into_iter().collect();
         let q = self.voxel_size_m;
-        let assembled: Vec<_> = columns.into_par_iter()
-            .map(|(xy, records)| (xy, ground_records::assemble_column_records(xy, q, records, samples(xy)))).collect();
-        let mut result = BTreeMap::new();
+        let assembled: Vec<_> = columns.into_par_iter().with_min_len(256)
+            .map(|(xy, records)| (xy, ground_records::assemble_column_records(xy, q, records))).collect();
         for (xy, column) in assembled {
             let column = column?;
-            if column.classified_empty || !column.heightfields.is_empty() { result.insert(xy, column); }
+            if column.classified_empty || !column.heightfields.is_empty() { self.retained_ground_columns.insert(xy, column); }
         }
-        Ok(result)
+        Ok(&self.retained_ground_columns)
+    }
+    fn ground_read_contains(&self, xy: [i32; 2]) -> bool {
+        let index = self.ground_read_rows.partition_point(|row| (row.0, row.1) <= (xy[0], xy[1]));
+        index > 0 && self.ground_read_rows[index - 1].0 == xy[0] && xy[1] <= self.ground_read_rows[index - 1].2
     }
     /// Replace the complete declared column, not arbitrary independent fragments.
     /// Every fallible read/validation precedes the infallible dirty installation.
@@ -274,39 +297,28 @@ impl Writer {
     pub fn replace_ground_columns<'a>(&mut self,
         columns: impl IntoIterator<Item = ([i32; 2], &'a ColumnGroundRecords)>) -> Result<(), String> {
         let columns: BTreeMap<_, _> = columns.into_iter().collect();
-        let prepared = self.prepare_ground_blocks(columns.keys().copied())?;
+        let prepared = self.prepare_ground_edits(columns.keys().copied())?;
         // 各列暂存只读���记录、互不依赖：并行计算后按列序合并，返回列序上的第一个错误。
         let columns: Vec<_> = columns.into_iter().collect();
         let q = self.voxel_size_m;
-        let staged: Vec<_> = columns.par_iter().map(|(xy, column)| Self::stage_column(*xy, q, column, &prepared)).collect();
+        let staged: Vec<_> = columns.par_iter().with_min_len(256).map(|(xy, column)| Self::stage_column(*xy, q, column, &prepared)).collect();
         let mut deltas = BTreeMap::new();
-        for pieces in staged { Self::merge_staged(&mut deltas, pieces?); }
+        let mut retained = Vec::with_capacity(columns.len());
+        for ((xy, column), pieces) in columns.into_iter().zip(staged) {
+            let (pieces, stored) = pieces?;
+            Self::merge_staged(&mut deltas, pieces);
+            retained.push((xy, stored.then_some(column)));
+        }
         let changed: BTreeSet<_> = deltas.keys().copied().collect();
-        self.validate_staged(&prepared, &deltas, &changed)?;
         self.install_ground_parts(prepared, deltas, &changed);
+        for (xy, column) in retained {
+            if self.ground_read_contains(xy) {
+                if let Some(column) = column { self.retained_ground_columns.insert(xy, column.clone()); }
+                else { self.retained_ground_columns.remove(&xy); }
+            }
+        }
         self.write_format = 5;
         Ok(())
-    }
-    /// 每个改动块在“原记录 + 增量”的视图上做整块校验，顺序与在改好的整表上校验相同。
-    /// 各块校验互不依赖：并行校验后按块键升序取结果，返回第一个错误。
-    fn validate_staged(&self, prepared: &BTreeMap<Key, (Arc<Block>, GroundRecords)>,
-        deltas: &BTreeMap<Key, BTreeMap<u16, Option<GroundRecord>>>, changed: &BTreeSet<Key>) -> Result<(), String> {
-        let q = self.voxel_size_m;
-        let keys: Vec<_> = changed.iter().copied().collect();
-        let results: Vec<_> = keys.par_iter().map(|key| {
-            let (block, records) = &prepared[key];
-            match deltas.get(key) {
-                // 有增量的块安装后必为版本化记录，按版本化分支校验。
-                Some(delta) => {
-                    let view = ground_records::overlay(records, delta);
-                    ground_records::validate_versioned_records(view.len(), view.iter().copied(), block)
-                }
-                None => {
-                    ground_records::validate_records(records, block)
-                }
-            }
-        }).collect();
-        results.into_iter().collect()
     }
     /// 把一列的分块增量并入总增量；同一批各列的键互不重叠。
     fn merge_staged(deltas: &mut BTreeMap<Key, BTreeMap<u16, Option<GroundRecord>>>,
@@ -319,15 +331,30 @@ impl Writer {
         let mut prepared = BTreeMap::new();
         for bxy in block_xys {
             for (key, block, records) in self.column_parts([bxy[0]*32,bxy[1]*32])? {
-                prepared.insert(key,(block,records));
+                prepared.insert(key, (block, records));
             }
+        }
+        Ok(prepared)
+    }
+    fn prepare_ground_edits(&mut self, columns: impl IntoIterator<Item = [i32; 2]>)
+        -> Result<BTreeMap<Key, Prepared>, String> {
+        let mut prepared = BTreeMap::new();
+        for (key, (block, records)) in self.prepare_ground_blocks(columns)? {
+            let (layer_bytes, original) = match self.dirty.get(&key) {
+                Some(dirty) => (dirty.layer_bytes, dirty.original.clone()),
+                None => {
+                    let bytes = records.bytes();
+                    (bytes, self.original(key, &block, &records, bytes)?)
+                }
+            };
+            prepared.insert(key, Prepared { block, layers: records, layer_bytes, original });
         }
         Ok(prepared)
     }
     /// 只读原记录，把本列的替换记成各块的增量；同一批各列的键互不重叠。
     fn stage_column(xy: [i32; 2], q: f32, column: &ColumnGroundRecords,
-        prepared: &BTreeMap<Key, (Arc<Block>, GroundRecords)>)
-        -> Result<Vec<(Key, BTreeMap<u16, Option<GroundRecord>>)>, String> {
+        prepared: &BTreeMap<Key, Prepared>)
+        -> Result<(Vec<(Key, BTreeMap<u16, Option<GroundRecord>>)>, bool), String> {
         let mut additions = ground_records::split_column(xy, q, column)?;
         if additions.keys().any(|key| !prepared.contains_key(key)) { return Err("heightfield members lack original occupied block".into()); }
         let mut pieces = Vec::new();
@@ -335,12 +362,15 @@ impl Writer {
         let low = [xy[0].div_euclid(32),xy[1].div_euclid(32),i32::MIN];
         let high = [low[0],low[1],i32::MAX];
         if column.classified_empty {
-            if let Some((&key, _)) = prepared.range(low..=high).find(|(_, (block, _))|
-                (0..32_u16).any(|z| block.contains_key(&(local_xy+1024*z)))) {
+            if let Some((&key, _)) = prepared.range(low..=high).find(|(_, part)|
+                (0..32_u16).any(|z| part.block.contains_key(&(local_xy+1024*z)))) {
                 additions.entry(key).or_default().insert(local_xy, GroundRecord::ClassifiedEmptyColumn {});
             }
         }
-        for (key, (_, records)) in prepared.range(low..=high) {
+        // 空声明仅在有实际占据分片时形成记录；保留列与这个写入结果一致。
+        let stored = !additions.is_empty();
+        for (key, part) in prepared.range(low..=high) {
+            let records = &part.layers;
             let add = additions.remove(key).unwrap_or_default();
             let same = (0..32_u16).all(|z| {
                 let k = local_xy + 1024*z;
@@ -356,13 +386,13 @@ impl Writer {
             delta.extend(add.into_iter().map(|(k, value)| (k, Some(value))));
             pieces.push((*key, delta));
         }
-        Ok(pieces)
+        Ok((pieces, stored))
     }
-    fn install_ground_parts(&mut self, prepared: BTreeMap<Key, (Arc<Block>, GroundRecords)>,
+    fn install_ground_parts(&mut self, prepared: BTreeMap<Key, Prepared>,
         mut deltas: BTreeMap<Key, BTreeMap<u16, Option<GroundRecord>>>, changed: &BTreeSet<Key>) {
         // No IO, encoding, pressure-flush or full-block equality comparison after
         // the first fragment is installed. The dirty set came from actual edits.
-        for (key, (block, mut records)) in prepared {
+        for (key, Prepared { block, layers: mut records, layer_bytes: prepared_bytes, original }) in prepared {
             if !changed.contains(&key) { continue; }
             // 先取出旧脏块，释放它对记录表的共享引用，增量随后原地应用。
             let mut layer_bytes = match self.dirty.remove(&key) {
@@ -370,11 +400,13 @@ impl Writer {
                     self.dirty_points -= old.block.len(); self.dirty_layer_bytes -= old.layer_bytes;
                     old.layer_bytes
                 }
-                None => records.bytes(),
+                None => prepared_bytes,
             };
             if let Some(delta) = deltas.remove(&key) {
                 let mutable = records.versioned_mut();
                 for (k, change) in delta {
+                    let xy = [key[0] * 32 + i32::from(k % 32), key[1] * 32 + i32::from(k % 1024 / 32)];
+                    self.retained_ground_columns.remove(&xy);
                     if let Some(old) = mutable.remove(&k) { layer_bytes -= ground_records::record_bytes(old.as_ref()); }
                     if let Some(value) = change {
                         layer_bytes += ground_records::record_bytes(value.as_ref());
@@ -383,13 +415,14 @@ impl Writer {
                 }
             }
             self.dirty_points += block.len(); self.dirty_layer_bytes += layer_bytes;
-            self.dirty.insert(key, Dirty { block, layers: records, layer_bytes, changed: true });
+            self.dirty.insert(key, Dirty { block, layers: records, layer_bytes, changed: true, original });
             self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
         }
     }
     pub fn remove(&mut self, keys: impl IntoIterator<Item = Key>) -> Result<(), String> {
-        if self.write_format < 5 { return self.remove_occupancy(keys); }
         let keys: BTreeSet<_> = keys.into_iter().collect();
+        for key in &keys { self.retained_ground_columns.remove(&[key[0], key[1]]); }
+        if self.write_format < 5 { return self.remove_occupancy(keys); }
         let block_keys: BTreeSet<_> = keys.iter().map(|k| block_key(*k)).collect();
         let mut versioned = false;
         for key in block_keys {
@@ -398,15 +431,16 @@ impl Writer {
         }
         if !versioned { return self.remove_occupancy(keys); }
         let columns: BTreeSet<_> = keys.iter().map(|k| [k[0],k[1]]).collect();
-        let mut prepared = self.prepare_ground_blocks(columns.iter().copied())?;
-        let records: Vec<_> = prepared.iter().map(|(k,(_,r))| (*k,r.clone())).collect();
+        let mut prepared = self.prepare_ground_edits(columns.iter().copied())?;
+        let records: Vec<_> = prepared.iter().map(|(k,part)| (*k,part.layers.clone())).collect();
         let mut originals = Vec::new();
         for xy in columns { originals.push((xy, ground_records::assemble_column(xy, self.voxel_size_m, &records)?)); }
         drop(records);
         let mut changed = BTreeSet::new();
         let mut deltas = BTreeMap::new();
         for key in &keys {
-            if let Some((block, _)) = prepared.get_mut(&block_key(*key)) {
+            if let Some(part) = prepared.get_mut(&block_key(*key)) {
+                let block = &mut part.block;
                 if block.contains_key(&local_key(*key)) {
                     Arc::make_mut(block).remove(&local_key(*key)); changed.insert(block_key(*key));
                 }
@@ -424,10 +458,9 @@ impl Writer {
                 Some(surface)
             }).collect();
             column.classified_empty = was_native && column.heightfields.is_empty();
-            Self::merge_staged(&mut deltas, Self::stage_column(xy, self.voxel_size_m, &column, &prepared)?);
+            Self::merge_staged(&mut deltas, Self::stage_column(xy, self.voxel_size_m, &column, &prepared)?.0);
         }
         changed.extend(deltas.keys().copied());
-        self.validate_staged(&prepared, &deltas, &changed)?;
         self.install_ground_parts(prepared, deltas, &changed);
         Ok(())
     }
@@ -510,10 +543,23 @@ impl Writer {
         // Do not change current references until every frozen payload is installed.
         for (key, dirty) in &self.dirty {
             if !dirty.changed { continue; }
+            if self.membership_touched.contains(key) {
+                let original = &dirty.original;
+                let changed = match (original.block.is_empty(), dirty.block.is_empty()) {
+                    (true, true) => false,
+                    (false, false) => original.block.keys().ne(dirty.block.keys())
+                        || !original.layers.geometry_eq(&dirty.layers),
+                    _ => true,
+                };
+                if changed { self.geometry_changes.insert(*key); }
+                else { self.geometry_changes.remove(key); }
+            }
             if dirty.block.is_empty() { self.blocks.remove(key); continue; }
             let previous = self.blocks.get(key);
             let reference = BlockRef { key: *key, object: self.pending[key].object,
                 block_revision: previous.map_or(0, |b| b.block_revision), geometry_revision: previous.map_or(0, |b| b.geometry_revision), points: dirty.block.len() as u32 };
+            self.reader.cache_written(reference.object, dirty.block.clone(),
+                intrinsic_bytes(&self.pending[key].bytes, &dirty.block), dirty.layers.clone(), dirty.layer_bytes);
             self.blocks.insert(*key, reference);
         }
         self.dirty.clear(); self.pending.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; Ok(())
@@ -529,22 +575,7 @@ impl Writer {
             return Err("publication revision did not advance".into());
         }
         self.flush()?;
-        let mut changed_members = BTreeSet::new();
-        if same_domain {
-            let old = self.published.as_ref().unwrap();
-            for key in &self.membership_touched {
-                let previous = old.blocks.binary_search_by_key(key, |b| b.key).ok().map(|i| &old.blocks[i]);
-                match (previous, self.blocks.get(key)) {
-                    (None, None) => {},
-                    (Some(a), Some(b)) if a.object == b.object => {},
-                    (Some(a), Some(b)) => {
-                        let (a, a_records) = self.reader.ground_parts(a)?; let (b, b_records) = self.reader.ground_parts(b)?;
-                        if a.keys().ne(b.keys()) || !a_records.geometry_eq(&b_records) { changed_members.insert(*key); }
-                    }
-                    _ => { changed_members.insert(*key); }
-                }
-            }
-        }
+        let changed_members = &self.geometry_changes;
         let geometry_revision = if !same_domain || !changed_members.is_empty() { revision } else { self.published.as_ref().unwrap().geometry_revision };
         let mut blocks = self.blocks.clone();
         let reuse_ordered_baseline = same_domain && changed_members.is_empty();
@@ -570,23 +601,9 @@ impl Writer {
             source_watermarks: self.source_watermarks.iter().map(|(source, &(source_timestamp_ns, source_sequence))|
                 SourceWatermark { source: source.clone(), source_timestamp_ns, source_sequence }).collect() });
         root.validate()?;
-        if self.write_format >= 5 {
-            let mut columns = BTreeSet::new();
-            for key in &self.membership_touched {
-                if let Some(reference) = blocks.get(key) {
-                    ground_records::heightfield_columns(*key, &self.reader.ground_records(reference)?, &mut columns)?;
-                }
-                if let Some(old) = &self.published {
-                    if let Ok(i) = old.blocks.binary_search_by_key(key, |r| r.key) {
-                        ground_records::heightfield_columns(*key, &self.reader.ground_records(&old.blocks[i])?, &mut columns)?;
-                    }
-                }
-            }
-            ground_records::validate_root_columns(&root, &mut self.reader, &columns)?;
-        }
         self.blocks = blocks; self.published = Some(root.clone());
-        self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
-        Ok(SealedMap { root, repository: self.repository.clone() })
+        self.touched.clear(); self.membership_touched.clear(); self.geometry_changes.clear(); self.source_watermarks_changed = false;
+        Ok(SealedMap { root, repository: self.repository.clone(), reader: self.reader.clone() })
     }
     pub fn retained_objects(&self) -> BTreeSet<ObjectIdentity> {
         self.blocks.values().map(|b| b.object).chain(self.pending.values().map(|p| p.object))
@@ -713,3 +730,7 @@ mod capture_column_tests {
         assert!(!writer.has_unpublished_changes());
     }
 }
+
+#[cfg(test)]
+#[path = "writer_retained_ground_tests.rs"]
+mod retained_ground_tests;

@@ -64,6 +64,30 @@ fn next_pose(f: &mut SurfaceFollower, position: [f64; 3]) {
 }
 
 #[test]
+fn terminal_reference_cuts_before_the_first_point_within_half_body_width() {
+    let half_width = 0.164;
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [2., 0., 0.]], [1.9, -0.05, 0.], half_width),
+        vec![[0., 0., 0.], [1.9, -0.05, 0.]]);
+    let stop = [4.775, -0.125, 0.];
+    let reference = [
+        [4.575, -0.075, 0.], [4.625, -0.075, 0.],
+        [4.675, -0.075, 0.], [4.725, -0.075, 0.], [4.775, -0.025, 0.],
+        [4.825, 0.025, 0.], [4.875, 0.075, 0.], [4.875, 0.025, 0.],
+        [4.875, -0.025, 0.], [4.875, -0.075, 0.], [4.875, -0.125, 0.],
+    ];
+    assert_eq!(SurfaceFollower::reference_to_stop(&reference, stop, half_width),
+        vec![reference[0], stop]);
+    let finding = [[4.575, -0.025, 0.], [4.625, -0.025, 0.], [4.785, -0.025, 0.]];
+    assert_eq!(SurfaceFollower::reference_to_stop(&finding, [4.76, -0.025, 0.], half_width),
+        vec![finding[0], [4.76, -0.025, 0.]]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&[], stop, half_width), Vec::<[f64; 3]>::new());
+    assert_eq!(SurfaceFollower::reference_to_stop(&reference, reference[0], half_width),
+        vec![reference[0], reference[0]]);
+    assert_eq!(SurfaceFollower::reference_to_stop(&[[0., 0., 0.], [1., 0., 0.]], [2., 0., 0.], half_width),
+        vec![[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]]);
+}
+
+#[test]
 fn business_tolerance_keeps_the_current_curve_running() {
     let mut f=ready_follower();
     f.options.position_tolerance_m=0.15;
@@ -72,7 +96,7 @@ fn business_tolerance_keeps_the_current_curve_running() {
     assert!(f.position_reached());
     let step=f.step();
     assert_ne!(step,PlannerStep::Succeeded,"进入业务容差不得跳过仍可执行的曲线");
-    assert!(f.active.is_some(),"应继续当前曲线而非切到原地朝向分支");
+    assert_eq!(f.terminal_phase(),TerminalPhase::Travel,"实测未停稳时不能提前进入末段");
 }
 
 #[test]
@@ -103,7 +127,9 @@ fn eighth_round_saved_arrivals_wait_for_measured_stop() {
         assert!(!f.reached(),"进入容差时仍在运动，不能提前成功");
         assert!(f.active.is_some());
         f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
-        assert!(f.reached(),"位置朝向合格、实测停稳即可完成");
+        assert!(!f.reached(),"停稳后仍须完成到停点的平移");
+        f.terminal_translation_finished=true;
+        assert!(f.reached(),"平移结束且原位置、朝向、实测停稳条件满足后完成");
     }
 }
 
@@ -116,12 +142,14 @@ fn ninth_round_stopped_arrival_succeeds_with_unfinished_curve() {
     goal.pose.orientation=Quaternion::from_yaw(-1.006363320716952);
     actual.pose.orientation=Quaternion::from_yaw(-1.072751879536303);
     f.goal=Some(goal);f.odometry=Some(actual);
+    f.terminal_approach=None;
     f.options.position_tolerance_m=0.15;f.options.yaw_tolerance_rad=0.3;
     f.observe_measured_motion(Some(crate::motion_feedback::tests::measured(
         [6.771426847813366e-05,-0.0002417263976858355,-0.00018311811803040358],
         [0.,0.,-5.7431892283567847e-05])));
     assert!(f.active.is_some());
     assert_eq!(f.step_at_goal(),Some(PlannerStep::Succeeded));
+    assert!(f.terminal_translation_finished,"检查后平移为零时，结束平移后按原位置、朝向和停稳条件完成");
     assert_eq!(f.step(),PlannerStep::Succeeded);
 }
 fn delayed_planner(
@@ -140,6 +168,7 @@ fn delayed_planner(
             &job.state,
             job.active.as_ref(),
             job.phase,
+            job.goal_yaw,
         )?;
         *saved.lock().unwrap() = Some(curve.clone());
         Ok(curve)
@@ -225,7 +254,7 @@ fn deviation_over_constant_threshold_requests_local_plan() {
     assert!(f.wait_reason.as_ref().unwrap().contains("偏离"));
 }
 #[test]
-fn remaining_two_point_five_seconds_requests_once_and_coalesces() {
+fn final_curve_remaining_two_point_five_seconds_keeps_tracking_without_replanning() {
     let mut f = ready_follower();
     delayed_planner(&mut f, Duration::from_millis(500));
     let samples = f.active.as_ref().unwrap().samples(0., 0.01);
@@ -240,14 +269,55 @@ fn remaining_two_point_five_seconds_requests_once_and_coalesces() {
         .unwrap();
     let position = at.position;
     next_pose(&mut f, position);
+    // 保留原尾段位置与时间锚；曲线已接到参考末点时不再由剩余时长触发新规划。
+    let config=f.native_config(f.map.as_ref().unwrap());
+    let state=f.state();
+    f.tracker.install(f.active.as_ref().unwrap());
+    f.tracker.track_and_check(&config,&f.prepared.as_ref().unwrap().snapshot,&state,[0.;3],None).unwrap();
     f.needs_plan = false;
     assert!(matches!(f.step(), PlannerStep::Command(_)));
-    assert!(f.early_requested && f.planning);
+    assert!(!f.early_requested && !f.planning);
     let calls = f.local_planning_calls();
     for _ in 0..3 {
         f.step();
         assert_eq!(f.local_planning_calls(), calls);
     }
+}
+#[test]
+fn final_curve_keeps_its_clock_and_installation_across_source_ticks() {
+    let mut f = ready_follower();
+    let curve = f.active.as_ref().unwrap().clone();
+    let samples = curve.samples(0., 0.01);
+    let duration = samples.last().unwrap().time;
+    let initial = samples.iter().min_by(|a,b| {
+        (a.time-(duration-2.49)).abs().total_cmp(&(b.time-(duration-2.49)).abs())
+    }).unwrap();
+    assert!((samples.last().unwrap().position[0]-f.reference.last().unwrap()[0]).abs()
+        <=f.config.scan.resolution);
+    next_pose(&mut f,initial.position);
+    let config=f.native_config(f.map.as_ref().unwrap());
+    let state=f.state();
+    f.tracker.install(&curve);
+    f.tracker.track_and_check(&config,&f.prepared.as_ref().unwrap().snapshot,&state,[0.;3],None).unwrap();
+    f.needs_plan=false;
+    let calls=f.local_planning_calls();
+    let installed=f.plans;
+    let mut phase=initial.time;
+    for tick in 0..5 {
+        let at=samples.iter().min_by(|a,b| {
+            (a.time-(initial.time+tick as f64*0.05)).abs()
+                .total_cmp(&(b.time-(initial.time+tick as f64*0.05)).abs())
+        }).unwrap();
+        next_pose(&mut f,at.position);
+        assert!(matches!(f.step(),PlannerStep::Command(_)));
+        assert!(!f.early_requested&&!f.planning);
+        assert_eq!(f.local_planning_calls(),calls);
+        assert_eq!(f.plans,installed);
+        assert!(f.active.as_ref().unwrap().same(&curve));
+        assert!(f.phase>=phase-0.02);
+        phase=f.phase;
+    }
+    assert!(phase>initial.time+0.1,"原曲线时钟必须随新来源拍前进");
 }
 #[test]
 fn final_no_candidate_zeroes_and_requests_plan_from_raw_motion() {
@@ -333,7 +403,7 @@ fn distant_new_curve_keeps_valid_old_curve_and_requests_again() {
             .iter()
             .map(|p| [p[0], p[1] + 1., p[2]])
             .collect();
-        planner.plan(&job.config, &job.map.snapshot, &reference, &state, None, 0.)
+        planner.plan(&job.config, &job.map.snapshot, &reference, &state, None, 0., None)
     })
     .unwrap();
     f.needs_plan = true;

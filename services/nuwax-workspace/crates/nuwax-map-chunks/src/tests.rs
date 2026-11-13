@@ -5,10 +5,10 @@ fn domain() -> Domain { Domain { session: "robot-owner".into(), } }
 fn writer() -> (Repository, Writer) { let r = Repository::temporary().unwrap(); let w = Writer::new(r.clone(), 0.125, BUDGET).unwrap(); (r,w) }
 fn one() -> (Repository, Writer, Arc<Manifest>) { let (r,mut w)=writer(); w.observe([[0,0,0]],1).unwrap(); let m=w.snapshot(domain(),1,1).unwrap(); (r,w,m) }
 fn transfer(root: &Manifest, source: &Repository) -> Transfer {
-    Transfer { root: root.encode().unwrap(), included: root.blocks.iter().map(|b| (b.object,source.read_object(b.object,MAX_BLOCK_BYTES).unwrap())).collect() }
+    Transfer { root: root.encode().unwrap(), repository_path: source.path().to_string_lossy().into_owned() }
 }
 fn receive(receiver: &mut Receiver, root: &Manifest, source: &Repository) -> Result<Arc<Manifest>,String> {
-    receiver.receive(&transfer(root, source), &root.domain, |_,_| panic!("unexpected fetch"))
+    receiver.receive(&transfer(root, source), &root.domain)
 }
 fn body(local: u16, stamp: u64, hits: u16) -> Vec<u8> { encode_block(&BTreeMap::from([(local,Evidence {observed_ns:stamp,hits})])).unwrap() }
 fn archive_bytes(root: &Manifest, bodies: &[Vec<u8>]) -> Vec<u8> {
@@ -69,14 +69,14 @@ fn assert_block_oracle(name: &str, bytes: &[u8], error: Option<&str>) {
     let summary = expected.as_ref().map(|block| (
         block.len() as u32, block.values().map(|value| value.observed_ns).max().unwrap_or(0),
     )).map_err(Clone::clone);
-    assert_eq!(block_summary(bytes), summary, "{name}");
+    assert_eq!(decoded_block_stats(bytes), summary, "{name}");
     if let Ok(block) = expected {
         assert_eq!(encode_block(&block).unwrap(), bytes, "{name}");
     }
 }
 
 #[test]
-fn block_summary_matches_frozen_header_count_and_error_precedence() {
+fn block_decode_matches_frozen_header_count_and_error_precedence() {
     let valid = unchecked_block(&[(0, 1, 1)]);
     let format = Some("精细块格式或长度无效");
     let count = Some("精细块记录数不匹配");
@@ -117,7 +117,7 @@ fn block_summary_matches_frozen_header_count_and_error_precedence() {
 }
 
 #[test]
-fn block_summary_matches_frozen_record_corpus() {
+fn block_decode_matches_frozen_record_corpus() {
     let invalid = Some("精细块重复、无序或无效证据");
     let cases: &[(&str, &[(u16, u64, u16)], Option<&str>)] = &[
         ("legacy zero evidence", &[(0, 0, 0), (32767, 0, 0)], None),
@@ -135,16 +135,16 @@ fn block_summary_matches_frozen_record_corpus() {
     for &(name, records, error) in cases {
         assert_block_oracle(name, &unchecked_block(records), error);
     }
-    assert_eq!(block_summary(&unchecked_block(&[(0, 0, 0)])), Ok((1, 0)));
+    assert_eq!(decoded_block_stats(&unchecked_block(&[(0, 0, 0)])), Ok((1, 0)));
 }
 
 #[test]
-fn block_summary_matches_frozen_maximum_valid_block() {
+fn block_decode_matches_frozen_maximum_valid_block() {
     let records: Vec<_> = (0..32768_u16).map(|key| (key, u64::from(key) + 1, 1)).collect();
     let bytes = unchecked_block(&records);
     assert_eq!(bytes.len(), MAX_LEGACY_BLOCK_BYTES);
     assert_block_oracle("maximum valid block", &bytes, None);
-    assert_eq!(block_summary(&bytes), Ok((32768, 32768)));
+    assert_eq!(decoded_block_stats(&bytes), Ok((32768, 32768)));
 }
 
 
@@ -221,55 +221,12 @@ fn repository_rejects_symlink_and_directory_without_overwrite() {
     let r=Repository::temporary().unwrap();let alias=ObjectIdentity::Assigned(ObjectId([3;16]));let path=r.path().join(format!("id-{}", "03".repeat(16)));
     let target=r.path().join("outside");std::fs::write(&target,b"unchanged").unwrap();std::os::unix::fs::symlink(&target,&path).unwrap();
     assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());assert_eq!(std::fs::read(&target).unwrap(),b"unchanged");
-    assert!(r.read_object_range(alias,100,0,7).is_err());
     std::fs::remove_file(&path).unwrap();std::fs::create_dir(&path).unwrap();assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());
-    assert!(r.read_object_range(alias,100,0,7).is_err());
 }
 
-#[test]
-fn repository_ranges_reassemble_exact_bytes_with_bounded_buffers() {
-    for length in [1, MAX_BLOCK_TRANSFER_PART_BYTES - 1, MAX_BLOCK_TRANSFER_PART_BYTES,
-        MAX_BLOCK_TRANSFER_PART_BYTES + 1, 393_232, MAX_BLOCK_BYTES] {
-        let repository = Repository::temporary().unwrap();
-        let expected: Vec<_> = (0..length).map(|index| index as u8).collect();
-        for object in [ObjectIdentity::Assigned(ObjectId([1; 16]))] {
-            repository.put_object(object, &expected).unwrap();
-            let mut joined = Vec::new();
-            while joined.len() < length {
-                let ObjectRangeRead::Data { bytes, total_bytes } = repository.read_object_range(
-                    object, MAX_BLOCK_BYTES, joined.len(), MAX_BLOCK_TRANSFER_PART_BYTES,
-                ).unwrap() else { panic!("valid range must return bytes"); };
-                assert_eq!(total_bytes, length);
-                assert_eq!(bytes.len(), MAX_BLOCK_TRANSFER_PART_BYTES.min(length - joined.len()));
-                assert!(bytes.capacity() <= MAX_BLOCK_TRANSFER_PART_BYTES,
-                    "a range must not allocate the complete object");
-                joined.extend_from_slice(&bytes);
-            }
-            assert_eq!(joined, repository.read_object(object, MAX_BLOCK_BYTES).unwrap());
-            assert_eq!(joined, expected);
-        }
-    }
-}
 
-#[test]
-fn repository_ranges_keep_bounds_separate_from_missing_or_invalid_objects() {
-    let repository = Repository::temporary().unwrap();
-    let object = ObjectIdentity::Assigned(ObjectId([1; 16]));
-    repository.put_object(object, &[7; 16]).unwrap();
-    for (offset, maximum) in [(16, 1), (usize::MAX, 1), (0, 0)] {
-        assert!(matches!(repository.read_object_range(object, MAX_BLOCK_BYTES, offset, maximum),
-            Ok(ObjectRangeRead::OutOfBounds)));
-    }
-    let ObjectRangeRead::Data { bytes, total_bytes } = repository.read_object_range(
-        object, MAX_BLOCK_BYTES, 15, usize::MAX,
-    ).unwrap() else { panic!("the last byte is in range"); };
-    assert_eq!((bytes, total_bytes), (vec![7], 16));
-    assert!(repository.read_object_range(object, 15, 0, 1).is_err());
-    assert!(repository.read_object_range(ObjectIdentity::Assigned(ObjectId([0; 16])),
-        MAX_BLOCK_BYTES, 0, 1).is_err());
-    assert!(repository.read_object_range(ObjectIdentity::Assigned(ObjectId([3; 16])),
-        MAX_BLOCK_BYTES, 0, 1).is_err());
-}
+
+
 
 #[test]
 fn cached_block_hit_does_not_reopen_or_rescan_members() {
@@ -277,29 +234,23 @@ fn cached_block_hit_does_not_reopen_or_rescan_members() {
     let mut rehome=m.blocks[0].clone();rehome.key=[50,0,0];rehome.geometry_revision=99;let again=cache.block(&rehome).unwrap();assert!(Arc::ptr_eq(&first,&again));assert_eq!(counts,r.counts());
 }
 #[test]
-fn inline_admission_and_separate_reader_materialize_distinct_blocks() {
+fn readonly_admission_and_separate_reader_materialize_distinct_blocks() {
     let source = Repository::temporary().unwrap();
     let mut writer = Writer::new(source.clone(), 0.05, BUDGET).unwrap();
     writer.observe((0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])), 1).unwrap();
     let root = writer.snapshot(domain(), 1, 1).unwrap();
     let transfer = transfer(&root, &source);
     assert_eq!(root.blocks.len(), 4);
-    assert_eq!(transfer.included.len(), 4);
-    assert!(root.blocks.iter().all(|b| transfer.included.contains_key(&b.object)));
     let destination = Repository::temporary().unwrap();
     let mut receiver = Receiver::new(destination.clone());
     // counts().0 counts read_object calls, including failed-open attempts.
-    let before = destination.counts().0;
-    let admitted = receiver.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
-    assert_eq!(destination.counts().0 - before, 0);
+    let admitted = receiver.receive(&transfer, &domain()).unwrap();
     let admission_blocks: Vec<_> = admitted.blocks.iter()
         .map(|reference| receiver.reader.block(reference).unwrap()).collect();
-    assert_eq!(destination.counts().0 - before, 0);
     // 保留旧的独立消费缓存布局，证明它会重复读取并物化同一块。
-    let mut consumer = RegionReader::new(destination.clone(), 32 * 1024 * 1024);
+    let mut consumer = RegionReader::new(source.read_only(), 32 * 1024 * 1024);
     let consumer_blocks: Vec<_> = admitted.blocks.iter()
         .map(|reference| consumer.block(reference).unwrap()).collect();
-    assert_eq!(destination.counts().0 - before, 4);
     for (admission, consumed) in admission_blocks.iter().zip(&consumer_blocks) {
         assert_eq!(admission.as_ref(), consumed.as_ref());
         assert!(!Arc::ptr_eq(admission, consumed));
@@ -307,10 +258,9 @@ fn inline_admission_and_separate_reader_materialize_distinct_blocks() {
     for (reference, consumed) in admitted.blocks.iter().zip(&consumer_blocks) {
         assert!(Arc::ptr_eq(consumed, &consumer.block(reference).unwrap()));
     }
-    assert_eq!(destination.counts().0 - before, 4);
 }
 #[test]
-fn inline_admission_and_shared_reader_reuse_blocks_without_object_reads() {
+fn readonly_admission_and_shared_reader_reuse_decoded_blocks() {
     let source = Repository::temporary().unwrap();
     let mut writer = Writer::new(source.clone(), 0.05, BUDGET).unwrap();
     let cells: Vec<_> = (0..64).flat_map(|x| (0..64).map(move |y| [x, y, 0])).collect();
@@ -318,12 +268,9 @@ fn inline_admission_and_shared_reader_reuse_blocks_without_object_reads() {
     let root = writer.snapshot(domain(), 1, 1).unwrap();
     let transfer = transfer(&root, &source);
     assert_eq!(root.blocks.len(), 4);
-    assert_eq!(transfer.included.len(), 4);
     let destination = Repository::temporary().unwrap();
     let mut receiver = Receiver::with_cache_budget(destination.clone(), 32 * 1024 * 1024);
-    let before = destination.counts().0;
-    let admitted = receiver.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
-    assert_eq!(destination.counts().0 - before, 0);
+    let admitted = receiver.receive(&transfer, &domain()).unwrap();
     let admission_blocks: Vec<_> = admitted.blocks.iter()
         .map(|reference| receiver.reader.block(reference).unwrap()).collect();
     for (reference, admission) in admitted.blocks.iter().zip(&admission_blocks) {
@@ -334,7 +281,6 @@ fn inline_admission_and_shared_reader_reuse_blocks_without_object_reads() {
         wrong_count.points += 1;
         assert!(receiver.block(&wrong_count).unwrap_err().contains("point count"));
     }
-    assert_eq!(destination.counts().0 - before, 0);
     assert_eq!(receiver.reader.cached_bytes(), 262_656);
 
     writer.observe(cells, 2).unwrap();
@@ -343,7 +289,6 @@ fn inline_admission_and_shared_reader_reuse_blocks_without_object_reads() {
     for (reference, admission) in admitted.blocks.iter().zip(&admission_blocks) {
         assert!(Arc::ptr_eq(admission, &receiver.block(reference).unwrap()));
     }
-    assert_eq!(destination.counts().0 - before, 0);
     assert_eq!(receiver.reader.cached_bytes(), 525_312);
     eprintln!("shared inline cells=4096 blocks=4 consumer_object_reads=0 reused_admission_arcs=4 retained_old_arcs=4 cache_accounted_bytes={}", receiver.reader.cached_bytes());
 }
@@ -360,28 +305,27 @@ fn receiver_default_budget_and_configured_working_set_remain_bounded() {
             block_revision: 1, geometry_revision: 1, points: 32768,
         }).collect(),
     };
-    let transfer = Transfer { root: root.encode().unwrap(), included: root.blocks.iter()
-        .map(|reference| (reference.object, bytes.clone())).collect() };
+    let source = Repository::temporary().unwrap();
+    for reference in &root.blocks { source.put_object(reference.object, &bytes).unwrap(); }
+    let transfer = transfer(&root, &source);
     let block_bytes = block.len() * 64 + 128;
     let destination = Repository::temporary().unwrap();
     let mut default = Receiver::new(destination.clone());
-    default.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
-    assert_eq!(destination.counts().0, 0);
+    default.receive(&transfer, &domain()).unwrap();
     assert_eq!(default.reader.cached_bytes(), block_bytes);
     assert!(default.reader.cached_bytes() <= BUDGET);
 
     let destination = Repository::temporary().unwrap();
     let budget = 32 * 1024 * 1024;
     let mut configured = Receiver::with_cache_budget(destination.clone(), budget);
-    let admitted = configured.receive(&transfer, &domain(), |_, _| panic!("unexpected fetch")).unwrap();
+    let admitted = configured.receive(&transfer, &domain()).unwrap();
     assert_eq!(configured.reader.cached_bytes(), 3 * block_bytes);
     assert!(configured.reader.cached_bytes() > BUDGET);
     assert!(configured.reader.cached_bytes() <= budget);
     for reference in &admitted.blocks { configured.block(reference).unwrap(); }
-    assert_eq!(destination.counts().0, 0);
 }
 #[test]
-fn shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc() {
+fn shared_reader_reloads_evicted_roots_without_collecting_source_objects() {
     let (source, mut writer, root) = one();
     let destination = Repository::temporary().unwrap();
     let budget = 64 + 128;
@@ -394,9 +338,7 @@ fn shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc() {
     // 仅能容纳一个块；读新根驱逐旧块，但旧根仍由调用方持有。
     let newer = receiver.block(&next_pin.blocks[0]).unwrap();
     assert_eq!(receiver.reader.cached_bytes(), budget);
-    let before = destination.counts().0;
     let reloaded = receiver.block(&pinned.blocks[0]).unwrap();
-    assert_eq!(destination.counts().0 - before, 1);
     assert!(!Arc::ptr_eq(&original, &reloaded));
     assert_eq!(original.as_ref(), reloaded.as_ref());
     assert_eq!(receiver.reader.cached_bytes(), budget);
@@ -405,49 +347,50 @@ fn shared_reader_reloads_evicted_pinned_root_and_releases_it_after_gc() {
     let empty = writer.snapshot(domain(), 3, 2).unwrap();
     receive(&mut receiver, &empty, &source).unwrap();
     assert!(receiver.reader.cache_is_empty());
-    assert!(receiver.block(&root.blocks[0]).is_err());
+    assert!(receiver.block(&root.blocks[0]).is_ok());
     assert_eq!(original[&0].observed_ns, 1);
     assert_eq!(receiver.block(&next_pin.blocks[0]).unwrap().as_ref(), newer.as_ref());
     assert_eq!(receiver.reader.cached_bytes(), budget);
 }
 #[test]
-fn duplicate_root_zero_work_and_included_conflict_is_admitted() {
-    let (r,_,m)=one();let dst=Repository::temporary().unwrap();let mut recv=Receiver::new(dst.clone());let first=receive(&mut recv,&m,&r).unwrap();let counts=dst.counts();
-    let empty=Transfer{root:m.encode().unwrap(),included:BTreeMap::new()};let same=recv.receive(&empty,&domain(),|_,_|panic!("fetch")).unwrap();assert!(Arc::ptr_eq(&first,&same));assert_eq!(counts,dst.counts());
-    let mut bad=transfer(&m,&r);bad.included.insert(m.blocks[0].object,body(1,1,1));assert!(recv.receive(&bad,&domain(),|_,_|panic!("fetch")).is_err());assert!(Arc::ptr_eq(&first,&recv.current().unwrap()));
+fn duplicate_root_reuses_admitted_root_and_decoded_block() {
+    let (source,_,root)=one();let mut receiver=Receiver::new(source.read_only());
+    let first=receive(&mut receiver,&root,&source).unwrap();let block=receiver.block(&first.blocks[0]).unwrap();
+    let same=receive(&mut receiver,&root,&source).unwrap();
+    assert!(Arc::ptr_eq(&first,&same));assert!(Arc::ptr_eq(&block,&receiver.block(&same.blocks[0]).unwrap()));
 }
 #[test]
-fn failed_fetch_preserves_current_root_and_retained_old_reader() {
-    let (src,mut w,one)=one();let dst=Repository::temporary().unwrap();let mut recv=Receiver::new(dst.clone());let pin=receive(&mut recv,&one,&src).unwrap();
-    w.observe([[32,0,0]],2).unwrap();let two=w.snapshot(domain(),2,2).unwrap();let incomplete=Transfer{root:two.encode().unwrap(),included:BTreeMap::new()};
-    assert!(recv.receive(&incomplete,&domain(),|_,_|Err("offline".into())).is_err());assert_eq!(recv.current().unwrap().revision,1);
-    receive(&mut recv,&two,&src).unwrap();w.remove([[0,0,0]]).unwrap();let three=w.snapshot(domain(),3,2).unwrap();receive(&mut recv,&three,&src).unwrap();
-    assert!(dst.read_object(pin.blocks[0].object,MAX_BLOCK_BYTES).is_ok());drop(pin);drop(one);
-    let four=w.snapshot(domain(),4,2).unwrap();receive(&mut recv,&four,&src).unwrap();assert!(dst.read_object(two.blocks[0].object,MAX_BLOCK_BYTES).is_err());
+fn failed_read_preserves_current_root_and_retained_old_reader() {
+    let (source,mut writer,first)=one();let mut receiver=Receiver::new(source.read_only());
+    let pin=receive(&mut receiver,&first,&source).unwrap();
+    writer.observe([[32,0,0]],2).unwrap();let next=writer.snapshot(domain(),2,2).unwrap();
+    let missing=next.blocks.iter().find(|r|!first.blocks.iter().any(|old|old.object==r.object)).unwrap().object;
+    let bytes=source.read_object(missing,MAX_BLOCK_BYTES).unwrap();std::fs::remove_file(source.path().join(format!("id-{}", match missing { ObjectIdentity::Assigned(id)=>id.0.iter().map(|v|format!("{v:02x}")).collect::<String>() }))).unwrap();
+    assert!(receive(&mut receiver,&next,&source).is_err());assert_eq!(receiver.current().unwrap().revision,1);
+    source.put_object(missing,&bytes).unwrap();receive(&mut receiver,&next,&source).unwrap();
+    writer.remove([[0,0,0]]).unwrap();let third=writer.snapshot(domain(),3,2).unwrap();receive(&mut receiver,&third,&source).unwrap();
+    assert!(source.read_object(pin.blocks[0].object,MAX_BLOCK_BYTES).is_ok());drop(pin);
+    let fourth=writer.snapshot(domain(),4,2).unwrap();receive(&mut receiver,&fourth,&source).unwrap();
+    assert!(source.read_object(next.blocks[0].object,MAX_BLOCK_BYTES).is_ok());
 }
 #[test]
-fn receiver_fetches_once_and_keeps_intrinsic_metadata() {
-    let (src,_,m)=one();let dst=Repository::temporary().unwrap();let mut recv=Receiver::new(dst.clone());let mut calls=0;
-    recv.receive(&Transfer{root:m.encode().unwrap(),included:BTreeMap::new()},&domain(),|root,b|{assert_eq!(root.identity(),m.identity());calls+=1;src.read_object(b.object,MAX_BLOCK_BYTES)}).unwrap();assert_eq!(calls,1);
-    let mut next=(*m).clone();next.revision=2;let count=dst.counts();recv.receive(&Transfer{root:next.encode().unwrap(),included:BTreeMap::new()},&domain(),|_,_|panic!("fetch")).unwrap();assert_eq!(count.0,dst.counts().0);
+fn receiver_reuses_decoded_objects_and_keeps_intrinsic_metadata() {
+    let (source,_,root)=one();let mut receiver=Receiver::new(source.read_only());
+    let first=receive(&mut receiver,&root,&source).unwrap();let block=receiver.block(&first.blocks[0]).unwrap();
+    let mut next=(*root).clone();next.revision=2;let next=receive(&mut receiver,&next,&source).unwrap();
+    assert!(Arc::ptr_eq(&block,&receiver.block(&next.blocks[0]).unwrap()));
 }
 #[test]
-fn receiver_rejects_false_geometry_and_block_revision_claims() {
-    let (src,mut w,m)=one();let mut recv=Receiver::new(Repository::temporary().unwrap());receive(&mut recv,&m,&src).unwrap();w.observe([[1,0,0]],2).unwrap();let next=w.snapshot(domain(),2,2).unwrap();
-    let mut bad=(*next).clone();bad.geometry_revision=1;bad.blocks[0].geometry_revision=1;assert!(receive(&mut recv,&bad,&src).is_err());
-    let mut bad=(*next).clone();bad.blocks[0].block_revision=1;bad.blocks[0].geometry_revision=1;assert!(receive(&mut recv,&bad,&src).is_err());receive(&mut recv,&next,&src).unwrap();
-}
-#[test]
-fn receiver_removal_needs_geometry_advance_and_resolution_change_is_allowed() {
+fn receiver_accepts_resolution_change_and_empty_root() {
     let (src,_,m)=one();let mut recv=Receiver::new(Repository::temporary().unwrap());receive(&mut recv,&m,&src).unwrap();
     let mut next=(*m).clone();next.revision=2;next.voxel_size_m=0.25;receive(&mut recv,&next,&src).unwrap();assert_eq!(next.changed_from(&m),vec![[0,0,0]]);
-    let mut empty=next.clone();empty.revision=3;empty.blocks.clear();assert!(receive(&mut recv,&empty,&src).is_err());empty.geometry_revision=3;receive(&mut recv,&empty,&src).unwrap();
+    let mut empty=next.clone();empty.revision=3;empty.blocks.clear();empty.geometry_revision=3;receive(&mut recv,&empty,&src).unwrap();
 }
 #[test]
-fn receiver_rejects_future_evidence_domain_mismatch_and_extra_inclusions() {
+fn receiver_rejects_future_evidence_and_domain_mismatch() {
     let (src,mut w,_)=one();w.observe([[0,0,0]],3).unwrap();let m=w.snapshot(domain(),2,3).unwrap();let mut bad=(*m).clone();bad.source_timestamp_ns=2;
-    let mut recv=Receiver::new(Repository::temporary().unwrap());assert!(receive(&mut recv,&bad,&src).is_err());let mut other=domain();other.session="另一会话".into();assert!(recv.receive(&transfer(&m,&src),&other,|_,_|panic!()).is_err());
-    let mut t=transfer(&m,&src);t.included.insert(ObjectIdentity::Assigned(ObjectId([9;16])),body(0,1,1));assert!(recv.receive(&t,&domain(),|_,_|panic!()).is_err());
+    let mut recv=Receiver::new(Repository::temporary().unwrap());assert!(receive(&mut recv,&bad,&src).is_err());let mut other=domain();other.session="另一会话".into();assert!(recv.receive(&transfer(&m,&src),&other).is_err());
+
 }
 #[test]
 fn archive_ar4_stream_roundtrip_and_exact_reference_binding() {
@@ -522,11 +465,11 @@ fn archive_open_is_framing_only_until_a_body_is_consumed() {
 }
 
 #[test]
-fn receiver_gc_releases_cached_payloads_outside_live_roots() {
+fn readonly_receiver_releases_cached_payloads_without_collecting_source() {
     let (source,_,root)=one();let target=Repository::temporary().unwrap();let mut receiver=Receiver::new(target.clone());receive(&mut receiver,&root,&source).unwrap();
     assert!(!receiver.reader.cache_is_empty());
     let mut empty=(*root).clone();empty.revision=2;empty.geometry_revision=2;empty.blocks.clear();receive(&mut receiver,&empty,&source).unwrap();
-    assert!(receiver.reader.cache_is_empty());assert!(target.read_object(root.blocks[0].object,MAX_BLOCK_BYTES).is_err());
+    assert!(receiver.reader.cache_is_empty());assert!(source.read_object(root.blocks[0].object,MAX_BLOCK_BYTES).is_ok());
 }
 
 #[test]
@@ -537,26 +480,7 @@ fn injectable_id_source_is_preserved_and_zero_ids_are_rejected() {
     let mut writer=Writer::with_id_source(repository,0.125,BUDGET,||Ok(ObjectId([0;16]))).unwrap();writer.observe([[0,0,0]],1).unwrap();assert!(writer.flush().is_err());
 }
 
-#[test]
-fn cleanup_failure_does_not_report_a_failed_committed_receive() {
-    let (source, mut writer, first) = one();
-    let destination = Repository::temporary().unwrap();
-    let mut receiver = Receiver::new(destination.clone());
-    let pinned = receive(&mut receiver, &first, &source).unwrap();
-    writer.observe([[32, 0, 0]], 2).unwrap();
-    let next = writer.snapshot(domain(), 2, 2).unwrap();
-    // A malformed unreferenced object entry deterministically fails collection.
-    let obstruction = destination.path().join(format!("id-{}", "ff".repeat(16)));
-    std::fs::create_dir(&obstruction).unwrap();
-    assert_eq!(receive(&mut receiver, &next, &source).unwrap().revision, 2);
-    assert_eq!(receiver.current().unwrap().revision, 2);
-    assert!(receiver.collection_error().is_some());
-    assert!(destination.read_object(pinned.blocks[0].object, MAX_BLOCK_BYTES).is_ok());
-    std::fs::remove_dir(obstruction).unwrap();
-    let later = writer.snapshot(domain(), 3, 2).unwrap();
-    assert_eq!(receive(&mut receiver, &later, &source).unwrap().revision, 3);
-    assert!(receiver.collection_error().is_none());
-}
+
 
 #[test]
 fn domain_only_reseal_reuses_objects_without_io_or_clock_advancement() {

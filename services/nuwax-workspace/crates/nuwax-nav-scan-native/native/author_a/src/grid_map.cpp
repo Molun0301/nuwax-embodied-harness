@@ -5,6 +5,143 @@
 // 删除ROS/PCL/深度传输与显示依赖，保留原概率射线与滑动缓存。
 // 宿主适配同帧输入、完整静态快照及真实机体碰撞候选。
 #include <stdexcept>
+#include <surface_obstacle_layer.h>
+#include <business_constraint_mask.h>
+
+namespace {
+// 一维抛物线下包络；每条抛物线至多入栈、出栈一次。
+void squaredDistanceTransform(const std::vector<double>& input,int count,
+    std::vector<double>& output,std::vector<int>& vertices,std::vector<double>& boundaries) {
+  int envelope=0;vertices[0]=0;boundaries[0]=-INFINITY;boundaries[1]=INFINITY;
+  for(int q=1;q<count;++q) {
+    auto crossing=[&] {
+      const int old=vertices[envelope];
+      return ((input[q]+double(q)*q)-(input[old]+double(old)*old))/(2.*(q-old));
+    };
+    double intersection=crossing();
+    while(intersection<=boundaries[envelope]){--envelope;intersection=crossing();}
+    vertices[++envelope]=q;boundaries[envelope]=intersection;boundaries[envelope+1]=INFINITY;
+  }
+  envelope=0;
+  for(int q=0;q<count;++q) {
+    while(boundaries[envelope+1]<q)++envelope;
+    const double delta=q-vertices[envelope];
+    output[q]=delta*delta+input[vertices[envelope]];
+  }
+}
+}
+
+BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
+    const SurfaceObstacleLayer* surface,const BusinessConstraintMask* business) const {
+  const int width=mp_.map_voxel_num_.x(),height=mp_.map_voxel_num_.y();
+  const int min_x=mp_.map_bound_min_idx_.x(),min_y=mp_.map_bound_min_idx_.y();
+  const double r=mp_.resolution_;
+  const size_t size=static_cast<size_t>(width)*height;
+  BodyClearanceField field{width,height,(min_x+.5)*r,(min_y+.5)*r,r,std::vector<double>(size)};
+  std::vector<std::vector<double>> ground_points(size);
+  if(surface) {
+    const auto& points=surface->groundPoints();
+    for(size_t i=0;i<points.size();i+=3) {
+      const int x=int(std::floor(points[i]/r))-min_x,y=int(std::floor(points[i+1]/r))-min_y;
+      if(x>=0&&x<width&&y>=0&&y<height)ground_points[y*width+x].push_back(points[i+2]);
+    }
+  }
+  const auto& body=md_.sliding_map_frame_pos_;
+  const int start_x=int(std::floor(body.x()/r))-min_x,start_y=int(std::floor(body.y()/r))-min_y;
+  const int start=start_y*width+start_x;
+  std::vector<double> ground(size);
+  std::vector<char> visited(size,0);
+  std::vector<int> queue;queue.reserve(size);queue.push_back(start);visited[start]=1;
+  ground[start]=body.z()-config.body_to_ground;
+  const double step=std::max(config.max_step_up,config.max_step_down);
+  for(size_t head=0;head<queue.size();++head) {
+    const int current=queue[head],x=current%width,y=current/width;
+    for(const auto& offset:std::array<std::array<int,2>,4>{{{1,0},{-1,0},{0,1},{0,-1}}}) {
+      const int nx=x+offset[0],ny=y+offset[1];
+      if(nx<0||nx>=width||ny<0||ny>=height)continue;
+      const int next=ny*width+nx;
+      if(visited[next])continue;
+      double selected=ground[current],difference=INFINITY;
+      for(double candidate:ground_points[next]) {
+        const double distance=std::abs(candidate-ground[current]);
+        if(distance<difference){selected=candidate;difference=distance;}
+      }
+      ground[next]=difference<=step?selected:ground[current];
+      visited[next]=1;queue.push_back(next);
+    }
+  }
+  const double far_squared=double(width)*width+double(height)*height+1.;
+  const int nz=mp_.map_voxel_num_.z();
+  bool any_obstacle=false;
+  for(int y=0;y<height;++y)for(int x=0;x<width;++x) {
+    const int gx=min_x+x,gy=min_y+y,index=y*width+x;
+    const double reference_z=ground[index]+config.body_to_ground;
+    bool occupied=(business&&business->rejectsColumn(gx,gy))
+        ||(surface&&surface->columnContact(gx,gy,reference_z));
+    const auto [low,high]=bodyCollisionBand(reference_z+mp_.body_center_offset_.z());
+    int z0=std::max(int(std::floor(low/r)),mp_.map_bound_min_idx_.z());
+    int z1=std::min(int(std::ceil(high/r))-1,mp_.map_bound_max_idx_.z());
+    while(z0<=z1&&(z0+1.)*r<=low)++z0;
+    while(z0<=z1&&z1*r>=high)--z1;
+    const int column=getLocalIndex(gx,0)*height+getLocalIndex(gy,1);
+    const auto* bits=md_.occupancy_bits_.data()+column*md_.occupancy_words_per_column_;
+    for(int z=z0;z<=z1&&!occupied;) {
+      const int local=getLocalIndex(z,2),count=std::min({z1-z+1,nz-local,64-local%64});
+      std::uint64_t mask=~std::uint64_t{0}<<(local%64);
+      if((local+count)%64)mask&=(std::uint64_t{1}<<((local+count)%64))-1;
+      auto hits=bits[local/64]&mask;
+      while(hits) {
+        const int lz=(local/64)*64+__builtin_ctzll(hits);
+        const auto support=md_.support_member_max_z_.find(column*nz+lz);
+        if(support==md_.support_member_max_z_.end()||!(support->second<low)){occupied=true;break;}
+        hits&=hits-1;
+      }
+      z+=count;
+    }
+    field.distances[index]=occupied?0.:far_squared;
+    any_obstacle|=occupied;
+  }
+  if(!any_obstacle){std::fill(field.distances.begin(),field.distances.end(),1e6);return field;}
+  const int longest=std::max(width,height);
+  std::vector<double> input(longest),output(longest),boundaries(longest+1);
+  std::vector<int> vertices(longest);
+  for(int y=0;y<height;++y) {
+    std::copy_n(field.distances.begin()+y*width,width,input.begin());
+    squaredDistanceTransform(input,width,output,vertices,boundaries);
+    std::copy_n(output.begin(),width,field.distances.begin()+y*width);
+  }
+  for(int x=0;x<width;++x) {
+    for(int y=0;y<height;++y)input[y]=field.distances[y*width+x];
+    squaredDistanceTransform(input,height,output,vertices,boundaries);
+    for(int y=0;y<height;++y)field.distances[y*width+x]=std::max(0.,std::sqrt(output[y])*r-r/2.);
+  }
+  return field;
+}
+
+double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw) const {
+  const double c=std::cos(yaw),s=std::sin(yaw);
+  const double hx=mp_.body_length_/2.,hy=mp_.body_width_/2.;
+  const int nx=int(std::ceil(mp_.body_length_/mp_.resolution_));
+  const int ny=int(std::ceil(mp_.body_width_/mp_.resolution_));
+  double clearance=INFINITY;
+  for(int x=0;x<=nx;++x)for(int y=0;y<=ny;++y) {
+    const double u=mp_.body_center_offset_.x()-hx+mp_.body_length_*x/nx;
+    const double v=mp_.body_center_offset_.y()-hy+mp_.body_width_*y/ny;
+    clearance=std::min(fieldDistance(pos.x()+c*u-s*v,pos.y()+s*u+c*v),clearance);
+  }
+  return clearance;
+}
+
+double GridMap::bodyFieldClearance(Eigen::Vector3d pos,double yaw,double upper_bound) const {
+  const double c=std::cos(yaw),s=std::sin(yaw);
+  const double x=mp_.body_center_offset_.x(),y=mp_.body_center_offset_.y();
+  const double radius=std::hypot(mp_.body_length_/2.,mp_.body_width_/2.);
+  // 距离变化不超过位移；另留一格覆盖双线性插值误差。
+  if(fieldDistance(pos.x()+c*x-s*y,pos.y()+s*x+c*y)>=radius+upper_bound+mp_.resolution_)
+    return upper_bound;
+  // 原查询作为首项，保留非有限试探的NaN传播。
+  return std::min(bodyFieldClearance(pos,yaw),upper_bound);
+}
 
 void GridMap::initMap(ros::NodeHandle &nh)
 {
@@ -13,6 +150,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   /* get parameter */
   double x_size, y_size, z_size;
   node_.param("grid_map/resolution", mp_.resolution_, -1.0);
+    node_.param("grid_map/obstacle_clearance", mp_.obstacle_clearance_, -1.0);
   node_.param("grid_map/sliding_map_size_x", x_size, -1.0);
   node_.param("grid_map/sliding_map_size_y", y_size, -1.0);
   node_.param("grid_map/sliding_map_size_z", z_size, -1.0);

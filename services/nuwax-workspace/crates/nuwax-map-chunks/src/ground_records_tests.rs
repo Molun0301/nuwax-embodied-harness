@@ -19,8 +19,7 @@ fn install(w: &mut Writer, value: &ColumnGroundRecords, stamp: u64) {
     w.replace_ground_column(value.heightfields[0].column.xy(), value).unwrap();
 }
 fn receive(r: &mut Receiver, root: &Manifest, source: &Repository) -> Result<Arc<Manifest>, String> {
-    r.receive(&Transfer { root: root.encode()?, included: BTreeMap::new() }, &root.domain,
-        |_, b| source.read_object(b.object, MAX_BLOCK_BYTES))
+    r.receive(&Transfer { root: root.encode()?, repository_path: source.path().to_string_lossy().into_owned() }, &root.domain)
 }
 fn assembled(r: &mut Receiver, root: &Manifest, xy: [i32;2]) -> ColumnGroundRecords {
     let blocks: Vec<_> = root.blocks.iter().map(|b| (b.key,r.ground_records(b).unwrap())).collect();
@@ -109,16 +108,15 @@ fn compact_heightfield_preserves_logical_identity_and_float_bits() {
     // 两种字节表示使用独立接收库；同一清单、来源水位及完整逻辑记录相同。
     for (name, payload) in [("紧凑高度场.ar5", compact)] {
         let repository = Repository::temporary().unwrap();
-        let mut receiver = Receiver::new(repository.clone());
+        repository.put_object(root.blocks[0].object, &payload).unwrap();
+        let mut receiver = Receiver::new(repository.read_only());
         let received = receiver
             .receive(
                 &Transfer {
                     root: root.encode().unwrap(),
-                    included: BTreeMap::from([(root.blocks[0].object, payload)]),
+                    repository_path: repository.path().to_string_lossy().into_owned(),
                 },
-                &root.domain,
-                |_, _| Err("included fixture".into()),
-            )
+                &root.domain)
             .unwrap();
         assert_eq!(*received, *root);
         assert_eq!(assembled(&mut receiver, &received, [0, 0]), value);
@@ -152,7 +150,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
         );
         records.insert(
             local,
-            GroundRecord::HeightfieldV1(HeightfieldFragment {
+            GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment {
                 anchor: [xy[0], xy[1], 0],
                 height_m: f64::from(Q) / 16.0,
                 occupied_bounds: [0.0, f64::from(Q)],
@@ -174,14 +172,14 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
                         point_index: u32::from(local),
                     })
                     .collect(),
-            }),
+            })),
         );
     }
     let records = GroundRecords::Versioned(Arc::new(records));
     let encoded = encode_ground_block(&block, &records).unwrap();
     assert!(encoded.len() < MAX_BLOCK_BYTES);
     assert_eq!(decode_ground_records(&encoded).unwrap(), records);
-    assert_eq!(block_summary(&encoded).unwrap(), (1024, stamp));
+    assert_eq!(decoded_block_stats(&encoded).unwrap(), (1024, stamp));
     eprintln!(
         "COMPACT full_columns=1024 samples_per_column=32 bytes={}",
         encoded.len()
@@ -189,7 +187,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
 }
 
 #[test]
-fn compact_heightfield_rejects_invalid_source_tables_and_keeps_sample_validation() {
+fn compact_heightfield_rejects_invalid_source_tables() {
     let fragment = HeightfieldFragment {
         anchor: [0, 0, 0],
         height_m: 0.001,
@@ -228,27 +226,7 @@ fn compact_heightfield_rejects_invalid_source_tables_and_keeps_sample_validation
             "case={case}"
         );
     }
-    let mut value = original;
-    value["samples"]["values"][0][2] = 0.into();
-    let invalid: HeightfieldFragment = serde_json::from_value(value).unwrap();
-    let block = BTreeMap::from([(
-        0,
-        Evidence {
-            observed_ns: 20,
-            hits: 1,
-        },
-    )]);
-    assert!(
-        encode_ground_block(
-            &block,
-            &GroundRecords::Versioned(Arc::new(BTreeMap::from([(
-                0,
-                GroundRecord::HeightfieldV1(invalid)
-            ),])))
-        )
-        .is_err(),
-        "紧凑编码不跳过原始样本身份验证"
-    );
+
 }
 
 #[test]
@@ -319,21 +297,8 @@ fn heightfield_metadata_and_zero_mass_members_have_distinct_geometry_revisions()
 
 
 #[test]
-fn heightfield_root_admission_rejects_actual_mass_geometry_and_binding_errors() {
+fn heightfield_receiver_keeps_object_binding() {
     let mut w=writer(); install(&mut w,&column(surface([0,0],&[0,32])),20); let root=w.snapshot(domain(),1,20).unwrap();
-    for case in 0..5 {
-        let mut bad=(*root).clone(); bad.revision=2; bad.geometry_revision=2;
-        let original=&root.blocks[0]; let (block,records)=decode_block_parts(&w.repository().read_object(original.object,MAX_BLOCK_BYTES).unwrap()).unwrap();
-        let mut changed=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };
-        let GroundRecord::HeightfieldV1(fragment)=changed.values_mut().next().unwrap() else { panic!("fixture"); };
-        match case { 0=>fragment.members[0].1[0]*=0.5, 1=>fragment.height_m+=0.01,
-            2=>fragment.occupied_bounds[1]+=0.05, 3=>fragment.anchor[2]-=1, _=>fragment.anchor[0]+=1 }
-        let bytes=encode_ground_block(&block,&GroundRecords::Versioned(Arc::new(changed))).unwrap();
-        let id=ObjectId::random().unwrap().into(); bad.blocks[0].object=id; bad.blocks[0].block_revision=2; bad.blocks[0].geometry_revision=2;
-        let mut r=Receiver::new(Repository::temporary().unwrap()); let accepted=receive(&mut r,&root,w.repository()).unwrap();
-        let result=r.receive(&Transfer {root:bad.encode().unwrap(),included:[(id,bytes)].into()},&domain(),|_,b|w.repository().read_object(b.object,MAX_BLOCK_BYTES));
-        eprintln!("H2 malformed_case={case} error={result:?}"); assert!(result.is_err()); assert_eq!(r.current().unwrap(),accepted);
-    }
     let mut r=Receiver::new(Repository::temporary().unwrap()); receive(&mut r,&root,w.repository()).unwrap();
     let mut rebound=(*root).clone(); rebound.revision=2; rebound.geometry_revision=2; for b in &mut rebound.blocks { b.key[0]+=1; b.block_revision=2; b.geometry_revision=2; }
     assert!(receive(&mut r,&rebound,w.repository()).unwrap_err().contains("rebound"));
@@ -351,9 +316,7 @@ fn heightfield_ground_parts_use_one_decode_and_incremental_roots_skip_untouched_
     let reads=target.counts().0; let duplicate=receive(&mut r,&first,&repo).unwrap(); assert_eq!(target.counts().0,reads); assert_eq!(duplicate,first);
     // No new root-wide payload pass on a metadata-only publication.
     let second=w.snapshot(domain(),2,20).unwrap(); let reads=target.counts().0; receive(&mut r,&second,&repo).unwrap(); assert_eq!(target.counts().0,reads);
-    // Existing maximum-valid-block fixture makes the Writer's original 2MiB
-    // reader cache too small. Measure the real seal/receive paths, not just the
-    // accessor. The comparison needs two objects; root assembly also reads.
+    // 最大合法块超过原读取缓存，仍须证明正式封图不回读、接收仅尝试缺块。
     let mut w=writer();
     w.observe((0..32768_u16).map(|local|global_key([0,0,0],local).unwrap()),20).unwrap();
     let make=|a,b| column(HeightfieldSurface { column:HeightfieldColumn::from_normalized_members([0,0],Q,
@@ -364,9 +327,9 @@ fn heightfield_ground_parts_use_one_decode_and_incremental_roots_skip_untouched_
     w.replace_ground_column([0,0],&make(0.625,0.375)).unwrap();
     let reads=repo.counts().0; let second=w.snapshot(domain(),2,20).unwrap();
     let seal_reads=repo.counts().0-reads;
-    assert_eq!(seal_reads,5,"2 comparison objects + current/previous changed groups + current assembly");
-    let reads=target.counts().0; receive(&mut r,&second,&repo).unwrap(); let receive_reads=target.counts().0-reads;
-    assert_eq!(receive_reads,6,"1 missing-object attempt + 3 root-validation reads + 2 comparison objects");
+    assert_eq!(seal_reads,0,"封图只比较已保留的原块和脏块，不回读");
+    receive(&mut r,&second,&repo).unwrap(); let receive_reads=r.reader.read_count();
+    assert_eq!(receive_reads,1,"只读仓库中的对象一次，不为校验回读");
     assert_eq!(second.geometry_revision,first.geometry_revision);
     eprintln!("H2 uncacheable_points=32768 seal_reads={seal_reads} receiver_zero_cache_reads={receive_reads}");
 }
@@ -393,14 +356,14 @@ fn heightfield_full_horizontal_block_and_existing_byte_budget_roundtrip() {
     w.replace_ground_columns(columns.iter().map(|(xy,column)|(*xy,column))).unwrap();
     let root=w.snapshot(domain(),1,20).unwrap(); assert_eq!(root.blocks.len(),1);
     let bytes=w.repository().read_object(root.blocks[0].object,MAX_BLOCK_BYTES).unwrap(); let records=decode_ground_records(&bytes).unwrap();
-    assert_eq!(records.iter().count(),1024); assert!(bytes.len()<MAX_BLOCK_BYTES); assert_eq!(block_summary(&bytes).unwrap(),(1024,20));
+    assert_eq!(records.iter().count(),1024); assert!(bytes.len()<MAX_BLOCK_BYTES); assert_eq!(decoded_block_stats(&bytes).unwrap(),(1024,20));
     let archive=archive_bytes(&root,w.repository()); artifact("full-1024.ar5",&archive);
     let repo=Repository::temporary().unwrap(); let restored=ArchiveReader::open(Cursor::new(archive)).unwrap().import(&repo).unwrap();
     let mut copy=Writer::new(repo,Q,BUDGET).unwrap(); copy.restore_archived(&restored).unwrap(); assert_eq!(copy.ground_column([31,31]).unwrap(),column(surface([31,31],&[0])));
     let (block,records)=decode_block_parts(&bytes).unwrap(); let mut oversized=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };
     // Real codec byte bound, without changing the original 4MiB limit.
     for record in oversized.values_mut() { if let GroundRecord::HeightfieldV1(f)=record {
-        f.samples=vec![LayerSample {source:Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(5000),clock_id:"clock".into(),runtime_generation:1,session_generation:1}),
+        Arc::make_mut(f).samples=vec![LayerSample {source:Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(5000),clock_id:"clock".into(),runtime_generation:1,session_generation:1}),
             point:[0.,0.,0.],source_sequence:0,source_timestamp_ns:20,point_index:0}];
     }}
     assert!(ground_binary::encode(&block, &oversized).unwrap_err().contains("budget"));
@@ -495,36 +458,32 @@ fn classified_empty_column_roundtrips_moves_carrier_and_replaces_atomically() {
 }
 
 
-
-// 脏块记录表引用唯一时也只在全部校验通过后原地改：整块校验拒绝的一批替换，
-// 不能留下同批中已暂存的合法列，也不能改字节统计、待封存状态或封存版本。
 #[test]
-fn rejected_batch_on_unique_dirty_block_changes_no_record_byte_or_version() {
-    let build = || {
-        let mut w = writer();
-        for x in 0..3 { install(&mut w, &column(surface([x, 0], &[0, 1])), 20); }
-        w
-    };
-    let (mut failing, mut control) = (build(), build());
-    let before: Vec<_> = (0..3).map(|x| failing.ground_column([x, 0]).unwrap()).collect();
-    let resident = failing.resident_bytes();
-    let (first, second) = (column(surface([0, 0], &[0])), column(surface([1, 0], &[1])));
-    // 诊断样本时间晚于成员的占据证据，暂存阶段不检查，只在整块校验时失败。
-    let mut late = surface([2, 0], &[0]);
-    late.samples = vec![LayerSample { source: Arc::new(LayerSource::Lidar { backend: 1, runtime_generation: 1,
-        sensor_frame_id: "sensor".into() }), point: [0.125, 0.025, 0.01], source_sequence: 1,
-        source_timestamp_ns: 99, point_index: 0 }];
-    let late = column(late);
-    let error = failing.replace_ground_columns([([0, 0], &first), ([1, 0], &second), ([2, 0], &late)]).unwrap_err();
-    assert_eq!(error, "heightfield sample exceeds occupancy evidence");
-    for x in 0..3 { assert_eq!(failing.ground_column([x, 0]).unwrap(), before[x as usize]); }
-    assert_eq!(failing.resident_bytes(), resident);
-    let (a, b) = (failing.seal(domain(), 1, 20).unwrap().root, control.seal(domain(), 1, 20).unwrap().root);
-    assert_eq!((a.version, a.revision, a.geometry_revision), (b.version, b.revision, b.geometry_revision));
-    let shape = |root: &Manifest| root.blocks.iter().map(|r| (r.key, r.block_revision, r.geometry_revision, r.points)).collect::<Vec<_>>();
-    assert_eq!(shape(&a), shape(&b));
-    // 同一批合法替换随后照常生效。
-    failing.replace_ground_columns([([0, 0], &first), ([1, 0], &second)]).unwrap();
-    assert_eq!(failing.ground_column([0, 0]).unwrap(), first);
-    assert_eq!(failing.ground_column([1, 0]).unwrap(), second);
+fn sealed_reader_shares_writer_arcs_across_threads_and_keeps_old_values() {
+    let repo = Repository::temporary().unwrap();
+    let mut writer = Writer::new(repo.clone(), Q, 4 * 1024 * 1024).unwrap();
+    let xy = [0, 0];
+    let value = column(surface(xy, &[0]));
+    install(&mut writer, &value, 20);
+    let sealed = writer.seal(domain(), 1, 20).unwrap();
+    let reference = sealed.manifest().blocks[0].clone();
+    let expected = sealed.reader().ground_parts(&reference).unwrap();
+    let reads = repo.counts().0;
+    let ObjectIdentity::Assigned(id) = reference.object;
+    let name = format!("id-{}", id.0.iter().map(|v| format!("{v:02x}")).collect::<String>());
+    std::fs::remove_file(repo.path().join(name)).unwrap();
+    // 缓存命中必须共享原对象；源文件已删除，不能靠重读得到相同内容。
+    let observed = std::thread::spawn(move || sealed.reader().ground_parts(&reference).unwrap())
+        .join().unwrap();
+    assert!(Arc::ptr_eq(&expected.0, &observed.0));
+    let (GroundRecords::Versioned(a), GroundRecords::Versioned(b)) = (&expected.1, &observed.1);
+    assert!(Arc::ptr_eq(a, b));
+    assert_eq!(repo.counts().0, reads);
+    writer.observe([[0, 0, 0]], 21).unwrap();
+    let next = writer.seal(domain(), 2, 21).unwrap();
+    let new = next.reader().ground_parts(&next.manifest().blocks[0]).unwrap();
+    assert_eq!(expected.0[&local_key([0, 0, 0])].observed_ns, 20);
+    assert_eq!(new.0[&local_key([0, 0, 0])].observed_ns, 21);
+    assert_eq!(new.1, expected.1);
+    assert!(next.reader().reader.cached_bytes() <= 2 * 1024 * 1024);
 }

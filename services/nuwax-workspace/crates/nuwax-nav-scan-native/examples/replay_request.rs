@@ -31,6 +31,9 @@ fn main() {
         max_yaw_acceleration: n("max_yaw_acceleration"),
         max_reverse_velocity: config["max_reverse_velocity"].as_f64().unwrap_or(0.0),
         max_lateral_velocity: config["max_lateral_velocity"].as_f64().unwrap_or(0.0),
+        obstacle_clearance_m: config["obstacle_clearance_m"].as_f64().unwrap(),
+        min_executable_linear_mps: config["min_executable_linear_mps"].as_f64().unwrap(),
+        min_executable_angular_rps: config["min_executable_angular_rps"].as_f64().unwrap(),
     };
     let points = |key: &str| serde_json::from_value::<Vec<[f64; 3]>>(value[key].clone()).unwrap();
     let obstacles = points("obstacles");

@@ -98,6 +98,9 @@ impl Planner {
     pub fn observe_applied(&mut self, command: [f64; 3]) {
         self.previous = command;
     }
+    pub fn pose_clearance(&self, position: [f64; 3], yaw: f64) -> PoseClearance {
+        self.map.as_ref().unwrap().snapshot().pose_clearance(position, yaw)
+    }
     pub fn plan_count(&self) -> u64 {
         self.plans
     }
@@ -284,6 +287,7 @@ impl Planner {
                 &state,
                 self.curve.as_ref(),
                 tracked.phase,
+                None,
             );
             self.changed = false;
             match result {

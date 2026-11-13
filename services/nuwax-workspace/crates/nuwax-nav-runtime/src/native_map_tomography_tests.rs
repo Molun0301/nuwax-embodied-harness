@@ -196,8 +196,7 @@ fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: 
     let domain = Domain { session: "tomography-ground".into(), };
     let root = writer.snapshot(domain, 1, 20).unwrap();
     let mut receiver = Receiver::new(Repository::temporary().unwrap());
-    receiver.receive(&Transfer { root: root.encode().unwrap(), included: BTreeMap::new() }, &root.domain,
-        |_, r| writer.repository().read_object(r.object, nuwax_map_chunks::MAX_BLOCK_BYTES)).unwrap();
+    receiver.receive(&Transfer { root: root.encode().unwrap(), repository_path: writer.repository().path().to_string_lossy().into_owned() }, &root.domain).unwrap();
     let mut observations = SurfaceObservations::new(Q, 32).unwrap();
     let mut parts = Vec::new();
     for r in &root.blocks {

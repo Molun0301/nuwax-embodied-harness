@@ -18,7 +18,6 @@ from .NativePgoResult import NativePgoResult as NativePgoResult
 from .NativePgoStatus import NativePgoStatus as NativePgoStatus
 from .NavigationGoal import NavigationGoal as NavigationGoal
 from .NavigationMap3D import NavigationMap3D as NavigationMap3D
-from .NavigationMapBlock import NavigationMapBlock as NavigationMapBlock
 from .NavigationStatus import NavigationStatus as NavigationStatus
 from .PathEnvelope import PathEnvelope as PathEnvelope
 from .PersonFollowCommand import PersonFollowCommand as PersonFollowCommand

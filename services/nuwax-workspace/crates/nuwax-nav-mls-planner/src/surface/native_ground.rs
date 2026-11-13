@@ -21,14 +21,11 @@ impl GroundKey {
 struct Fragment {
     block: Key,
     local: u16,
-    records: GroundRecords,
+    record: Arc<HeightfieldFragment>,
 }
 impl Fragment {
     fn value(&self) -> &HeightfieldFragment {
-        match self.records.get(self.local) {
-            Some(GroundRecordRef::HeightfieldV1(value)) => value,
-            _ => unreachable!("immutable native descriptor names its original heightfield record"),
-        }
+        &self.record
     }
 }
 
@@ -193,9 +190,24 @@ impl Iterator for GroundMembers<'_> {
     }
 }
 
+/// 原有列索引的值；空声明保留来源块坐标，以便仅按变化块撤销。
+#[derive(Clone, Debug)]
+enum NativeGroundColumn {
+    Heightfields(Vec<ObservedHeightfield>),
+    ClassifiedEmpty(Key),
+}
+impl NativeGroundColumn {
+    fn records(&self) -> &[ObservedHeightfield] {
+        match self {
+            Self::Heightfields(records) => records,
+            Self::ClassifiedEmpty(_) => &[],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct NativeGroundIndex {
-    columns: im::HashMap<[i32; 2], Arc<Vec<ObservedHeightfield>>, ahash::RandomState>,
+    columns: im::HashMap<[i32; 2], Arc<NativeGroundColumn>, ahash::RandomState>,
     // Empty-classified columns carry no measured ground. Keep this source-wide
     // compatibility predicate constant-time without counting their markers.
     measured_columns: usize,
@@ -205,11 +217,11 @@ impl NativeGroundIndex {
         self.columns
             .get(&xy)
             .into_iter()
-            .flat_map(|records| records.iter())
+            .flat_map(|column| column.records().iter())
             .map(SourceGroundRecord::HeightfieldV1)
     }
     pub(super) fn classified_empty(&self, xy: [i32; 2]) -> bool {
-        self.columns.get(&xy).is_some_and(|records| records.is_empty())
+        self.columns.get(&xy).is_some_and(|column| matches!(column.as_ref(), NativeGroundColumn::ClassifiedEmpty(_)))
     }
     pub(super) fn is_empty(&self) -> bool {
         self.measured_columns == 0
@@ -232,91 +244,130 @@ impl NativeGroundIndex {
             };
             let valid =
                 |record: &ObservedHeightfield| record.members().all(|z| present([xy[0], xy[1], z]));
-            if records.iter().all(valid) {
+            if records.records().iter().all(valid) {
                 continue;
             }
-            let retained: Vec<_> = records.iter().filter(|r| valid(r)).cloned().collect();
+            let retained: Vec<_> = records.records().iter().filter(|r| valid(r)).cloned().collect();
             if retained.is_empty() {
                 self.measured_columns -= 1;
                 self.columns.remove(&xy);
             } else {
-                self.columns.insert(xy, Arc::new(retained));
+                self.columns.insert(xy, Arc::new(NativeGroundColumn::Heightfields(retained)));
             }
             retired = true;
         }
         retired
     }
 
-    /// All vertical native blocks for one changed block-XY, already admitted by
-    /// the original complete-root boundary. Query code never reassembles them.
+    /// 完整列组入口仍复用同一增量更新；列组中消失的原块视为删除。
     pub(super) fn replace_block_xy(
         &mut self,
         block_xy: [i32; 2],
         blocks: &[(Key, GroundRecords)],
     ) -> Vec<[i32; 2]> {
+        let mut old_blocks = std::collections::BTreeSet::new();
+        let mut dirty = std::collections::BTreeSet::new();
+        for x in 0..32 { for y in 0..32 {
+            let xy = [block_xy[0] * 32 + x, block_xy[1] * 32 + y];
+            if let Some(column) = self.columns.get(&xy) {
+                dirty.insert(xy);
+                match column.as_ref() {
+                    NativeGroundColumn::ClassifiedEmpty(block) => { old_blocks.insert(*block); }
+                    NativeGroundColumn::Heightfields(records) => {
+                        old_blocks.extend(records.iter().flat_map(|record| record.fragments.iter().map(|f| f.block)));
+                    }
+                }
+            }
+        }}
+        for (block, records) in blocks { for (local, record) in records.iter() {
+            dirty.insert(match record {
+                GroundRecordRef::HeightfieldV1(record) => [record.anchor[0], record.anchor[1]],
+                GroundRecordRef::ClassifiedEmptyColumn => [block[0] * 32 + i32::from(local % 32), block[1] * 32 + i32::from(local / 32)],
+            });
+        }}
+        let removed: Vec<_> = old_blocks.into_iter()
+            .filter(|old| !blocks.iter().any(|(block, _)| block == old)).collect();
+        self.replace_blocks(blocks, &removed, &dirty)
+    }
+
+    /// 仅变化块提供新记录，未变化片段直接保留原共享记录；只重建实际变化的列。
+    pub(super) fn replace_blocks(
+        &mut self,
+        blocks: &[(Key, GroundRecords)],
+        removed: &[Key],
+        dirty: &std::collections::BTreeSet<[i32; 2]>,
+    ) -> Vec<[i32; 2]> {
+        use std::collections::BTreeSet;
+        let updated: BTreeSet<_> = blocks.iter().map(|(block, _)| *block)
+            .chain(removed.iter().copied()).collect();
+        let mut empty_columns = BTreeMap::new();
+        for (block, records) in blocks { for (local, record) in records.iter() {
+            if matches!(record, GroundRecordRef::ClassifiedEmptyColumn) {
+                empty_columns.insert([block[0] * 32 + i32::from(local % 32), block[1] * 32 + i32::from(local / 32)], *block);
+            }
+        }}
         let mut groups: BTreeMap<Key, ObservedHeightfield> = BTreeMap::new();
-        let mut empty_columns = std::collections::BTreeSet::new();
+        for &xy in dirty {
+            if let Some(old) = self.columns.get(&xy) {
+                for record in old.records() {
+                    for fragment in record.fragments.iter().filter(|f| !updated.contains(&f.block)) {
+                        groups.entry(record.anchor).or_insert_with(|| ObservedHeightfield {
+                            anchor: record.anchor, height: record.height, bounds: record.bounds,
+                            fragments: Vec::new(), direction: record.direction,
+                        }).fragments.push(fragment.clone());
+                    }
+                }
+            }
+        }
         for (block, records) in blocks {
             for (local, record) in records.iter() {
-                if matches!(record, GroundRecordRef::ClassifiedEmptyColumn) {
-                    empty_columns.insert([block[0]*32+i32::from(local%32), block[1]*32+i32::from(local/32)]);
-                    continue;
-                }
-                let GroundRecordRef::HeightfieldV1(record) = record else {
-                    continue;
-                };
-                let group = groups
-                    .entry(record.anchor)
-                    .or_insert_with(|| ObservedHeightfield {
-                        anchor: record.anchor,
-                        height: record.height_m,
-                        bounds: record.occupied_bounds,
-                        fragments: Vec::new(),
-                        direction: None,
-                    });
-                group.fragments.push(Fragment {
-                    block: *block,
-                    local,
-                    records: records.clone(),
-                });
+                let GroundRecordRef::HeightfieldV1(record) = record else { continue; };
+                if !dirty.contains(&[record.anchor[0], record.anchor[1]]) { continue; }
+                groups.entry(record.anchor).or_insert_with(|| ObservedHeightfield {
+                    anchor: record.anchor, height: record.height_m, bounds: record.occupied_bounds,
+                    fragments: Vec::new(), direction: None,
+                }).fragments.push(Fragment { block: *block, local, record: Arc::clone(record) });
             }
         }
         let mut columns: BTreeMap<[i32; 2], Vec<ObservedHeightfield>> = BTreeMap::new();
         for (anchor, mut record) in groups {
-            record
-                .fragments
-                .sort_unstable_by_key(|fragment| fragment.block);
-            columns
-                .entry([anchor[0], anchor[1]])
-                .or_default()
-                .push(record);
+            record.fragments.sort_unstable_by_key(|fragment| fragment.block);
+            columns.entry([anchor[0], anchor[1]]).or_default().push(record);
         }
         let mut changed = Vec::new();
-        for x in 0..32 {
-            for y in 0..32 {
-                let xy = [block_xy[0] * 32 + x, block_xy[1] * 32 + y];
-                let next = columns.remove(&xy).unwrap_or_default();
-                let old = self.columns.get(&xy);
-                let had_measured = old.is_some_and(|records| !records.is_empty());
-                let has_measured = !next.is_empty();
-                let present = has_measured || empty_columns.contains(&xy);
-                let equal = old.is_some() == present && old.map_or(next.is_empty(), |old| {
-                    old.len() == next.len() && old.iter().zip(&next).all(|(a, b)| a.geometry_eq(b))
-                });
-                if !equal {
-                    changed.push(xy);
-                }
-                self.measured_columns = self.measured_columns - usize::from(had_measured)
-                    + usize::from(has_measured);
-                if !present {
-                    self.columns.remove(&xy);
-                } else {
-                    self.columns.insert(xy, Arc::new(next));
-                }
+        for &xy in dirty {
+            let records = columns.remove(&xy).unwrap_or_default();
+            let old = self.columns.get(&xy);
+            let empty = empty_columns.get(&xy).copied().or_else(|| old.and_then(|old| match old.as_ref() {
+                NativeGroundColumn::ClassifiedEmpty(block) if !updated.contains(block) => Some(*block),
+                _ => None,
+            }));
+            let had_measured = old.is_some_and(|old| !old.records().is_empty());
+            let has_measured = !records.is_empty();
+            let next = if has_measured { Some(NativeGroundColumn::Heightfields(records)) }
+                else { empty.map(NativeGroundColumn::ClassifiedEmpty) };
+            let equal = match (old.map(|old| old.as_ref()), next.as_ref()) {
+                (None, None) => true,
+                (Some(NativeGroundColumn::ClassifiedEmpty(_)), Some(NativeGroundColumn::ClassifiedEmpty(_))) => true,
+                (Some(a), Some(b)) => a.records().len() == b.records().len()
+                    && a.records().iter().zip(b.records()).all(|(a, b)| a.geometry_eq(b)),
+                _ => false,
+            };
+            let same_origin = match (old.map(|old| old.as_ref()), next.as_ref()) {
+                (Some(NativeGroundColumn::ClassifiedEmpty(a)), Some(NativeGroundColumn::ClassifiedEmpty(b))) => a == b,
+                _ => true,
+            };
+            if equal && same_origin { continue; }
+            if !equal { changed.push(xy); }
+            self.measured_columns = self.measured_columns - usize::from(had_measured) + usize::from(has_measured);
+            match next {
+                Some(next) => { self.columns.insert(xy, Arc::new(next)); }
+                None => { self.columns.remove(&xy); }
             }
         }
         changed
     }
+
 }
 
 #[cfg(test)]
@@ -377,14 +428,9 @@ mod tests {
             .receive(
                 &Transfer {
                     root: root.encode().unwrap(),
-                    included: BTreeMap::new(),
+                    repository_path: w.repository().path().to_string_lossy().into_owned(),
                 },
-                &root.domain,
-                |_, r| {
-                    w.repository()
-                        .read_object(r.object, nuwax_map_chunks::MAX_BLOCK_BYTES)
-                },
-            )
+                &root.domain)
             .unwrap();
         let mut source = SurfaceObservations::new(Q, 32).unwrap();
         let mut parts = Vec::new();
@@ -476,15 +522,10 @@ mod tests {
         };
         for fragment in &native.fragments {
             let original = parts.iter().find(|(k, _)| *k == fragment.block).unwrap();
-            let (GroundRecords::Versioned(a), GroundRecords::Versioned(b)) =
-                (&fragment.records, &original.1)
-            else {
-                panic!("versioned");
+            let GroundRecordRef::HeightfieldV1(record) = original.1.get(fragment.local).unwrap() else {
+                panic!("heightfield");
             };
-            assert!(
-                Arc::ptr_eq(a, b),
-                "projection must borrow the original admitted payload"
-            );
+            assert!(Arc::ptr_eq(&fragment.record, record), "投影必须共享原始地面记录");
         }
         let fork = source.fork_for_planning();
         let SourceGroundRecord::HeightfieldV1(shared) = fork.ground_record(record.key()).unwrap()
@@ -524,6 +565,8 @@ mod tests {
             }],
             };
         install(&mut w, xy, &make(0.75, 0.25, true));
+        let neighbour = [1, 0];
+        install(&mut w, neighbour, &column(neighbour, &[0, 32, 64]));
         let first = root(&mut w, 1);
         let (mut source, _) = admitted(&w, &first);
         let old = source.clone();
@@ -536,6 +579,10 @@ mod tests {
             .is_empty());
         source.mark_complete_geometry_source();
         assert!(source.same_geometry(&old));
+        assert!(matches!((source.ground_records(xy).next(), old.ground_records(xy).next()), (Some(SourceGroundRecord::HeightfieldV1(a)), Some(SourceGroundRecord::HeightfieldV1(b))) if std::ptr::eq(a, b)),
+            "几何未变化的地面列必须继续共用原投影对象");
+        assert!(matches!((source.ground_records(neighbour).next(), old.ground_records(neighbour).next()), (Some(SourceGroundRecord::HeightfieldV1(a)), Some(SourceGroundRecord::HeightfieldV1(b))) if std::ptr::eq(a, b)),
+            "同块的未变化邻列不能因本块更新而重建");
         assert!(source.same_planning_query_view(&old));
         w.replace_ground_column(xy, &make(0.625, 0.375, false))
             .unwrap();
@@ -544,6 +591,8 @@ mod tests {
         assert_eq!(source.replace_heightfield_columns([0, 0], &parts), vec![xy]);
         source.mark_complete_geometry_source();
         assert!(!source.same_geometry(&old));
+        assert!(matches!((source.ground_records(neighbour).next(), old.ground_records(neighbour).next()), (Some(SourceGroundRecord::HeightfieldV1(a)), Some(SourceGroundRecord::HeightfieldV1(b))) if std::ptr::eq(a, b)),
+            "另一列成员变化后，邻列仍须共用原对象");
         assert!(!source.same_planning_query_view(&old));
         assert!(
             source.get([0, 0, 32]).is_some(),

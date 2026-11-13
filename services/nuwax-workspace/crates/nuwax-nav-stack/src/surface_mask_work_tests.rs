@@ -131,6 +131,15 @@ fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
             [mask.info.origin.position[0], mask.info.origin.position[1]],
             f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
             blocked.iter().copied()), "{variant}");
+        let actual_columns: std::collections::BTreeMap<_,_> = actual.navigation_height_columns().collect();
+        let expected_columns: std::collections::BTreeMap<_,_> = expected.navigation_height_columns().collect();
+        assert_eq!(actual_columns, expected_columns, "{variant}");
+        for (column, _) in actual_columns {
+            assert_eq!(actual.navigation_column_allowed(column, 0.1),
+                expected.navigation_column_allowed(column, 0.1));
+        }
+        let actual=super::test_source::full_surface_fixture(&actual);
+        let expected=super::test_source::full_surface_fixture(&expected);
         let mut actual_cells: Vec<_> = actual.cell_keys().collect();
         let mut expected_cells: Vec<_> = expected.cell_keys().collect();
         actual_cells.sort_unstable(); expected_cells.sort_unstable();

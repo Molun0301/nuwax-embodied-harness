@@ -16,17 +16,10 @@ pub(crate) struct SurfaceMapUpdate {
 
 /// Publication identities are assigned by the owner, never derived from payload bytes.
 #[derive(Clone, PartialEq, Eq)]
-enum GeometryRevision {
-    Fine {
-        domain: nuwax_map_chunks::Domain,
-        resolution: u32,
-        geometry_revision: u64,
-    },
-    FullCloud {
-        domain: nuwax_map_chunks::Domain,
-        resolution: u32,
-        publication_revision: i64,
-    },
+struct GeometryRevision {
+    domain: nuwax_map_chunks::Domain,
+    resolution: u32,
+    geometry_revision: u64,
 }
 
 /// 修订先走常量时间快路；同域较新提交可再逐格证明虚拟几何完全未变。
@@ -87,7 +80,6 @@ pub struct SurfaceMapCache {
     latest: Option<DerivedSurface>,
     last_stats: Option<SurfaceBuildStats>,
     fine: Option<crate::surface_chunks::FineMapReader>,
-    lcm_url: String,
     fine_built_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     fine_observed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     observations: Option<Arc<nuwax_nav_mls_planner::SurfaceObservations>>,
@@ -106,26 +98,14 @@ impl SurfaceMapCache {
             fine_built_root: None,
             fine_observed_root: None,
             observations: None,
-            lcm_url: String::new(),
         }
     }
 
     /// 使用启动时捕获的同一完整模型构建消费者缓存。
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
-        cache.lcm_url = config.lcm_url.clone();
         cache.builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
-        cache
-    }
-
-    /// 同`configured`，精细地图缺块补取改用调用方给定的LCM地址，不读进程环境变量。
-    pub fn configured_with_lcm_url(
-        config: &crate::surface_config::SurfaceNavigationConfig,
-        lcm_url: impl Into<String>,
-    ) -> Self {
-        let mut cache = Self::configured(config);
-        cache.lcm_url = lcm_url.into();
         cache
     }
 
@@ -179,46 +159,27 @@ impl SurfaceMapCache {
             self.reset();
             return Err("surface map cleared by mapping owner".into());
         }
-        let fine_root = if message.fine.is_some() {
-            if self.fine.is_none() {
-                self.fine = Some(crate::surface_chunks::FineMapReader::new(
-                    self.lcm_url.clone(),
-                )?);
-            }
-            Some(self.fine.as_mut().unwrap().receive(message)?)
-        } else {
-            None
-        };
+        let transfer = message.fine.as_ref().expect("解码边界已提供精细根");
+        if self.fine.is_none() {
+            self.fine = Some(crate::surface_chunks::FineMapReader::new(&transfer.repository_path));
+        }
+        let fine_root = self.fine.as_mut().unwrap().receive(message)?;
         let receive_ms = started.elapsed().as_secs_f64() * 1000.0;
         // 原生规划始终消费完整精细几何和地面记录，与旧机体复核开关无关。
-        let (observations, fine_changes) = match fine_root.as_ref() {
-            Some(root) => {
-                let (observations, changes) = self.fine.as_mut().unwrap().observations_with_changes(root,
-                    self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?;
-                (Some(observations), changes)
-            }
-            None => (None, self.observations.is_none().then(Vec::new)),
-        };
+        let (observations, fine_changes) = self.fine.as_mut().unwrap().observations_with_changes(
+            &fine_root, self.fine_observed_root.as_deref().zip(self.observations.as_ref()))?;
+        let observations = Some(observations);
         let observations_ms = started.elapsed().as_secs_f64() * 1000.0 - receive_ms;
         let domain = schema::navigation_map_3d_domain(message);
-        let physical_revision = match fine_root.as_ref() {
-            Some(root) => GeometryRevision::Fine {
-                domain: root.domain.clone(),
-                resolution: root.voxel_size_m.to_bits(),
-                geometry_revision: root.geometry_revision,
-            },
-            None => GeometryRevision::FullCloud {
-                domain: domain.clone(),
-                resolution: message.source_voxel_size.to_bits(),
-                publication_revision: message.revision,
-            },
+        let physical_revision = GeometryRevision {
+            domain: fine_root.domain.clone(), resolution: fine_root.voxel_size_m.to_bits(),
+            geometry_revision: fine_root.geometry_revision,
         };
         let mask_revision = message.virtual_obstacles.as_ref().map(|_| MaskRevision {
             domain,
             revision: message.revision,
         });
         let mask_layout = message.virtual_obstacles.as_ref().map(MaskLayout::new);
-        let mut frontier_changes = None;
         let mut coarse_changes = Some(Vec::new());
         let physical = if let Some((_, snapshot)) = self
             .physical
@@ -229,43 +190,24 @@ impl SurfaceMapCache {
             self.record_reuse();
             snapshot
         } else {
-            let result = if let Some(root) = &fine_root {
-                let previous = self.fine_built_root.as_deref().filter(|old| {
-                    old.domain == root.domain
-                        && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
-                });
-                let (updates, read_points) =
-                    self.fine
-                        .as_mut()
-                        .unwrap()
-                        .columns(root, previous, self.config.voxel_size)?;
-                self.builder
-                    .build_column_updates(
-                        &updates,
-                        root.voxel_size_m,
-                        previous.is_none(),
-                        read_points,
-                    )
-                    .map_err(|error| error.to_string())?
-            } else {
-                let points = admitted_cloud_points(&message.cloud);
-                self.builder
-                    .build(&points, message.source_voxel_size)
-                    .map_err(|error| error.to_string())?
-            };
-            self.fine_built_root = fine_root.clone();
+            let root = &fine_root;
+            let previous = self.fine_built_root.as_deref().filter(|old| {
+                old.domain == root.domain && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits()
+            });
+            let (updates, read_points) = nuwax_nav_mls_planner::surface_chunks::column_updates(
+                root, previous, self.config.voxel_size, observations.as_ref().unwrap(), fine_changes.as_deref());
+            let result = self.builder.build_column_data(&updates, root.voxel_size_m, previous.is_none(), read_points)
+                .map_err(|error| error.to_string())?;
+            self.fine_built_root = Some(fine_root.clone());
             if result.stats.kind != SurfaceBuildKind::Full {
-                frontier_changes = Some(result.changed_columns.clone());
                 coarse_changes = Some(result.changed_columns);
             } else { coarse_changes = None; }
             self.last_stats = Some(result.stats);
             self.physical = Some((physical_revision, Arc::clone(&result.snapshot)));
             result.snapshot
         };
-        // An evidence-only fine publication advances the retained root without
-        // rebuilding geometry. Full-cloud compatibility goes through the builder's
-        // existing exact column comparison on each new publication revision.
-        self.fine_built_root = fine_root.clone();
+        // 纯证据发布推进保留根，列几何仍复用已有产物。
+        self.fine_built_root = Some(fine_root.clone());
         tracing::debug!(target: "navigation.surface.build", event="surface.build.stages",
             cloud_revision=message.revision, receive_ms, observations_ms,
             geometry_ms=started.elapsed().as_secs_f64()*1000.0-receive_ms-observations_ms,
@@ -312,7 +254,7 @@ impl SurfaceMapCache {
             let snapshot = if same_observations { Arc::clone(snapshot) }
                 else { Arc::new(snapshot.with_observations(observations.clone())) };
             self.observations = observations;
-            self.fine_observed_root = fine_root;
+            self.fine_observed_root = Some(fine_root);
             self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
             let changes = Arc::new(changes(&snapshot));
             return Ok(SurfaceMapUpdate { snapshot, change_basis, changes });
@@ -341,42 +283,13 @@ impl SurfaceMapCache {
         } else {
             Arc::clone(&physical)
         };
-        if let (Some(changes), Some(previous)) = (frontier_changes, self.latest.as_ref()) {
-            snapshot.inherit_frontier_cache(&previous.snapshot, &changes);
-        }
         let snapshot = Arc::new(snapshot.with_observations(observations.clone()));
         self.observations = observations;
-        self.fine_observed_root = fine_root;
+        self.fine_observed_root = Some(fine_root);
         self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
         let changes = Arc::new(changes(&snapshot));
         Ok(SurfaceMapUpdate { snapshot, change_basis, changes })
     }
-}
-
-/// 解码边界已确认字段、布局与有限坐标；此处只展开坐标，不重复校验协议。
-fn admitted_cloud_points(cloud: &schema::PointCloud2) -> Vec<(f32, f32, f32)> {
-    let axes = ["x", "y", "z"].map(|name| {
-        let field = cloud.fields.iter().find(|field| field.name == name).unwrap();
-        (field.offset as usize, field.datatype)
-    });
-    let mut points = Vec::with_capacity(cloud.width as usize * cloud.height as usize);
-    for row in 0..cloud.height as usize {
-        for column in 0..cloud.width as usize {
-            let base = row * cloud.row_step as usize + column * cloud.point_step as usize;
-            let xyz = axes.map(|(offset, datatype)| {
-                let start = base + offset;
-                if datatype == 7 {
-                    let bytes = cloud.data[start..start + 4].try_into().unwrap();
-                    if cloud.is_bigendian { f32::from_be_bytes(bytes) } else { f32::from_le_bytes(bytes) }
-                } else {
-                    let bytes = cloud.data[start..start + 8].try_into().unwrap();
-                    (if cloud.is_bigendian { f64::from_be_bytes(bytes) } else { f64::from_le_bytes(bytes) }) as f32
-                }
-            });
-            points.push((xyz[0], xyz[1], xyz[2]));
-        }
-    }
-    points
 }
 
 #[cfg(test)]
@@ -387,35 +300,5 @@ pub(crate) mod tests {
         cache.physical.as_ref().map(|(_, snapshot)| Arc::clone(snapshot))
     }
 
-    #[test]
-    fn admitted_coordinates_preserve_endianness_offsets_and_padded_rows() {
-        for big_endian in [false, true] {
-            for datatype in [7, 8] {
-                let bytes = if datatype == 7 { 4 } else { 8 };
-                let mut cloud = schema::PointCloud2 {
-                    width: 2, height: 2, point_step: bytes * 4, row_step: bytes * 9,
-                    is_bigendian: big_endian,
-                    fields: ["z", "x", "y"].iter().enumerate().map(|(index, name)| schema::PointField {
-                        name: (*name).into(), offset: index as i32 * bytes, datatype, count: 1,
-                    }).collect(),
-                    ..Default::default()
-                };
-                cloud.data = vec![0; (cloud.row_step * cloud.height) as usize];
-                for index in 0..4 {
-                    let base = index / 2 * cloud.row_step as usize + index % 2 * cloud.point_step as usize;
-                    for (axis, offset) in [(0, bytes), (1, bytes * 2), (2, 0)] {
-                        let value = (index * 3 + axis) as f64;
-                        let encoded = if datatype == 7 {
-                            if big_endian { (value as f32).to_be_bytes() } else { (value as f32).to_le_bytes() }.to_vec()
-                        } else {
-                            if big_endian { value.to_be_bytes() } else { value.to_le_bytes() }.to_vec()
-                        };
-                        let start = base + offset as usize;
-                        cloud.data[start..start + bytes as usize].copy_from_slice(&encoded);
-                    }
-                }
-                assert_eq!(admitted_cloud_points(&cloud), vec![(0.,1.,2.),(3.,4.,5.),(6.,7.,8.),(9.,10.,11.)]);
-            }
-        }
-    }
+
 }

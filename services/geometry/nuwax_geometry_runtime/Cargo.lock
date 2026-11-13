@@ -1541,7 +1541,6 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "async-trait",
- "base64",
  "futures",
  "libc",
  "memmap2",
@@ -1569,7 +1568,6 @@ dependencies = [
  "nuwax-nav-terrain-map-ext",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
- "nuwax-rpc",
  "nuwax-slam-2d-runtime",
  "nuwax-tf",
  "nuwax-transport",
@@ -1865,7 +1863,6 @@ dependencies = [
 name = "nuwax-nav-stack"
 version = "0.1.0"
 dependencies = [
- "base64",
  "bitflags",
  "futures",
  "nuwax-codec",
@@ -1883,7 +1880,6 @@ dependencies = [
  "nuwax-nav-simple-planner",
  "nuwax-nav-types-messages",
  "nuwax-protocol",
- "nuwax-rpc",
  "nuwax-transport",
  "serde",
  "serde_json",

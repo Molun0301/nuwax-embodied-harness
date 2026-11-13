@@ -1,6 +1,6 @@
 //! 探索对象及曲面计算独立运行，会话只接收结果并决定是否派发。
 use super::*;
-use crate::explorer::{apply_forbidden, build_surface_input, ExplorerTick};
+use crate::explorer::{apply_forbidden, SurfaceInputBuilder, ExplorerTick};
 use std::sync::mpsc as channel;
 
 enum Work {
@@ -46,13 +46,13 @@ mod tests {
             mapper.snapshot().await.unwrap();
             let n = nuwax_config::test_support::section("navigation");
             let r = nuwax_config::test_support::section("robot");
-            let d = nuwax_config::sections::Derived {
+            let d = nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,
                 nav_profile: "pct-scan-3d".into(), actuator_max_linear_mps: 0.0,
                 actuator_max_yaw_rps: 0.0, actuator_motion_model: String::new(),
                 robot_geometry_json: r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"曲面来源时钟回归"}"#.into(),
             };
             let explorer = Explorer::from_config("测试".into(), "map".into(), true, &n, &r, &d).unwrap();
-            let mut worker = Worker { explorer, surface_cache: None, masked_surface_cache: None };
+            let mut worker = Worker { explorer, surface_builder: None, surface_cache: None, masked_surface_cache: None };
             let (_, pose) = watch::channel(None);
             worker.tick(&mapper, &pose).await.unwrap();
             assert!(worker.surface_cache.is_some(), "来源年龄100毫秒的曲面不能因墙钟差一小时丢弃");
@@ -80,6 +80,7 @@ impl ExplorerWorker {
         tokio::task::spawn_blocking(move || {
             let mut worker = Worker {
                 explorer,
+                surface_builder: None,
                 surface_cache: None,
                 masked_surface_cache: None,
             };
@@ -162,6 +163,7 @@ impl ExplorerWorker {
 }
 struct Worker {
     explorer: Explorer,
+    surface_builder: Option<SurfaceInputBuilder>,
     surface_cache: Option<(
         Arc<nuwax_map_chunks::SealedMap>,
         Arc<nuwax_nav_mls_planner::SurfaceSnapshot>,
@@ -186,7 +188,10 @@ impl Worker {
                 Err(reason) => Err(format!("等待曲面快照：{reason}")),
                 Ok(()) => {
                     if self.surface_cache.as_ref().is_none_or(|(current, _)| !Arc::ptr_eq(current, &sealed)) {
-                        let built = build_surface_input(sealed.clone())?;
+                        if self.surface_builder.is_none() {
+                            self.surface_builder = Some(SurfaceInputBuilder::new()?);
+                        }
+                        let built = self.surface_builder.as_mut().unwrap().build(sealed.clone())?;
                         self.surface_cache = Some((sealed, built));
                         self.masked_surface_cache = None;
                     }
@@ -216,7 +221,7 @@ async fn forbidden_read_failure_stays_running_and_recovers_after_a_valid_array()
     let (entered, _) = oneshot::channel();
     let (_release, released) = channel::channel();
     let explorer = crate::explorer::tests::blocking_fixture(entered, released);
-    let mut worker = Worker { explorer, surface_cache: None, masked_surface_cache: None };
+    let mut worker = Worker { explorer, surface_builder: None, surface_cache: None, masked_surface_cache: None };
     let (_, pose) = watch::channel(None);
     for _ in 0..2 {
         let waiting = worker.tick(&mapper, &pose).await.unwrap();

@@ -10,7 +10,7 @@ fn dense(layers: u16) -> (Block, GroundRecords, Arc<LayerSource>) {
         for xy in 0..1024 {
             let local = xy + 1024*z; let x = i32::from(xy%32); let y = i32::from(xy/32);
             block.insert(local, Evidence {observed_ns:STAMP,hits:32});
-            records.insert(local, GroundRecord::HeightfieldV1(HeightfieldFragment {
+            records.insert(local, GroundRecord::HeightfieldV1(Arc::new(HeightfieldFragment {
                 anchor:[x,y,i32::from(z)], height_m:(f64::from(z)+0.0625)*f64::from(Q),
                 occupied_bounds:[f64::from(z)*f64::from(Q),(f64::from(z)+1.)*f64::from(Q)],
                 members:vec![(local,[1.,0.,0.,0.,0.,0.,0.,0.])],
@@ -18,7 +18,7 @@ fn dense(layers: u16) -> (Block, GroundRecords, Arc<LayerSource>) {
                     point:[(f64::from(x)+0.03141592653589793+f64::from(i)/33.)*f64::from(Q),
                         (f64::from(y)+0.04+f64::from(i)/34.)*f64::from(Q), (f64::from(z)+0.0625)*f64::from(Q)],
                     source_sequence:u64::from(i)+1,source_timestamp_ns:STAMP-31+u64::from(i),point_index:u32::from(local)}).collect(),
-            }));
+            })));
         }
     }
     (block,GroundRecords::Versioned(Arc::new(records)),source)
@@ -49,12 +49,11 @@ fn bl6_three_four_and_maximum_layers_preserve_every_sample_and_original_shape() 
         assert!(bytes.len()>MAX_V1_TO_V5_BLOCK_BYTES && bytes.len()<=MAX_BLOCK_BYTES);
         let(decoded,actual)=decode_block_parts(&bytes).unwrap();
         assert_eq!(decoded,block);assert_eq!(actual,records);
-        assert_eq!(block_summary(&bytes).unwrap(),(block.len() as u32,STAMP));
+        assert_eq!(decoded_block_stats(&bytes).unwrap(),(block.len() as u32,STAMP));
         let repo=Repository::temporary().unwrap();let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
         let manifest=root(id,block.len(),vec![source]);
         let mut reader=Receiver::with_cache_budget(Repository::temporary().unwrap(),4*1024*1024);
-        let received=reader.receive(&Transfer{root:manifest.encode().unwrap(),included:BTreeMap::new()},&manifest.domain,
-            |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+        let received=reader.receive(&Transfer{root:manifest.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&manifest.domain).unwrap();
         assert_eq!(reader.ground_records(&received.blocks[0]).unwrap(),records);
         assert!(reader.reader.cached_bytes()<=4*1024*1024);
         if layers<32 {artifact(&format!("BL6-{layers}层.ar5"),&manifest,&repo);}
@@ -70,20 +69,18 @@ fn bl6_near_full_source_and_numeric_bounds_fit_and_removing_root_sources_revalid
     let old=Arc::new(LayerSource::Auxiliary {sensor_id:format!("y{}","a".repeat(MAX_V1_TO_V5_BLOCK_BYTES-1024-26)),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
     let field=match records.versioned_mut().get_mut(&0).unwrap() {GroundRecord::HeightfieldV1(f)=>f,_=>unreachable!()};
-    field.samples[30].source=old.clone(); field.samples[31].source=declared.clone();
+    Arc::make_mut(field).samples[30].source=old.clone(); Arc::make_mut(field).samples[31].source=declared.clone();
     // 未声明来源确实能完整来自旧BL5，而非凭空增加兼容额度。
-    let mut legacy=field.clone();legacy.samples=vec![legacy.samples[30].clone()];
+    let mut legacy=field.clone();let sample=legacy.samples[30].clone();Arc::make_mut(&mut legacy).samples=vec![sample];
     assert!(ground_binary::encode(&[(0,block[&0])].into(),&[(0,GroundRecord::HeightfieldV1(legacy))].into()).unwrap().len()<=MAX_V1_TO_V5_BLOCK_BYTES);
     let bytes=encode_ground_block(&block,&records).unwrap();
     assert!(bytes.len()<=MAX_BLOCK_BYTES && MAX_BLOCK_BYTES-bytes.len()<8192);
     let repo=Repository::temporary().unwrap();let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
     let manifest=root(id,block.len(),vec![normal,declared]);assert!(manifest.encode().unwrap().len()<=MAX_MANIFEST_BYTES);
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),256*1024*1024);
-    receiver.receive(&Transfer{root:manifest.encode().unwrap(),included:BTreeMap::new()},&manifest.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+    receiver.receive(&Transfer{root:manifest.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&manifest.domain).unwrap();
     let mut bad=manifest.clone();bad.revision=2;bad.source_watermarks.clear();
-    let error=receiver.receive(&Transfer{root:bad.encode().unwrap(),included:BTreeMap::new()},&bad.domain,
-        |_,_|panic!("已缓存对象不应补取")).unwrap_err();
+    let error=receiver.receive(&Transfer{root:bad.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&bad.domain).unwrap_err();
     assert!(error.contains("unregistered source"),"{error}");
     assert_eq!(receiver.current().unwrap().revision,1);
     let mut small=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };small.retain(|&key,_|key==0);
@@ -127,24 +124,21 @@ fn failed_candidate_cannot_lend_its_source_declaration_to_a_later_root() {
     let old_id=ObjectId::random().unwrap().into();repo.put_object(old_id,&encode_block(&base).unwrap()).unwrap();
     let old=root(old_id,1,vec![]);
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),16*1024*1024);
-    receiver.receive(&Transfer{root:old.encode().unwrap(),included:BTreeMap::new()},&old.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
+    receiver.receive(&Transfer{root:old.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&old.domain).unwrap();
     let(_,all,_)=dense(1);let mut records=match &all { GroundRecords::Versioned(values) => values.as_ref().clone() };records.retain(|&key,_|key==0);
     let source=Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(MAX_V1_TO_V5_BLOCK_BYTES+1),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
     let GroundRecord::HeightfieldV1(field)=records.get_mut(&0).unwrap() else{unreachable!()};
-    field.samples.truncate(1);field.samples[0].source=source.clone();
+    Arc::make_mut(field).samples.truncate(1);Arc::make_mut(field).samples[0].source=source.clone();
     let bytes=encode_ground_block(&base,&GroundRecords::Versioned(Arc::new(records))).unwrap();
     let id=ObjectId::random().unwrap().into();repo.put_object(id,&bytes).unwrap();
     let mut candidate=root(id,1,vec![source]);candidate.revision=2;candidate.geometry_revision=2;
     candidate.blocks[0].block_revision=2;candidate.blocks[0].geometry_revision=2;
     candidate.blocks.push(BlockRef{key:[1,0,0],object:ObjectId::random().unwrap().into(),points:1,block_revision:2,geometry_revision:2});
-    assert!(receiver.receive(&Transfer{root:candidate.encode().unwrap(),included:BTreeMap::new()},&candidate.domain,
-        |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).is_err());
+    assert!(receiver.receive(&Transfer{root:candidate.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&candidate.domain).is_err());
     assert_eq!(receiver.current().unwrap().revision,1);
     candidate.blocks.pop();candidate.source_watermarks.clear();
-    let error=receiver.receive(&Transfer{root:candidate.encode().unwrap(),included:BTreeMap::new()},&candidate.domain,
-        |_,_|panic!("失败候选已留下对象，不应补取")).unwrap_err();
+    let error=receiver.receive(&Transfer{root:candidate.encode().unwrap(),repository_path: repo.path().to_string_lossy().into_owned()},&candidate.domain).unwrap_err();
     assert!(error.contains("unregistered source"),"{error}");
     assert_eq!(receiver.current().unwrap().revision,1);
 }

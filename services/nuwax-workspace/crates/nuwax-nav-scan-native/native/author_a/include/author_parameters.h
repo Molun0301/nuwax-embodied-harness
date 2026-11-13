@@ -1,5 +1,6 @@
 #pragma once
 #include <author_host.h>
+#include <author_clearance.h>
 #include <scan_native.h>
 namespace scan_planner {
 // Algorithm defaults from author A advanced_param.xml. Physical limits and
@@ -12,15 +13,17 @@ inline ros::NodeHandle authorParameters(const ScanConfig& c) {
  n.setParam("fsm/emergency_time_",1.0); n.setParam("fsm/fail_safe",true);
  n.setParam("fsm/max_replan_fail_count",1000);
  n.setParam("manager/max_vel",c.max_velocity);n.setParam("manager/max_acc",c.max_acceleration);n.setParam("manager/max_yaw_rate",c.max_yaw_rate);
+ n.setParam("manager/max_reverse",c.max_reverse_velocity);n.setParam("manager/max_lateral",c.max_lateral_velocity);
  n.setParam("manager/max_jerk",4.0);n.setParam("manager/control_points_distance",.2);
  n.setParam("manager/feasibility_tolerance",.5);n.setParam("manager/planning_horizon",c.planning_horizon);
  n.setParam("optimization/lambda_smooth",1.0);n.setParam("optimization/lambda_collision",1.0);
  n.setParam("optimization/lambda_feasibility",.1);n.setParam("optimization/lambda_fitness",1.0);
- // 余量相对机体表面；两倍体素余量保留排斥梯度，窄处仍由原硬判定决定通行。
- n.setParam("optimization/dist0",2.*std::max(.05,c.resolution));n.setParam("optimization/max_vel",c.max_velocity);
+ // 余量相对机体表面；两倍首选净空保留排斥梯度，窄处仍由原硬判定决定通行。
+ n.setParam("optimization/dist0",2.*preferredClearance(c.resolution,c.obstacle_clearance_m));n.setParam("optimization/max_vel",c.max_velocity);
  n.setParam("optimization/max_acc",c.max_acceleration);n.setParam("optimization/order",3);
  n.setParam("optimization/vel_tolerance",1.0);n.setParam("optimization/acc_tolerance",1.0);
  n.setParam("grid_map/resolution",c.resolution);
+ n.setParam("grid_map/obstacle_clearance",c.obstacle_clearance_m);
  n.setParam("grid_map/sliding_map_size_x",10.0);n.setParam("grid_map/sliding_map_size_y",10.0);n.setParam("grid_map/sliding_map_size_z",5.0);
  n.setParam("grid_map/map_sliding_thresh",.2);n.setParam("grid_map/map_sliding_en",true);
  // Original two-cylinder covering approximation with unchanged actual dimensions.

@@ -204,10 +204,7 @@ async fn publish_map(
         source_timestamp_ns: stamp as i64,
         source_voxel_size: root.voxel_size_m,
         virtual_obstacles,
-        fine: Some(navigation_map_transfer::prepare(
-            &sealed,
-            output.prior.as_deref(),
-        )?),
+        fine: Some(navigation_map_transfer::prepare(&sealed)?),
         cloud: cloud(Vec::new(), &effective.header.frame_id, stamp, 0),
         ..Default::default()
     };

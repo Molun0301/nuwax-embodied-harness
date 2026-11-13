@@ -27,7 +27,9 @@ impl Pair {
         actual
     }
     fn seal(&mut self, domain: Domain, revision: u64, timestamp: u64) -> Result<Arc<Manifest>, String> {
+        let reads = self.actual.repository.counts().0;
         let actual = self.actual.seal(domain.clone(), revision, timestamp).map(|sealed| sealed.root);
+        assert_eq!(self.actual.repository.counts().0, reads, "封图不回读");
         let expected = self.oracle.frozen_binary_seal(domain, revision, timestamp).map(|sealed| sealed.root);
         assert_eq!(actual, expected); // Complete Manifest, not only revision counters.
         self.assert_state();
@@ -53,10 +55,13 @@ impl Pair {
         assert_eq!((a.dirty_points, a.dirty_layer_bytes, a.dirty_point_budget),
             (b.dirty_points, b.dirty_layer_bytes, b.dirty_point_budget));
         assert_eq!(a.encoded_blocks, b.encoded_blocks);
-        assert_eq!(a.resident_bytes(), b.resident_bytes());
+        assert_eq!(a.resident_bytes() - a.reader.cached_bytes(),
+            b.resident_bytes() - b.reader.cached_bytes());
         assert_eq!(a.retained_objects(), b.retained_objects());
         assert_eq!(a.has_unpublished_changes(), b.has_unpublished_changes());
-        assert_eq!(a.repository.counts(), b.repository.counts());
+        let (_, a_puts, a_scans) = a.repository.counts();
+        let (_, b_puts, b_scans) = b.repository.counts();
+        assert_eq!((a_puts, a_scans), (b_puts, b_scans));
         for w in [a, b] {
             if let Some(old) = &w.published {
                 let previous = old.blocks.iter().map(|r| r.key).collect::<BTreeSet<_>>();
@@ -78,8 +83,8 @@ struct OldReaders {
 }
 impl OldReaders {
     fn capture(pair: &Pair) -> Self {
-        let actual = Arc::new(SealedMap { root: pair.actual.published.clone().unwrap(), repository: pair.actual.repository.clone() });
-        let oracle = Arc::new(SealedMap { root: pair.oracle.published.clone().unwrap(), repository: pair.oracle.repository.clone() });
+        let actual = Arc::new(SealedMap { root: pair.actual.published.clone().unwrap(), repository: pair.actual.repository.clone(), reader: pair.actual.reader.clone() });
+        let oracle = Arc::new(SealedMap { root: pair.oracle.published.clone().unwrap(), repository: pair.oracle.repository.clone(), reader: pair.oracle.reader.clone() });
         let before = (*actual.root).clone();
         let mut actual_reader = RegionReader::new(actual.repository.clone(), BUDGET);
         let mut oracle_reader = RegionReader::new(oracle.repository.clone(), BUDGET);
@@ -158,7 +163,7 @@ impl Writer {
         root.validate()?;
         self.blocks = blocks; self.published = Some(root.clone());
         self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
-        Ok(SealedMap { root, repository: self.repository.clone() })
+        Ok(SealedMap { root, repository: self.repository.clone(), reader: self.reader.clone() })
     }
 }
 
@@ -337,11 +342,18 @@ fn seal_cursor_partial_edit_and_membership_read_failures_preserve_tracking() {
     pair.edit(Writer::flush).unwrap();
     let old_object = baseline.blocks[0].object;
     pair.edit(|w| hide_object(w, old_object, true)).unwrap();
-    assert!(pair.seal(domain(), 3, 3).is_err());
-    assert!(Arc::ptr_eq(pair.actual.published.as_ref().unwrap(), &baseline));
-    assert!(pair.actual.membership_touched.contains(&[0, 0, 0]));
-    pair.edit(|w| hide_object(w, old_object, false)).unwrap();
-    let next = pair.seal(domain(), 3, 3).unwrap();
+    // 原实现此处回读失败；新实现已有内存比较结果，封图不访问隐藏对象。
+    let reads = pair.actual.repository.counts().0;
+    let next = pair.actual.seal(domain(), 3, 3).unwrap().root;
+    assert_eq!(pair.actual.repository.counts().0, reads);
+    assert!(pair.oracle.frozen_binary_seal(domain(), 3, 3).is_err());
+    assert_eq!(pair.oracle.published.as_deref(), Some(baseline.as_ref()));
+    assert!(pair.oracle.membership_touched.contains(&[0, 0, 0]));
+    hide_object(&mut pair.actual, old_object, false).unwrap();
+    hide_object(&mut pair.oracle, old_object, false).unwrap();
+    let expected = pair.oracle.frozen_binary_seal(domain(), 3, 3).unwrap().root;
+    assert_eq!(next, expected);
+    pair.assert_state();
     assert_eq!(geometry(&next), geometry(&baseline));
     assert_eq!(next.geometry_revision, 2);
 }

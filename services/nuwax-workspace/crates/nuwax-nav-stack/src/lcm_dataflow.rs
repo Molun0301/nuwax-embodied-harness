@@ -5441,7 +5441,13 @@ path: schema::Path {
     }
 
     #[derive(Clone)]
-    pub(super) struct RecordingMotion(pub(super) Arc<Mutex<Vec<String>>>);
+    pub(super) struct RecordingMotion(pub(super) Arc<Mutex<Vec<String>>>, Twist2);
+
+    impl RecordingMotion {
+        pub(super) fn new(calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self(calls, Twist2::ZERO)
+        }
+    }
 
     struct FirstAcquireMotion {
         inner: RecordingMotion,
@@ -5450,6 +5456,9 @@ path: schema::Path {
 
     #[async_trait::async_trait]
     impl nuwax_nav_runtime::NavMotionPort for FirstAcquireMotion {
+        fn measured_motion(&self) -> Option<nuwax_nav_runtime::MeasuredMotion> {
+            nuwax_nav_runtime::NavMotionPort::measured_motion(&self.inner)
+        }
         async fn acquire(&mut self,generation:u64)->Result<u64,nuwax_nav_runtime::MotionPortError> {
             if self.reject_first {
                 self.reject_first=false;
@@ -5465,11 +5474,26 @@ path: schema::Path {
 
     #[async_trait::async_trait]
     impl nuwax_nav_runtime::NavMotionPort for RecordingMotion {
+        fn measured_motion(&self) -> Option<nuwax_nav_runtime::MeasuredMotion> {
+            // 夹具即时采用已接受命令；读取时给出当前执行速度的测量快照。
+            let now = nuwax_nav_runtime::motion_feedback::monotonic_ns();
+            Some(nuwax_nav_runtime::MeasuredMotion {
+                source_id: "test:recording-motion".into(),
+                source_timestamp_ns: current_unix_timestamp_ns().unwrap() as u64,
+                received_monotonic_ns: now,
+                valid_until_monotonic_ns: u64::MAX,
+                frame_id: "base_link".into(),
+                body_linear_xyz: [self.1.linear.x, self.1.linear.y, 0.],
+                body_angular_xyz: [0., 0., self.1.angular_z],
+                orientation_wxyz: Some([1., 0., 0., 0.]),
+            })
+        }
         async fn acquire(&mut self,generation:u64)->Result<u64,nuwax_nav_runtime::MotionPortError> {
             self.0.lock().unwrap().push(format!("acquire:{generation}")); Ok(generation)
         }
-        async fn velocity(&mut self,_twist:Twist2)->Result<(),nuwax_nav_runtime::MotionPortError> {
-            self.0.lock().unwrap().push("twist:".into()); Ok(())
+        async fn velocity(&mut self,twist:Twist2)->Result<(),nuwax_nav_runtime::MotionPortError> {
+            self.0.lock().unwrap().push("twist:".into());
+            self.1=twist; Ok(())
         }
         async fn release(&mut self)->Result<(),nuwax_nav_runtime::MotionPortError> {
             self.0.lock().unwrap().push("release:".into()); Ok(())
@@ -5797,7 +5821,7 @@ path: schema::Path {
         async fn spawn_with_first_acquire(planar_mode:bool, body_reference: &'static str, reject_first: bool) -> Self {
             let calls=Arc::new(Mutex::new(Vec::new()));
             Self::spawn_with_motion(planar_mode,body_reference,
-                FirstAcquireMotion {inner:RecordingMotion(calls.clone()),reject_first},calls).await
+                FirstAcquireMotion {inner:RecordingMotion::new(calls.clone()),reject_first},calls).await
         }
 
         async fn spawn_with_motion<M:nuwax_nav_runtime::NavMotionPort>(planar_mode:bool, body_reference: &'static str, motion:M, motion_calls:Arc<Mutex<Vec<String>>>) -> Self {

@@ -640,7 +640,16 @@ async fn run_surface_planner_with_computer(
                 }
                 geometry_retired = false;
                 match result {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        if plan.kind == nuwax_nav_runtime::RouteKind::Approach {
+                            let end = plan.path.poses.last().expect("原生非空路线").pose.position;
+                            if nuwax_nav_runtime::surface_follower::position_within_tolerance(
+                                [end.x, end.y, end.z], planned_goal.goal.pose.position,
+                                planned_goal.options().position_tolerance_m,
+                                f64::from(input.source.config().step_threshold_m)) {
+                                plan.kind = nuwax_nav_runtime::RouteKind::Complete;
+                            }
+                        }
                         let is_approach=plan.kind==nuwax_nav_runtime::RouteKind::Approach;
                         if is_approach {
                             let end=plan.path.poses.last().expect("原生非空路线").pose.position;
@@ -653,7 +662,11 @@ async fn run_surface_planner_with_computer(
                                 // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
                                 let at_end=pose.as_ref().is_some_and(|current|
                                     current.pose.position.distance(state.endpoint)<=0.15);
-                                if at_end {
+                                let terminal = execution_feedback.as_ref().is_some_and(|feedback|
+                                    feedback.path_identity.session_id == planned_goal.session_id
+                                        && feedback.path_identity.goal_key == planned_goal.goal_key()
+                                        && feedback.terminal_phase != nuwax_nav_runtime::TerminalPhase::Travel);
+                                if at_end && !terminal {
                                     state.stagnant+=1;
                                     if state.stagnant>=3 {
                                         let reason=approach_failure(end,target,state.stagnant);
@@ -814,6 +827,16 @@ async fn run_surface_planner_with_computer(
 
 #[cfg(test)]
 mod tests {
+    mod test_source { include!("surface_test_source.rs"); }
+    use test_source::{FixtureSurfaceCache as SurfaceGeometryCache, FineFixtureSource};
+
+    fn prepare_surface_map(message: impl Into<Arc<schema::NavigationMap3D>>, received_at: Instant,
+        config: &SurfaceNavigationConfig, cache: &mut SurfaceGeometryCache) -> PreparedSurfaceMap {
+        let message=message.into();
+        let fine=cache.source.message(&message);
+        super::prepare_surface_map(fine,received_at,config,&mut cache.inner)
+    }
+
     mod replan_feedback_tests { include!("surface_replan_feedback_tests.rs"); }
     mod mask_reuse_tests { include!("surface_mask_reuse_tests.rs"); }
     mod mask_work_tests { include!("surface_mask_work_tests.rs"); }
@@ -836,38 +859,10 @@ mod tests {
     #[ignore = "需要本轮冻结的实机规范地图、机体位姿及实机配置"]
     async fn recorded_live_surface_navigation_diagnostic() {
         nuwax_core::logging::init_component_logging("navigation-diagnostic", "nuwax_nav_mls_planner=debug");
-        struct Blocks {
-            repository: nuwax_map_chunks::Repository,
-        }
-        #[async_trait::async_trait]
-        impl nuwax_rpc::RpcHandler for Blocks {
-            async fn handle(&self, request: nuwax_rpc::RpcRequest) -> nuwax_rpc::RpcResponse {
-                let Some(scope) = request.args.0.first() else {
-                    return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"missing block scope"}));
-                };
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
-                let id: [u8;16] = serde_json::from_value(scope["object_id"].clone()).unwrap();
-                match self.repository.read_object_range(nuwax_map_chunks::ObjectIdentity::Assigned(nuwax_map_chunks::ObjectId(id)),
-                    nuwax_map_chunks::MAX_BLOCK_BYTES, scope["offset"].as_u64().unwrap() as usize,
-                    nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES) {
-                    Ok(nuwax_map_chunks::ObjectRangeRead::Data {bytes,total_bytes}) =>
-                        nuwax_rpc::RpcResponse::ok(request.id, serde_json::json!({"total_bytes":total_bytes,"data_base64":STANDARD.encode(bytes)})),
-                    Ok(_) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"偏移超出范围"})),
-                    Err(error) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":error})),
-                }
-            }
-        }
         let directory = std::path::PathBuf::from(std::env::var("NUWAX_NAV_DIAGNOSTIC_INPUT").unwrap());
         let bytes = std::fs::read(directory.join("navigation-map.lcm")).unwrap();
-        let message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
-        let broker = nuwax_rpc::RpcBroker::new();
-        let method = "GeometryRuntimeService/get_navigation_map_block";
-        let blocks = Blocks {
-            repository: nuwax_map_chunks::Repository::open(directory.join("blocks")).unwrap(),
-        };
-        broker.register(method, Box::new(blocks)).await.unwrap();
-        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&nuwax_config::transport().unwrap().lcm_url).unwrap());
-        let server = broker.serve(transport, method).await.unwrap();
+        let mut message = schema::decode_navigation_map_3d_body(&bytes[8..]).unwrap();
+        message.fine.as_mut().unwrap().repository_path = directory.join("blocks").to_string_lossy().into_owned();
         let pose_file = std::env::var("NUWAX_NAV_DIAGNOSTIC_POSE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_|directory.join("pose.json"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(pose_file).unwrap()).unwrap();
         let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
@@ -898,8 +893,7 @@ mod tests {
                     eprintln!("原地转向 yaw={yaw:.3} 投影={target:?} 扫掠={swept:?}");
                 }
             }
-            server.stop().await.unwrap();
-            return;
+                return;
         }
         if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_EDGES").is_some() {
             let mut printed=std::collections::BTreeSet::new();
@@ -1007,8 +1001,7 @@ mod tests {
                 eprintln!("原路径闭环 outcome={outcome}, replans={replans}, commands={commands}, travelled={travelled}");
                 let output=std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT").unwrap();
                 std::fs::write(std::path::Path::new(&output).join("原路径闭环.json"),serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
-                server.stop().await.unwrap();
-                return;
+                        return;
             }
             let mut results = Vec::new();
             for tick in 0..12 {
@@ -1024,8 +1017,7 @@ mod tests {
             if let Ok(output) = std::env::var("NUWAX_NAV_DIAGNOSTIC_OUTPUT") {
                 std::fs::write(std::path::Path::new(&output).join("原路径控制统计.json"), serde_json::to_vec_pretty(&results).unwrap()).unwrap();
             }
-            server.stop().await.unwrap();
-            return;
+                return;
         }
         let mut current = goal_for(&message, 1, position);
         current.goal.pose.orientation_xyzw = quaternion;
@@ -1179,7 +1171,6 @@ mod tests {
                 follower.stop();
             }
         }
-        server.stop().await.unwrap();
     }
 
     #[test]
@@ -1193,7 +1184,7 @@ mod tests {
     }
 
     fn config() -> SurfaceNavigationConfig {
-        SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap()
+        SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2, 0.15).unwrap()
     }
 
     #[test]
@@ -1203,6 +1194,10 @@ mod tests {
         geometry.wall_buffer_m = 0.0;
         geometry.wall_buffer_weight = 0.0;
         let map = SurfaceSnapshot::from_points(&[(0.55,0.55,0.05)], geometry, 0.1).unwrap();
+        let mut observations=nuwax_nav_mls_planner::SurfaceObservations::new(0.1,32).unwrap();
+        observations.replace_block([0,0,0], [([5,5,0],nuwax_nav_mls_planner::SurfaceObservation {observed_ns:1,hits:1})].into()).unwrap();
+        observations.mark_complete_geometry_source();
+        let map=map.with_observations(Some(Arc::new(observations)));
         let standing = PoseStamped { frame_id: nuwax_nav_types_messages::NavFrameId::Map, stamp: Default::default(), pose: Pose3 { position: Point3::new(0.55, 0.55, 0.5), orientation: Quaternion::IDENTITY } };
         let mut lying = standing.clone(); lying.pose.position.z = 0.2;
         let placed = place_surface_start(&map, &standing, &config.body_envelope);
@@ -1361,9 +1356,7 @@ goal: schema::PoseStamped {
             writer.observe(cells.iter().copied(), message.source_timestamp_ns as u64).unwrap();
             let root = writer.snapshot(schema::navigation_map_3d_domain(&message),
                 revision as u64, message.source_timestamp_ns as u64).unwrap();
-            let included = root.blocks.iter().map(|block| (block.object,
-                repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
-            message.fine=Some(Transfer { root: root.encode().unwrap(), included });
+                message.fine=Some(Transfer { root: root.encode().unwrap(), repository_path: repository.path().to_string_lossy().into_owned() });
             previous_cells = cells.clone();
             publications.insert(revision, message.clone());
             message
@@ -1402,7 +1395,7 @@ goal: schema::PoseStamped {
             nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
         cells.retain(|c|!(40..42).contains(&c[0]) || !(28..34).contains(&c[1]));
         let mut bad=message(&cells,3);
-        bad.fine.as_mut().unwrap().included.values_mut().next().unwrap()[0]^=1;
+        bad.fine.as_mut().unwrap().root[0]^=1;
         assert!(cache.build(&bad).is_err());
         assert!(observed_cache.build(&bad).is_err());
         let next=cache.build(&message(&cells,4)).unwrap();
@@ -1411,7 +1404,12 @@ goal: schema::PoseStamped {
         assert_eq!(observed_first.observations().unwrap().get([40,30,40]), Some(old_evidence));
         let points:Vec<_>=cells.iter().map(|c|((c[0] as f32+0.5)*0.05,(c[1] as f32+0.5)*0.05,(c[2] as f32+0.5)*0.05)).collect();
         let full=nuwax_nav_mls_planner::SurfaceSnapshot::from_points(&points,configured.geometry,0.05).unwrap();
-        assert_eq!(next.cell_keys().collect::<BTreeSet<_>>(),full.cell_keys().collect());
+        assert_eq!(next.navigation_height_columns().collect::<BTreeMap<_,_>>(),
+            full.navigation_height_columns().collect::<BTreeMap<_,_>>());
+        {
+            let next=test_source::full_surface_fixture(&next);
+            assert_eq!(next.cell_keys().collect::<BTreeSet<_>>(),full.cell_keys().collect());
+        }
         for goal in [[0.8,0.8,2.05],[3.2,2.2,2.05],[2.025,1.525,2.05]] {
             assert_eq!(native_ground_route(&next,[0.55,1.55,2.05],goal),native_ground_route(&full,[0.55,1.55,2.05],goal));
         }
@@ -1476,39 +1474,7 @@ goal: schema::PoseStamped {
         assert_eq!(cache.last_build_stats().unwrap().kind, SurfaceBuildKind::Full);
     }
 
-    #[test]
-    fn production_derived_surface_carries_deferred_frontier_updates() {
-        let configured = config();
-        let mut cache = SurfaceGeometryCache::new(configured.geometry.clone());
-        let mut first_message = map_message(1, "map");
-        first_message.virtual_obstacles = Some(virtual_mask(&first_message, false));
-        let first = prepare_surface_map(first_message, Instant::now(), &configured, &mut cache)
-            .snapshot
-            .unwrap();
-        first.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap();
-        let old_stats = first.frontier_cache_stats().unwrap();
-        let mut changed = map_message(2, "map");
-        changed.virtual_obstacles = Some(virtual_mask(&changed, false));
-        for value in [3.55_f32, 0.55, 2.35] {
-            changed.cloud.data.extend_from_slice(&value.to_le_bytes());
-        }
-        changed.cloud.width += 1;
-        changed.cloud.row_step += 12;
-        let next = prepare_surface_map(changed.clone(), Instant::now(), &configured, &mut cache)
-            .snapshot
-            .unwrap();
-        assert!(next.frontier_cache_stats().is_none());
-        let mut fresh_cache = SurfaceGeometryCache::new(configured.geometry.clone());
-        let full = prepare_surface_map(changed, Instant::now(), &configured, &mut fresh_cache)
-            .snapshot
-            .unwrap();
-        assert_eq!(
-            next.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap(),
-            full.reachable_frontiers([0.55, 1.55, 2.1], &[]).unwrap()
-        );
-        assert!(next.frontier_cache_stats().unwrap().incremental);
-        assert_eq!(first.frontier_cache_stats(), Some(old_stats));
-    }
+
 
     #[test]
     fn virtual_mask_is_applied_to_the_surface_and_cache_ignores_only_its_clock() {
@@ -1560,19 +1526,7 @@ goal: schema::PoseStamped {
         assert!(native_ground_route(&cleared_mask,[0.55,1.55,2.1],[3.05,1.55,2.1]));
     }
 
-    #[test]
-    fn fullcloud_publication_reuses_only_after_exact_builder_change_detection() {
-        let mut cache = SurfaceGeometryCache::new(config().geometry);
-        let first = map_message(1, "legacy-fullcloud");
-        let old = cache.build(&first).unwrap();
-        assert!(Arc::ptr_eq(&old, &cache.build(&first).unwrap()));
-        assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
-        let second = map_message(2, "legacy-fullcloud");
-        let next = cache.build(&second).unwrap();
-        assert!(Arc::ptr_eq(&old, &next));
-        assert_eq!(cache.last_build_stats().unwrap().kind, nuwax_nav_mls_planner::SurfaceBuildKind::Reused);
-        assert_eq!(cache.last_build_stats().unwrap().input_points, 40 * 30);
-    }
+
 
     #[test]
     fn generated_body_path_does_not_turn_quantization_duplicates_into_vertical_motion() {
@@ -1700,6 +1654,7 @@ goal: schema::PoseStamped {
     }
 
     struct FeedState {
+        source: FineFixtureSource,
         map: schema::NavigationMap3D,
         map_enabled: bool,
         frozen_pose_stamp: Option<i64>,
@@ -1777,7 +1732,7 @@ goal: schema::PoseStamped {
             .await
             .unwrap();
             let hub = SurfaceMapHub::new(Arc::from("base_link"));
-            let map_computer = map_computer.unwrap_or_else(|| Arc::new(prepare_surface_map));
+            let map_computer = map_computer.unwrap_or_else(|| Arc::new(super::prepare_surface_map));
             let planner_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let planner_hub = hub.clone();
             let planner_spec = planner_node.clone();
@@ -1802,6 +1757,7 @@ goal: schema::PoseStamped {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let motion_calls = Arc::clone(&calls);
             let initial_position = [0.55, 1.55, 2.5];
+            let fixture_geometry = configured.geometry.clone();
             let scheduler_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let scheduler_hub = hub.clone();
             let scheduler_spec = scheduler_node.clone();
@@ -1813,7 +1769,7 @@ goal: schema::PoseStamped {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
                             let mut local = crate::static_map_follower(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
-                                RecordingMotion(motion_calls),local,scheduler_config)?);
+                                RecordingMotion::new(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();
                             Ok(pair)
                         }))
@@ -1821,6 +1777,7 @@ goal: schema::PoseStamped {
             ).unwrap();
             let scheduler = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
             let feed = Arc::new(Mutex::new(FeedState {
+                source: FineFixtureSource::new(fixture_geometry),
                 map: map_message(1, "first-map"),
                 map_enabled: true,
                 frozen_pose_stamp: None,
@@ -1890,7 +1847,7 @@ goal: schema::PoseStamped {
                             }
                             let map = state.map.clone();
                             state.last_published = Some(map.clone());
-                            Some(map)
+                            Some(state.source.message(&map))
                         } else {
                             None
                         };
@@ -1959,6 +1916,21 @@ goal: schema::PoseStamped {
             .unwrap_or_else(|_| panic!("完整三维路径未实际执行: {:?}", self.scheduler.status()));
         }
 
+        async fn wait_local_stop_or_reverse(&self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let status=self.scheduler.status();
+                    let safe=status.last_applied_twist.is_some_and(|twist| {
+                        (twist==Twist2::ZERO && status.message.contains("重规划"))
+                            || (twist.linear.x<0. && twist.linear.x>=-0.04
+                                && twist.linear.y==0. && twist.angular_z==0.)
+                    });
+                    if status.phase==SchedulerPhase::Controlling && safe {break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap_or_else(|_|panic!("物理占据后应停车重规划或执行已证明的低速倒退：{:?}",self.scheduler.status()));
+        }
+
         async fn wait_local_zero(&self){
             tokio::time::timeout(Duration::from_secs(3),async{
                 loop{let status=self.scheduler.status();
@@ -1990,11 +1962,12 @@ goal: schema::PoseStamped {
             .unwrap();
         }
         async fn map(&self, map: &schema::NavigationMap3D) {
+            let map = self.feed.lock().unwrap().source.message(map);
             publish_body(
                 &self.transport,
                 &self.planner_node.inputs[0],
                 "nuwax_msgs.NavigationMap3D",
-                schema::encode_navigation_map_3d_body(map).unwrap(),
+                schema::encode_navigation_map_3d_body(&map).unwrap(),
             )
             .await
             .unwrap();
@@ -2290,6 +2263,42 @@ goal: schema::PoseStamped {
         assert!(state.message.contains("无进展重规划3次"));
 
         assert_eq!(state.last_applied_twist,Some(Twist2::ZERO));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn approach_endpoint_inside_goal_tolerance_executes_as_complete_and_arrives() {
+        let computer: SurfacePathComputer = Arc::new(|map, pose, goal, config| {
+            let mut endpoint = goal.clone();
+            endpoint.goal.pose.position[0] -= 0.10;
+            endpoint.goal.pose.position[2] += 0.05;
+            Ok(SurfacePlan { path: body_path(map, pose, &endpoint, config)?,
+                kind: nuwax_nav_runtime::RouteKind::Approach, resolution: 0.1 })
+        });
+        let mut harness = Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [1.15, 1.55, 2.5]);
+        harness.goal(&goal).await;
+        let route = harness.path_for(&goal).await;
+        assert_eq!(route.route_kind, 0, "端点满足平面及高度容差时按完整路线交付");
+        harness.wait_controlling().await;
+        assert_eq!(harness.scheduler.status().last_terminal, None, "路线接纳不能替代实测到达");
+        harness.feed.lock().unwrap().position = route.path.poses.last().unwrap().pose.position;
+        // 夹具位置固定在距目标0.10米处；新到达规则须继续平移，不能只进容差就完成。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = harness.scheduler.status();
+                if status.surface_replan_feedback.as_ref().is_some_and(|feedback|
+                    feedback.terminal_phase == nuwax_nav_runtime::TerminalPhase::Translating)
+                    && status.last_applied_twist.is_some_and(|command| command.linear.x > 0.) {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(harness.scheduler.status().last_terminal, None, "尚未平移到停点时不得提前到达");
+        assert_eq!(harness.scheduler.status().path_revision, route.path_revision as u64);
+        harness.cancel(&goal).await;
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
         harness.shutdown().await;
     }
 
@@ -2599,7 +2608,7 @@ goal: schema::PoseStamped {
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
         assert_eq!(starts.lock().unwrap().len(), 1, "新图不能触发全程重复检查和搜索");
         harness.feed.lock().unwrap().position[0] = 1.85;
-        harness.wait_local_zero().await;
+        harness.wait_local_stop_or_reverse().await;
         assert_eq!(starts.lock().unwrap().len(),1,"局部受阻由局部规划线程处理，保留全局路线身份");
         assert_eq!(harness.scheduler.status().path_revision,1);
         assert!(harness.scheduler.status().pose_source_timestamp_ns>0);
@@ -2728,7 +2737,7 @@ goal: schema::PoseStamped {
         first.path_for(&pending).await;
         first.wait_controlling().await;
 
-        // 同域的新点云新增真实占据冲突，实际执行先零速等待；清障后连续重规划。
+        // 同域真实占据冲突允许经证明低速倒退；清障后连续重规划。
         // 缺测本身不是障碍，不能只删除地面采样就要求执行端宣告阻塞。
         let original = first.feed.lock().unwrap().map.cloud.clone();
         {
@@ -2739,11 +2748,10 @@ goal: schema::PoseStamped {
             feed.map.cloud.width = (feed.map.cloud.data.len() / 12) as i32;
             feed.map.cloud.row_step = feed.map.cloud.data.len() as i32;
         }
-        first.wait_local_zero().await;
-        assert_eq!(
-            first.scheduler.status().last_applied_twist,
-            Some(Twist2::ZERO)
-        );
+        first.wait_local_stop_or_reverse().await;
+        let action=first.scheduler.status().last_applied_twist.unwrap();
+        assert!(action.linear.x>=-0.04 && action.linear.x<=0.
+            && action.linear.y==0. && action.angular_z==0.);
         assert!(first.scheduler.status().last_terminal.is_none());
         {
             let mut feed = first.feed.lock().unwrap();

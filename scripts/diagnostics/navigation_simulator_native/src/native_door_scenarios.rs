@@ -197,7 +197,7 @@ mod tests {
 
     fn diagnostic_config() -> (SurfaceNavigationConfig, &'static str) {
         let mut config =
-            SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.328)/2., -(0.328)/2.], [(0.328)/2., -(0.328)/2.], [(0.328)/2., (0.328)/2.], [-(0.328)/2., (0.328)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2)
+            SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.328)/2., -(0.328)/2.], [(0.328)/2., -(0.328)/2.], [(0.328)/2., (0.328)/2.], [-(0.328)/2., (0.328)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2, 0.15)
                 .unwrap();
         // Synthetic fixture-contract body only; runtime scenes keep the full
         // actual Go2 convex hull loaded by the unchanged launcher.

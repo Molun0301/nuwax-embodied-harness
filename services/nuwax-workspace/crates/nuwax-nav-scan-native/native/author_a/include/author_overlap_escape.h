@@ -8,14 +8,17 @@ namespace scan_planner {
 // 同一事件保留退出方向和运动记账；连续半秒来源时间无重叠或新目标才结束事件。
 class AuthorOverlapEscape {
   struct Contact { GridMap::BodyCell cell; Eigen::Vector2d axis; double depth; double remaining=0.; bool body_axis=false; bool directed=false; };
-  bool active_=false,latched_=false,recontact_=false;
+  bool active_=false,latched_=false,recontact_=false,waiting_for_stop_=false;
   std::optional<int64_t> clear_since_;
+  std::optional<int64_t> decision_stamp_;
+  std::vector<ScanSample> decision_samples_;
+  ScanOutput decision_output_{};
   int64_t began_=0,last_stamp_=0;
   unsigned ticks_=0;
   double traveled_=0.;
   double admitted_=0.;
   double distance_limit_=0.,time_limit_=0.;
-  static constexpr double escape_speed_=.04;
+  static double escapeSpeed(const ScanConfig& c) {return std::max(.04,c.min_executable_linear_mps);}
   // 三格误差带覆盖定位偏差与占据量化；只用于恢复准入，不改变碰撞外包。
   static double penetrationLimit(const ScanConfig& c) {return 3.*c.resolution;}
   std::string failure_;
@@ -135,7 +138,7 @@ class AuthorOverlapEscape {
 
   // 实测瞬时速度不能先向内再靠本拍平均位移抵消；在切向平台处允许数值零。
   static bool startsOutward(const Contact& contact,const ScanConfig& c,
-      const command_check_detail::State& state) {
+      const command_check_detail::State& state,double allowance=0.) {
     using namespace command_check_detail;
     const double co=std::cos(state.yaw),si=std::sin(state.yaw),w=state.angular;
     const auto abs_rate=[](double value,double rate) {
@@ -156,13 +159,13 @@ class AuthorOverlapEscape {
           :cell_rate-sign*local_rate[i-2];
       if(d<best){best=d;rate=r;}else if(d==best)rate=std::min(rate,r);
     }
-    return best<0.||rate<=64.*std::numeric_limits<double>::epsilon()*
+    return best<0.||rate<=allowance+64.*std::numeric_limits<double>::epsilon()*
         (1.+state.linear.norm()+std::abs(w)*(radius(c)+local.norm()));
   }
 
   bool advance(GridMap& map,const ScanConfig& c,command_check_detail::State& state,
       const Eigen::Vector2d& target,double angular,command_check_detail::Clock::time_point deadline,
-      bool& exhausted,double& path_bound) const {
+      bool& exhausted,double& path_bound,bool& budget_exhausted,bool measured_stopped=false) const {
     using namespace command_check_detail;
     const auto next=toward(state.linear,target,c.max_acceleration*c.sample_dt);
     const double next_w=std::clamp(angular,state.angular-c.max_yaw_acceleration*c.sample_dt,
@@ -172,18 +175,22 @@ class AuthorOverlapEscape {
     const double turn=std::max(std::abs(state.angular),std::abs(next_w));
     const double speed=std::max(state.linear.norm(),next.norm());
     path_bound+=(speed+radius(c)*turn)*c.sample_dt;
-    if(admitted_+path_bound>distance_limit_)return false;
+    if(admitted_+path_bound>distance_limit_){budget_exhausted=true;return false;}
+    // 停稳实测只将起步导数按零速证明；连续运动及制动扫掠仍使用原实测边界。
+    State start=state;
+    if(measured_stopped){start.linear.setZero();start.angular=0.;}
     for(const auto& contact:contacts_) {
-      if(!startsOutward(contact,c,state)||!monotone(contact,c,state,mean,mean_w,c.sample_dt))return false;
+      if(!startsOutward(contact,c,start)||!monotone(contact,c,state,mean,mean_w,c.sample_dt))return false;
     }
     if(!sweepFree(map,state,mean,mean_w,radius(c),0.,c.sample_dt,deadline,exhausted,&initial_))return false;
     auto end=motionAt(state,mean,mean_w,c.sample_dt);end.linear=next;end.angular=next_w;
-    if(traveled_+(end.position-last_).norm()>distance_limit_)return false;
+    if((end.position-last_).norm()>distance_limit_){budget_exhausted=true;return false;}
     state=end;return true;
   }
 
  public:
   bool active() const { return active_; }
+  bool hasDecision(int64_t stamp) const {return decision_stamp_&&*decision_stamp_==stamp;}
   void observeOverlap() {
     if(clear_since_){recontact_=true;clear_since_.reset();}
   }
@@ -191,20 +198,30 @@ class AuthorOverlapEscape {
     if(!active_)return;
     if(!clear_since_||stamp<last_stamp_)clear_since_=stamp;
     if(stamp-*clear_since_>=500000000){*this=AuthorOverlapEscape{};return;}
-    // 暂时清除仍属于原事件；保留预算并记入这期间的实测行程。
-    if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
+    // 暂时清除保留原事件，以确认进展点为原点计算净位移。
+    if(stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
   }
 
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
-      const double* velocity,double angular,int64_t stamp,ScanOutput& output) {
+      const double* velocity,double angular,int64_t stamp,const double previous[3],ScanOutput& output) {
+    if(hasDecision(stamp)) {
+      // 同源重复只停车，沿用首拍证明样本，不重新准入、记账或失败。
+      output=decision_output_;
+      output.command_forward=output.command_lateral=output.command_yaw_rate=0.;
+      output.samples=static_cast<ScanSample*>(std::calloc(decision_samples_.size(),sizeof(ScanSample)));
+      std::copy(decision_samples_.begin(),decision_samples_.end(),output.samples);return;
+    }
     // 缺测尚不能开始恢复证明，保留原输入等待语义，不宣告几何恢复失败。
     if(!velocity||!std::isfinite(angular))
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
+    decision_stamp_=stamp;decision_samples_.clear();decision_output_={};
     try {
-      planImpl(map,c,p,yaw,velocity,angular,stamp,recontact_,output);
+      planImpl(map,c,p,yaw,velocity,angular,stamp,previous,recontact_,output);
       recontact_=false;
-      // 只有通过整拍和制动证明并输出动作，才将后续无安全候选记为真实失败。
+      // 只有输出非零动作，才开始事件运动预算。
       latched_|=output.command_forward!=0.||output.command_lateral!=0.||output.command_yaw_rate!=0.;
+      decision_output_=output;decision_output_.samples=nullptr;
+      decision_samples_.assign(output.samples,output.samples+output.sample_count);
     } catch(const std::runtime_error& error) {
       throw std::runtime_error("BODY_OVERLAP_RECOVERY_FAILED: "+std::string(error.what()));
     }
@@ -212,99 +229,130 @@ class AuthorOverlapEscape {
 
  private:
   void planImpl(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
-      const double* velocity,double angular,int64_t stamp,bool recontact,ScanOutput& output) {
+      const double* velocity,double angular,int64_t stamp,const double previous[3],bool recontact,ScanOutput& output) {
     using namespace command_check_detail;
+    const double escape_speed=escapeSpeed(c);
+    // 每个新来源先按当前接触检查三格上限，优先于旧事件故障和动作后增深。
+    std::vector<GridMap::BodyCell> cells;
+    if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())
+      throw std::runtime_error("Current body pose is occupied or outside the local map; no eligible contacts");
+    std::vector<Contact> current;
+    for(const auto& cell:cells) {
+      Contact selected{cell,Eigen::Vector2d::Zero(),std::numeric_limits<double>::infinity()};
+      const Eigen::Vector2d center=p.head<2>()+world({c.body_center_x,c.body_center_y},yaw);
+      const Eigen::Vector2d delta=center-Eigen::Vector2d((cell[0]+.5)*c.resolution,(cell[1]+.5)*c.resolution);
+      for(auto axis:std::array<Eigen::Vector2d,4>{Eigen::Vector2d::UnitX(),Eigen::Vector2d::UnitY(),
+          world(Eigen::Vector2d::UnitX(),yaw),world(Eigen::Vector2d::UnitY(),yaw)}) {
+        if(axis.dot(delta)<0.)axis=-axis;
+        const Contact candidate{cell,axis,0.};const double penetration=depth(candidate,c,p,yaw);
+        if(penetration<selected.depth)selected={cell,axis,penetration};
+      }
+      if(!(selected.depth>=0.&&selected.depth<=penetrationLimit(c))) {
+        waiting_for_stop_|=latched_;
+        throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
+      }
+      selected.remaining=selected.depth;current.push_back(selected);
+    }
     if(!failure_.empty())throw std::runtime_error(failure_);
-    const bool starting=!active_;
+    const bool starting=!latched_;
+    ScanState measured{};std::copy(velocity,velocity+3,measured.velocity);measured.yaw_rate=angular;
+    measured.measured_velocity=measured.measured_yaw_rate=1;
+    const bool stopped=nuwax_scan_motion_stopped(&measured);
+    const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
+    const bool rebuilding=waiting_for_stop_&&stopped;
     if(starting) {
       last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;failure_.clear();
       contacts_.clear();initial_.clear();
     }
-    if(starting||recontact) {
-      // 短暂清除后新出现的当前接触重新过三格准入；原方向和原预算不重置。
-      std::vector<GridMap::BodyCell> cells;
-      if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())
-        throw std::runtime_error("Current body pose is occupied or outside the local map; no eligible contacts");
-      for(const auto& cell:cells) {
-        if(initial_.count(cell))continue;
-        Contact selected{cell,Eigen::Vector2d::Zero(),std::numeric_limits<double>::infinity()};
-        const Eigen::Vector2d center=p.head<2>()+world({c.body_center_x,c.body_center_y},yaw);
-        const Eigen::Vector2d delta=center-Eigen::Vector2d((cell[0]+.5)*c.resolution,(cell[1]+.5)*c.resolution);
-        for(auto axis:std::array<Eigen::Vector2d,4>{Eigen::Vector2d::UnitX(),Eigen::Vector2d::UnitY(),
-            world(Eigen::Vector2d::UnitX(),yaw),world(Eigen::Vector2d::UnitY(),yaw)}) {
-          if(axis.dot(delta)<0.)axis=-axis;
-          const Contact candidate{cell,axis,0.};const double penetration=depth(candidate,c,p,yaw);
-          if(penetration<selected.depth)selected={cell,axis,penetration};
-        }
-        if(!(selected.depth>=0.&&selected.depth<=penetrationLimit(c)))
-          throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
-        selected.remaining=selected.depth;contacts_.push_back(selected);initial_.insert(cell);
+    if(rebuilding){contacts_.clear();initial_.clear();}
+    if(starting||recontact||rebuilding) {
+      // 当前接触已经逐成员通过三格准入；重建退出方向时不重置事件预算。
+      for(const auto& contact:current) {
+        if(initial_.count(contact.cell))continue;
+        contacts_.push_back(contact);initial_.insert(contact.cell);
       }
+      if(rebuilding)waiting_for_stop_=false;
     }
     if(starting) {
       // 深重叠需要超过一格的退出行程；按初始最大穿透的两倍计入斜向退出，
       // 时间由同一行程和既有低速推出。浅接触保留原一格、两秒未确认预算。
       distance_limit_=c.resolution;
       for(const auto& contact:contacts_)distance_limit_=std::max(distance_limit_,2.*contact.depth);
-      time_limit_=std::max(2.,distance_limit_/escape_speed_+c.sample_dt);
-      active_=true;
+      time_limit_=std::max(2.,distance_limit_/escape_speed+c.sample_dt);
     }
     if(stamp<last_stamp_)throw std::runtime_error("Current body pose is occupied; escape source clock regressed");
+    const auto check_budget=[&]() {
+      if(latched_&&(stamp-began_>time_limit_*1e9||ticks_>static_cast<unsigned>(std::ceil(time_limit_/c.sample_dt))
+          ||traveled_>=distance_limit_||admitted_>=distance_limit_)) {
+        failure_="Current body pose is occupied; escape time or distance budget exhausted";
+        throw std::runtime_error(failure_);
+      }
+    };
     bool progress_observed=false;
+    if(waiting_for_stop_) {
+      if(stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
+      check_budget();
+      throw std::runtime_error("Current body pose is occupied; measured escape penetration increased; waiting for measured stop");
+    }
     for(auto& contact:contacts_) {
       const double now=penetration(contact,c,p,yaw);
       const double remaining=depth(contact,c,p,yaw);
-      if(latched_&&(now>contact.depth+1e-10
-          ||(contact.directed&&std::max(0.,remaining)>std::max(0.,contact.remaining)+1e-10))) {
-        failure_="Current body pose is occupied; measured escape penetration increased";
-        throw std::runtime_error(failure_);
-      }
-      if(now>penetrationLimit(c))
+      if(now>penetrationLimit(c)) {
+        waiting_for_stop_|=latched_;
         throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
-      // 动作前的静止测量变化只更新基准，不结算或重发未确认运动预算。
+      }
+      const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
+      const double stopped_rate=.02+.02*(voxel-p.head<2>()).norm();
+      if(latched_&&!rebuilding&&!startsOutward(contact,c,actual,stopped_rate)) {
+        waiting_for_stop_=true;
+        if(stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
+        check_budget();
+        throw std::runtime_error("Current body pose is occupied; measured escape penetration increased");
+      }
+      // 动作前只更新基准；动作后未证实向内的数值增深也不触发等待停车。
       if(!latched_){contact.depth=now;contact.remaining=remaining;continue;}
-      if(now<contact.depth-1e-10||remaining<contact.remaining-1e-10)progress_observed=true;
+      if(!rebuilding&&(now<contact.depth-1e-10||remaining<contact.remaining-1e-10))progress_observed=true;
+      contact.depth=now;contact.remaining=remaining;
     }
     // 只有新的实测采样证实退出进展，才结清未确认运动预算。
     if(stamp>last_stamp_&&progress_observed) {
-      began_=stamp;ticks_=0;traveled_=admitted_=0.;
+      began_=stamp;ticks_=0;traveled_=admitted_=0.;last_=p;
     }
-    if(stamp>last_stamp_){traveled_+=(p-last_).norm();++ticks_;last_=p;last_stamp_=stamp;}
-    if(stamp-began_>time_limit_*1e9||ticks_>static_cast<unsigned>(std::ceil(time_limit_/c.sample_dt))
-        ||traveled_>=distance_limit_||admitted_>=distance_limit_) {
-      failure_="Current body pose is occupied; escape time or distance budget exhausted";
-      throw std::runtime_error(failure_);
-    }
-    const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
+    if(latched_&&stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}
+    check_budget();
     const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
     std::vector<Eigen::Vector2d> requests;Eigen::Vector2d sum=Eigen::Vector2d::Zero();
     for(const auto& contact:contacts_)sum+=contact.body_axis?world(contact.axis,yaw):contact.axis;
-    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed_,yaw));
-    for(const auto& contact:contacts_)requests.push_back(body((contact.body_axis?world(contact.axis,yaw):contact.axis)*escape_speed_,yaw));
+    if(sum.norm()>0.)requests.push_back(body(sum.normalized()*escape_speed,yaw));
+    for(const auto& contact:contacts_)requests.push_back(body((contact.body_axis?world(contact.axis,yaw):contact.axis)*escape_speed,yaw));
     // 机体系精确轴候选避免坐标往返舍入使严格单调条件失去本可执行的零切向量。
     for(int axis=0;axis<2;++axis)for(double sign:{-1.,1.})
-      requests.emplace_back(axis==0?sign*escape_speed_:0.,axis==1?sign*escape_speed_:0.);
-    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed_,yaw));
+      requests.emplace_back(axis==0?sign*escape_speed:0.,axis==1?sign*escape_speed:0.);
+    for(int i=0;i<16;++i)requests.push_back(body(world(Eigen::Vector2d::UnitX(),i*2.*M_PI/16.)*escape_speed,yaw));
     // 先平移，再原地正反转向，最后小幅平移转向组合；请求仍按平台命令盒和实测加速度限幅。
     std::vector<std::pair<Eigen::Vector2d,double>> candidates;
     for(const auto& request:requests)candidates.emplace_back(request,0.);
-    const double turn_speed=escape_speed_/radius(c);
+    const double turn_speed=std::max(escape_speed/radius(c),c.min_executable_angular_rps);
     for(double sign:{-1.,1.})candidates.emplace_back(Eigen::Vector2d::Zero(),sign*turn_speed);
     for(double fraction:{.5,1.})for(double sign:{-1.,1.})for(const auto& request:requests)
-      candidates.emplace_back(request*.5,sign*fraction*turn_speed);
-    bool exhausted=false;
+      candidates.emplace_back(request*.5,sign*std::max(fraction*turn_speed,c.min_executable_angular_rps));
+    bool exhausted=false,budget_exhausted=false;
+    // 恢复允许既有低速倒退，普通导航的后退选项不限制退出证明。
+    ScanConfig escape_config=c;escape_config.max_reverse_velocity=escape_speed;
+    // 命令加速以上拍下发值为基准；运动与扫掠仍从实测状态开始。
+    const State command_base{p,yaw,{previous[0],previous[1]},previous[2]};
     for(const auto& requested:candidates) {
       if(Clock::now()>=deadline){exhausted=true;break;}
-      const auto command=bounded(requested.first,requested.second,actual,c,false);
+      const auto command=bounded(requested.first,requested.second,command_base,escape_config,false);
       State state=actual;
       double path_bound=0.;
       std::vector<State> samples{actual};
-      if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound))continue;
+      if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound,budget_exhausted,stopped))continue;
       const double issued_bound=path_bound;
       samples.push_back(state);
       bool safe=true;
       while(!state.linear.isZero(0.)||state.angular!=0.) {
-        if(!advance(map,c,state,Eigen::Vector2d::Zero(),0.,deadline,exhausted,path_bound)){safe=false;break;}
+        if(!advance(map,c,state,Eigen::Vector2d::Zero(),0.,deadline,exhausted,path_bound,budget_exhausted)){safe=false;break;}
         samples.push_back(state);
       }
       if(!safe)continue;
@@ -348,8 +396,11 @@ class AuthorOverlapEscape {
           out.acceleration[j]=(out.velocity[j]-output.samples[i-1].velocity[j])/c.sample_dt;
       }
       output.motion_boundary_sources[0]=0;output.motion_boundary_sources[1]=2;output.motion_boundary_sources[2]=0;
-      // 每次发出的整拍最大运动量都记入未确认窗口；重复来源时间不能绕过位移上限。
-      admitted_+=issued_bound;
+      // 首次非零输出起计；同源输出由缓存复用，只计一次未确认整拍运动。
+      if(latched_||output.command_forward!=0.||output.command_lateral!=0.||output.command_yaw_rate!=0.) {
+        if(!latched_){began_=last_stamp_=stamp;last_=p;active_=true;}
+        admitted_+=issued_bound;
+      }
       contacts_=std::move(exits);
       for(auto& contact:contacts_) {
         contact.depth=penetration(contact,c,p,yaw);
@@ -357,9 +408,13 @@ class AuthorOverlapEscape {
       }
       return;
     }
-    const std::string reason=exhausted?"Current body pose is occupied; escape proof computation exhausted"
+    const std::string reason=budget_exhausted?"Current body pose is occupied; escape time or distance budget exhausted"
+        :exhausted?"Current body pose is occupied; escape proof computation exhausted"
         :"Current body pose is occupied; no safe escape candidate: no monotone collision-free escape and braking sweep";
-    if(latched_&&!exhausted)failure_=reason;
+    if(latched_) {
+      if(budget_exhausted)failure_=reason;
+      else waiting_for_stop_=true;
+    }
     throw std::runtime_error(reason);
   }
 };

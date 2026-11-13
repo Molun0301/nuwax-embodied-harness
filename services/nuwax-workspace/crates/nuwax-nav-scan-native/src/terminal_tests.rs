@@ -154,3 +154,23 @@ fn terminal_translation_uses_the_executable_floor_without_moving_a_zero_request(
         }
     }
 }
+
+#[test]
+fn terminal_turning_uses_the_executable_floor_and_preserves_zero() {
+    let mut c=config();
+    c.min_executable_angular_rps=0.20;
+    c.max_yaw_acceleration=20.;
+    let state=MotionState{position:[0.,0.,0.4],measured_velocity:1,
+        measured_yaw_rate:1,timestamp_ns:1_000_000_000,..Default::default()};
+    let mut map=MapOwner::new(&c).unwrap();
+    map.seed_occupied(&[],state.position);
+    map.update_surface(&[],&[],&[],&[]).unwrap();
+    let snapshot=map.snapshot();
+    for yaw in [-0.01,0.,0.01] {
+        let tracked=ScanTracker::default().track_terminal_position(
+            &c,&snapshot,&state,[0.;3],Some(yaw),None).unwrap();
+        assert!(!tracked.invalid());
+        assert!((tracked.command[2]-if yaw==0. {0.} else {0.20*yaw.signum()}).abs()<1e-12);
+        assert_eq!(&tracked.command[..2],&[0.,0.]);
+    }
+}

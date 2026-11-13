@@ -268,6 +268,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw));
       s.raw={};s.raw.angular.z=std::clamp(s.controller.kp_yaw*diff,-c->max_yaw_rate,c->max_yaw_rate);desired_yaw=terminal_yaw;
+      if(s.raw.angular.z!=0.&&std::abs(s.raw.angular.z)<c->min_executable_angular_rps)s.raw.angular.z=std::copysign(c->min_executable_angular_rps,s.raw.angular.z);
       if(terminal_position) {
         target=Eigen::Map<const Vector3d>(terminal_position);
         Eigen::Vector2d velocity=(target-position).head<2>();
@@ -317,6 +318,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.reference_time+s.controller.time_forward));s.controller.cmdCallback({});
       if(turning)s.raw.linear={};
       s.raw.angular.z=std::clamp(s.controller.kp_yaw*scan_planner::headingDifference(desired_yaw,yaw),-c->max_yaw_rate,c->max_yaw_rate);
+      if(turning&&s.raw.angular.z!=0.&&std::abs(s.raw.angular.z)<c->min_executable_angular_rps)s.raw.angular.z=std::copysign(c->min_executable_angular_rps,s.raw.angular.z);
       if(out->remaining<=REPLAN_REMAINING_SECONDS&&!s.curve->reaches_reference_end)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }

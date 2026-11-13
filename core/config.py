@@ -199,8 +199,8 @@ def resolve_paths(values, home):
 def derived_values(values, code_root=CODE_ROOT):
     from core.robot_geometry import RobotGeometryConfig, resolve_robot_geometry
     robot, go2 = values["robot"], values["go2"]
-    from importlib import import_module
-    motion = import_module("drivers." + robot["driver"] + ".navigation_capabilities")
+    from runpy import run_path
+    motion = run_path(str(Path(code_root) / "drivers" / robot["driver"] / "navigation_capabilities.py"))
     profile = {"lio_3d": "pct-scan-3d", "slam_2d": "simple-2d"}[values["geometry"]["pipeline"]]
     linear, yaw, model = (robot[key] for key in (
         "actuator_max_linear_mps", "actuator_max_yaw_rps", "actuator_motion_model"))
@@ -215,8 +215,8 @@ def derived_values(values, code_root=CODE_ROOT):
                                       robot_name=values["unitree_sim"]["model"] if robot["driver"] == "unitree_sim" else robot["driver"],
                                       base_dir=code_root)
     return {"nav_profile": profile,
-            "min_executable_linear_mps": motion.MIN_EXECUTABLE_LINEAR_MPS,
-            "min_executable_angular_rps": motion.MIN_EXECUTABLE_ANGULAR_RPS,
+            "min_executable_linear_mps": motion["MIN_EXECUTABLE_LINEAR_MPS"],
+            "min_executable_angular_rps": motion["MIN_EXECUTABLE_ANGULAR_RPS"],
             "actuator_max_linear_mps": float(linear),
             "actuator_max_yaw_rps": float(yaw), "actuator_motion_model": model if profile == "pct-scan-3d" else "",
             "robot_geometry_json": geometry.to_runtime_json()}

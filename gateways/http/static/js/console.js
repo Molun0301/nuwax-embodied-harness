@@ -314,11 +314,18 @@
       }
       initTabPanels();
 
+      // 三维视图只在监控页、3D 模式且标签页可见时运行；机器人模型与完整点云的轮询随之启停。
+      function sync3dVisibility() {
+        window.pointcloud3d?.setVisible(state.mapViewMode === "3d" && !document.hidden
+          && document.getElementById("monitor-view").classList.contains("active"));
+      }
+      document.addEventListener("visibilitychange", sync3dVisibility);
       function openConsoleView(targetId) {
         const buttons = Array.from(document.querySelectorAll(".view-switch-btn"));
         const panes = Array.from(document.querySelectorAll("#view-host > .view-pane"));
         for (const item of buttons) item.classList.toggle("active", item.dataset.viewTarget === targetId);
         for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
+        sync3dVisibility();
         if (targetId === "config-view") window.nuwaxConsoleSettings?.open();
         if (targetId === "logs-view") window.nuwaxConsoleLogs?.open();
         if (targetId === "monitor-view") redrawMapAfterResize();
@@ -5343,7 +5350,7 @@
         updateMapStreamChip();
         if (nextMode === "3d") resetMapInteraction(true);
         syncMapViewControls();
-        window.pointcloud3d?.setVisible(nextMode === "3d");
+        sync3dVisibility();
         if (nextMode === "3d") {
           if (!window.pointcloud3d || !els.map3dContainer) {
             updateMapStreamChip();

@@ -291,6 +291,7 @@ class ComponentDiagnosticChecks(Checks):
         (self.engine.home / "logs/runtime.log").write_text("OLD_RUNTIME_POISON_DO_NOT_USE\n")
         actual = runtime.Runtime(self.engine.home)
         with patch.object(actual, "status", return_value={"running": False, "healthy": False}), \
+                patch.object(actual, "gateway_healthy", return_value=False), \
                 patch.object(actual, "_components", return_value=report), \
                 patch.object(runtime, "probe", return_value={"transport.real_lcm_required": False}), \
                 patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace(poll=lambda: None)), \

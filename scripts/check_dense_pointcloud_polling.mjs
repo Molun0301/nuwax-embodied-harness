@@ -79,9 +79,10 @@ try {
     assert.deepEqual(partial.calls.map(query => query.get('offset')), ['0', '0', '2', '4']);
     await advance(1000); assert.equal(partial.calls.length, 4); checks++;
     for (const kind of ['live', 'legacy']) {
-      const dynamic = fixture({ kind }); dynamic.layer.start(); await settle(); await advance(1000);
+      // 读完后每秒查一次新点：2秒内共3次请求，新点在下一次查询时读入。
+      const dynamic = fixture({ kind }); dynamic.layer.start(); await settle(); await advance(2000);
       assert.equal(dynamic.calls.length, 3); assert.equal(dynamic.calls[0].get('delta'), '1');
-      dynamic.setTotal(4); await advance(500); assert.equal(dynamic.layer.count, 4);
+      dynamic.setTotal(4); await advance(1000); assert.equal(dynamic.layer.count, 4);
       dynamic.layer.stop(); checks++;
     }
     console.log(JSON.stringify({ checks, scope: 'CPU module/fake timer checks; no browser, network or WebGL benchmark' }));

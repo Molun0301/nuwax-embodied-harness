@@ -756,7 +756,7 @@ class Engine:
                 if runtime_state["healthy"]:
                     self._journal(job, committed=True)
                     return {"version": current.get("version"), "unchanged": True, "runtime": runtime_state}
-                raise ManagerError("already_running", "业务拥有方已运行但健康接口尚未响应，请检查原服务；不会重复启动或停止。", 409)
+                raise ManagerError("already_running", "业务拥有方已运行但网关尚未就绪，请检查原服务；不会重复启动或停止。", 409)
             if action in ("stop", "restart"):
                 self._journal(job, stop_intent=True)
                 self._progress(job, "stopping", 25, "通过原拥有方停止业务")

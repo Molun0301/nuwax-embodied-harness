@@ -54,13 +54,17 @@ try {
   assert.equal(layer.status.mode, 'live');
   const point = new Vector3(1, 0, 0).applyMatrix4(layer.links.get('hand').matrix);
   assert.ok(Math.abs(point.x) < 1e-8 && Math.abs(point.y - 1) < 1e-8);
+  // 关节每秒取一次：取到时有效的状态保持一个取数周期加其有效期（1000 + 400 毫秒）。
+  time += 1000;
+  layer.checkFreshness();
+  assert.equal(layer.status.mode, 'live');
   time += 401;
   layer.checkFreshness();
   assert.equal(layer.status.mode, 'reference');
   assert.equal(layer.links.get('hand').matrix.elements[12], 0.4);
   assert.match(layer.status.message, /过期/);
   // 传输耗时计入时效，不在响应到达时续签旧关节。
-  layer.applyState(live, time - 500);
+  layer.applyState(live, time - 1500);
   assert.equal(layer.status.mode, 'reference');
   layer.applyState({ ...live, link_transforms: { torso: identity } });
   assert.equal(layer.status.mode, 'reference');

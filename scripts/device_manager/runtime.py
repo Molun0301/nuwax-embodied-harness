@@ -332,19 +332,23 @@ class Runtime:
         return {"ready": False, "reason": "无法读取新鲜的网关空闲状态，稍后重查"}
 
     def status(self):
-        running = self.has_owner()
-        healthy = False
-        if running:
-            try:
-                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:{}/api/health".format(self.port()), timeout=2) as response:
-                    result = json.loads(response.read(2 * 1024 * 1024))
-                    healthy = response.status == 200 and isinstance(result, dict)
-            except (OSError, ValueError):
-                pass
-        result = {"running": running, "healthy": healthy, "console_url": "/console"}
-        if running and not healthy:
-            result["error"] = "网关进程存在，HTTP健康接口尚未响应；算法和设备就绪请查看控制台。"
+        """业务是否运行、网关是否就绪只问监督者，不回调网关；网关自身的健康由控制台直接查询网关。"""
+        try:
+            gateway = self._components()["components"]["gateway"]
+        except OSError:
+            return {"running": False, "healthy": False, "console_url": "/console"}
+        result = {"running": True, "healthy": gateway["state"] == "running", "console_url": "/console"}
+        if not result["healthy"]:
+            result["error"] = "业务监督者在运行，网关尚未就绪；算法和设备就绪请查看控制台。"
         return result
+
+    def gateway_healthy(self):
+        """启动业务时以网关 HTTP 健康接口应答作为启动成功的判据。"""
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:{}/api/health".format(self.port()), timeout=2) as response:
+                return response.status == 200 and isinstance(json.loads(response.read(2 * 1024 * 1024)), dict)
+        except (OSError, ValueError):
+            return False
 
     def diagnostic(self):
         """按监督者报告取已退出组件及其实际日志，不读取历史业务总日志。"""
@@ -385,7 +389,7 @@ class Runtime:
             if process.poll() is not None:
                 raise ManagerError("start_failed", "业务监督者提前退出。", 500,
                                    log_diagnostic(self.home, self.home / "logs/runtime.log"))
-            if self.status()["healthy"]:
+            if self.gateway_healthy():
                 return
             time.sleep(0.4)
         raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, self.diagnostic())

@@ -395,17 +395,6 @@
         idle: "空闲",
       };
       const BOOL_LABELS = { true: "是", false: "否" };
-      const SOURCE_KIND_LABELS = {
-        live: "实时",
-        stream: "流式",
-        stream_bus: "流总线",
-        cache: "缓存",
-        offline: "离线",
-        unavailable: "不可用",
-        pointcloud_provider: "点云服务",
-        gateway: "网关",
-        psutil: "系统采集",
-      };
       const COMMON_FIELD_LABELS = {
         latency: "延迟",
         frame: "坐标系",
@@ -470,18 +459,6 @@
         if (value === true || value === "true") return BOOL_LABELS.true;
         if (value === false || value === "false") return BOOL_LABELS.false;
         return "未上报";
-      }
-      function displaySource(value) {
-        const key = String(value === null || value === undefined || value === "" ? "missing" : value).toLowerCase();
-        return SOURCE_KIND_LABELS[key] || safeText(value);
-      }
-      function displayValue(value, kind) {
-        if (kind === "status") return displayStatus(value);
-        if (kind === "bool") return displayBool(value);
-        if (kind === "source") return displaySource(value);
-        if (kind === "task_state") return TASK_STATE_LABELS[normalizeTaskState(value)] || displayStatus(value);
-        if (value === true || value === false) return displayBool(value);
-        return safeText(value);
       }
       function statusOf(envelope) { return envelope && envelope.status ? String(envelope.status) : "missing"; }
       function statusClass(status) {
@@ -814,12 +791,15 @@
           const title = left.querySelector(".mono") || document.createElement("div");
           title.className = "mono";
           const taskId = safeText(task.task_id || task.id);
-          title.textContent = task.feedback?.source?.display_name || task.capability || taskId;
+          // 中文标题来自能力定义，能力标识作小字。
+          const capabilityId = document.createElement("span");
+          capabilityId.className = "meta";
+          capabilityId.textContent = ` ${task.capability}`;
+          title.replaceChildren(task.title, capabilityId);
           title.title = taskId;
           const meta = left.querySelector(":scope > .meta") || document.createElement("div");
           meta.className = "meta";
           const taskState = normalizeTaskState(task.state || task.status);
-          const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timed_out", "cancelled"].includes(taskState) ? "未上报原因" : "");
           const progressNumber = Number(task.progress);
           const progressPercent = Number.isFinite(Number(task.progress_percent))
             ? Math.round(Number(task.progress_percent))
@@ -828,9 +808,9 @@
               : null;
           const progressText = progressPercent === null ? "进度未上报" : `进度 ${progressPercent}%`;
           const timeText = taskUpdatedMs(task) ? `更新 ${shortTime(new Date(taskUpdatedMs(task)).toISOString())}` : "时间未上报";
-          const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
-          const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timed_out"].includes(taskState) ? " · 不建议原样重试" : "";
-          meta.textContent = task.feedback?.message || task.summary || `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
+          // 阶段的中文说明由任务处理器随每次进度写在 message（ctx.progress 的第三个参数），阶段标识放悬停提示。
+          meta.textContent = `${task.message} · ${progressText} · ${timeText}`;
+          meta.title = `阶段标识：${task.stage}`;
           if (!heading.parentElement) left.prepend(heading);
           if (title.parentElement !== heading) heading.append(title);
           if (!meta.parentElement) left.append(meta);
@@ -841,7 +821,7 @@
           }
           const pill = heading.querySelector(".pill") || row.querySelector(":scope > .pill") || document.createElement("span");
           pill.className = `pill ${taskState === "failed" || taskState === "timed_out" ? "error" : taskState === "running" || taskState === "cancelling" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
-          pill.textContent = displayValue(taskState, "task_state");
+          pill.textContent = task.state_title;
           pill.title = taskState;
           if (!left.parentElement) row.append(left);
           if (pill.parentElement !== heading) heading.append(pill);

@@ -19,7 +19,7 @@ def build_task_feedback(platform, status):
     return {"stream_id": platform.events.instance_id,
             "event_type": "task.updated", "task_id": task["task_id"],
             "source": {"role": "tool", "component": "tasks", "capability_name": task["capability"],
-                       "display_name": task["capability"]},
+                       "display_name": task["title"]},
             "state": state, "stage": task["stage"], "progress": task["progress"],
             "severity": "error" if state in {"failed", "timed_out"} else "info",
             "message": task["message"], "attention": "wake" if state in TERMINAL_STATES else "observe",

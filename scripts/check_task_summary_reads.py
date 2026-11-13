@@ -13,7 +13,7 @@ from scripts.diagnostics.current_fixtures import task_platform,finished
 class TaskSummaryChecks(unittest.TestCase):
     def test_history_order_retention_and_complete_result(self):
         with task_platform(history_limit=2) as p:
-            p.capabilities.register(Capability("work","样例",{"type":"object"},"task",lambda p,c,a:a))
+            p.capabilities.register(Capability("work","样例", "样例",{"type":"object"},"task",lambda p,c,a:a))
             ids=[]
             for value in range(3):
                 task_id=invoke(p,"work",{"value":value},"check")["task"]["task_id"]
@@ -37,7 +37,7 @@ class TaskTimeoutChecks(unittest.TestCase):
                     finally:
                         cleaning.set()
                         release.wait()
-                p.capabilities.register(Capability("work", "样例", {"type":"object"}, "task", handler, timeout_sec=.1))
+                p.capabilities.register(Capability("work", "样例", "样例", {"type":"object"}, "task", handler, timeout_sec=.1))
                 task_id = invoke(p, "work", {}, "check")["task"]["task_id"]
                 try:
                     self.assertTrue(cleaning.wait(2), "到期后必须先完成处理器收尾")
@@ -59,7 +59,7 @@ class TaskTimeoutChecks(unittest.TestCase):
 
     def test_timeout_without_progress_keeps_timeout_message(self):
         with task_platform() as p:
-            p.capabilities.register(Capability("work", "样例", {"type":"object"}, "task", lambda p,c,a:c.wait(10), timeout_sec=.02))
+            p.capabilities.register(Capability("work", "样例", "样例", {"type":"object"}, "task", lambda p,c,a:c.wait(10), timeout_sec=.02))
             task_id = invoke(p, "work", {}, "check")["task"]["task_id"]
             status = finished(p, task_id)
             self.assertEqual(status.state, TaskState.TIMED_OUT)

@@ -8,6 +8,8 @@ CapabilityKind = Literal["query", "action", "task"]
 @dataclass(frozen=True)
 class Capability:
     name: str
+    # 面向用户的中文标题；任务快照与网页显示都取这里，标识 name 只作次要信息。
+    title: str
     description: str
     input_schema: dict
     kind: CapabilityKind

@@ -26,12 +26,19 @@ class TaskState(str, Enum):
     TIMED_OUT = "timed_out"
 
 
+# 任务状态的中文与状态同处定义，快照随状态一并带出。
+STATE_TITLES = {TaskState.RUNNING: "运行中", TaskState.CANCELLING: "取消中", TaskState.SUCCEEDED: "已完成",
+                TaskState.FAILED: "失败", TaskState.CANCELLED: "已取消", TaskState.TIMED_OUT: "已超时"}
+
+
 @dataclass(frozen=True)
 class TaskStatus:
     task_id: str
     capability: str
+    title: str
     caller: str
     state: TaskState
+    state_title: str
     motion: bool
     progress: float
     stage: str
@@ -135,8 +142,8 @@ class TaskRunner:
             duration = args.get("timeout_sec", cap.timeout_sec)
             ctx = TaskContext(task_id, threading.Event(),
                               None if duration is None else time.monotonic() + duration, self)
-            status = TaskStatus(task_id, cap.name, caller, TaskState.RUNNING, cap.motion, 0.0,
-                                "running", "任务正在执行。", {}, None, None, None, time.time(), None)
+            status = TaskStatus(task_id, cap.name, cap.title, caller, TaskState.RUNNING, STATE_TITLES[TaskState.RUNNING],
+                                cap.motion, 0.0, "running", "任务正在执行。", {}, None, None, None, time.time(), None)
             self._statuses[task_id] = status
             self._contexts[task_id] = ctx
             if cap.motion:
@@ -191,7 +198,8 @@ class TaskRunner:
                     result = dict(error.details)
             else:
                 state, message, code = TaskState.SUCCEEDED, "任务已完成。", None
-            status = replace(current, state=state, message=message, result=result, error_code=code,
+            status = replace(current, state=state, state_title=STATE_TITLES[state], message=message, result=result,
+                             error_code=code,
                              progress=1.0 if state == TaskState.SUCCEEDED else current.progress,
                              cancel_reason="期限" if timed_out else current.cancel_reason, finished_at=time.time())
             self._statuses[ctx.task_id] = status
@@ -222,7 +230,8 @@ class TaskRunner:
         current = self._statuses[task_id]
         if current.state == TaskState.CANCELLING:
             return None
-        status = replace(current, state=TaskState.CANCELLING, cancel_reason=reason, message=reason)
+        status = replace(current, state=TaskState.CANCELLING, state_title=STATE_TITLES[TaskState.CANCELLING],
+                         cancel_reason=reason, message=reason)
         self._statuses[task_id] = status
         return self._prepare(status)
 

@@ -69,13 +69,13 @@ def stop_perception_runtime(platform, args):
 CAMERA = {"camera_id": {"type": "string"}}
 DETECTION = {**CAMERA, "detector_backend": {"type": "string"}}
 CAPABILITIES = [
-    Capability("capture_image", "抓取单帧图像并生成观察与图像制品。", schema(CAMERA), "action", capture_image),
-    Capability("get_latest_observation", "读取缓存的最新观察。", schema(CAMERA), "query", get_latest_observation),
-    Capability("perceive_current_scene", "识别当前画面并生成场景摘要。", schema(DETECTION), "action", perceive_current_scene),
-    Capability("describe_current_scene", "返回当前场景摘要与完整感知结果。",
+    Capability("capture_image", "抓取图像", "抓取单帧图像并生成观察与图像制品。", schema(CAMERA), "action", capture_image),
+    Capability("get_latest_observation", "获取最新观察", "读取缓存的最新观察。", schema(CAMERA), "query", get_latest_observation),
+    Capability("perceive_current_scene", "感知当前场景", "识别当前画面并生成场景摘要。", schema(DETECTION), "action", perceive_current_scene),
+    Capability("describe_current_scene", "描述当前场景", "返回当前场景摘要与完整感知结果。",
         schema({**DETECTION, "refresh": {"type": "boolean", "default": True}}), "action", describe_current_scene),
-    Capability("get_latest_perception", "读取缓存的最新识别结果。", schema(CAMERA), "query", get_latest_perception),
-    Capability("get_perception_runtime_status", "读取连续识别状态及使用原因。", schema({}), "query", get_perception_runtime_status),
-    Capability("start_perception_runtime", "申请手动连续识别原因。", schema({}), "action", start_perception_runtime),
-    Capability("stop_perception_runtime", "释放手动连续识别原因。", schema({}), "action", stop_perception_runtime),
+    Capability("get_latest_perception", "获取最新感知", "读取缓存的最新识别结果。", schema(CAMERA), "query", get_latest_perception),
+    Capability("get_perception_runtime_status", "读取连续识别状态", "读取连续识别状态及使用原因。", schema({}), "query", get_perception_runtime_status),
+    Capability("start_perception_runtime", "开启连续识别", "申请手动连续识别原因。", schema({}), "action", start_perception_runtime),
+    Capability("stop_perception_runtime", "关闭连续识别", "释放手动连续识别原因。", schema({}), "action", stop_perception_runtime),
 ]

@@ -127,7 +127,7 @@ def follow_target(platform, ctx, args):
 
 
 CAPABILITIES = [
-    Capability("follow_target", "在指定时段消费统一感知结果跟随目标；目标丢失超时结束。",
+    Capability("follow_target", "跟随目标", "在指定时段消费统一感知结果跟随目标；目标丢失超时结束。",
         schema({"query": {"type": "string", "minLength": 1}, "camera_id": {"type": "string"},
                 "detector_backend": {"type": "string"},
                 "duration_sec": {"type": "number", "exclusiveMinimum": 0, "default": 2.0},

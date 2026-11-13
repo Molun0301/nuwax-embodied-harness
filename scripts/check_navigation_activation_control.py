@@ -16,7 +16,7 @@ class PreparationChecks(unittest.TestCase):
                 entered,release,dispatched=threading.Event(),threading.Event(),threading.Event()
                 def ensure(names,budget,*,ctx=None):entered.set();release.wait(2)
                 p.ensure=ensure
-                p.capabilities.register(Capability("prepare","准备",{"type":"object"},"task",
+                p.capabilities.register(Capability("prepare","准备", "准备",{"type":"object"},"task",
                     lambda *a:dispatched.set(),needs=("geometry",),timeout_sec=.03 if timeout else 2))
                 task_id=invoke(p,"prepare",{},"check")["task"]["task_id"]
                 self.assertTrue(entered.wait(1))

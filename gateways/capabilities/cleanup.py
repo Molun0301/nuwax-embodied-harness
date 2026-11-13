@@ -21,14 +21,14 @@ def apply(platform, ctx, args):
 
 TEXT = {"type": "string"}
 CAPABILITIES = [
-    Capability("preview_map_cleanup", "对已保存地图按力度识别浮空点，生成真实清理预览。",
+    Capability("preview_map_cleanup", "预览完成地图清理", "对已保存地图按力度识别浮空点，生成真实清理预览。",
                schema({"map_name": TEXT, "strength_percent": {"type": "integer", "minimum": 0, "maximum": 100, "default": 50}},
                       ("map_name",)), "action", preview, agent_tool=False, normalize_names=("map_name",)),
-    Capability("get_map_cleanup", "读取清理作业状态与工具统计摘要。",
+    Capability("get_map_cleanup", "读取清理预览", "读取清理作业状态与工具统计摘要。",
                schema({"preview_id": TEXT}, ("preview_id",)), "query", status, agent_tool=False),
-    Capability("cancel_map_cleanup", "结束清理预览进程并删除预览工作目录。",
+    Capability("cancel_map_cleanup", "取消清理预览", "结束清理预览进程并删除预览工作目录。",
                schema({"preview_id": TEXT}, ("preview_id",)), "action", cancel, agent_tool=False),
-    Capability("apply_map_cleanup", "将确认后的清理候选另存为新地图，保留源地图。",
+    Capability("apply_map_cleanup", "另存清理后新图", "将确认后的清理候选另存为新地图，保留源地图。",
                schema({"preview_id": TEXT, "new_map_name": TEXT, "confirmed": {"type": "boolean", "const": True}},
                       ("preview_id", "new_map_name", "confirmed")), "task", apply, agent_tool=False,
                normalize_names=("new_map_name",)),

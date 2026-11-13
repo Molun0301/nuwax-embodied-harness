@@ -218,6 +218,32 @@ DESCRIPTIONS = {'get_navigation_semantic_context': '读取当前地图绑定的�
  'update_scene_space_label': '按预期修订设置区域名称并保护该显式修改，不伪造人工审核或导航就绪。'}
 
 
+TITLES = {'get_navigation_semantic_context': '获取导航语义上下文',
+ 'resolve_navigation_candidates': '解析导航候选',
+ 'list_memory_libraries': '列出记忆库',
+ 'delete_memory_library': '删除记忆库',
+ 'tag_location': '标记当前位置',
+ 'query_location': '查询地点记忆',
+ 'query_semantic_memory': '查询语义记忆',
+ 'list_scene_spaces': '列出场景空间',
+ 'get_scene_space': '获取场景空间',
+ 'query_scene_spaces': '查询场景空间',
+ 'review_scene_space': '审核场景空间',
+ 'remember_current_scene': '记住当前场景',
+ 'list_semantic_instances': '列出语义实例',
+ 'get_scene_mapping_status': '读取语义地图状态',
+ 'start_scene_mapping': '启动语义地图后台',
+ 'stop_scene_mapping': '停止语义地图后台',
+ 'refresh_semantic_map': '刷新语义地图',
+ 'get_semantic_map': '读取语义地图',
+ 'get_scene_graph': '读取场景关系图',
+ 'get_scene_graph_node': '读取关系图节点',
+ 'plan_scene_graph_route': '查询区域路线',
+ 'render_scene_graph_image': '绘制场景关系图',
+ 'locate_current_scene_space': '判断当前所在区域',
+ 'update_scene_space_label': '修改区域名称'}
+
+
 def _text(args, key):
     value = args.get(key)
     return value.strip() or None if value is not None else None
@@ -429,7 +455,7 @@ SCHEMAS["refresh_semantic_map"]["properties"]["timeout_sec"]["default"] = 300
 DESCRIPTIONS["delete_memory_library"] = "删除记忆库；当前库立即重建为空库并继续记录。"
 
 CAPABILITIES = [
-    Capability(name, DESCRIPTIONS[name], input_schema, "task" if name == "refresh_semantic_map" else
+    Capability(name, TITLES[name], DESCRIPTIONS[name], input_schema, "task" if name == "refresh_semantic_map" else
         "action" if name in {"tag_location", "remember_current_scene", "review_scene_space", "delete_memory_library",
                             "start_scene_mapping", "stop_scene_mapping", "render_scene_graph_image",
                             "update_scene_space_label"} else "query",

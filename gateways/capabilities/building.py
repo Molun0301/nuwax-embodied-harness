@@ -38,15 +38,15 @@ def explore_building(platform, ctx, args):
 TEXT = {"type": "string", "minLength": 1}
 TIMEOUT = {"type": "number", "exclusiveMinimum": 0, "maximum": 7200, "default": 600}
 CAPABILITIES = [
-    Capability("list_buildings", "列出楼栋楼层和设施连接。", schema(), "query", list_buildings),
-    Capability("register_building", "登记楼栋楼层及设施连接。",
+    Capability("list_buildings", "列出建筑楼层", "列出楼栋楼层和设施连接。", schema(), "query", list_buildings),
+    Capability("register_building", "登记建筑楼层", "登记楼栋楼层及设施连接。",
                schema({"topology": TOPOLOGY_SCHEMA}, ("topology",)), "action", register_building),
-    Capability("navigate_to_floor", "经登记的设施到目标楼层，加载地图并重定位后导航到目标位姿。",
+    Capability("navigate_to_floor", "导航到楼层位姿", "经登记的设施到目标楼层，加载地图并重定位后导航到目标位姿。",
                schema({"building_id": TEXT, "floor_id": TEXT, "x": {"type": "number"},
                        "y": {"type": "number"}, "yaw_rad": {"type": "number"}, "timeout_sec": TIMEOUT},
                       ("building_id", "x", "y")),
                "task", navigate_to_floor, needs=("nav_stack", "geometry"), motion=True, timeout_sec=600),
-    Capability("explore_building", "按楼层顺序跨层、探索并保存地图。",
+    Capability("explore_building", "逐层探索建筑", "按楼层顺序跨层、探索并保存地图。",
                schema({"building_id": TEXT, "floor_ids": {"type": "array", "items": TEXT},
                        "stop_conditions": CONDITIONS,
                        "per_floor_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "default": 300},

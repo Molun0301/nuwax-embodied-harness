@@ -56,7 +56,7 @@ def fixture():
     from scripts.diagnostics.current_fixtures import task_platform
     owner=task_platform();runtime=owner.__enter__()
     runtime.close=lambda:owner.__exit__(None,None,None)
-    runtime.capabilities.register(Capability("wait_example","等待样例",{"type":"object"},"task",lambda p,c,a:c.wait(10)))
+    runtime.capabilities.register(Capability("wait_example","等待样例", "等待样例",{"type":"object"},"task",lambda p,c,a:c.wait(10)))
     for cap in CAPABILITIES:runtime.capabilities.register(cap)
     service=AgentToolService(runtime);app=FastAPI();app.include_router(build_agent_router(service))
     @app.get("/diagnostic/sync")

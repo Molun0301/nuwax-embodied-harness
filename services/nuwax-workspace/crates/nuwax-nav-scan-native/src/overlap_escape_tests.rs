@@ -437,3 +437,28 @@ fn n6_20_healthy_event_ends_after_half_second_of_source_clear() {
     assert!(safe.command[0] < 0.);
     check_escape_sweep(&req.config, &[opposite], &safe.recovery_samples);
 }
+
+#[test]
+fn escape_repeated_source_reuses_only_the_proven_number_of_commands() {
+    let route=[[0.295,0.025,0.35],[1.,0.025,0.35]];
+    let obstacles=[[-0.025,0.025,0.35]];
+    let mut req=shallow_surface_request(&route,&obstacles);
+    req.config.body_length=0.6;
+    req.config.sample_dt=0.05;
+    let mut planner=registered_fixture(&req);
+    let first=planner.step(&req).unwrap();
+    let repeated=planner.step(&req).unwrap();
+    assert_eq!([repeated.command_forward,repeated.command_lateral,repeated.command_yaw_rate],[0.;3],"无上一来源时K=1");
+    req.odometry_timestamp_ns+=100_000_000;
+    let next=planner.step(&req).unwrap();
+    assert!(next.command_forward>0.);
+    check_escape_sweep(&req.config,&obstacles,&next.samples);
+    assert!(next.samples.len()>=3,"证明须包含两拍命令前进和制动");
+    let repeat=planner.step(&req).unwrap();
+    assert_eq!([repeat.command_forward,repeat.command_lateral,repeat.command_yaw_rate],
+        [next.command_forward,next.command_lateral,next.command_yaw_rate],"K=2的第二次调用沿用已证明命令");
+    check_escape_sweep(&req.config,&obstacles,&repeat.samples);
+    let beyond=planner.step(&req).unwrap();
+    assert_eq!([beyond.command_forward,beyond.command_lateral,beyond.command_yaw_rate],[0.;3],"超出K必须停车");
+    assert!(first.command_forward>0.);
+}

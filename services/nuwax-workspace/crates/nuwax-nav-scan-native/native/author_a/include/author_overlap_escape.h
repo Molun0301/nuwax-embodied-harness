@@ -11,6 +11,7 @@ class AuthorOverlapEscape {
   bool active_=false,latched_=false,recontact_=false,waiting_for_stop_=false;
   std::optional<int64_t> clear_since_;
   std::optional<int64_t> decision_stamp_;
+  size_t decision_periods_=1,decision_calls_=0;
   std::vector<ScanSample> decision_samples_;
   ScanOutput decision_output_{};
   int64_t began_=0,last_stamp_=0;
@@ -205,16 +206,17 @@ class AuthorOverlapEscape {
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
       const double* velocity,double angular,int64_t stamp,const double previous[3],ScanOutput& output) {
     if(hasDecision(stamp)) {
-      // 同源重复只停车，沿用首拍证明样本，不重新准入、记账或失败。
+      // 同源调用在已证明的K拍内沿用首拍命令，超过后停车；不重新准入或记账。
       output=decision_output_;
-      output.command_forward=output.command_lateral=output.command_yaw_rate=0.;
+      if(++decision_calls_>decision_periods_)output.command_forward=output.command_lateral=output.command_yaw_rate=0.;
       output.samples=static_cast<ScanSample*>(std::calloc(decision_samples_.size(),sizeof(ScanSample)));
       std::copy(decision_samples_.begin(),decision_samples_.end(),output.samples);return;
     }
     // 缺测尚不能开始恢复证明，保留原输入等待语义，不宣告几何恢复失败。
     if(!velocity||!std::isfinite(angular))
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
-    decision_stamp_=stamp;decision_samples_.clear();decision_output_={};
+    decision_periods_=decision_stamp_?static_cast<size_t>(std::max(1.,std::ceil((stamp-*decision_stamp_)*1e-9/c.sample_dt))):1;
+    decision_calls_=1;decision_stamp_=stamp;decision_samples_.clear();decision_output_={};
     try {
       planImpl(map,c,p,yaw,velocity,angular,stamp,previous,recontact_,output);
       recontact_=false;
@@ -347,10 +349,13 @@ class AuthorOverlapEscape {
       State state=actual;
       double path_bound=0.;
       std::vector<State> samples{actual};
-      if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound,budget_exhausted,stopped))continue;
-      const double issued_bound=path_bound;
-      samples.push_back(state);
       bool safe=true;
+      for(size_t tick=0;tick<decision_periods_;++tick) {
+        if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound,budget_exhausted,tick==0&&stopped)){safe=false;break;}
+        samples.push_back(state);
+      }
+      if(!safe)continue;
+      const double issued_bound=path_bound;
       while(!state.linear.isZero(0.)||state.angular!=0.) {
         if(!advance(map,c,state,Eigen::Vector2d::Zero(),0.,deadline,exhausted,path_bound,budget_exhausted)){safe=false;break;}
         samples.push_back(state);

@@ -1457,7 +1457,7 @@ class Go2DirectDdsBridge:
             return
         native_input = self.config.lio_backend in {"fastlio2", "pointlio"}
         canonical_imu_sample = None
-        if native_input:
+        if native_input and self._input_delivery_active:
             # 原生估计器只需要每条原始惯性；完整设备状态不参与算法输入。
             stamp = message.stamp
             source_timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
@@ -1476,6 +1476,8 @@ class Go2DirectDdsBridge:
                 _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2 IMU canonical 映射失败。', key='Go2 IMU canonical 映射失败。', interval_sec=30.0, exc_info=True)
             if canonical_imu_sample is not None:
                 self._publish_sensor_sample(canonical_imu_sample, generation)
+        if native_input or not self._input_delivery_active:
+            # 空闲只保留原有展示节流，标准输入已经在节流之前完整交付。
             now = time.monotonic()
             state_key = (generation, getattr(message, "mode", None), getattr(message, "gait_type", None))
             with self._lock:
@@ -1501,7 +1503,7 @@ class Go2DirectDdsBridge:
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
         )
-        if not native_input and imu_state is not None:
+        if not native_input and self._input_delivery_active and imu_state is not None:
             try:
                 canonical_imu_sample = adapt_go2_l2_imu(
                     calibration_profile=self._calibration_profile,
@@ -1824,7 +1826,7 @@ class Go2DirectDdsBridge:
                         else RegistrationState.BODY
                     ),
                 )
-                if source_frame == _GO2_UTLIDAR_FRAME
+                if source_frame == _GO2_UTLIDAR_FRAME and self._input_delivery_active
                 else None
             )
         except (Go2L2DecodeError, ValueError) as exc:
@@ -1983,6 +1985,7 @@ class Go2DirectDdsBridge:
                     "source_xyz_array": source_xyz_array,
                     "intensity_array": intensity_array,
                     "offset_ns_array": offset_ns_array,
+                    "source_id": "go2_l2" if source_frame == _GO2_UTLIDAR_FRAME else None,
                     "canonical_lidar_frame": canonical_lidar_frame,
                     "point_cloud_xyz_registered_to_odom": registered_to_odom,
                     "upstream_point_cloud_xyz_registered_to_odom": upstream_registered_to_odom,
@@ -2007,8 +2010,8 @@ class Go2DirectDdsBridge:
                         else []
                     ),
                     "calibration_ref": (
-                        canonical_lidar_frame.calibration_ref
-                        if canonical_lidar_frame is not None
+                        self._calibration_profile.calibration_ref
+                        if source_frame == _GO2_UTLIDAR_FRAME
                         else None
                     ),
                     "yaw_stabilization_applied": yaw_stabilization_applied,

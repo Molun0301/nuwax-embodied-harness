@@ -1,6 +1,38 @@
 use super::*;
 
 #[tokio::test]
+async fn frame_tree_edges_share_timestamp_during_concurrent_pose_updates() {
+    let mapper = Mapper::start(714, MapperConfig::default()).unwrap();
+    let (session, poses, _) = test_output_session(mapper.clone());
+    poses.send_replace(Some(pose_from_isometry(
+        nalgebra::Isometry3::identity(), "map", 1,
+    )));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let publisher_barrier = barrier.clone();
+    let publisher = std::thread::spawn(move || {
+        publisher_barrier.wait();
+        for stamp in 2..=100_000 {
+            poses.send_replace(Some(pose_from_isometry(
+                nalgebra::Isometry3::translation(stamp as f64, 0., 0.), "map", stamp,
+            )));
+        }
+    });
+    barrier.wait();
+    let mut mismatches = 0;
+    let mut last_stamp = 0;
+    for _ in 0..100_000 {
+        let tree = session.frame_tree();
+        assert_eq!(tree.transforms.len(), 2);
+        mismatches += usize::from(tree.transforms[0].timestamp_ns != tree.transforms[1].timestamp_ns);
+        last_stamp = tree.transforms[1].timestamp_ns;
+    }
+    publisher.join().unwrap();
+    mapper.shutdown().await.unwrap();
+    assert!(last_stamp > 1, "读取期间确有另一线程发布的新位姿");
+    assert_eq!(mismatches, 0, "同条坐标树的两条动态边必须来自同一帧");
+}
+
+#[tokio::test]
 async fn saved_pgo_map_load_uses_relocalization_and_new_mapping_keeps_pgo() {
     let root = std::env::temp_dir().join(format!("nuwax-loaded-pgo-{}", uuid::Uuid::new_v4()));
     let mapper = Mapper::start(713, MapperConfig::default()).unwrap();

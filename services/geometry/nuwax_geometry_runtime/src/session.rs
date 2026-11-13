@@ -346,29 +346,28 @@ impl SessionHandle {
     }
     pub fn frame_tree(&self) -> FrameTree {
         let info = self.state.borrow().info.clone().unwrap();
+        let pose = self.pose.borrow().clone();
+        let map_from_odom = self
+            .route
+            .borrow()
+            .as_ref()
+            .filter(|route| route.map_pose)
+            .map(|route| route.mapper.map_from_odom());
         let mut transforms = Vec::new();
-        if let Some(route) = self.route.borrow().as_ref().filter(|route| route.map_pose) {
+        if let Some(map_from_odom) = map_from_odom {
             transforms.push(transform(
-                route.mapper.map_from_odom(),
+                map_from_odom,
                 &info.map_frame_id,
                 &info.odom_frame_id,
-                self.pose
-                    .borrow()
-                    .as_ref()
-                    .map_or(0, |pose| pose.timestamp_ns),
+                pose.as_ref().map_or(0, |pose| pose.timestamp_ns),
             ));
         }
-        if let Some(pose) = self.pose.borrow().as_ref() {
+        if let Some(pose) = pose.as_ref() {
             // 地图位姿先还原为里程计位姿，保持坐标树边的真实含义。
-            let odom_from_base = self
-                .route
-                .borrow()
-                .as_ref()
-                .filter(|route| route.map_pose)
-                .map_or_else(
-                    || pose_isometry(pose),
-                    |route| route.mapper.map_from_odom().inverse() * pose_isometry(pose),
-                );
+            let odom_from_base = map_from_odom.map_or_else(
+                || pose_isometry(pose),
+                |map_from_odom| map_from_odom.inverse() * pose_isometry(pose),
+            );
             transforms.push(transform(
                 odom_from_base,
                 &info.odom_frame_id,

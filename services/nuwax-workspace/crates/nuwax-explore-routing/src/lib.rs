@@ -265,6 +265,16 @@ impl RegionalSchedule {
     }
 }
 
+/// 不带等待优先的区域代表与访问顺序：每个区域取收益÷（1+路程）最大的候选作代表
+/// （有视域时只取视域非空的），至多8个区域，访问顺序由动态规划求出。
+pub fn select_regions(
+    candidates: &[Candidate],
+    observations: Option<&[BTreeSet<[i32; 3]>]>,
+    costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
+) -> Option<Selection> {
+    select_with_priority(candidates, None, observations, costs)
+}
+
 fn select_with_priority(
     candidates: &[Candidate],
     priority: Option<[i64; 3]>,

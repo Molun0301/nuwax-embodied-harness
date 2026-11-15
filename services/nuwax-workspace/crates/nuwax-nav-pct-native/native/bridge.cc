@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <queue>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -25,7 +27,7 @@ struct PctBand { int32_t x, y; double low, high; };
 struct PctResult { double* points; size_t length; double elapsed_ms; size_t expanded; int32_t kind; };
 struct PctCost { double cost, endpoint[3], yaw, elapsed_ms; size_t expanded; };
 struct PctSearchStats {
-  size_t checks, hits, source_searches, rejected;
+  size_t checks, hits, source_searches;
   size_t source_expanded, exact_queries, exact_searches, exact_expanded;
   double source_elapsed_ms, exact_elapsed_ms;
 };
@@ -48,55 +50,10 @@ struct EdgeHash {
     return hash;
   }
 };
-struct SourceLabel {
-  double ground, cost, weighted=INFINITY, length=INFINITY;
-};
-// 一棵单源父链：起点、全图实测节点、已定值标签与可达表。
-struct SourceTree {
-  std::map<XY,std::vector<double>> nodes,reachable;
-  std::map<XY,std::vector<SourceLabel>> labels;
-  XY source_xy{};
-  Edge source{};
-  std::array<double,3> requested_source{};
-  bool complete=false;
-  // 展开到队列耗尽；目标定值即停的父链只对那批目标有效。
-  bool full=false;
-};
-// 一批排序目标的定值状态。目标代价是吸附端点格八邻域里已定值标签的“加权值+入边代价”最小者；
-// 入边代价不小于一格，之后定值的邻居加权值不小于当前出队值，所以出队值超过各目标当前最小代价减一时，
-// 该目标的最小代价与它的入边都不会再变。
-struct PendingGoal {
-  XY target{};
-  double ground=0,cost=0,gx=0,gy=0;
-  double best=INFINITY;
-};
-struct PendingGoals {
-  std::unordered_map<XY,std::vector<size_t>,XYHash> by_neighbor;
-  std::vector<PendingGoal> goals;
-  size_t unknown=0;
-};
 // 同一冻结几何内的纯转移判定。键包含两端真实坐标，保留格内偏移、方向与层高。
-struct SharedTransitions : SourceTree {
+struct SharedTransitions {
   std::unordered_map<Edge,bool,EdgeHash> edges;
   PctSearchStats stats{};
-  // 本轮最近一棵展开到队列耗尽的父链，换起点后保留，供回到该起点时直接取用。
-  SourceTree kept;
-  // 本次单源展开只需定值的目标，空表示展开全图。
-  const double* goals=nullptr;
-  size_t goal_count=0;
-  // 按与原完整查询一致的十格、三维距离吸附目标端点标签；只从本轮全图实测节点选取。
-  const SourceLabel* snap(const double* goal,double q,double body_to_ground,XY& target) const {
-    const XY requested{static_cast<int>(std::floor(goal[0]/q)),static_cast<int>(std::floor(goal[1]/q))};
-    const SourceLabel* label=nullptr;double best=INFINITY;
-    for(int y=requested.second-10;y<=requested.second+10;++y)for(int x=requested.first-10;x<=requested.first+10;++x) {
-      auto found=labels.find({x,y});if(found==labels.end())continue;
-      for(const auto& candidate:found->second) {
-        const double d=std::hypot(std::hypot((x+0.5)*q-goal[0],(y+0.5)*q-goal[1]),candidate.ground+body_to_ground-goal[2]);
-        if(d<best){best=d;target={x,y};label=&candidate;}
-      }
-    }
-    return label;
-  }
 };
 struct Column {
   std::vector<PctCell> surfaces;
@@ -309,22 +266,35 @@ struct Planner {
     // 包络在窄门处可有负净距，软代价仍连续；原真实多边形硬判定保留通行能力。
     return 20.*(1.-clearance/range)*std::hypot(edge[3]-edge[0],edge[4]-edge[1])/q;
   }
-  // 排序代价的一条入边：前一格已定值标签（加权值、地面）到目标端点；不允许时为无穷。
-  // 返回加权值，并写出这条入边对应的几何长度与末段朝向。
-  double rank_step(XY from,double weighted,double length,double previous_ground,XY target,double ground,
-                   double label_cost,double gx,double gy,XY source_xy,const Edge& source,double& cost,double& yaw) {
+  // 完整平面梯度与行进方向无关：两侧最近实测面高度差同向且相符才计连续坡面。
+  double grade_sq(XY key,double height) const {
     const double q=cfg.resolution;
-    const double height_limit=std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8;
-    if(std::abs(ground-previous_ground)>height_limit)return INFINITY;
-    const bool first=from==source_xy && previous_ground==source[2];
-    const double ax=first?source[0]:(from.first+0.5)*q,ay=first?source[1]:(from.second+0.5)*q;
-    if(!transition({ax,ay,previous_ground,gx,gy,ground},from,target))return INFINITY;
-    const int dx=from.first-target.first,dy=from.second-target.second;
-    const double dz=(ground-previous_ground)/q;
-    const double soft=label_cost+clearance_cost({ax,ay,previous_ground,gx,gy,ground});
-    cost=length+std::hypot(std::hypot(gx-ax,gy-ay),ground-previous_ground);
-    yaw=std::atan2(gy-ay,gx-ax);
-    return weighted+std::sqrt(dz*dz+dx*dx+dy*dy)+soft;
+    double grade_sq=0;
+    const double tolerance=cfg.point_resolution*0.5+1e-8;
+    auto nearest=[&](XY neighbor)->const PctCell* {
+      auto column=columns.find(neighbor);
+      if(column==columns.end()||column->second.surfaces.empty())return nullptr;
+      const auto& surfaces=column->second.surfaces;
+      return &*std::min_element(surfaces.begin(),surfaces.end(),[&](const PctCell& a,const PctCell& b) {
+        return std::abs(a.ground-height)<std::abs(b.ground-height);
+      });
+    };
+    for(int axis=0;axis<2;++axis) {
+      const int coordinate=axis==0?key.first:key.second;
+      if(coordinate==std::numeric_limits<int>::min()||coordinate==std::numeric_limits<int>::max())continue;
+      XY minus=key,plus=key;
+      (axis==0?minus.first:minus.second)--;
+      (axis==0?plus.first:plus.second)++;
+      const auto* lower=nearest(minus);const auto* upper=nearest(plus);
+      if(!lower||!upper)continue;
+      const double before=height-lower->ground,after=upper->ground-height;
+      // 双侧同向且高度增量相符才计连续坡面；阶边一侧为踏面时仍由原阶高判定。
+      if(before*after>0&&std::abs(before-after)<=tolerance) {
+        const double grade=std::min(std::abs(before),std::abs(after))/q;
+        grade_sq+=grade*grade;
+      }
+    }
+    return grade_sq;
   }
   bool transition(const Edge& edge,XY from,XY to) {
     const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
@@ -384,7 +354,7 @@ struct Planner {
     }
   }
   bool plan_region(const double* start,const double* goal,double margin,PctResult& result,
-                   CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false,bool connectivity=false) {
+                   CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false) {
     astar.Reset();
     const double q=cfg.resolution,sg=start[2]-cfg.body_to_ground,gg=goal[2]-cfg.body_to_ground;
     int minx=static_cast<int>(std::floor((std::min(start[0],goal[0])-margin)/q));
@@ -434,34 +404,6 @@ struct Planner {
     measured.assign(static_cast<size_t>(layers)*nx*ny,0);
     auto key_index=[&](int l,int y,int x){return (static_cast<size_t>(l)*ny+y)*nx+x;};
     const double dx=goal[0]-start[0],dy=goal[1]-start[1];
-    auto continuous_grade_sq=[&](XY key,double height) {
-      double grade_sq=0;
-      const double tolerance=cfg.point_resolution*0.5+1e-8;
-      auto nearest=[&](XY neighbor)->const PctCell* {
-        auto column=columns.find(neighbor);
-        if(column==columns.end()||column->second.surfaces.empty())return nullptr;
-        const auto& surfaces=column->second.surfaces;
-        return &*std::min_element(surfaces.begin(),surfaces.end(),[&](const PctCell& a,const PctCell& b) {
-          return std::abs(a.ground-height)<std::abs(b.ground-height);
-        });
-      };
-      for(int axis=0;axis<2;++axis) {
-        const int coordinate=axis==0?key.first:key.second;
-        if(coordinate==std::numeric_limits<int>::min()||coordinate==std::numeric_limits<int>::max())continue;
-        XY minus=key,plus=key;
-        (axis==0?minus.first:minus.second)--;
-        (axis==0?plus.first:plus.second)++;
-        const auto* lower=nearest(minus);const auto* upper=nearest(plus);
-        if(!lower||!upper)continue;
-        const double before=height-lower->ground,after=upper->ground-height;
-        // 双侧同向且高度增量相符才计连续坡面；阶边一侧为踏面时仍由原阶高判定。
-        if(before*after>0&&std::abs(before-after)<=tolerance) {
-          const double grade=std::min(std::abs(before),std::abs(after))/q;
-          grade_sq+=grade*grade;
-        }
-      }
-      return grade_sq;
-    };
     for(const auto& entry:columns){
       if(cancel&&cancel(user))return false;
       const int x=entry.first.first-minx,y=entry.first.second-miny;
@@ -476,7 +418,7 @@ struct Planner {
         }
         measured[index]=1;heights(l*ny+y,x)=s.ground;
         // 完整平面梯度与行进方向无关，不能通过斜向走格绕过连续坡度上限。
-        const bool steep=continuous_grade_sq(entry.first,s.ground)>std::pow(std::tan(cfg.max_slope),2)+1e-8;
+        const bool steep=grade_sq(entry.first,s.ground)>std::pow(std::tan(cfg.max_slope),2)+1e-8;
         cost(l*ny+y,x)=s.ceiling-s.ground+1e-8<cfg.robot_height||steep?100:0;
       }
     }
@@ -511,45 +453,10 @@ struct Planner {
     const double goal_x=gx==original_gx&&gy==original_gy?goal[0]:(gx+minx+0.5)*q;
     const double goal_y=gx==original_gx&&gy==original_gy?goal[1]:(gy+miny+0.5)*q;
 
-    if(!connectivity && sx==gx&&sy==gy&&sl==gl) {
+    if(sx==gx&&sy==gy&&sl==gl) {
       const double yaw=std::atan2(dy,dx);
       if(collision(start_x,start_y,heights(sl*ny+sy,sx),yaw)||
          collision(goal_x,goal_y,heights(gl*ny+gy,gx),yaw))return false;
-    }
-    if(shared && !progressive) {
-      const Edge source{start_x,start_y,heights(sl*ny+sy,sx),0,0,0};
-      if(connectivity) {
-        shared->source=source;
-        shared->source_xy={sx+minx,sy+miny};
-        for(int l=0;l<layers;++l)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x)
-          if(measured[key_index(l,y,x)] && cost(l*ny+y,x)<=20) {
-            shared->nodes[{x+minx,y+miny}].push_back(heights(l*ny+y,x));
-            shared->labels[{x+minx,y+miny}].push_back({heights(l*ny+y,x),cost(l*ny+y,x)});
-          }
-        gl=-1;
-      } else if(shared->complete && shared->full && shared->source==source && !(sx==gx&&sy==gy&&sl==gl)) {
-        // 全图必须覆盖本窗口的每个真实节点；层分组不同则沿原查询，不能错误排除。
-        bool compatible=true;
-        for(int l=0;l<layers && compatible;++l)for(int y=0;y<ny && compatible;++y)for(int x=0;x<nx;++x) {
-          if(!measured[key_index(l,y,x)] || cost(l*ny+y,x)>20)continue;
-          auto found=shared->nodes.find({x+minx,y+miny});
-          if(found==shared->nodes.end() || std::find(found->second.begin(),found->second.end(),heights(l*ny+y,x))==found->second.end()) {compatible=false;break;}
-        }
-        bool possible=!compatible;
-        const double limit=std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8;
-        for(int y=gy-1;y<=gy+1 && !possible;++y)for(int x=gx-1;x<=gx+1 && !possible;++x) {
-          if(x==gx && y==gy)continue;
-          const XY xy{x+minx,y+miny};
-          auto found=shared->reachable.find(xy);if(found==shared->reachable.end())continue;
-          for(double ground:found->second) {
-            if(std::abs(ground-heights(gl*ny+gy,gx))>limit)continue;
-            const bool first=x==sx && y==sy && ground==source[2];
-            if(transition({first?start_x:(xy.first+0.5)*q,first?start_y:(xy.second+0.5)*q,ground,
-                           goal_x,goal_y,heights(gl*ny+gy,gx)},xy,{gx+minx,gy+miny})) {possible=true;break;}
-          }
-        }
-        if(!possible){++shared->stats.rejected;return false;}
-      }
     }
     astar.Init(20,layers,q,1,cost,heights,elevation);
     astar.SetHeightLimit(std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8);
@@ -575,64 +482,6 @@ struct Planner {
           first?start_y:(a->idx[1]+miny+.5)*q,a->height,
           last?goal_x:(b->idx[2]+minx+.5)*q,last?goal_y:(b->idx[1]+miny+.5)*q,b->height});
     });
-    if(connectivity) {
-      ++shared->stats.source_searches;
-      // 给定目标时只展开到这批目标全部定值。
-      PendingGoals pending;
-      if(shared->goals) {
-        for(size_t i=0;i<shared->goal_count;++i) {
-          const double* goal=shared->goals+3*i;
-          XY target{};
-          const SourceLabel* label=shared->snap(goal,q,cfg.body_to_ground,target);
-          // 无端点或端点即起点时不依赖展开。
-          if(!label || (target==shared->source_xy && label->ground==shared->source[2]))continue;
-          const XY requested{static_cast<int>(std::floor(goal[0]/q)),static_cast<int>(std::floor(goal[1]/q))};
-          pending.goals.push_back({target,label->ground,label->cost,
-              target==requested?goal[0]:(target.first+0.5)*q,target==requested?goal[1]:(target.second+0.5)*q});
-          for(int y=target.second-1;y<=target.second+1;++y)for(int x=target.first-1;x<=target.first+1;++x)
-            if(x!=target.first || y!=target.second)pending.by_neighbor[{x,y}].push_back(pending.goals.size()-1);
-        }
-        pending.unknown=pending.goals.size();
-      }
-      astar.SetStop(shared->goals ? std::function<bool(double)>([&](double g) {
-        if(pending.unknown!=0)return false;
-        double latest=-INFINITY;
-        for(const auto& goal:pending.goals)latest=std::max(latest,goal.best);
-        return g>latest-1.0;
-      }) : std::function<bool(double)>());
-      astar.Search({sl,sx,sy},{-1,0,0},[&](const Node* node) {
-        const XY xy{node->idx[2]+minx,node->idx[1]+miny};
-        shared->reachable[xy].push_back(node->height);
-        double length=0;
-        if(const auto* parent=node->parent) {
-          const XY pxy{parent->idx[2]+minx,parent->idx[1]+miny};
-          const auto& previous=shared->labels.at(pxy);
-          const auto& label=*std::find_if(previous.begin(),previous.end(),[&](const SourceLabel& v){return v.ground==parent->height;});
-          const double ax=parent->parent?(pxy.first+0.5)*q:start_x;
-          const double ay=parent->parent?(pxy.second+0.5)*q:start_y;
-          length=label.length+std::hypot(std::hypot((xy.first+0.5)*q-ax,(xy.second+0.5)*q-ay),node->height-parent->height);
-        }
-        auto& labels=shared->labels.at(xy);
-        auto& label=*std::find_if(labels.begin(),labels.end(),[&](const SourceLabel& v){return v.ground==node->height;});
-        label.weighted=node->g;label.length=length;
-        if(auto waiting=pending.by_neighbor.find(xy);waiting!=pending.by_neighbor.end()) {
-          for(size_t i:waiting->second) {
-            auto& goal=pending.goals[i];
-            double cost=0,yaw=0;
-            const double weight=rank_step(xy,node->g,length,node->height,goal.target,goal.ground,goal.cost,
-                goal.gx,goal.gy,shared->source_xy,shared->source,cost,yaw);
-            if(!std::isfinite(weight))continue;
-            if(!std::isfinite(goal.best))--pending.unknown;
-            goal.best=std::min(goal.best,weight);
-          }
-        }
-      });
-      astar.SetStop({});
-      shared->complete=!astar.Cancelled() && !(cancel&&cancel(user));
-      shared->full=shared->complete && !shared->goals;
-      shared->stats.source_expanded+=astar.Expanded();
-      return false;
-    }
     const bool found=astar.Search({sl,sx,sy},{gl,gx,gy});result.expanded+=astar.Expanded();
     if(shared){++shared->stats.exact_searches;shared->stats.exact_expanded+=astar.Expanded();}
     if(!found && (!allow_partial || astar.Cancelled()))return false;
@@ -732,69 +581,190 @@ extern "C" int pct_plan(void* planner,const double* start,const double* goal,Pct
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
 namespace {
+// 从一个起点按需展开的单源搜索：只在展开到某格时由原生列计算该格的节点，不建全图矩阵，
+// 展开量只取决于到达目标所需的范围。地面层按起点地面高度分组（层参考高度为起点地面加整数倍层距）；
+// 节点代价（低净空、连续坡度、地面边缘软代价）、转移判定与入边代价的定义与目标窗口搜索相同。
+struct SourceSearch {
+  struct Layer { int k; double ground, ceiling; bool valid=false; double soft=-1; };
+  struct Key {
+    int x,y,k;
+    bool operator==(const Key& other) const {return x==other.x&&y==other.y&&k==other.k;}
+  };
+  struct KeyHash {
+    size_t operator()(const Key& key) const {
+      return std::hash<uint64_t>{}((uint64_t(uint32_t(key.x))<<32)|uint32_t(key.y))^
+          (std::hash<int>{}(key.k)*0x9e3779b97f4a7c15ull);
+    }
+  };
+  // 已定值节点的加权代价、沿父链的几何长度，以及最后一条入边的起点（供目标端点计长度与朝向）。
+  struct State {
+    double g=INFINITY,length=0,ground=0;
+    double from_x=0,from_y=0,from_ground=0,from_length=0;
+    bool from_source=true,closed=false;
+  };
+  struct Entry { double g; uint64_t sequence; Key key; };
+  struct Later {
+    bool operator()(const Entry& a,const Entry& b) const {return a.g==b.g?a.sequence>b.sequence:a.g>b.g;}
+  };
+  struct Offset { int dx,dy; double distance; };
+
+  Planner& p;
+  double q,sg,spacing,influence,height_limit;
+  std::vector<Offset> offsets;
+  std::unordered_map<XY,std::vector<Layer>,XYHash> columns;
+  std::unordered_map<Key,State,KeyHash> states;
+  std::priority_queue<Entry,std::vector<Entry>,Later> open;
+  uint64_t sequence=0;
+  Key start{};
+  double start_x=0,start_y=0;
+  std::unordered_map<Key,std::vector<size_t>,KeyHash> waiting;
+  std::vector<std::array<double,2>> targets;
+  std::deque<std::pair<size_t,Key>> ready;
+  size_t expanded=0;
+
+  SourceSearch(Planner& planner,double source_ground):p(planner),q(planner.cfg.resolution),sg(source_ground) {
+    spacing=std::max({p.cfg.robot_height,q,std::max(p.cfg.max_step,p.cfg.max_step_down)*2+1e-6});
+    influence=p.clearance_radius+std::max(.05,q)+q;
+    height_limit=std::max({p.cfg.max_step,p.cfg.max_step_down,std::tan(p.cfg.max_slope)*q*std::sqrt(2.0)})+1e-8;
+    const int reach=static_cast<int>(std::ceil(influence/q));
+    for(int dy=-reach;dy<=reach;++dy)for(int dx=-reach;dx<=reach;++dx) {
+      const double distance=std::hypot(dx,dy);
+      if((dx||dy) && distance*q<influence)offsets.push_back({dx,dy,distance});
+    }
+    std::stable_sort(offsets.begin(),offsets.end(),[](const Offset& a,const Offset& b){return a.distance<b.distance;});
+  }
+  // 一列的节点：每层取最接近层参考高度的实测面；边界外与缺测列没有节点。
+  std::vector<Layer>& column(XY key) {
+    auto found=columns.find(key);
+    if(found!=columns.end())return found->second;
+    std::vector<Layer> layers;
+    auto source=p.columns.find(key);
+    if(source!=p.columns.end() && inside(p.boundary,(key.first+0.5)*q,(key.second+0.5)*q)) {
+      for(const auto& surface:source->second.surfaces) {
+        const int k=static_cast<int>(std::llround((surface.ground-sg)/spacing));
+        const double reference=sg+k*spacing;
+        auto same=std::find_if(layers.begin(),layers.end(),[&](const Layer& layer){return layer.k==k;});
+        if(same==layers.end())layers.push_back({k,surface.ground,surface.ceiling});
+        else if(std::abs(same->ground-reference)>std::abs(surface.ground-reference)) {
+          same->ground=surface.ground;same->ceiling=surface.ceiling;
+        }
+      }
+      std::sort(layers.begin(),layers.end(),[](const Layer& a,const Layer& b){return a.k<b.k;});
+      for(auto& layer:layers) {
+        const bool steep=p.grade_sq(key,layer.ground)>std::pow(std::tan(p.cfg.max_slope),2)+1e-8;
+        layer.valid=!(layer.ceiling-layer.ground+1e-8<p.cfg.robot_height||steep);
+      }
+    }
+    return columns.emplace(key,std::move(layers)).first->second;
+  }
+  Layer* node(int x,int y,int k) {
+    for(auto& layer:column({x,y}))if(layer.k==k)return &layer;
+    return nullptr;
+  }
+  // 地面边缘软代价：到同层最近无效格（缺测、低净空或过陡）的格心距离，取值与全图距离变换相同。
+  double soft(int x,int y,Layer& layer) {
+    if(layer.soft>=0)return layer.soft;
+    double distance=INFINITY;
+    for(const auto& offset:offsets) {
+      const Layer* other=node(x+offset.dx,y+offset.dy,layer.k);
+      if(!other||!other->valid){distance=offset.distance;break;}
+    }
+    layer.soft=std::isfinite(distance)?20.0*std::clamp(1.0-distance*q/influence,0.0,1.0):0.0;
+    return layer.soft;
+  }
+  double x_of(const Key& key) const {return key==start?start_x:(key.x+0.5)*q;}
+  double y_of(const Key& key) const {return key==start?start_y:(key.y+0.5)*q;}
+  // 起点按原完整查询的十格、三维距离吸附到附近有效节点，吸附到别的格时用格心；
+  // 目标按平面位置所在格与地面高度所在层对应到节点，没有有效节点即不可达。
+  bool begin(const double* requested,const double* goals,size_t count,unsigned char* reachable) {
+    const XY origin{static_cast<int>(std::floor(requested[0]/q)),static_cast<int>(std::floor(requested[1]/q))};
+    double best=INFINITY;bool found=false;
+    for(int y=origin.second-10;y<=origin.second+10;++y)for(int x=origin.first-10;x<=origin.first+10;++x)
+      for(const auto& layer:column({x,y})) {
+        if(!layer.valid)continue;
+        const double score=std::hypot(std::hypot((x+0.5)*q-requested[0],(y+0.5)*q-requested[1]),layer.ground-sg);
+        if(score<best){best=score;start={x,y,layer.k};found=true;}
+      }
+    for(size_t i=0;i<count;++i)reachable[i]=0;
+    if(!found)return false;
+    const bool same=start.x==origin.first&&start.y==origin.second;
+    start_x=same?requested[0]:(start.x+0.5)*q;start_y=same?requested[1]:(start.y+0.5)*q;
+    auto& source=states[start];
+    source.g=0;source.ground=node(start.x,start.y,start.k)->ground;
+    open.push({0,sequence++,start});
+    for(size_t i=0;i<count;++i) {
+      const double* goal=goals+3*i;
+      targets.push_back({goal[0],goal[1]});
+      const Key key{static_cast<int>(std::floor(goal[0]/q)),static_cast<int>(std::floor(goal[1]/q)),
+          static_cast<int>(std::llround((goal[2]-p.cfg.body_to_ground-sg)/spacing))};
+      const Layer* layer=node(key.x,key.y,key.k);
+      if(!layer||!layer->valid)continue;
+      reachable[i]=1;
+      waiting[key].push_back(i);
+    }
+    return true;
+  }
+  void relax(const Key& from,const State& state) {
+    // 与上游A*相同的八邻域顺序（行、列偏移），每格先查同层再按层号查其它层。
+    static const int neighbors[8][2]={{-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,-1},{1,0},{1,1}};
+    const double ax=x_of(from),ay=y_of(from);
+    for(const auto& offset:neighbors) {
+      const int x=from.x+offset[1],y=from.y+offset[0];
+      auto& layers=column({x,y});
+      auto visit=[&](Layer& layer) {
+        if(!layer.valid||std::abs(layer.ground-state.ground)>height_limit)return;
+        const double bx=(x+0.5)*q,by=(y+0.5)*q;
+        if(!p.transition({ax,ay,state.ground,bx,by,layer.ground},{from.x,from.y},{x,y}))return;
+        const double dz=(layer.ground-state.ground)/q;
+        const double step=soft(x,y,layer)+p.clearance_cost({ax,ay,state.ground,bx,by,layer.ground});
+        const double g=state.g+std::sqrt(dz*dz+offset[0]*offset[0]+offset[1]*offset[1])+step;
+        const Key key{x,y,layer.k};
+        auto& next=states[key];
+        if(next.closed||g>=next.g)return;
+        next.g=g;next.ground=layer.ground;
+        next.length=state.length+std::hypot(std::hypot(bx-ax,by-ay),layer.ground-state.ground);
+        next.from_x=ax;next.from_y=ay;next.from_ground=state.ground;next.from_length=state.length;
+        next.from_source=false;
+        open.push({g,sequence++,key});
+      };
+      for(auto& layer:layers)if(layer.k==from.k)visit(layer);
+      for(auto& layer:layers)if(layer.k!=from.k)visit(layer);
+    }
+  }
+  // 展开到下一个已登记目标的节点定值。返回0为得到一个目标，1为可达范围已展开完，2为取消。
+  // 目标长度与末段朝向按最后一条入边起点到目标平面位置计；起点格内的目标从起点直接计。
+  int next(size_t& index,double& weighted,PctCost& out,CancelFn cancel,const void* user) {
+    while(ready.empty()) {
+      if(open.empty())return 1;
+      if(cancel&&cancel(user))return 2;
+      const Entry entry=open.top();open.pop();
+      auto& state=states.at(entry.key);
+      if(state.closed||entry.g!=state.g)continue;
+      state.closed=true;++expanded;
+      if(auto found=waiting.find(entry.key);found!=waiting.end()) {
+        for(size_t i:found->second)ready.push_back({i,entry.key});
+        waiting.erase(found);
+      }
+      relax(entry.key,state);
+    }
+    const auto [i,key]=ready.front();ready.pop_front();
+    const auto& state=states.at(key);
+    const auto& target=targets[i];
+    const double ax=state.from_source?start_x:state.from_x,ay=state.from_source?start_y:state.from_y;
+    const double ground=state.from_source?state.ground:state.from_ground;
+    out=PctCost{};
+    out.cost=(state.from_source?0.0:state.from_length)+std::hypot(std::hypot(target[0]-ax,target[1]-ay),state.ground-ground);
+    out.yaw=std::atan2(target[1]-ay,target[0]-ax);
+    out.endpoint[0]=target[0];out.endpoint[1]=target[1];out.endpoint[2]=state.ground+p.cfg.body_to_ground;
+    index=i;weighted=state.g;
+    return 0;
+  }
+};
 struct MultiGoalSearch {
   Planner& planner;
   SharedTransitions transitions;
+  std::unique_ptr<SourceSearch> source;
   explicit MultiGoalSearch(Planner& p):planner(p) {}
-  // goals为空时要求展开到队列耗尽的父链，否则只需这批目标定值。
-  bool prepare_source(const double* start,const double* goals,size_t count,CancelFn cancel,const void* user) {
-    const std::array<double,3> requested{start[0],start[1],start[2]};
-    auto& t=transitions;
-    SourceTree& current=t;
-    if(current.full && current.requested_source==requested)return true;
-    if(t.kept.full && t.kept.requested_source==requested) {
-      std::swap(current,t.kept);
-      return true;
-    }
-    if(current.full)std::swap(current,t.kept);
-    current=SourceTree{};
-    t.requested_source=requested;
-    t.goals=goals;t.goal_count=count;
-    struct Clear {SharedTransitions& t;~Clear(){t.goals=nullptr;t.goal_count=0;}} clear{t};
-    double full=std::max(planner.cfg.search_margin,planner.cfg.resolution*2);
-    for(const auto& entry:planner.columns)full=std::max({full,
-        std::abs(entry.first.first*planner.cfg.resolution-start[0])+planner.cfg.resolution*2,
-        std::abs(entry.first.second*planner.cfg.resolution-start[1])+planner.cfg.resolution*2});
-    PctResult unused{};
-    const auto began=std::chrono::steady_clock::now();
-    planner.plan_region(start,start,full,unused,cancel,user,false,false,true);
-    transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
-    return transitions.complete;
-  }
-  // 在已准备的单源父链上取一个目标的排序代价；只复核目标附近的真实入边。
-  bool rank_goal(const double* goal,PctCost& out) {
-    auto& p=planner;auto& t=transitions;
-    const double q=p.cfg.resolution;
-    const XY requested{static_cast<int>(std::floor(goal[0]/q)),static_cast<int>(std::floor(goal[1]/q))};
-    XY target{};
-    const SourceLabel* label=t.snap(goal,q,p.cfg.body_to_ground,target);
-    auto unavailable=[&] {++t.stats.rejected;return false;};
-    if(!label)return unavailable();
-    const double gx=target==requested?goal[0]:(target.first+0.5)*q;
-    const double gy=target==requested?goal[1]:(target.second+0.5)*q;
-    if(target==t.source_xy && label->ground==t.source[2]) {
-      const double yaw=std::atan2(gy-t.source[1],gx-t.source[0]);
-      if(!p.transition({t.source[0],t.source[1],label->ground,gx,gy,label->ground},t.source_xy,target))return unavailable();
-      out.cost=std::hypot(gx-t.source[0],gy-t.source[1]);out.yaw=yaw;
-    } else {
-      double weight=INFINITY;
-      for(int y=target.second-1;y<=target.second+1;++y)for(int x=target.first-1;x<=target.first+1;++x) {
-        if(x==target.first && y==target.second)continue;
-        auto found=t.labels.find({x,y});if(found==t.labels.end())continue;
-        for(const auto& previous:found->second) {
-          if(!std::isfinite(previous.length))continue;
-          double cost=0,yaw=0;
-          const double g=p.rank_step({x,y},previous.weighted,previous.length,previous.ground,target,label->ground,
-              label->cost,gx,gy,t.source_xy,t.source,cost,yaw);
-          if(g<weight) {weight=g;out.cost=cost;out.yaw=yaw;}
-        }
-      }
-      if(!std::isfinite(weight))return unavailable();
-    }
-    out.endpoint[0]=gx;out.endpoint[1]=gy;out.endpoint[2]=label->ground+p.cfg.body_to_ground;
-    out.expanded=0;
-    return true;
-  }
 };
 }
 extern "C" void* pct_multi_goal_create(void* planner,char* err,size_t cap) {
@@ -813,7 +783,6 @@ extern "C" int pct_multi_goal_cost(void* search,const double* start,const double
   struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};
   s.planner.shared=&s.transitions;
   PctResult route{};
-  s.prepare_source(start,nullptr,0,cancel,user);
   if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
   ++s.transitions.stats.exact_queries;
   const auto began=std::chrono::steady_clock::now();
@@ -832,26 +801,34 @@ extern "C" int pct_multi_goal_cost(void* search,const double* start,const double
   return status;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
-// 前沿排序沿同一加权单源父树计实际几何长度：一个起点只做一次单源搜索，每个目标只复核附近真实入边。
-// found[i]为0表示该目标没有满足机体约束的入边。完整/逼近导航仍使用原目标专属A*，不调用本入口。
-// bounded为真时单源展开到这批目标全部定值即停，代价与展开全图相同。
-extern "C" int pct_multi_goal_rank_costs(void* search,const double* start,const double* goals,size_t count,
-                                         bool bounded,PctCost* out,unsigned char* found,CancelFn cancel,
-                                         const void* user,char* err,size_t cap) {
+// 从起点开始一次按需展开的单源搜索并登记目标；reachable[i]为0表示该目标没有对应的有效节点。
+extern "C" int pct_source_begin(void* search,const double* start,const double* goals,size_t count,
+                                unsigned char* reachable,char* err,size_t cap) {
   try {
     auto& s=*static_cast<MultiGoalSearch*>(search);
     struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};s.planner.shared=&s.transitions;
-    if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
-    if(!s.prepare_source(start,bounded?goals:nullptr,count,cancel,user)) {
-      error(err,cap,cancel&&cancel(user)?"PCT规划已取消":"PCT没有可搜索的实测起点");return 1;
-    }
-    for(size_t i=0;i<count;++i) {
-      const auto began=std::chrono::steady_clock::now();
-      out[i]=PctCost{};
-      found[i]=s.rank_goal(goals+3*i,out[i]);
-      out[i].elapsed_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
-    }
+    const auto began=std::chrono::steady_clock::now();
+    ++s.transitions.stats.source_searches;
+    s.source=std::make_unique<SourceSearch>(s.planner,start[2]-s.planner.cfg.body_to_ground);
+    const bool ready=s.source->begin(start,goals,count,reachable);
+    s.transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
+    if(!ready){s.source.reset();error(err,cap,"PCT没有可搜索的实测起点");return 1;}
     return 0;
+  }catch(const std::exception& e){error(err,cap,e.what());return 3;}
+}
+// 继续当前单源搜索到下一个已登记目标定值：0为得到目标，1为可达范围已展开完，2为取消。
+extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCost* out,
+                               CancelFn cancel,const void* user,char* err,size_t cap) {
+  try {
+    auto& s=*static_cast<MultiGoalSearch*>(search);
+    struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};s.planner.shared=&s.transitions;
+    const auto began=std::chrono::steady_clock::now();
+    const size_t before=s.source->expanded;
+    const int status=s.source->next(*index,*weighted,*out,cancel,user);
+    s.transitions.stats.source_expanded+=s.source->expanded-before;
+    s.transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
+    if(status==2)error(err,cap,"PCT规划已取消");
+    return status;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
 // 平面点所在原生格的实测地面高度个数，并复制至多cap个；缺测列为零个，不补造地面。

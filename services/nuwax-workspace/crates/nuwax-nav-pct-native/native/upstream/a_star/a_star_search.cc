@@ -124,7 +124,6 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal,
     if (closed != closed_set.end() && closed->second->g < entry.g) continue;
     ++expanded_;
     if (visitor) visitor(current_node);
-    if (visitor && stop_ && stop_(current_node->g)) return false;
     if (approach_score_) {
       const double score = approach_score_(current_node);
       if (score < closest_score) { closest_score = score; closest = current_node; }

@@ -162,6 +162,8 @@ impl Explorer {
         })
     }
 
+    pub(crate) fn uses_surface(&self) -> bool { self.surface_config.is_some() }
+
     pub fn set_map_name(&mut self, name: String) {
         self.map_name = name;
     }
@@ -477,14 +479,16 @@ impl Explorer {
         if let Err(reason) = fresh(pose.timestamp_ns, self.pose_ttl_ns) {
             return self.wait_input(&format!("等待地图位姿：{reason}"));
         }
-        let Some(meta) = grid.as_ref().and_then(|grid| grid.meta.as_ref()) else {
-            return self.wait_input("等待占据栅格：尚未收到元数据，来源年龄未知");
-        };
-        if meta.frame_id != self.map_frame {
-            return self.wait_input(&format!("等待占据栅格：坐标系{}不匹配{}", meta.frame_id, self.map_frame));
-        }
-        if let Err(reason) = fresh(meta.timestamp_ns, 2_000_000_000) {
-            return self.wait_input(&format!("等待占据栅格：{reason}"));
+        if !self.uses_surface() {
+            let Some(meta) = grid.as_ref().and_then(|grid| grid.meta.as_ref()) else {
+                return self.wait_input("等待占据栅格：尚未收到元数据，来源年龄未知");
+            };
+            if meta.frame_id != self.map_frame {
+                return self.wait_input(&format!("等待占据栅格：坐标系{}不匹配{}", meta.frame_id, self.map_frame));
+            }
+            if let Err(reason) = fresh(meta.timestamp_ns, 2_000_000_000) {
+                return self.wait_input(&format!("等待占据栅格：{reason}"));
+            }
         }
         if self.surface_config.is_some() {
             if let Err(reason) = &surface {
@@ -497,7 +501,7 @@ impl Explorer {
             self.mission = Some(MissionProgress::new(location.clone())?);
         }
         self.mission.as_mut().expect("探索行程").observe(&location, pose.timestamp_ns);
-        let grid = grid.as_ref().map(to_grid).transpose()?;
+        let grid = if self.uses_surface() { None } else { grid.as_ref().map(to_grid).transpose()? };
         let route = if config.return_policy.maximum_distance_m.is_some() {
             Some(match (&surface, &self.surface_config) {
                 (Ok(map), Some(surface_config)) => MissionRoutes::Surface {

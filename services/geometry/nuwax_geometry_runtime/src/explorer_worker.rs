@@ -205,7 +205,8 @@ impl Worker {
             },
             None => Err("等待曲面快照：尚未生成，来源年龄未知".into()),
         };
-        self.explorer.tick(pose.borrow().clone(), mapper.occupancy(true), surface, Ok(()))
+        let grid = if self.explorer.uses_surface() { None } else { mapper.occupancy(true) };
+        self.explorer.tick(pose.borrow().clone(), grid, surface, Ok(()))
     }
 }
 

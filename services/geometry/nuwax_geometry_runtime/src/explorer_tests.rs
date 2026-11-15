@@ -661,8 +661,13 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
             z: 0.,
             w: 0.05_f64.cos(),
         });
+        let grid = if floor == 0.0 { None } else {
+            let mut stale = grid();
+            stale.meta.as_mut().unwrap().timestamp_ns = unix_ns() - 10_000_000_000;
+            Some(stale)
+        };
         let update = explorer
-            .tick(Some(position.clone()), Some(grid()), Ok(surface.clone()), Ok(()))
+            .tick(Some(position.clone()), grid, Ok(surface.clone()), Ok(()))
             .unwrap();
         assert!(update.status.frontier_count > 1, "三维前沿数应统计未排除格子");
         let (_, target) = update.goal.expect("实际曲面源应产生目标");

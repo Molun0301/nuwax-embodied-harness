@@ -149,6 +149,9 @@ pub struct SurfaceFollower {
     early_requested: bool,
     plans: u64,
     execution_cycle_complete: bool,
+    untrackable_since_ns: Option<i64>,
+    last_local_failure: Option<String>,
+    correction_replan_pending: bool,
     terminal_phase: TerminalPhase,
     terminal_approach: Option<TerminalApproach>,
     terminal_heading: f64,
@@ -200,6 +203,9 @@ impl SurfaceFollower {
             early_requested: false,
             plans: 0,
             execution_cycle_complete: false,
+            untrackable_since_ns: None,
+            last_local_failure: None,
+            correction_replan_pending: false,
             terminal_phase: TerminalPhase::Travel,
             terminal_approach: None,
             terminal_heading: 0.,
@@ -426,6 +432,8 @@ impl SurfaceFollower {
         self.local_path.clear();
         self.local_body_path = None;
         self.execution_cycle_complete = false;
+        self.untrackable_since_ns = None;
+        self.last_local_failure = None;
         self.wait_reason = None;
         self.motion_sample_time = None;
         self.planning_velocity = [0.; 3];
@@ -549,6 +557,7 @@ impl SurfaceFollower {
                         self.pending_curve = Some((curve, self.plan_snapshot.take().unwrap()));
                     }
                     Err(reason) => {
+                        self.last_local_failure = Some(reason.clone());
                         self.wait_reason = Some(reason);
                         self.needs_plan = true;
                     }
@@ -727,6 +736,7 @@ impl NavPlanner for SurfaceFollower {
         self.retire_route();
         self.tracker.clear();
         self.goal = Some(goal.clone());
+        self.correction_replan_pending = false;
         self.options = options;
         self.path = None;
         self.reference = Arc::new(Vec::new());
@@ -761,6 +771,7 @@ impl NavPlanner for SurfaceFollower {
         self.retire_route();
         self.reference = Arc::new(path.poses.iter().map(Self::position).collect());
         self.path = Some(path);
+        self.correction_replan_pending = false;
         self.goal = Some(goal);
         self.submit_map();
         Ok(())
@@ -797,6 +808,9 @@ impl NavPlanner for SurfaceFollower {
         self.applied = command;
     }
     fn observe_registered_frame(&mut self, frame: Option<Arc<crate::RegisteredFrame>>) {
+        if frame.is_none() && self.path.is_some() {
+            self.correction_replan_pending = true;
+        }
         if self.registered_frame.as_ref().map(|f| &f.identity)
             == frame.as_ref().map(|f| &f.identity)
         {
@@ -838,6 +852,7 @@ impl NavPlanner for SurfaceFollower {
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
         self.local_path.clone()
     }
+    fn has_pending_replan(&self) -> bool { self.correction_replan_pending }
     fn execution_cycle_complete(&self) -> bool {
         self.execution_cycle_complete
     }
@@ -853,7 +868,23 @@ impl NavPlanner for SurfaceFollower {
         if self.reached() {
             return PlannerStep::Succeeded;
         }
-        match self.compute() {
+        if std::mem::take(&mut self.correction_replan_pending) {
+            return PlannerStep::ReplanRequired("地图已校正，重新规划路线".into());
+        }
+        let previous_plans = self.plans;
+        let computed = self.compute();
+        if self.terminal_phase == TerminalPhase::Travel && !self.tracker.recovery_active()
+            && self.active.is_none() && self.plans == previous_plans {
+            let stamp = self.odometry.as_ref().unwrap().stamp.nanos;
+            let began = *self.untrackable_since_ns.get_or_insert(stamp);
+            if stamp - began >= 2_000_000_000 {
+                return PlannerStep::ReplanRequired(format!("连续2秒没有可跟踪曲线，重新规划路线：{}",
+                    self.last_local_failure.as_deref().or(self.wait_reason.as_deref()).unwrap_or("等待局部规划结果")));
+            }
+        } else {
+            self.untrackable_since_ns = None;
+        }
+        match computed {
             Ok(_) if self.reached() => PlannerStep::Succeeded,
             Ok(command) => PlannerStep::Command(command),
             Err(reason) => {

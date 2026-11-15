@@ -212,6 +212,7 @@ extern "C" {
         trajectory: *const c_void,
         from: f64,
     ) -> i32;
+    fn nuwax_scan_snapshot_ground(map: *const c_void, config: *const Config, ground: *const f64, count: usize) -> *mut c_void;
     fn nuwax_scan_snapshot_destroy(map: *mut c_void);
     fn nuwax_scan_terminal_points(
         map: *const c_void, config: *const Config, goal: *const f64,
@@ -246,6 +247,7 @@ extern "C" {
     fn nuwax_scan_tracker_create() -> *mut c_void;
     fn nuwax_scan_tracker_destroy(tracker: *mut c_void);
     fn nuwax_scan_tracker_clear(tracker: *mut c_void);
+    fn nuwax_scan_tracker_recovery_active(tracker: *const c_void) -> i32;
     fn nuwax_scan_tracker_clear_trajectory(tracker: *mut c_void);
     fn nuwax_scan_tracker_install(tracker: *mut c_void, trajectory: *const c_void);
     fn nuwax_scan_tracker_track(
@@ -363,6 +365,12 @@ impl Drop for SnapshotHandle {
 #[derive(Clone)]
 pub struct CollisionSnapshot(Arc<SnapshotHandle>);
 impl CollisionSnapshot {
+    /// 单独替换机身下地面过滤视图，概率地图与实体索引继续共享。
+    pub fn with_ground(&self, config: &Config, ground: &[[f64; 3]]) -> Self {
+        Self(Arc::new(SnapshotHandle(NonNull::new(unsafe {
+            nuwax_scan_snapshot_ground(self.0.0.as_ptr(), config, ground.as_ptr().cast(), ground.len())
+        }).unwrap())))
+    }
     /// 为要求朝向的目标选择停点。
     pub fn terminal_points(
         &self, config: &Config, goal: [f64; 3], yaw: f64, tolerance: f64,
@@ -505,6 +513,11 @@ impl Default for ScanTracker {
     }
 }
 impl ScanTracker {
+    /// 读取原生脱困事件状态，不改变事件预算或退出判定。
+    pub fn recovery_active(&self) -> bool {
+        unsafe { nuwax_scan_tracker_recovery_active(self.0.as_ptr()) != 0 }
+    }
+
     /// 新目标退休旧跟踪，同时结束原脱困事件和故障锁。
     pub fn clear(&mut self) {
         unsafe { nuwax_scan_tracker_clear(self.0.as_ptr()) }

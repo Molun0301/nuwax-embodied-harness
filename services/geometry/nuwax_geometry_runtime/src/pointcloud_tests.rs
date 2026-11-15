@@ -50,6 +50,41 @@ fn recording_keeps_other_io_errors_on_the_existing_failure_path() {
 }
 
 #[test]
+fn streamed_replay_matches_the_old_sensor_concatenation_and_stable_sort() {
+    use nuwax_cloud_cleanup::scan_log::ScanReader;
+    let mut map = CloudMap::new(944, None, None).unwrap();
+    for (index, (sensor, seconds)) in [
+        ("主", 3), ("副", 2), ("主", 6), ("副", 3), ("辅", 1),
+        ("主", 9), ("副", 9), ("辅", 9),
+    ].into_iter().enumerate() {
+        let mut frame = crate::mapper::tests::room_frame(944, seconds * 1_000_000_000);
+        frame.sensor_id = sensor.into();
+        frame.ray_origin_body = [index as f64 * 0.01, 0.02, 0.3];
+        frame.odom_pose.position.as_mut().unwrap().x = index as f64;
+        map.record(index as u64 + 1, &frame, Isometry3::translation(0.1, 0., 0.)).unwrap();
+    }
+    let mut expected = Vec::new();
+    // 旧实现先按传感器日志收集全部帧，再按时间稳定排序。
+    for log in map.logs.values() {
+        log.sync().unwrap();
+        let mut reader = ScanReader::open(&log.path).unwrap();
+        while let Some(scan) = reader.next_scan().unwrap() { expected.push(scan); }
+    }
+    expected.sort_by_key(|scan| scan.metadata.source_timestamp_ns);
+    let mut stream = map.replay_frames().unwrap();
+    for scan in expected {
+        let frame = stream.next().unwrap().unwrap();
+        assert_eq!(frame.sensor_id, scan.metadata.sensor);
+        assert_eq!(frame.odom_pose, pose_from_isometry(matrix_isometry(&scan.metadata.odom_from_body),
+            "odom", scan.metadata.source_timestamp_ns));
+        assert_eq!(frame.points_body, scan.points.iter().map(|p| p.map(f64::from)).collect::<Vec<_>>());
+        assert_eq!(frame.ray_origin_body, scan.metadata.sensor_origin_body.unwrap().map(f64::from));
+        assert!(!frame.mapping_only);
+    }
+    assert!(stream.next().is_none());
+}
+
+#[test]
 fn display_removals_match_full_scan_for_every_frame() {
     let mut total_removed = 0;
     for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::{BufReader, Read, Seek, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -306,7 +306,7 @@ impl ScanLog {
     }
 }
 pub struct ScanReader {
-    file: std::io::Take<BufReader<File>>,
+    file: BufReader<File>,
     pub session: Session,
     pub observed_until_ns: u64,
     pub dropped_frames: u64,
@@ -329,7 +329,7 @@ impl ScanReader {
         let session = read_json(&mut file)?;
         let valid_bytes = file.stream_position().map_err(error)?;
         Ok(Self {
-            file: BufReader::with_capacity(1024 * 1024, file).take(u64::MAX),
+            file: BufReader::with_capacity(1024 * 1024, file),
             session,
             observed_until_ns: 0,
             dropped_frames: 0,
@@ -346,20 +346,27 @@ impl ScanReader {
             }
         }
     }
+    /// 归并日志时只预读下一帧元数据；选中该日志后仍由 next_scan 读取和校验完整记录。
+    pub fn peek_next_scan_timestamp(&mut self) -> Result<Option<u64>, String> {
+        loop {
+            let position = self.file.stream_position().map_err(error)?;
+            let Some(size) = self.next_record_size()? else { return Ok(None) };
+            if position + 4 + size as u64 + 32 > self.file.get_ref().metadata().map_err(error)?.len() {
+                self.file.seek(SeekFrom::Start(position)).map_err(error)?;
+                self.next_record()?;
+                return Ok(None);
+            }
+            let header: Record = read_json(&mut self.file)?;
+            self.file.seek(SeekFrom::Start(position)).map_err(error)?;
+            match header {
+                Record::Scan { metadata, .. } => return Ok(Some(metadata.source_timestamp_ns)),
+                Record::Progress { .. } => { self.next_record()?; }
+            }
+        }
+    }
     /// 每次只解析一条记录，按日志顺序读取扫描和源时间进度。
     pub fn next_record(&mut self) -> Result<Option<ReplayRecord>, String> {
-        let mut size = [0; 4];
-        let first = self.file.read(&mut size[..1]).map_err(error)?;
-        if first == 0 {
-            return Ok(None);
-        }
-        if let Err(e) = self.file.read_exact(&mut size[1..]) {
-            return self.tail(e);
-        }
-        let n = u32::from_le_bytes(size) as usize;
-        if !(4..=MAX_POINTS * 16 + 65540).contains(&n) {
-            return Err("原始扫描记录长度无效".into());
-        }
+        let Some(n) = self.next_record_size()? else { return Ok(None) };
         let mut bytes = vec![0; n];
         if let Err(e) = self.file.read_exact(&mut bytes) {
             return self.tail(e);
@@ -374,7 +381,7 @@ impl ScanReader {
         let mut input = std::io::Cursor::new(&bytes);
         let header: Record = read_json(&mut input)?;
         let offset = input.position() as usize;
-        self.valid_bytes = self.file.get_mut().stream_position().map_err(error)?;
+        self.valid_bytes = self.file.stream_position().map_err(error)?;
         match header {
             Record::Progress {
                 source_timestamp_ns,
@@ -400,7 +407,7 @@ impl ScanReader {
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect();
-                if !floats.iter().all(|v| v.is_finite()) {
+                if !floats.iter().all(|value| value.is_finite()) {
                     return Err("原始扫描含无效坐标或强度".into());
                 }
                 let points = floats[..metadata.point_count * 3]
@@ -416,7 +423,22 @@ impl ScanReader {
             }
         }
     }
-    fn tail(&mut self, e: std::io::Error) -> Result<Option<ReplayRecord>, String> {
+    fn next_record_size(&mut self) -> Result<Option<usize>, String> {
+        let mut size = [0; 4];
+        let first = self.file.read(&mut size[..1]).map_err(error)?;
+        if first == 0 {
+            return Ok(None);
+        }
+        if let Err(e) = self.file.read_exact(&mut size[1..]) {
+            return self.tail(e);
+        }
+        let n = u32::from_le_bytes(size) as usize;
+        if !(4..=MAX_POINTS * 16 + 65540).contains(&n) {
+            return Err("原始扫描记录长度无效".into());
+        }
+        Ok(Some(n))
+    }
+    fn tail<T>(&mut self, e: std::io::Error) -> Result<Option<T>, String> {
         if e.kind() != std::io::ErrorKind::UnexpectedEof {
             return Err(error(e));
         }
@@ -617,6 +639,15 @@ mod v2_tests {
             while let Some(scan) = reader.next_scan().unwrap() {
                 stamps.push(scan.metadata.source_timestamp_ns);
             }
+            let mut streaming = ScanReader::open(&path).unwrap();
+            let mut streamed_stamps = Vec::new();
+            while let Some(stamp) = streaming.peek_next_scan_timestamp().unwrap() {
+                assert_eq!(streaming.peek_next_scan_timestamp().unwrap(), Some(stamp));
+                let scan = streaming.next_scan().unwrap().unwrap();
+                assert_eq!(scan.metadata.source_timestamp_ns, stamp);
+                streamed_stamps.push(stamp);
+            }
+            assert_eq!(streamed_stamps, stamps, "预读必须保留相同的完整记录前缀，截断={cut}");
             assert_eq!(stamps[0], 10);
             assert!(stamps == [10] || stamps == [10, 20]);
             assert!(reader.valid_bytes <= cut as u64);

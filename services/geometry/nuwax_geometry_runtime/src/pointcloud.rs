@@ -462,33 +462,19 @@ impl CloudMap {
     pub fn final_poses(&self) -> Vec<(u64, [f64; 16])> {
         self.poses.clone()
     }
-    pub fn replay_frames(&self) -> Result<Vec<MappingFrame>, String> {
-        let mut result = Vec::new();
+    pub(crate) fn building_pose(&self, stamp: u64) -> Option<Isometry3<f64>> {
+        self.poses.iter().min_by_key(|(time, _)| time.abs_diff(stamp))
+            .map(|(_, pose)| matrix_isometry(pose))
+    }
+    pub fn replay_frames(&self) -> Result<ReplayFrames, String> {
+        let mut readers = Vec::new();
         for log in self.logs.values() {
             log.sync()?;
             let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&log.path)?;
-            while let Some(scan) = reader.next_scan()? {
-                result.push(MappingFrame {
-                    session_id: self.session_id,
-                    odom_pose: pose_from_isometry(
-                        matrix_isometry(&scan.metadata.odom_from_body),
-                        "odom",
-                        scan.metadata.source_timestamp_ns,
-                    ),
-                    points_body: scan.points.into_iter().map(|p| p.map(f64::from)).collect(),
-                    ray_origin_body: scan
-                        .metadata
-                        .sensor_origin_body
-                        .ok_or("扫描缺少雷达原点")?
-                        .map(f64::from),
-                    mapping_only: false,
-                    sensor_id: scan.metadata.sensor.clone(),
-                    registered_cloud: None,
-                });
-            }
+            let stamp = reader.peek_next_scan_timestamp()?;
+            readers.push((reader, stamp));
         }
-        result.sort_by_key(|frame| frame.odom_pose.timestamp_ns);
-        Ok(result)
+        Ok(ReplayFrames { session_id: self.session_id, readers })
     }
     pub fn adopt_publication(&mut self, previous: &mut Self) -> Result<(), String> {
         // 重建地图首次封存就接续会话版本，根几何与全部块版本一起推进。
@@ -553,6 +539,34 @@ impl CloudMap {
             result.base_offset_points = request.offset_points;
         }
         Ok(result)
+    }
+}
+pub(crate) struct ReplayFrames {
+    session_id: u64,
+    readers: Vec<(nuwax_cloud_cleanup::scan_log::ScanReader, Option<u64>)>,
+}
+impl Iterator for ReplayFrames {
+    type Item = Result<MappingFrame, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // 同时间戳沿传感器日志原顺序，和旧的稳定排序结果一致。
+        let (index, _) = self.readers.iter().enumerate()
+            .filter_map(|(index, (_, stamp))| stamp.map(|stamp| (index, stamp)))
+            .min_by_key(|(index, stamp)| (*stamp, *index))?;
+        Some((|| {
+            let (reader, stamp) = &mut self.readers[index];
+            let scan = reader.next_scan()?.expect("已预读完整扫描元数据");
+            *stamp = reader.peek_next_scan_timestamp()?;
+            Ok(MappingFrame {
+                session_id: self.session_id,
+                odom_pose: pose_from_isometry(matrix_isometry(&scan.metadata.odom_from_body),
+                    "odom", scan.metadata.source_timestamp_ns),
+                points_body: scan.points.into_iter().map(|p| p.map(f64::from)).collect(),
+                ray_origin_body: scan.metadata.sensor_origin_body.ok_or("扫描缺少雷达原点")?.map(f64::from),
+                mapping_only: false,
+                sensor_id: scan.metadata.sensor,
+                registered_cloud: None,
+            })
+        })())
     }
 }
 fn domain(session_id: u64) -> nuwax_map_chunks::Domain {

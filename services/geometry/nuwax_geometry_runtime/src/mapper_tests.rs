@@ -108,6 +108,61 @@ fn failed_replay_or_publication_preserves_the_current_map() {
     }
 }
 
+#[test]
+fn small_pgo_updates_compare_against_the_poses_that_built_the_current_map() {
+    let mut worker = Worker::new(
+        945, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    worker.frame(room_frame(945, first)).unwrap();
+    let original = worker.snapshot().unwrap();
+    for offset in [0.01, 0.04, 0.049] {
+        worker.apply_pgo(PgoUpdate::constant_for_test(first + 100,
+            Isometry3::translation(offset, 0., 0.))).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, original.cloud.revision);
+        assert_eq!(worker.cloud.snapshot().display, original.cloud.display);
+        assert_eq!(worker.cloud.final_poses(), original.final_poses);
+        assert!((worker.poses.borrow().as_ref().unwrap().position.as_ref().unwrap().x - offset).abs() < 1e-12);
+        assert_eq!(worker.map_from_odom, Isometry3::translation(offset, 0., 0.));
+    }
+    worker.apply_pgo(PgoUpdate::constant_for_test(first,
+        Isometry3::translation(0.051, 0., 0.))).unwrap();
+    let rebuilt_revision = worker.cloud.snapshot().revision;
+    assert_eq!(rebuilt_revision, original.cloud.revision + 1,
+        "连续小校正相对建图位姿累计超过阈值时必须重放");
+    worker.apply_pgo(PgoUpdate::constant_for_test(first,
+        Isometry3::translation(0.075, 0., 0.))).unwrap();
+    assert_eq!(worker.cloud.snapshot().revision, rebuilt_revision,
+        "重放后应比较更新后的建图位姿");
+}
+
+#[test]
+fn pgo_replay_threshold_combines_rotation_and_translation_and_checks_every_keyframe() {
+    for early_large_change in [false, true] {
+        let mut worker = Worker::new(
+            946, config(), None, false,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        ).unwrap();
+        let first = 1_000_000_000;
+        worker.frame(room_frame(946, first)).unwrap();
+        worker.frame(room_frame(946, first + 1_000_000_000)).unwrap();
+        let before = worker.cloud.snapshot().revision;
+        let poses = if early_large_change {
+            vec![(0., Isometry3::translation(0.1, 0., 0.)), (1., Isometry3::identity())]
+        } else {
+            vec![(0., Isometry3::new(nalgebra::Vector3::new(0.02, 0., 0.),
+                nalgebra::Vector3::new(0., 0., 0.004)))]
+        };
+        worker.apply_pgo(PgoUpdate::timeline_for_test(first, poses)).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, before + 1);
+    }
+}
+
 pub(crate) fn frames_without_candidate_keep_session_healthy(
     backend: MappingBackendSpec,
     corrector: Corrector,
@@ -186,7 +241,8 @@ fn pgo_rebuild_keeps_root_and_block_versions_accepted_by_navigation() {
         assert!(previous.revision > 1);
         assert!(!previous.blocks.is_empty());
 
-        for offset in [0.01, 0.02] {
+        // 超过小校正阈值，继续验证真实重建的版本接续。
+        for offset in [0.1, 0.2] {
             worker.apply_pgo(PgoUpdate::constant_for_test(
                 first_stamp, Isometry3::translation(offset, 0., 0.),
             )).unwrap();

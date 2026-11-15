@@ -826,6 +826,18 @@ impl Worker {
         self.correction_stopped.send_replace(Some(reason));
     }
     fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
+        let small = update.optimized_poses().all(|(stamp, optimized)| {
+            self.cloud.building_pose(stamp).is_some_and(|built| {
+                let delta = built.inverse() * optimized;
+                delta.translation.vector.norm() + 10.0 * delta.rotation.angle() < 0.05
+            })
+        });
+        if small {
+            self.map_from_odom = update.latest;
+            self.transform.send_replace(update.latest);
+            self.publish_pose();
+            return Ok(());
+        }
         // 原始扫描按优化后的关键帧轨迹逐帧重建，数值内核仍为同一组内核。
         let frames = self.cloud.replay_frames()?;
         let mut rebuilt = CloudMap::new(self.session_id, None, None)?;
@@ -835,7 +847,10 @@ impl Worker {
             .backend
             .into_kernel(self.config.compute.window_capacity);
         let mut persistent = None;
-        for (index, frame) in frames.iter().enumerate() {
+        let mut stamp = 0;
+        for (index, frame) in frames.enumerate() {
+            let frame = frame?;
+            stamp = frame.odom_pose.timestamp_ns;
             let correction = update.correction_at(frame.odom_pose.timestamp_ns);
             let body = correction * pose_isometry(&frame.odom_pose);
             let points: Vec<_> = frame
@@ -846,7 +861,7 @@ impl Worker {
             let origin = body * Point3::from(frame.ray_origin_body);
             let (dynamic, _, _) = rebuilt.accumulate(
                 index as u64 + 1,
-                frame,
+                &frame,
                 &points,
                 [origin.x, origin.y, origin.z],
                 correction,
@@ -871,13 +886,13 @@ impl Worker {
                 )?);
             }
         }
-        let publication = self.prepare_grid(persistent.as_ref(), frames.last().map_or(0, |f| f.odom_pose.timestamp_ns))?;
+        let publication = self.prepare_grid(persistent.as_ref(), stamp)?;
         rebuilt.adopt_publication(&mut self.cloud)?;
         self.cloud = rebuilt;
         self.fine_root.send_replace(self.cloud.surface());
         self.kernel = Some(kernel);
         self.grid = persistent;
-        self.grid_stamp = frames.last().map_or(0, |f| f.odom_pose.timestamp_ns);
+        self.grid_stamp = stamp;
         self.map_from_odom = update.latest;
         self.transform.send_replace(update.latest);
         self.publish_pose();

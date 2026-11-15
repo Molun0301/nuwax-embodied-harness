@@ -421,6 +421,14 @@ impl CloudMap {
             Some(dynamic),
         )
     }
+    /// 切到写入时释放只读分类副本；切回只读后由 `classify_readonly` 按当前精细根重新建立。
+    pub fn release_readonly_classifier(&mut self) {
+        self.readonly_classifier = None;
+    }
+    #[cfg(test)]
+    pub(crate) fn has_readonly_classifier(&self) -> bool {
+        self.readonly_classifier.is_some()
+    }
     pub fn disable_recording(&mut self) {
         self.recording = false;
     }

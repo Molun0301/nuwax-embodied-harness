@@ -174,6 +174,7 @@ enum Command {
     ),
     Transform(Isometry3<f64>, oneshot::Sender<Result<(), String>>),
     Name(String),
+    Writing(bool),
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
     Forbidden(PathBuf, oneshot::Sender<Result<(), String>>),
@@ -399,6 +400,10 @@ impl Mapper {
     }
     pub fn set_map_name(&self, name: String) {
         let _ = self.sender.send(Command::Name(name));
+    }
+    /// 加载的三维地图在只读与写入之间切换；写入时帧按新建地图会话处理。
+    pub fn set_writing(&self, writing: bool) {
+        let _ = self.sender.send(Command::Writing(writing));
     }
     pub(crate) async fn display_cloud(&self) -> Result<crate::pointcloud::CloudSnapshot, String> {
         let (tx, rx) = oneshot::channel();
@@ -663,6 +668,13 @@ impl Worker {
                 Ok(())
             }
             Command::Shutdown => Ok(()),
+            Command::Writing(writing) => {
+                self.read_only = !writing;
+                if writing {
+                    self.cloud.release_readonly_classifier();
+                }
+                Ok(())
+            }
             Command::ActivateShared(reply) => {
                 let result = match self.config.cloudmap_shm_path.as_deref() {
                     Some(path) => self.cloud.attach_shared(path),

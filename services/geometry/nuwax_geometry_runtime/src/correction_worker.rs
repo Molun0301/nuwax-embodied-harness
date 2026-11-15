@@ -57,9 +57,14 @@ impl CorrectionWorker {
         *self.inbox.input.lock() = Some(input);
         self.inbox.ready.notify_one();
     }
-    pub fn next(&self) -> Option<Update> { self.updates.try_recv().ok() }
+    pub fn next(&self) -> Option<Update> {
+        if self.inbox.stop.load(Ordering::Acquire) { return None; }
+        self.updates.try_recv().ok()
+    }
     pub fn request_stop(&self) {
         self.inbox.stop.store(true, Ordering::Release);
+        self.inbox.input.lock().take();
+        while self.updates.try_recv().is_ok() {}
         self.inbox.ready.notify_all();
         #[cfg(test)]
         self.inbox.probe.changed.notify_all();
@@ -184,6 +189,25 @@ impl Rebuilt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stopping_discards_a_completed_correction_and_rejects_later_input() {
+        let (corrector, confirmed) = Corrector::scripted_for_test(vec![Ok(Some(
+            PgoUpdate::constant_for_test(1_000_000_000, Isometry3::translation(0.2, 0., 0.))
+        ))]);
+        let mut worker = CorrectionWorker::start(957, MapperConfig::default(), corrector).unwrap();
+        let frame = tests_frame(1_000_000_000);
+        worker.submit(CorrectionInput::new(&frame, &[], None, Isometry3::identity()));
+        let started = Instant::now();
+        while confirmed.lock().unwrap().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        worker.request_stop();
+        worker.submit(CorrectionInput::new(&frame, &[], None, Isometry3::identity()));
+        worker.shutdown();
+        assert!(worker.next().is_none(), "停止后已经算出的校正也不能再采用");
+        assert!(worker.inbox.input.lock().is_none());
+    }
     #[test]
     fn replay_shutdown_finishes_within_one_frame_and_pending_input_keeps_only_latest() {
         let frame = tests_frame(1_000_000_000);

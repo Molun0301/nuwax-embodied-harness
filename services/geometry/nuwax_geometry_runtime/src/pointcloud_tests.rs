@@ -236,3 +236,26 @@ fn synchronous_recording_selects_against_last_saved_frame_per_sensor_and_survive
     drop(replacement);
     drop(map);
 }
+
+#[test]
+fn recorded_scan_keeps_the_first_body_point_in_each_five_centimeter_voxel() {
+    let mut map = CloudMap::new(959, None, None).unwrap();
+    let mut frame = crate::mapper::tests::room_frame(959, 1_000_000_000);
+    frame.points_body = vec![
+        [0.011, 0.022, 0.033], [0.014, 0.024, 0.034],
+        [-0.011, -0.022, -0.033], [-0.014, -0.024, -0.034],
+        [1.011, 2.022, 3.033], [1.014, 2.024, 3.034],
+    ];
+    let original = frame.points_body.clone();
+    map.record(1, &frame, Isometry3::translation(2., 3., 4.)).unwrap();
+    let prefix = map.scan_prefix().unwrap();
+    let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&prefix[0].0).unwrap();
+    let scan = reader.next_scan().unwrap().unwrap();
+    assert_eq!(frame.points_body, original, "记录降采样不改在线帧");
+    assert_eq!(scan.metadata.point_count, 3);
+    assert_eq!(scan.points, [original[0], original[2], original[4]].map(|point| point.map(|v| v as f32)));
+    let voxel = |point: [f64; 3]| point.map(|v| (v / 0.05).floor() as i64);
+    let before: ahash::AHashSet<_> = original.into_iter().map(voxel).collect();
+    let after: ahash::AHashSet<_> = scan.points.iter().map(|point| voxel(point.map(f64::from))).collect();
+    assert_eq!(before, after);
+}

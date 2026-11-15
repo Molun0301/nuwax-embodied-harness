@@ -276,7 +276,7 @@ impl CloudMap {
         }
         let result: Result<(), String> = (|| {
             use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-            let metadata = ScanMetadata {
+            let mut metadata = ScanMetadata {
                 source_timestamp_ns: frame.odom_pose.timestamp_ns,
                 source_sequence: sequence,
                 sensor: frame.sensor_id.clone(),
@@ -315,11 +315,12 @@ impl CloudMap {
             }
             let log = self.logs.get_mut(&frame.sensor_id).unwrap();
             if selected {
-                log.append(
-                    &metadata,
-                    frame.points_body.iter().map(|p| p.map(|v| v as f32)),
-                    None,
-                )?;
+                let mut voxels = ahash::AHashSet::new();
+                let points: Vec<_> = frame.points_body.iter()
+                    .filter(|point| voxels.insert(point.map(|v| (v / 0.05).floor() as i64)))
+                    .map(|point| point.map(|v| v as f32)).collect();
+                metadata.point_count = points.len();
+                log.append(&metadata, points.into_iter(), None)?;
             }
             log.progress(frame.odom_pose.timestamp_ns, 0)?;
             if selected {

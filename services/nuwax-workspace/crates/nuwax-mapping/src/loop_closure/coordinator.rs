@@ -341,6 +341,7 @@ pub struct LoopClosureCoordinator {
     pending_loop: Option<PendingLoop>,
     search_diagnostics: LoopSearchDiagnostics,
     last_search_report_timestamp: Option<f64>,
+    last_time_probe_timestamp: Option<f64>,
 }
 
 #[derive(Default)]
@@ -367,6 +368,7 @@ impl LoopClosureCoordinator {
             pending_loop: None,
             search_diagnostics: LoopSearchDiagnostics::default(),
             last_search_report_timestamp: None,
+            last_time_probe_timestamp: None,
         })
     }
 
@@ -389,22 +391,26 @@ impl LoopClosureCoordinator {
         if points.len() < self.config.min_keyframe_points {
             return Ok(ProcessFrameResult::InsufficientPoints);
         }
+        let mut time_only = false;
         if let Some((_, last)) = self.keyframes.last_key_value() {
             if timestamp <= last.timestamp {
                 return Err(LoopClosurePipelineError::InvalidCorrectionTimeline);
             }
             let delta = last.local_pose.inverse() * local_pose;
+            let probe_from = self.last_time_probe_timestamp
+                .map_or(last.timestamp, |probe| last.timestamp.max(probe));
             let confirmation_due = self.pending_loop.is_some()
-                && timestamp - last.timestamp >= self.config.loop_confirmation_interval_secs;
+                && timestamp - probe_from >= self.config.loop_confirmation_interval_secs;
             let stationary_probe_due = self.keyframes.len() >= self.config.min_keyframes_for_loop_search
-                && timestamp - last.timestamp >= self.config.stationary_probe_interval_secs;
-            if !confirmation_due
-                && !stationary_probe_due
-                && delta.translation.vector.norm() < self.config.keyframe_translation
-                && delta.rotation.angle() < self.config.keyframe_rotation
-            {
+                && timestamp - probe_from >= self.config.stationary_probe_interval_secs;
+            time_only = delta.translation.vector.norm() < self.config.keyframe_translation
+                && delta.rotation.angle() < self.config.keyframe_rotation;
+            if time_only && !confirmation_due && !stationary_probe_due {
                 return Ok(ProcessFrameResult::BelowKeyframeThreshold);
             }
+        }
+        if time_only {
+            self.last_time_probe_timestamp = Some(timestamp);
         }
 
         let previous = self
@@ -462,7 +468,13 @@ impl LoopClosureCoordinator {
         );
 
         let loop_result = self.find_and_measure_loop(node_id);
+        let measured = loop_result.is_some();
         let confirmed = self.confirm_loop(loop_result, timestamp);
+        if time_only && !measured {
+            self.graph.remove_last_node();
+            self.keyframes.remove(&node_id);
+            return Ok(ProcessFrameResult::BelowKeyframeThreshold);
+        }
         let result = if let Some(records) = confirmed {
             let mut optimized_graph = self.graph.clone();
             for record in &records {
@@ -526,6 +538,7 @@ impl LoopClosureCoordinator {
         self.pending_loop = None;
         self.search_diagnostics = LoopSearchDiagnostics::default();
         self.last_search_report_timestamp = None;
+        self.last_time_probe_timestamp = None;
     }
 
     fn find_and_measure_loop(&mut self, current_id: u64) -> Option<LoopClosureRecord> {
@@ -1174,6 +1187,96 @@ fn has_valid_correction(before: &PoseGraph, after: &PoseGraph) -> bool {
 mod tests {
     use super::*;
     use nalgebra::UnitQuaternion;
+
+    #[test]
+    fn time_only_probes_keep_the_search_interval_after_node_rollback() {
+        for confirmation in [false, true] {
+            let mut owner = consistency_fixture();
+            let last = owner.keyframes.last_key_value().unwrap().1;
+            let pose = last.local_pose;
+            let points = last.points.clone();
+            let start = last.timestamp;
+            if confirmation {
+                owner.confirm_loop(Some(measured_loop(11, 5.5, 0.)), start);
+            }
+            // 四秒内不触发五秒汇总，直接统计既有诊断中的真实搜索次数。
+            owner.last_search_report_timestamp = Some(start);
+            owner.search_diagnostics = LoopSearchDiagnostics::default();
+            let steps_per_probe = if confirmation { 10 } else { 20 };
+            for step in 1..=40 {
+                assert!(matches!(owner.process_frame(start + step as f64 / 10., pose, &points).unwrap(),
+                    ProcessFrameResult::BelowKeyframeThreshold));
+                assert_eq!(owner.search_diagnostics.searches, step / steps_per_probe,
+                    "待确认={confirmation}，第{step}个0.1秒帧");
+                assert_eq!(owner.graph.num_nodes(), 12);
+                assert_eq!(owner.graph.num_edges(), 11);
+            }
+            owner.process_frame(start + 4.1, pose * Isometry3::translation(0.2, 0., 0.), &points).unwrap();
+            assert_eq!(owner.graph.num_nodes(), 13, "运动帧不受时间探测间隔限制");
+            assert_eq!(owner.last_time_probe_timestamp, Some(start + 4.));
+            owner.reset();
+            assert!(owner.last_time_probe_timestamp.is_none());
+        }
+    }
+
+    #[test]
+    fn time_only_probes_without_measurements_leave_graph_and_timeline_unchanged() {
+        let mut owner = consistency_fixture();
+        let nodes = owner.graph.num_nodes();
+        let edges = owner.graph.num_edges();
+        let timeline = owner.corrections().keyframes().len();
+        let points = owner.keyframes.last_key_value().unwrap().1.points.clone();
+        let last = owner.keyframes.last_key_value().unwrap().1.local_pose;
+        // 先走待确认间隔，再覆盖没有待确认记录时的静止探测间隔。
+        owner.confirm_loop(Some(measured_loop(11, 5.5, 0.)), 11.);
+        for stamp in 12..=80 {
+            assert!(matches!(owner.process_frame(stamp as f64, last, &points).unwrap(),
+                ProcessFrameResult::BelowKeyframeThreshold));
+            assert_eq!(owner.graph.num_nodes(), nodes);
+            assert_eq!(owner.graph.num_edges(), edges);
+            assert_eq!(owner.keyframes.len(), nodes);
+            assert_eq!(owner.corrections().keyframes().len(), timeline);
+            assert!(owner.graph.edges.iter().all(|edge|
+                owner.graph.nodes.contains_key(&edge.from) && owner.graph.nodes.contains_key(&edge.to)));
+        }
+        assert!(matches!(owner.process_frame(81., last * Isometry3::translation(0.2, 0., 0.), &points).unwrap(),
+            ProcessFrameResult::KeyframeAdded { node_id } if node_id == nodes as u64));
+        assert_eq!(owner.graph.num_nodes(), nodes + 1);
+        assert_eq!(owner.graph.num_edges(), edges + 1);
+    }
+
+    #[test]
+    fn time_only_probe_with_an_unconfirmed_measurement_keeps_its_node() {
+        let world: Vec<_> = (-8..=8).flat_map(|a| (-8..=8).flat_map(move |b| {
+            let u = a as f64 * 0.2;
+            let v = b as f64 * 0.2;
+            [Point3::new(4., u, v), Point3::new(u, 3., v), Point3::new(u, v, -1.)]
+        })).collect();
+        let mut owner = LoopClosureCoordinator::new(LoopClosurePipelineConfig {
+            min_keyframes_for_loop_search: 3,
+            min_loop_separation_secs: 2.,
+            loop_confirmation_frames: 3,
+            stationary_probe_interval_secs: 1.,
+            min_loop_interval_secs: 0.,
+            ..Default::default()
+        }).unwrap();
+        for (stamp, x) in [(0., 0.), (1., 0.6), (2., 1.2)] {
+            let pose = Isometry3::translation(x, 0., 0.);
+            let body: Vec<_> = world.iter().map(|point| pose.inverse() * point).collect();
+            owner.process_frame(stamp, pose, &body).unwrap();
+        }
+        let pose = Isometry3::translation(1.2, 0., 0.);
+        let body: Vec<_> = world.iter().map(|point| pose.inverse() * point).collect();
+        assert_eq!(owner.pending_loop.as_ref().unwrap().records.len(), 1);
+        assert!(matches!(owner.process_frame(4., pose, &body).unwrap(),
+            ProcessFrameResult::KeyframeAdded { .. }));
+        assert_eq!(owner.keyframes.len(), 4);
+        assert_eq!(owner.graph.num_edges(), 3);
+        let pending = owner.pending_loop.as_ref().expect("量到了尚待确认的回环");
+        assert_eq!(pending.records.len(), 2, "静止探测追加了一次真实测量，仍未达到三帧确认");
+        assert!(owner.keyframes.contains_key(&pending.records[0].to));
+        assert!(owner.loops().is_empty());
+    }
 
     #[test]
     fn point_lio_profile_preserves_accurate_room_and_corrects_supported_drift() {

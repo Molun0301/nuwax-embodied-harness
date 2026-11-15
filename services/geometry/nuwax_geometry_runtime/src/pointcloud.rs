@@ -70,6 +70,7 @@ pub(crate) struct CloudMap {
     save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy,
     poses: Vec<(u64, [f64; 16])>,
     recording: bool,
+    recording_limit_reached: bool,
     raw_directory: Option<PathBuf>,
     readonly_classifier: Option<FineCloud>,
     history_scans: Vec<(PathBuf, u64)>,
@@ -167,6 +168,7 @@ impl CloudMap {
             save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy::from_runtime()?,
             poses: Vec::new(),
             recording: true,
+            recording_limit_reached: false,
             raw_directory: None,
             readonly_classifier: None,
             history_scans: Vec::new(),
@@ -223,10 +225,10 @@ impl CloudMap {
             .iter()
             .filter_map(|p| voxel_key([p.x, p.y, p.z], self.voxel_size))
             .collect();
-        let removed: Vec<_> = self
-            .voxels
-            .iter()
-            .copied()
+        let removed: Vec<_> = dynamic
+            .candidate_grid_keys(f64::from(self.voxel_size), |key| self.voxels.contains(&key))
+            .expect("去动态后端提供规则格候选")
+            .into_iter()
             .filter(|key| {
                 !hits.contains(key) && dynamic.clears(voxel_center_f64(*key, self.voxel_size))
             })
@@ -259,9 +261,7 @@ impl CloudMap {
         self.stamp = frame.odom_pose.timestamp_ns;
         self.poses
             .push((self.stamp, isometry_matrix(&(map_from_odom * odom))));
-        if self.recording {
-            self.record(sequence, frame, map_from_odom)?;
-        }
+        self.record(sequence, frame, map_from_odom)?;
         Ok((dynamic, indices, ground))
     }
     fn record(
@@ -270,57 +270,73 @@ impl CloudMap {
         frame: &MappingFrame,
         transform: Isometry3<f64>,
     ) -> Result<(), String> {
-        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-        let metadata = ScanMetadata {
-            source_timestamp_ns: frame.odom_pose.timestamp_ns,
-            source_sequence: sequence,
-            sensor: frame.sensor_id.clone(),
-            source_generation: 1,
-            odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
-            map_from_odom: isometry_matrix(&transform),
-            sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
-            observation_minimum_range_m: Some(
-                crate::dynamic_backend::online_params().min_range as f64,
-            ),
-            point_count: frame.points_body.len(),
-        };
-        let selected = self.save_policy.selects(self.last_recorded.get(&frame.sensor_id), &metadata);
-        if self.raw_directory.is_none() {
-            self.raw_directory = Some(
-                nuwax_cloud_cleanup::scan_log::scan_directory()
-                    .join(format!(".geometry-{}", uuid::Uuid::new_v4())),
-            );
+        if !self.recording {
+            return Ok(());
         }
-        if !self.logs.contains_key(&frame.sensor_id) {
-            let root = self
-                .raw_directory
-                .as_ref()
-                .unwrap()
-                .join(format!("source-{}", self.logs.len()));
-            self.logs.insert(
-                frame.sensor_id.clone(),
-                ScanLog::open(
-                    &root,
-                    Session {
-                        session_id: self.session_id.to_string(),
-                        generation: SCAN_LOG_GENERATION,
-                    },
-                )?,
-            );
+        let result: Result<(), String> = (|| {
+            use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+            let metadata = ScanMetadata {
+                source_timestamp_ns: frame.odom_pose.timestamp_ns,
+                source_sequence: sequence,
+                sensor: frame.sensor_id.clone(),
+                source_generation: 1,
+                odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
+                map_from_odom: isometry_matrix(&transform),
+                sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
+                observation_minimum_range_m: Some(
+                    crate::dynamic_backend::online_params().min_range as f64,
+                ),
+                point_count: frame.points_body.len(),
+            };
+            let selected = self.save_policy.selects(self.last_recorded.get(&frame.sensor_id), &metadata);
+            if self.raw_directory.is_none() {
+                self.raw_directory = Some(
+                    nuwax_cloud_cleanup::scan_log::scan_directory()
+                        .join(format!(".geometry-{}", uuid::Uuid::new_v4())),
+                );
+            }
+            if !self.logs.contains_key(&frame.sensor_id) {
+                let root = self
+                    .raw_directory
+                    .as_ref()
+                    .unwrap()
+                    .join(format!("source-{}", self.logs.len()));
+                self.logs.insert(
+                    frame.sensor_id.clone(),
+                    ScanLog::open(
+                        &root,
+                        Session {
+                            session_id: self.session_id.to_string(),
+                            generation: SCAN_LOG_GENERATION,
+                        },
+                    )?,
+                );
+            }
+            let log = self.logs.get_mut(&frame.sensor_id).unwrap();
+            if selected {
+                log.append(
+                    &metadata,
+                    frame.points_body.iter().map(|p| p.map(|v| v as f32)),
+                    None,
+                )?;
+            }
+            log.progress(frame.odom_pose.timestamp_ns, 0)?;
+            if selected {
+                self.last_recorded.insert(frame.sensor_id.clone(), metadata);
+            }
+            Ok(())
+        })();
+        match result {
+            Err(error) if error == nuwax_cloud_cleanup::scan_log::DIRECTORY_BUDGET_EXCEEDED => {
+                self.recording = false;
+                self.recording_limit_reached = true;
+                Ok(())
+            }
+            result => result,
         }
-        let log = self.logs.get_mut(&frame.sensor_id).unwrap();
-        if selected {
-            log.append(
-                &metadata,
-                frame.points_body.iter().map(|p| p.map(|v| v as f32)),
-                None,
-            )?;
-        }
-        log.progress(frame.odom_pose.timestamp_ns, 0)?;
-        if selected {
-            self.last_recorded.insert(frame.sensor_id.clone(), metadata);
-        }
-        Ok(())
+    }
+    pub(crate) fn take_recording_limit(&mut self) -> bool {
+        std::mem::take(&mut self.recording_limit_reached)
     }
     pub fn commit(&mut self, stamp: u64) -> Result<(), String> {
         if !self.dirty || self.stamp == 0 || stamp == 0 {
@@ -446,33 +462,15 @@ impl CloudMap {
     pub fn final_poses(&self) -> Vec<(u64, [f64; 16])> {
         self.poses.clone()
     }
-    pub fn replay_frames(&self) -> Result<Vec<MappingFrame>, String> {
-        let mut result = Vec::new();
+    pub fn replay_frames(&self) -> Result<ReplayFrames, String> {
+        let mut readers = Vec::new();
         for log in self.logs.values() {
             log.sync()?;
             let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&log.path)?;
-            while let Some(scan) = reader.next_scan()? {
-                result.push(MappingFrame {
-                    session_id: self.session_id,
-                    odom_pose: pose_from_isometry(
-                        matrix_isometry(&scan.metadata.odom_from_body),
-                        "odom",
-                        scan.metadata.source_timestamp_ns,
-                    ),
-                    points_body: scan.points.into_iter().map(|p| p.map(f64::from)).collect(),
-                    ray_origin_body: scan
-                        .metadata
-                        .sensor_origin_body
-                        .ok_or("扫描缺少雷达原点")?
-                        .map(f64::from),
-                    mapping_only: false,
-                    sensor_id: scan.metadata.sensor.clone(),
-                    registered_cloud: None,
-                });
-            }
+            let stamp = reader.peek_next_scan_timestamp()?;
+            readers.push((reader, stamp));
         }
-        result.sort_by_key(|frame| frame.odom_pose.timestamp_ns);
-        Ok(result)
+        Ok(ReplayFrames { session_id: self.session_id, readers })
     }
     pub fn adopt_publication(&mut self, previous: &mut Self) -> Result<(), String> {
         // 重建地图首次封存就接续会话版本，根几何与全部块版本一起推进。
@@ -537,6 +535,34 @@ impl CloudMap {
             result.base_offset_points = request.offset_points;
         }
         Ok(result)
+    }
+}
+pub(crate) struct ReplayFrames {
+    session_id: u64,
+    readers: Vec<(nuwax_cloud_cleanup::scan_log::ScanReader, Option<u64>)>,
+}
+impl Iterator for ReplayFrames {
+    type Item = Result<MappingFrame, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // 同时间戳沿传感器日志原顺序，和旧的稳定排序结果一致。
+        let (index, _) = self.readers.iter().enumerate()
+            .filter_map(|(index, (_, stamp))| stamp.map(|stamp| (index, stamp)))
+            .min_by_key(|(index, stamp)| (*stamp, *index))?;
+        Some((|| {
+            let (reader, stamp) = &mut self.readers[index];
+            let scan = reader.next_scan()?.expect("已预读完整扫描元数据");
+            *stamp = reader.peek_next_scan_timestamp()?;
+            Ok(MappingFrame {
+                session_id: self.session_id,
+                odom_pose: pose_from_isometry(matrix_isometry(&scan.metadata.odom_from_body),
+                    "odom", scan.metadata.source_timestamp_ns),
+                points_body: scan.points.into_iter().map(|p| p.map(f64::from)).collect(),
+                ray_origin_body: scan.metadata.sensor_origin_body.ok_or("扫描缺少雷达原点")?.map(f64::from),
+                mapping_only: false,
+                sensor_id: scan.metadata.sensor,
+                registered_cloud: None,
+            })
+        })())
     }
 }
 fn domain(session_id: u64) -> nuwax_map_chunks::Domain {

@@ -125,6 +125,7 @@ pub struct Mapper {
     maps: watch::Receiver<Option<proto::MapUpdate>>,
     fine_root: watch::Receiver<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     errors: watch::Receiver<Option<String>>,
+    correction_stopped: watch::Receiver<Option<String>>,
     transform: watch::Receiver<Isometry3<f64>>,
     config: MapperConfig,
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
@@ -218,6 +219,7 @@ impl Mapper {
             forbidden_status_tx,
             attach_shared,
         )?;
+        let correction_stopped = worker.correction_stopped.subscribe();
         let worker_handle = std::thread::Builder::new()
             .name(format!("geometry-map-{session_id}"))
             .spawn(move || loop {
@@ -258,6 +260,7 @@ impl Mapper {
             maps,
             fine_root,
             errors,
+            correction_stopped,
             transform,
             config,
             forbidden,
@@ -299,6 +302,9 @@ impl Mapper {
     }
     pub fn error_rx(&self) -> watch::Receiver<Option<String>> {
         self.errors.clone()
+    }
+    pub(crate) fn correction_stopped_rx(&self) -> watch::Receiver<Option<String>> {
+        self.correction_stopped.clone()
     }
     pub fn planar_view_only(&self) -> bool {
         self.planar_view_only
@@ -431,12 +437,16 @@ struct Worker {
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     transform: watch::Sender<Isometry3<f64>>,
     corrector: Corrector,
+    correction_stopped: watch::Sender<Option<String>>,
     sequence: u64,
     forbidden_path: Option<PathBuf>,
     forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
     failure: Option<String>,
     anchored: bool,
     base_anchor: Isometry3<f64>,
+    built_timeline: Option<PgoUpdate>,
+    built_until: u64,
+    built_corrections: Vec<(u64, Isometry3<f64>)>,
     forbidden_zones: Vec<crate::forbidden_zones::ForbiddenZone>,
     forbidden_metadata: Option<(SystemTime, u64)>,
     forbidden_checked_at: Instant,
@@ -522,12 +532,16 @@ impl Worker {
             fine_root,
             transform,
             corrector,
+            correction_stopped: watch::channel(None).0,
             sequence: 0,
             forbidden_path: None,
             forbidden,
             failure: None,
             anchored: snapshot.is_some(),
             base_anchor: map_from_odom,
+            built_timeline: None,
+            built_until: 0,
+            built_corrections: Vec::new(),
             forbidden_zones: Vec::new(),
             forbidden_metadata: None,
             forbidden_checked_at: Instant::now(),
@@ -702,6 +716,7 @@ impl Worker {
                 rotation,
             );
             self.base_anchor = self.map_from_odom;
+            self.built_corrections.push((frame.odom_pose.timestamp_ns, self.map_from_odom));
             self.anchored = true;
             self.transform.send_replace(self.map_from_odom);
         }
@@ -755,6 +770,9 @@ impl Worker {
             [origin.x, origin.y, origin.z],
             self.map_from_odom,
         )?;
+        if self.cloud.take_recording_limit() {
+            self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+        }
         if !frame.mapping_only {
             self.recent_cloud.send_replace(Some(encode_recent_cloud(
                 self.sequence,
@@ -794,18 +812,49 @@ impl Worker {
         }
         self.last_input = Some(input);
         if committed_this_frame && !frame.mapping_only {
-            if let Some(update) = self.corrector.process_frame(
+            let result = self.corrector.process_frame(
                 &frame,
                 &pgo,
                 self.grid.as_ref().map(|g| (&g.grid, self.grid_stamp)),
                 self.base_anchor,
-            )? {
-                self.apply_pgo(update)?;
+            ).and_then(|update| {
+                if let Some(update) = update { self.apply_pgo(update)?; }
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.stop_correction(format!("回环校正已停止：{error}"));
             }
         }
         Ok(())
     }
+    fn stop_correction(&mut self, reason: String) {
+        tracing::error!(%reason, "回环校正已停止");
+        self.corrector.stop();
+        self.correction_stopped.send_replace(Some(reason));
+    }
+    fn building_correction(&self, stamp: u64) -> Isometry3<f64> {
+        if let Some(timeline) = &self.built_timeline {
+            if stamp <= self.built_until {
+                return timeline.correction_at(stamp);
+            }
+        }
+        self.built_corrections.iter().rev()
+            .find(|(start, _)| *start <= stamp).unwrap().1
+    }
     fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
+        let small = update.local_poses().all(|(stamp, local_pose)| {
+            let optimized = update.correction_at(stamp) * local_pose;
+            let built = self.building_correction(stamp) * local_pose;
+            let delta = built.inverse() * optimized;
+            delta.translation.vector.norm() + 10.0 * delta.rotation.angle() < 0.05
+        });
+        if small {
+            self.map_from_odom = update.latest;
+            self.built_corrections.push((self.last_input.as_ref().unwrap().source_timestamp_ns, update.latest));
+            self.transform.send_replace(update.latest);
+            self.publish_pose();
+            return Ok(());
+        }
         // 原始扫描按优化后的关键帧轨迹逐帧重建，数值内核仍为同一组内核。
         let frames = self.cloud.replay_frames()?;
         let mut rebuilt = CloudMap::new(self.session_id, None, None)?;
@@ -815,7 +864,10 @@ impl Worker {
             .backend
             .into_kernel(self.config.compute.window_capacity);
         let mut persistent = None;
-        for (index, frame) in frames.iter().enumerate() {
+        let mut stamp = 0;
+        for (index, frame) in frames.enumerate() {
+            let frame = frame?;
+            stamp = frame.odom_pose.timestamp_ns;
             let correction = update.correction_at(frame.odom_pose.timestamp_ns);
             let body = correction * pose_isometry(&frame.odom_pose);
             let points: Vec<_> = frame
@@ -826,7 +878,7 @@ impl Worker {
             let origin = body * Point3::from(frame.ray_origin_body);
             let (dynamic, _, _) = rebuilt.accumulate(
                 index as u64 + 1,
-                frame,
+                &frame,
                 &points,
                 [origin.x, origin.y, origin.z],
                 correction,
@@ -856,11 +908,18 @@ impl Worker {
         self.fine_root.send_replace(self.cloud.surface());
         self.kernel = Some(kernel);
         self.grid = persistent;
-        self.grid_stamp = frames.last().map_or(0, |f| f.odom_pose.timestamp_ns);
+        self.grid_stamp = stamp;
         self.map_from_odom = update.latest;
-        self.transform.send_replace(update.latest);
+        self.built_until = stamp;
+        self.built_corrections.clear();
+        self.built_corrections.push((stamp, update.latest));
+        self.built_timeline = Some(update);
+        self.transform.send_replace(self.map_from_odom);
         self.publish_pose();
-        self.publish_grid()
+        if let Err(error) = self.publish_grid() {
+            tracing::warn!(%error,"禁行区尚未刷新，等待输入");
+        }
+        Ok(())
     }
     fn publish_pose(&self) {
         if let Some(odom) = &self.latest_odometry {

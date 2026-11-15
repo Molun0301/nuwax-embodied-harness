@@ -233,6 +233,7 @@ impl Lio {
             let ingress = Ingress {
                 router: self.router.clone(),
                 native: self.native.clone(),
+                body_from_sensor: self.body_from_sensor.clone(),
                 self_filter: crate::self_cloud::RobotSelfFilter::from_runtime(
                     &self.info.base_frame_id,
                 )?,
@@ -509,6 +510,7 @@ fn binding(value: &str, default_type: &str) -> Result<Binding, String> {
 struct Ingress {
     router: FrameRouter,
     native: Option<BoundNativeLioRuntime>,
+    body_from_sensor: Option<crate::native_lio_owner::BodyFromSensorTransform>,
     self_filter: Option<crate::self_cloud::RobotSelfFilter>,
     transport: LcmTransport,
     auxiliary: Arc<parking_lot::Mutex<VecDeque<AuxiliaryFrame>>>,
@@ -630,7 +632,9 @@ impl Ingress {
             for point in &mut points {
                 *point = body_from_odom.transform_point(point);
             }
-            Point3::origin()
+            self.body_from_sensor.as_ref().map_or_else(
+                Point3::origin, |transform| transform.ray_origin_body(),
+            )
         };
         if let Some(filter) = &self.self_filter {
             filter.retain_external(&mut points, &nalgebra::Isometry3::identity());

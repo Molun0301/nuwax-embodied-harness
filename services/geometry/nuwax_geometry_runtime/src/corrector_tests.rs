@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn native_pgo_sends_only_motion_keyframes() {
+    let mut corrector = Corrector::from_config(
+        "native_pgo", &nuwax_config::test_support::section("geometry"),
+        &nuwax_config::test_support::section("robot"),
+        &nuwax_config::test_support::section("transport"),
+    ).unwrap();
+    let first = 1_000_000_000;
+    let mut grid = nuwax_mapping::OccupancyGrid::new(8, 8, 0.05);
+    grid.frame_id = "map".into();
+    for (index, x, roll, expected) in [
+        (0, 0., 0., 1), (1, 0.2, 0., 1), (2, 0.5, 0., 2),
+        (3, 0.7, 0., 2), (4, 0.7, 10.1_f64.to_radians(), 3),
+    ] {
+        let mut frame = crate::mapper::tests::room_frame(936, first + index * 1_000_000_000);
+        frame.odom_pose = pose_from_isometry(Isometry3::new(
+            nalgebra::Vector3::new(x, 0., 0.), nalgebra::Vector3::new(roll, 0., 0.),
+        ), "odom", frame.odom_pose.timestamp_ns);
+        let indices: Vec<_> = (0..frame.points_body.len() as u32).collect();
+        corrector.process_frame(&frame, &indices, Some((&grid, frame.odom_pose.timestamp_ns)), Isometry3::identity()).unwrap();
+        let Mode::Native(native) = &corrector.mode else { unreachable!() };
+        assert_eq!(native.local_poses.len(), expected);
+        assert_eq!(corrector.sequence as usize, expected);
+        assert_eq!(native.owner.as_ref().unwrap().request_diagnostics().submitted.count, 1);
+    }
+    corrector.stop();
+    let sequence = corrector.sequence;
+    let frame = crate::mapper::tests::room_frame(936, first + 9_000_000_000);
+    assert!(corrector.process_frame(&frame, &[u32::MAX], None, Isometry3::identity()).unwrap().is_none());
+    assert_eq!(corrector.sequence, sequence, "停止后必须直接跳过");
+}
+
+#[test]
 fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
     use std::{io::Write, os::unix::fs::PermissionsExt, sync::{Arc, Mutex}};
     use nuwax_nav_pgo_bridge as bridge;
@@ -78,6 +110,25 @@ fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
 }
 
 impl PgoUpdate {
+    pub(crate) fn corrected_trajectory_for_test(
+        first_stamp: u64,
+        poses: Vec<(f64, Isometry3<f64>, Isometry3<f64>)>,
+    ) -> Self {
+        let keyframes = poses.into_iter().map(|(timestamp, local_pose, correction)| CorrectionKeyframe {
+            timestamp, local_pose, optimized_pose: correction * local_pose,
+        }).collect();
+        let timeline = CorrectionTimeline::new(keyframes).unwrap();
+        let latest = timeline.correction_at(timeline.keyframes().last().unwrap().timestamp).unwrap();
+        Self { latest, timeline, first_stamp }
+    }
+    pub(crate) fn timeline_for_test(first_stamp: u64, poses: Vec<(f64, Isometry3<f64>)>) -> Self {
+        let keyframes = poses.into_iter().map(|(timestamp, optimized_pose)| CorrectionKeyframe {
+            timestamp, local_pose: Isometry3::identity(), optimized_pose,
+        }).collect();
+        let timeline = CorrectionTimeline::new(keyframes).unwrap();
+        let latest = timeline.correction_at(timeline.keyframes().last().unwrap().timestamp).unwrap();
+        Self { latest, timeline, first_stamp }
+    }
     pub(crate) fn constant_for_test(first_stamp: u64, correction: Isometry3<f64>) -> Self {
         Self {
             latest: correction,

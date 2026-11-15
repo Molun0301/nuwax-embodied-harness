@@ -1,4 +1,129 @@
 use super::*;
+
+#[test]
+fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_continues() {
+    for stage in ["open", "scan", "progress"] {
+        let root = std::env::temp_dir().join(format!("g1-budget-{}", uuid::Uuid::new_v4()));
+        let mut map = CloudMap::new(940, None, None).unwrap();
+        map.raw_directory = Some(root.clone());
+        let mut frame = crate::mapper::tests::room_frame(940, 1_000_000_000);
+        if stage != "open" {
+            map.record(1, &frame, Isometry3::identity()).unwrap();
+        }
+        let source = root.join("source-0");
+        std::fs::create_dir_all(&source).unwrap();
+        let used: u64 = std::fs::read_dir(&source).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+        let filler = File::create(source.join("budget-used")).unwrap();
+        filler.set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+        let log_before = map.logs.values().next().map(|log| std::fs::metadata(&log.path).unwrap().len());
+        frame.odom_pose.timestamp_ns += if stage == "progress" { 1 } else { 1_000_000_000 };
+        let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
+        map.accumulate(2, &frame, &points, frame.ray_origin_body, Isometry3::identity())
+            .expect("预算耗尽不能使 accumulate 失败");
+        assert!(!map.recording, "{stage}");
+        assert!(map.take_recording_limit());
+        assert!(!map.take_recording_limit(), "预算停止只通知一次");
+        if let Some(before) = log_before {
+            assert_eq!(map.logs.values().next().unwrap().path.metadata().unwrap().len(), before);
+        }
+        std::fs::remove_file(source.join("budget-used")).unwrap();
+        frame.odom_pose.timestamp_ns += 2_000_000_000;
+        let before = map.scan_prefix().unwrap();
+        map.accumulate(3, &frame, &points, frame.ray_origin_body, Isometry3::identity()).unwrap();
+        assert_eq!(map.poses.len(), 2);
+        assert_eq!(map.scan_prefix().unwrap(), before, "释放空间后本会话也不恢复记录");
+    }
+}
+
+#[test]
+fn recording_keeps_other_io_errors_on_the_existing_failure_path() {
+    let path = std::env::temp_dir().join(format!("g1-record-io-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, b"not a directory").unwrap();
+    let mut map = CloudMap::new(941, None, None).unwrap();
+    map.raw_directory = Some(path.clone());
+    let frame = crate::mapper::tests::room_frame(941, 1_000_000_000);
+    assert!(map.record(1, &frame, Isometry3::identity()).is_err());
+    assert!(map.recording);
+    assert!(!map.take_recording_limit());
+    drop(map);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn streamed_replay_matches_the_old_sensor_concatenation_and_stable_sort() {
+    use nuwax_cloud_cleanup::scan_log::ScanReader;
+    let mut map = CloudMap::new(944, None, None).unwrap();
+    for (index, (sensor, seconds)) in [
+        ("主", 3), ("副", 2), ("主", 6), ("副", 3), ("辅", 1),
+        ("主", 9), ("副", 9), ("辅", 9),
+    ].into_iter().enumerate() {
+        let mut frame = crate::mapper::tests::room_frame(944, seconds * 1_000_000_000);
+        frame.sensor_id = sensor.into();
+        frame.ray_origin_body = [index as f64 * 0.01, 0.02, 0.3];
+        frame.odom_pose.position.as_mut().unwrap().x = index as f64;
+        map.record(index as u64 + 1, &frame, Isometry3::translation(0.1, 0., 0.)).unwrap();
+    }
+    let mut expected = Vec::new();
+    // 旧实现先按传感器日志收集全部帧，再按时间稳定排序。
+    for log in map.logs.values() {
+        log.sync().unwrap();
+        let mut reader = ScanReader::open(&log.path).unwrap();
+        while let Some(scan) = reader.next_scan().unwrap() { expected.push(scan); }
+    }
+    expected.sort_by_key(|scan| scan.metadata.source_timestamp_ns);
+    let mut stream = map.replay_frames().unwrap();
+    for scan in expected {
+        let frame = stream.next().unwrap().unwrap();
+        assert_eq!(frame.sensor_id, scan.metadata.sensor);
+        assert_eq!(frame.odom_pose, pose_from_isometry(matrix_isometry(&scan.metadata.odom_from_body),
+            "odom", scan.metadata.source_timestamp_ns));
+        assert_eq!(frame.points_body, scan.points.iter().map(|p| p.map(f64::from)).collect::<Vec<_>>());
+        assert_eq!(frame.ray_origin_body, scan.metadata.sensor_origin_body.unwrap().map(f64::from));
+        assert!(!frame.mapping_only);
+    }
+    assert!(stream.next().is_none());
+}
+
+#[test]
+fn display_removals_match_full_scan_for_every_frame() {
+    let mut total_removed = 0;
+    for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {
+        let mut map = CloudMap::new(931, None, None).unwrap();
+        map.disable_recording();
+        map.voxel_size = size;
+        let transform = Isometry3::new(
+            nalgebra::Vector3::new(0.37, -0.19, 0.08),
+            nalgebra::Vector3::new(0.02, -0.03, 0.27),
+        );
+        for index in 0..8 {
+            let (body, _) = crate::dynamic_scene::tests::corridor(
+                (index < 2).then_some(0.), index as f64 * 0.3,
+            );
+            let frame = MappingFrame {
+                session_id: 931,
+                odom_pose: pose_from_isometry(Isometry3::identity(), "odom", index + 1),
+                points_body: body.iter().map(|p| [p.x, p.y, p.z]).collect(),
+                ray_origin_body: crate::dynamic_scene::tests::ORIGIN,
+                mapping_only: false, sensor_id: "主雷达".into(), registered_cloud: None,
+            };
+            let points: Vec<_> = body.iter().map(|p| transform * p).collect();
+            let origin = transform * Point3::from(frame.ray_origin_body);
+            let before = map.voxels.clone();
+            let (dynamic, _, _) = map.accumulate(index + 1, &frame, &points,
+                [origin.x, origin.y, origin.z], transform).unwrap();
+            let hits: VoxelIndex = points.iter()
+                .filter_map(|p| voxel_key([p.x, p.y, p.z], size)).collect();
+            // 保留旧实现的逐键判定作为独立对照，比较生产 accumulate 实际删除结果。
+            let expected: VoxelIndex = before.iter().copied().filter(|key| {
+                !hits.contains(key) && dynamic.clears(voxel_center_f64(*key, size))
+            }).collect();
+            let actual: VoxelIndex = before.difference(&map.voxels).copied().collect();
+            assert_eq!(actual, expected, "体素边长={size}，帧={index}");
+            total_removed += actual.len();
+        }
+    }
+    assert!(total_removed > 0, "必须实际覆盖历史展示体素清除");
+}
 #[test]
 fn dense_delta_returns_only_the_unread_surviving_tail() {
     let mut map = CloudMap::new(41, None, None).unwrap();

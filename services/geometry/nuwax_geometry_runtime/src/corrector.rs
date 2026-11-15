@@ -19,6 +19,7 @@ pub struct Corrector {
     sequence: u64,
 }
 enum Mode {
+    Stopped,
     Relocalization,
     Library(LoopClosureCoordinator),
     Native(Native),
@@ -28,6 +29,7 @@ struct Native {
     owner: Option<nuwax_nav_pgo_bridge::OnlinePgoOwner>,
     ingress: Option<nuwax_nav_pgo_bridge::OnlinePgoIngress>,
     local_poses: std::collections::BTreeMap<u64, Isometry3<f64>>,
+    keyframe_config: nuwax_nav_pgo_bridge::PgoBridgeConfig,
     lcm_url:String, mapping_backend:String,lio_backend:String,base_frame:String,
 }
 #[derive(Clone)]
@@ -37,6 +39,12 @@ pub(crate) struct PgoUpdate {
     first_stamp: u64,
 }
 impl PgoUpdate {
+    pub(crate) fn local_poses(&self) -> impl Iterator<Item = (u64, Isometry3<f64>)> + '_ {
+        self.timeline.keyframes().iter().map(|keyframe| (
+            self.first_stamp + (keyframe.timestamp * 1e9).round() as u64,
+            keyframe.local_pose,
+        ))
+    }
     pub fn correction_at(&self, stamp: u64) -> Isometry3<f64> {
         self.timeline
             .correction_at(stamp.saturating_sub(self.first_stamp) as f64 / 1e9)
@@ -82,6 +90,7 @@ impl Corrector {
                 owner: None,
                 ingress: None,
                 local_poses: Default::default(),
+                keyframe_config: Default::default(),
                 lcm_url: transport.lcm_url.clone(),
                 mapping_backend: g.mapping_backend.clone(),
                 lio_backend: g.lio_backend.clone(),
@@ -102,8 +111,13 @@ impl Corrector {
         grid: Option<(&nuwax_mapping::OccupancyGrid, u64)>,
         anchor: Isometry3<f64>,
     ) -> Result<Option<PgoUpdate>, String> {
-        if matches!(self.mode, Mode::Relocalization) {
+        if matches!(self.mode, Mode::Relocalization | Mode::Stopped) {
             return Ok(None);
+        }
+        if let Mode::Native(owner) = &self.mode {
+            if !owner.is_keyframe(pose_isometry(&frame.odom_pose)) {
+                return Ok(None);
+            }
         }
         let first = *self.first_stamp.get_or_insert(frame.odom_pose.timestamp_ns);
         self.sequence += 1;
@@ -143,8 +157,11 @@ impl Corrector {
                 let Some(grid) = grid else { return Ok(None) };
                 owner.process(frame, &points, grid, self.sequence, anchor, first)
             }
-            Mode::Relocalization => Ok(None),
+            Mode::Relocalization | Mode::Stopped => Ok(None),
         }
+    }
+    pub(crate) fn stop(&mut self) {
+        self.mode = Mode::Stopped;
     }
     pub async fn relocalize(
         mapper: &Mapper,
@@ -298,6 +315,13 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 impl Native {
+    fn is_keyframe(&self, pose: Isometry3<f64>) -> bool {
+        self.local_poses.last_key_value().is_none_or(|(_, previous)| {
+            let delta = previous.inverse() * pose;
+            delta.translation.vector.norm() >= self.keyframe_config.key_pose_delta_trans
+                || delta.rotation.angle().to_degrees() >= self.keyframe_config.key_pose_delta_deg
+        })
+    }
     fn process(
         &mut self,
         frame: &MappingFrame,

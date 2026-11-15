@@ -264,6 +264,7 @@ impl OnlinePgoConfig {
 /// Render the frozen online child argument vector, excluding argv[0].
 #[must_use]
 pub fn online_pgo_argv(config: &OnlinePgoConfig, topics: &OnlinePgoTopics) -> Vec<String> {
+    let graph = crate::PgoBridgeConfig::default();
     vec![
         "--mode".into(),
         "online".into(),
@@ -281,6 +282,10 @@ pub fn online_pgo_argv(config: &OnlinePgoConfig, topics: &OnlinePgoTopics) -> Ve
         topics.status.clone(),
         "--cancel-channel".into(),
         topics.cancel.clone(),
+        "--key_pose_delta_trans".into(),
+        graph.key_pose_delta_trans.to_string(),
+        "--key_pose_delta_deg".into(),
+        graph.key_pose_delta_deg.to_string(),
     ]
 }
 
@@ -1935,7 +1940,10 @@ mod tests {
         let restarted_topics = OnlinePgoTopics::for_runtime(41, 8).unwrap();
         assert_ne!(topics, restarted_topics);
         let argv = online_pgo_argv(&config, &topics);
-        assert_eq!(argv.len(), 16);
+        assert_eq!(argv.len(), 20);
+        let graph = crate::PgoBridgeConfig::default();
+        assert!(argv.windows(2).any(|pair| pair == ["--key_pose_delta_trans", &graph.key_pose_delta_trans.to_string()]));
+        assert!(argv.windows(2).any(|pair| pair == ["--key_pose_delta_deg", &graph.key_pose_delta_deg.to_string()]));
         assert_eq!(&argv[0..2], ["--mode", "online"]);
         assert!(argv
             .windows(2)

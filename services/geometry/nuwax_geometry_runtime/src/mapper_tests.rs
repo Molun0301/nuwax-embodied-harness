@@ -29,6 +29,230 @@ fn config() -> MapperConfig {
     }
 }
 
+#[test]
+fn rejected_native_correction_stops_once_and_mapping_continues() {
+    let mut worker = Worker::new(
+        937, MapperConfig { correction_backend: "native_pgo".into(), ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut stopped = worker.correction_stopped.subscribe();
+    let mut rejected = room_frame(937, 1_000_000_000);
+    rejected.points_body.truncate(3);
+    worker.frame(rejected).expect("原生拒绝本帧时建图仍成功");
+    assert!(worker.failure.is_none());
+    assert!(stopped.has_changed().unwrap());
+    assert!(stopped.borrow_and_update().as_ref().unwrap().contains("回环校正已停止："));
+    let revision = worker.cloud.snapshot().revision;
+    worker.frame(room_frame(937, 2_000_000_000)).unwrap();
+    assert!(worker.cloud.snapshot().revision > revision);
+    assert!(!stopped.has_changed().unwrap(), "停止通知只发一次");
+    assert!(worker.snapshot().unwrap().occupancy.is_some());
+}
+
+#[test]
+fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
+    let mut worker = Worker::new(
+        942, MapperConfig { correction_backend: "library_pgo".into(), ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    worker.frame(room_frame(942, 1_000_000_000)).unwrap();
+    let saved = worker.snapshot().unwrap();
+    let source = saved.scans[0].0.parent().unwrap();
+    let used: u64 = std::fs::read_dir(source).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+    let filler_path = source.join("budget-used");
+    std::fs::File::create(&filler_path).unwrap()
+        .set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+    let mut stopped = worker.correction_stopped.subscribe();
+    worker.frame(room_frame(942, 2_000_000_000)).unwrap();
+    assert_eq!(stopped.borrow_and_update().as_deref(), Some("扫描记录已达上限，回环校正已停止"));
+    std::fs::remove_file(filler_path).unwrap();
+    worker.frame(room_frame(942, 3_000_000_000)).unwrap();
+    let after = worker.snapshot().unwrap();
+    assert_eq!(after.scans, saved.scans);
+    assert!(after.cloud.revision > saved.cloud.revision);
+    assert_eq!(after.final_poses.len(), 3);
+    assert!(worker.failure.is_none());
+    assert!(!stopped.has_changed().unwrap());
+}
+
+#[test]
+fn failed_replay_preserves_the_current_map() {
+    let mut worker = Worker::new(
+        938, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    worker.frame(room_frame(938, 1_000_000_000)).unwrap();
+    let before = worker.snapshot().unwrap();
+    let (path, _) = &before.scans[0];
+    let mut bytes = std::fs::read(path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    assert!(worker.apply_pgo(PgoUpdate::constant_for_test(1_000_000_000,
+        Isometry3::translation(0.2, 0., 0.))).is_err());
+    assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
+    assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+    assert_eq!(isometry_matrix(&worker.map_from_odom), before.map_from_odom);
+    assert_eq!(worker.maps.borrow().as_ref().unwrap().raw_data,
+        before.occupancy.as_ref().unwrap().data);
+}
+
+#[test]
+fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates() {
+    use std::{io::Write, sync::{Arc, Mutex}};
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut worker = Worker::new(
+        948, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    worker.frame(room_frame(948, first)).unwrap();
+    let before = worker.cloud.snapshot().revision;
+    let mut physical = worker.raw_grid.subscribe();
+    let _ = worker.forbidden_status.send_replace(Err("测试禁行区读取失败".into()));
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogBuffer(buffer.clone());
+    let subscriber = tracing_subscriber::fmt().json().with_ansi(false)
+        .with_writer(move || writer.clone()).finish();
+    tracing::subscriber::with_default(subscriber, || {
+        worker.apply_pgo(PgoUpdate::constant_for_test(first,
+            Isometry3::translation(0.2, 0., 0.)))
+    }).expect("禁行区发布失败不能使已完成重建的校正失败");
+    assert_eq!(worker.cloud.snapshot().revision, before + 1);
+    assert_eq!(worker.map_from_odom, Isometry3::translation(0.2, 0., 0.));
+    assert!(physical.has_changed().unwrap());
+    let mut expected = kernel_grid_to_proto(&worker.grid.as_ref().unwrap().grid, &worker.config.map_name);
+    expected.meta.as_mut().unwrap().timestamp_ns = worker.grid_stamp;
+    assert_eq!(physical.borrow_and_update().as_ref(), Some(&expected));
+    assert!(worker.correction_stopped.borrow().is_none());
+    let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let warnings: Vec<serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|row: &serde_json::Value| row["fields"]["message"] == "禁行区尚未刷新，等待输入").collect();
+    assert_eq!(warnings.len(), 1, "重放后只记录一次禁行区警告：{text}");
+    assert_eq!(warnings[0]["level"], "WARN");
+    worker.frame(room_frame(948, first + 1_000_000_000)).unwrap();
+    assert!(physical.has_changed().unwrap(), "后续在线帧也须先更新物理栅格");
+    assert_eq!(physical.borrow().as_ref().unwrap().meta.as_ref().unwrap().timestamp_ns,
+        first + 1_000_000_000);
+    assert!(worker.failure.is_none());
+}
+
+#[test]
+fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map() {
+    let mut worker = Worker::new(
+        945, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    worker.frame(room_frame(945, first)).unwrap();
+    for (index, offset) in [0.01, 0.04, 0.049].into_iter().enumerate() {
+        worker.frame(room_frame(945, first + (index as u64 + 1) * 1_000_000_000)).unwrap();
+        let before = worker.snapshot().unwrap();
+        worker.apply_pgo(PgoUpdate::constant_for_test(first,
+            Isometry3::translation(offset, 0., 0.))).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+        assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
+        assert_eq!(worker.cloud.final_poses(), before.final_poses);
+        assert!((worker.poses.borrow().as_ref().unwrap().position.as_ref().unwrap().x - offset).abs() < 1e-12);
+        assert_eq!(worker.map_from_odom, Isometry3::translation(offset, 0., 0.));
+    }
+    let before_replay = worker.cloud.snapshot().revision;
+    worker.apply_pgo(PgoUpdate::constant_for_test(first,
+        Isometry3::translation(0.051, 0., 0.))).unwrap();
+    let rebuilt_revision = worker.cloud.snapshot().revision;
+    assert_eq!(rebuilt_revision, before_replay + 1,
+        "连续小校正相对建图位姿累计超过阈值时必须重放");
+    worker.apply_pgo(PgoUpdate::constant_for_test(first,
+        Isometry3::translation(0.075, 0., 0.))).unwrap();
+    assert_eq!(worker.cloud.snapshot().revision, rebuilt_revision,
+        "重放后应比较更新后的建图位姿");
+}
+
+#[test]
+fn replayed_timeline_keeps_centimeter_updates_small_after_robot_motion() {
+    let mut worker = Worker::new(
+        947, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    assert!(worker.built_timeline.is_none());
+    assert_eq!(worker.built_until, 0);
+    worker.frame(room_frame(947, first)).unwrap();
+    let mut moving = room_frame(947, first + 1_000_000_000);
+    moving.odom_pose.position.as_mut().unwrap().x = 1.;
+    worker.frame(moving).unwrap();
+    let trajectory = |offset, latest: f64| {
+        PgoUpdate::corrected_trajectory_for_test(first, [0., 0.45, 1., latest].into_iter()
+            .filter(|time| *time < latest).chain(std::iter::once(latest))
+            .map(|time| (time, Isometry3::translation(time, 0., 0.),
+                Isometry3::translation(offset, 0., 0.))).collect())
+    };
+    let update = trajectory(0.2, 1.);
+    let latest = update.latest;
+    worker.apply_pgo(update).unwrap();
+    assert_eq!(worker.built_until, first + 1_000_000_000);
+    assert_eq!(worker.built_corrections, vec![(worker.built_until, latest)]);
+    assert!(!worker.cloud.final_poses().iter().any(|(stamp, _)| *stamp == first + 450_000_000),
+        "关键帧时刻不在重放扫描位姿表中");
+    for (time, offset) in [(2., 0.21), (3., 0.22)] {
+        let mut moving = room_frame(947, first + (time * 1e9) as u64);
+        moving.odom_pose.position.as_mut().unwrap().x = time;
+        worker.frame(moving).unwrap();
+        let before = worker.snapshot().unwrap();
+        worker.apply_pgo(trajectory(offset, time)).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+        assert_eq!(worker.cloud.final_poses(), before.final_poses);
+        assert_eq!(worker.built_until, first + 1_000_000_000, "小校正不推进重放时刻");
+    }
+    for (time, expected) in [(0.45, 0.2), (1., 0.2), (1.5, 0.2), (2., 0.21), (3., 0.22)] {
+        let correction = worker.building_correction(first + (time * 1e9) as u64);
+        assert!((correction.translation.vector.x - expected).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn pgo_replay_threshold_combines_rotation_and_translation_and_checks_every_keyframe() {
+    for early_large_change in [false, true] {
+        let mut worker = Worker::new(
+            946, config(), None, false,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        ).unwrap();
+        let first = 1_000_000_000;
+        worker.frame(room_frame(946, first)).unwrap();
+        worker.frame(room_frame(946, first + 1_000_000_000)).unwrap();
+        let before = worker.cloud.snapshot().revision;
+        let poses = if early_large_change {
+            vec![(0., Isometry3::translation(0.1, 0., 0.)), (1., Isometry3::identity())]
+        } else {
+            vec![(0., Isometry3::new(nalgebra::Vector3::new(0.02, 0., 0.),
+                nalgebra::Vector3::new(0., 0., 0.004)))]
+        };
+        worker.apply_pgo(PgoUpdate::timeline_for_test(first, poses)).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, before + 1);
+    }
+}
+
 pub(crate) fn frames_without_candidate_keep_session_healthy(
     backend: MappingBackendSpec,
     corrector: Corrector,
@@ -107,7 +331,8 @@ fn pgo_rebuild_keeps_root_and_block_versions_accepted_by_navigation() {
         assert!(previous.revision > 1);
         assert!(!previous.blocks.is_empty());
 
-        for offset in [0.01, 0.02] {
+        // 超过小校正阈值，继续验证真实重建的版本接续。
+        for offset in [0.1, 0.2] {
             worker.apply_pgo(PgoUpdate::constant_for_test(
                 first_stamp, Isometry3::translation(offset, 0., 0.),
             )).unwrap();

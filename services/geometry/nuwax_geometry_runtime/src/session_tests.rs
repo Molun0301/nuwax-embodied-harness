@@ -92,7 +92,7 @@ async fn recent_input_survives_end_and_load_for_immediate_relocalization() {
     session.nav.shutdown().await;
 }
 
-async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
+pub(super) async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
     let (router, _, _) = test_router(mapper.clone());
     let (route, _) = watch::channel(router.route.borrow().clone());
     let router = FrameRouter {

@@ -4,10 +4,10 @@ use super::nearest::NearestPointIndex;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 
 use super::features::{
-    compute_fpfh, match_fpfh_indexed, preprocess, voxel_downsample, FeatureConfig, FeatureMatch,
-    ProcessedCloud,
+    compute_fpfh, estimate_normals, match_fpfh_indexed, preprocess, voxel_downsample,
+    FeatureConfig, FeatureMatch, ProcessedCloud,
 };
-use super::ransac::{evaluate_alignment, ransac_align, AlignmentScore, RansacConfig};
+use super::ransac::{ransac_align, RansacConfig};
 
 /// ICP 配置
 #[derive(Debug, Clone, Copy)]
@@ -384,6 +384,7 @@ pub struct SourceCloud {
     pub points: Vec<Point3<f64>>,
     /// 与源点一一对应的射线原点。
     pub origins: Vec<Point3<f64>>,
+    walls: Vec<bool>,
 }
 impl SourceCloud {
     /// 每个0.1米体素保留首个实测点，原点来自该点所属帧。
@@ -392,8 +393,92 @@ impl SourceCloud {
         for (point, origin) in rays {
             voxels.entry(voxel_key(&point)).or_insert((point, origin));
         }
-        let (points, origins) = voxels.into_values().unzip();
-        Self { points, origins }
+        let (points, origins): (Vec<_>, Vec<_>) = voxels.into_values().unzip();
+        let walls = wall_subset_mask(&estimate_normals(&points, 0.2, 100), WALL_NORMAL_Z_MAX);
+        Self {
+            points,
+            origins,
+            walls,
+        }
+    }
+}
+
+/// 局部和全局共用的墙面与自由空间评分。
+#[derive(Clone, Copy, Debug)]
+pub struct RelocalizationScore {
+    /// 墙面源点中0.15米内有目标点的比例。
+    pub wall_fitness: f64,
+    /// 射线中段穿过地图占据体素的比例。
+    pub penetration: f64,
+    /// 墙面内点均方根误差。
+    pub rmse: f64,
+}
+impl RelocalizationScore {
+    /// 按任务规定的四个条件判断结果。
+    pub fn accepts(&self, transform: &Isometry3<f64>) -> bool {
+        self.wall_fitness >= 0.45
+            && self.penetration <= 0.15
+            && is_upright(transform, GRAVITY_TILT_MAX_DEG)
+            && self.rmse.is_finite()
+    }
+    /// 候选先比较墙面适配度，再比较穿透比例。
+    pub fn better_than(&self, other: &Self) -> bool {
+        self.wall_fitness > other.wall_fitness
+            || (self.wall_fitness == other.wall_fitness && self.penetration < other.penetration)
+    }
+}
+
+/// 对带所属帧射线原点的降采样源点评分。
+pub fn score_relocalization(
+    source: &SourceCloud,
+    transform: Isometry3<f64>,
+    target: &TargetCache,
+) -> RelocalizationScore {
+    let mut walls = 0_usize;
+    let mut inliers = 0_usize;
+    let mut squared_error = 0.0;
+    let mut rays = 0_usize;
+    let mut penetrated = 0_usize;
+    for ((point, origin), wall) in source.points.iter().zip(&source.origins).zip(&source.walls) {
+        if !wall {
+            continue;
+        }
+        walls += 1;
+        let point = transform * point;
+        if let Some((_, distance)) = target.index.nearest(&point) {
+            if distance <= 0.15_f64.powi(2) {
+                inliers += 1;
+                squared_error += distance;
+            }
+        }
+        let origin = transform * origin;
+        let direction = point - origin;
+        let length = direction.norm();
+        if length <= 0.8 {
+            continue;
+        }
+        rays += 1;
+        let direction = direction / length;
+        let mut distance = 0.5;
+        while distance < length - 0.3 {
+            if target
+                .occupied
+                .contains(&voxel_key(&(origin + direction * distance)))
+            {
+                penetrated += 1;
+                break;
+            }
+            distance += 0.1;
+        }
+    }
+    RelocalizationScore {
+        wall_fitness: inliers as f64 / walls.max(1) as f64,
+        penetration: penetrated as f64 / rays.max(1) as f64,
+        rmse: if inliers == 0 {
+            f64::INFINITY
+        } else {
+            (squared_error / inliers as f64).sqrt()
+        },
     }
 }
 
@@ -448,9 +533,7 @@ pub struct RelocalizationConfig {
     pub fine_voxel_size: f64,
     /// Maximum residual used for final candidate scoring and ICP in metres.
     pub fine_correspondence_distance: f64,
-    /// Minimum final source-cloud inlier count.
-    pub min_final_inliers: usize,
-    /// Minimum final source-cloud inlier ratio.
+    /// RANSAC候选生成阶段的共识比例；最终接受由统一墙面评分决定。
     pub min_final_fitness: f64,
     /// ICP settings used for the final seeded local refinement.
     pub icp: IcpConfig,
@@ -467,7 +550,6 @@ impl Default for RelocalizationConfig {
             min_feature_matches: 3,
             fine_voxel_size,
             fine_correspondence_distance,
-            min_final_inliers: 3,
             min_final_fitness: 0.45,
             icp: IcpConfig {
                 max_correspondence_distance: fine_correspondence_distance,
@@ -486,7 +568,7 @@ pub struct RelocalizationResult {
     pub feature_matches: usize,
     /// Largest RANSAC geometric consensus observed at any configured scale.
     pub ransac_inliers: usize,
-    /// Final fine-scale inlier ratio.
+    /// 最终墙面适配度。
     pub fitness: f64,
 }
 
@@ -515,7 +597,7 @@ pub fn relocation_pipeline_cached(
     let mut maximum_feature_matches = 0;
     let mut maximum_ransac_inliers = 0;
     let mut ransac_iterations = 0;
-    let mut best_candidate: Option<(Isometry3<f64>, AlignmentScore)> = None;
+    let mut best_candidate: Option<(Isometry3<f64>, RelocalizationScore)> = None;
 
     for (voxel_size, target_features) in config.voxel_sizes.into_iter().zip(&target.scales) {
         let feature_config = FeatureConfig::for_voxel(voxel_size, config.max_feature_neighbors);
@@ -545,7 +627,7 @@ pub fn relocation_pipeline_cached(
             RansacConfig {
                 max_iterations: config.ransac_iterations,
                 inlier_threshold: voxel_size * 1.5,
-                min_inliers: config.min_final_inliers.min(source_features.points.len()),
+                min_inliers: 3,
                 min_inlier_ratio: config.min_final_fitness.min(0.5),
                 ..RansacConfig::default()
             },
@@ -556,18 +638,11 @@ pub fn relocation_pipeline_cached(
             continue;
         }
 
+        consider_candidate(source, target, ransac.transformation, &mut best_candidate);
         consider_candidate(
-            &fine_source,
-            &target.index,
-            ransac.transformation,
-            config.fine_correspondence_distance,
-            &mut best_candidate,
-        );
-        consider_candidate(
-            &fine_source,
-            &target.index,
+            source,
+            target,
             ransac.transformation * centroid_yaw_flip(&fine_source),
-            config.fine_correspondence_distance,
             &mut best_candidate,
         );
     }
@@ -589,22 +664,13 @@ pub fn relocation_pipeline_cached(
     let refinement =
         IcpSolver::new(icp_config).align_indexed(&seeded_source, fine_target, &target.index);
     let refined_transform = refinement.transformation * candidate;
-    let refined_score = evaluate_alignment(
-        &fine_source,
-        &target.index,
-        refined_transform,
-        config.fine_correspondence_distance,
-    );
-    let (transformation, score) = if score_is_better(refined_score, candidate_score) {
+    let refined_score = score_relocalization(source, refined_transform, target);
+    let (transformation, score) = if refined_score.better_than(&candidate_score) {
         (refined_transform, refined_score)
     } else {
         (candidate, candidate_score)
     };
-
-    let accepted = score.inlier_count >= config.min_final_inliers
-        && score.fitness >= config.min_final_fitness
-        && score.rmse.is_finite()
-        && is_upright(&transformation, GRAVITY_TILT_MAX_DEG);
+    let accepted = score.accepts(&transformation);
     if !accepted {
         return rejected_relocalization(
             maximum_feature_matches,
@@ -622,7 +688,7 @@ pub fn relocation_pipeline_cached(
         },
         feature_matches: maximum_feature_matches,
         ransac_inliers: maximum_ransac_inliers,
-        fitness: score.fitness,
+        fitness: score.wall_fitness,
     }
 }
 
@@ -644,7 +710,6 @@ fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
         && config.fine_voxel_size > 0.0
         && config.fine_correspondence_distance.is_finite()
         && config.fine_correspondence_distance > 0.0
-        && config.min_final_inliers >= 3
         && config.min_final_fitness.is_finite()
         && (0.0..=1.0).contains(&config.min_final_fitness)
         && config.icp.max_iterations > 0
@@ -655,27 +720,18 @@ fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
 }
 
 fn consider_candidate(
-    source: &[Point3<f64>],
-    target: &NearestPointIndex,
+    source: &SourceCloud,
+    target: &TargetCache,
     transformation: Isometry3<f64>,
-    threshold: f64,
-    best: &mut Option<(Isometry3<f64>, AlignmentScore)>,
+    best: &mut Option<(Isometry3<f64>, RelocalizationScore)>,
 ) {
-    if !is_upright(&transformation, GRAVITY_TILT_MAX_DEG) {
-        return;
-    }
-    let score = evaluate_alignment(source, target, transformation, threshold);
+    let score = score_relocalization(source, transformation, target);
     if best
         .as_ref()
-        .is_none_or(|(_, current)| score_is_better(score, *current))
+        .is_none_or(|(_, current)| score.better_than(current))
     {
         *best = Some((transformation, score));
     }
-}
-
-fn score_is_better(candidate: AlignmentScore, current: AlignmentScore) -> bool {
-    candidate.inlier_count > current.inlier_count
-        || (candidate.inlier_count == current.inlier_count && candidate.rmse < current.rmse)
 }
 
 fn centroid_yaw_flip(source: &[Point3<f64>]) -> Isometry3<f64> {
@@ -836,6 +892,68 @@ mod tests {
         let _fine_res = IcpSolver::new(fine).align(&pts, &pts);
         // 两个尺度都能跑通：标记 multi-scale ICP 入口可用
     }
+    #[test]
+    fn same_floor_and_ceiling_cannot_accept_a_room_with_different_walls() {
+        let points = synthetic_room();
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        let truth = Isometry3::translation(30.0, 20.0, 0.0);
+        let mut target: Vec<_> = points.iter().map(|p| truth * p).collect();
+        // 甲房间保留相同地面和天花板，墙面布局扩大，乙房间为实际观测。
+        target.extend(
+            points
+                .iter()
+                .filter(|p| p.z == -1.0 || p.z == 1.73)
+                .copied(),
+        );
+        target.extend(
+            points
+                .iter()
+                .filter(|p| p.z != -1.0 && p.z != 1.73)
+                .map(|p| Point3::new(p.x * 2.0, p.y * 2.0, p.z)),
+        );
+        let target = TargetCache::new(&target, RelocalizationConfig::default());
+        let wrong = score_relocalization(&source, Isometry3::identity(), &target);
+        let correct = score_relocalization(&source, truth, &target);
+        assert!(
+            wrong.wall_fitness < 0.45,
+            "错误房间不能靠水平面通过：{wrong:?}"
+        );
+        assert!(!wrong.accepts(&Isometry3::identity()));
+        assert!(correct.accepts(&truth), "乙房间真值应通过：{correct:?}");
+    }
+
+    #[test]
+    fn penetration_uses_each_frames_origin_and_excludes_both_ray_ends() {
+        let points: Vec<_> = (-12..=12)
+            .flat_map(|y| (-12..=12).map(move |z| Point3::new(3.05, (y as f64 + 0.5) * 0.1, (z as f64 + 0.5) * 0.1)))
+            .collect();
+        let mut target = points.clone();
+        target.extend(points.iter().map(|p| Point3::new(1.55, p.y, p.z)));
+        let target = TargetCache::new(&target, RelocalizationConfig::default());
+        let through = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        let score = score_relocalization(&through, Isometry3::identity(), &target);
+        assert_eq!(score.wall_fitness, 1.0);
+        assert!(score.penetration > 0.9, "完全贴墙仍须排除穿墙：{score:?}");
+        assert!(!score.accepts(&Isometry3::identity()));
+        let clear = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::new(2.0, p.y, p.z))));
+        let score = score_relocalization(&clear, Isometry3::identity(), &target);
+        assert!(
+            score.accepts(&Isometry3::identity()),
+            "帧原点改变后不经过内墙：{score:?}"
+        );
+        // 占据点只在0.5米起点排除段或0.3米终点排除段内。
+        let mut endpoints = points.clone();
+        endpoints.extend(points.iter().flat_map(|p| {
+            [
+                Point3::from(p.coords.normalize() * 0.2),
+                p - p.coords.normalize() * 0.1,
+            ]
+        }));
+        let endpoints = TargetCache::new(&endpoints, RelocalizationConfig::default());
+        let score = score_relocalization(&through, Isometry3::identity(), &endpoints);
+        assert_eq!(score.penetration, 0.0, "两端排除段不能计为穿透：{score:?}");
+    }
+
     #[test]
     fn source_downsampling_preserves_the_selected_frames_ray_origin() {
         let a = Point3::new(0.01, 0.02, 0.03);

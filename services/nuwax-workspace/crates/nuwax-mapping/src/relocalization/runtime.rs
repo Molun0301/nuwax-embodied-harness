@@ -263,7 +263,6 @@ fn algorithm_config_is_valid(config: RelocalizationConfig) -> bool {
         && config.fine_voxel_size > 0.0
         && config.fine_correspondence_distance.is_finite()
         && config.fine_correspondence_distance > 0.0
-        && config.min_final_inliers >= 3
         && config.min_final_fitness.is_finite()
         && (0.0..=1.0).contains(&config.min_final_fitness)
         && config.icp.max_iterations > 0

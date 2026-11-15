@@ -1,4 +1,5 @@
 use super::*;
+use nuwax_mapping::relocalization::{is_upright, GRAVITY_TILT_MAX_DEG};
 
 #[test]
 fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
@@ -238,7 +239,7 @@ fn relocalization_local_consensus_accepts_supported_seed() {
     let initial = Isometry3::from_parts(truth.translation * initial.translation, truth.rotation * initial.rotation);
     let (actual, fitness, succeeded) = compute_for_test(&source, &target, initial);
     assert!(succeeded);
-    assert!(fitness < 0.01);
+    assert!(fitness >= 0.45 && fitness <= 1.0);
     assert_transform(actual, truth);
 }
 

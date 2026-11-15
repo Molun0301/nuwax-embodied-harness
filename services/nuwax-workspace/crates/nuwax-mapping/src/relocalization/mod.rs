@@ -28,3 +28,5 @@ pub use runtime::{
     RelocalizationRuntime, RelocalizationRuntimeConfig, RelocalizationRuntimeError,
     RelocalizationStatus, RelocalizationUpdate,
 };
+
+pub use relocalize::{score_relocalization, RelocalizationScore};

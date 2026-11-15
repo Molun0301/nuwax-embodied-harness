@@ -10,8 +10,8 @@ use nuwax_mapping::loop_closure::{
     ProcessFrameResult,
 };
 use nuwax_mapping::relocalization::{
-    evaluate_alignment, is_upright, relocation_pipeline_cached, local_registration,
-    RelocalizationConfig, SourceCloud, TargetCache, GRAVITY_TILT_MAX_DEG,
+    score_relocalization, relocation_pipeline_cached, local_registration,
+    RelocalizationConfig, SourceCloud, TargetCache,
 };
 use std::sync::Arc;
 
@@ -289,25 +289,15 @@ fn compute_relocalization(
     for initial in initials {
         let local = local_registration(source, target, *initial, odom)?;
         let transform = local.transformation;
-        let score = evaluate_alignment(
-            &source.points,
-            &target.index,
-            transform,
-            config.fine_correspondence_distance,
-        );
-        if local.mse.is_finite()
-            && score.inlier_count >= config.min_final_inliers
-            && score.fitness >= config.min_final_fitness
-            && score.rmse.is_finite()
-            && is_upright(&transform, GRAVITY_TILT_MAX_DEG)
-        {
-            return Ok((transform, score.rmse * score.rmse, true));
+        let score = score_relocalization(source, transform, target);
+        if score.accepts(&transform) {
+            return Ok((transform, score.wall_fitness, true));
         }
     }
     let global = relocation_pipeline_cached(source, target, config);
     Ok((
         global.registration.transformation,
-        global.registration.mse,
+        global.fitness,
         global.registration.converged,
     ))
 }

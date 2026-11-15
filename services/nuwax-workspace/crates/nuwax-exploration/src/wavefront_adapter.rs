@@ -436,6 +436,8 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         self.last_frontiers.clone()
     }
 
+    fn excluded_frontiers(&self) -> usize { self.session.failed_exclusion_count() }
+
     fn diagnostics(&self) -> ExplorationSourceDiagnostics {
         ExplorationSourceDiagnostics {
             source_name: self.name.to_string(),

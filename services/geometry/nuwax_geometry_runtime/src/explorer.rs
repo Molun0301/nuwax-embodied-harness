@@ -594,7 +594,7 @@ impl Explorer {
             .poll_next_goal_with_deferred_stop(&snapshot, config.return_policy.enabled())
             .map_err(|e| e.to_string())?;
         if matches!(poll, ExplorationPoll::Goal(_) | ExplorationPoll::NoFrontier) {
-            self.frontier_count = self.controller.frontier_snapshot().len() as u32;
+            self.frontier_count = self.controller.frontier_count() as u32;
         }
         match poll {
             ExplorationPoll::Goal(frontier) => {
@@ -789,10 +789,19 @@ impl Explorer {
                         ExplorationTerminalKind::Failed => proto::ExplorationPhase::Failed,
                     }
                 });
+        let excluded_frontiers = self.controller.excluded_frontiers() as u32;
+        let no_frontier = self.stop_reason == Some(ExplorationStopReason::NoFrontierTimeout);
+        let message = if no_frontier {
+            if excluded_frontiers == 0 { "探索完成，没有剩余可达前沿".into() }
+            else { format!("探索结束，{excluded_frontiers} 处前沿因导航失败未能到达") }
+        } else { message.into() };
         proto::ExplorationStatus {
             exploration_id: self.id.clone(),
             phase: phase as i32,
-            message: message.into(),
+            message,
+            stop_reason: self.stop_reason.map_or_else(String::new, |reason| format!("{reason:?}")),
+            excluded_frontiers,
+            exploration_complete: no_frontier && excluded_frontiers == 0,
             frontier_count: self.frontier_count,
             goals_completed: self.reached_goals,
             returning: self.mission.as_ref().is_some_and(|m| m.returning),

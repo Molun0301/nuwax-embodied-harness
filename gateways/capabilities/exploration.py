@@ -153,14 +153,18 @@ def _explore_area(platform, ctx, args):
                                 raise
                             except Exception as error:
                                 raise GatewayError(
-                                    f"{status.message}；保存地图失败：{error}",
+                                    f"{status.stop_reason}：{status.message}；保存地图失败：{error}",
                                     error_code="exploration_failed", http_status=409,
-                                    details={"exploration_error": status.message, "map_save_error": str(error)},
+                                    details={"exploration_error": status.message, "stop_reason": status.stop_reason,
+                                             "map_save_error": str(error)},
                                 ) from error
-                        raise GatewayError(status.message, error_code="exploration_failed", http_status=409)
+                        raise GatewayError(f"{status.stop_reason}：{status.message}", error_code="exploration_failed",
+                                           http_status=409, details={"stop_reason": status.stop_reason})
                     if status.phase is ExplorationPhase.STOPPED:
                         raise Cancelled(status.message or "探索已被停止")
-                    result = {"exploration_id": exploration_id, "map_name": name, "exploration": asdict(status)}
+                    result = {"exploration_id": exploration_id, "map_name": name, "exploration": asdict(status),
+                              "stop_reason": status.stop_reason, "excluded_frontiers": status.excluded_frontiers,
+                              "exploration_complete": status.exploration_complete}
                     if args.get("save_map", True):
                         result["saved_map"] = save_map(platform, ctx, {"map_name": name})
                     return result

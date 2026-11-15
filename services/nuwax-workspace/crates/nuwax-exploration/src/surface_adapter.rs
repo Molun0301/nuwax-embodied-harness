@@ -315,6 +315,7 @@ struct SurfacePollDelta {
     last_no_frontier: Option<bool>,
     retry_support: Option<Option<[f64; 3]>>,
     last_frontiers: Option<Vec<FrontierGoal>>,
+    frontier_count: Option<usize>,
     last_error: Option<Option<String>>,
     regional: Option<nuwax_explore_routing::RegionalPresenceDelta>,
     // 仅是下一次搜索的顺序，不写入控制器历史或提交检查点。
@@ -360,6 +361,7 @@ impl SurfacePollDelta {
         if let Some(value) = self.retry_support {
             source.retry_support = value;
         }
+        if let Some(value) = self.frontier_count { source.frontier_count = value; }
         if let Some(value) = self.last_frontiers {
             source.last_frontiers = value;
         }
@@ -432,6 +434,7 @@ pub struct SurfaceGoalSourceAdapter {
     last_no_frontier: bool,
     retry_support: Option<[f64; 3]>,
     last_frontiers: Vec<FrontierGoal>,
+    frontier_count: usize,
     last_error: Option<String>,
     prepared_poll: Option<PendingSurfacePoll>,
     search_hint: Option<SurfaceSearchHint>,
@@ -474,6 +477,7 @@ impl SurfaceGoalSourceAdapter {
             last_no_frontier: false,
             retry_support: None,
             last_frontiers: Vec::new(),
+            frontier_count: 0,
             last_error: None,
             prepared_poll: None,
             search_hint: None,
@@ -755,6 +759,8 @@ impl SurfaceGoalSourceAdapter {
         // 默认3米策略半径不能跨越另一楼层；高度只覆盖局部可跨台阶及量化差。
         let vertical_radius =
             f64::from(snapshot.config().step_threshold_m) + f64::from(snapshot.config().voxel_size);
+        delta.frontier_count = Some(candidates.iter()
+            .filter(|candidate| !self.excluded(candidate.support_xyz, vertical_radius)).count());
         let geometric_candidate_count = candidates.len();
         if !selecting {
             candidates.retain(|candidate| {
@@ -1629,6 +1635,13 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
 
     fn frontier_snapshot(&self) -> Vec<FrontierGoal> {
         self.last_frontiers.clone()
+    }
+
+    fn frontier_count(&self) -> usize { self.frontier_count }
+
+    fn excluded_frontiers(&self) -> usize {
+        self.history.iter().filter(|entry| !entry.reached
+            && entry.failures > u64::from(self.max_navigation_retries)).count()
     }
 
     fn diagnostics(&self) -> ExplorationSourceDiagnostics {

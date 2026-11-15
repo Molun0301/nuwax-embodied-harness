@@ -534,6 +534,12 @@ pub trait ExplorationGoalSource: Send {
         Vec::new()
     }
 
+    /// 本次选点时未被排除的前沿格数。
+    fn frontier_count(&self) -> usize { self.frontier_snapshot().len() }
+
+    /// 仍因导航失败超限而排除的历史条目数。
+    fn excluded_frontiers(&self) -> usize { 0 }
+
     /// 保存已经确认的源历史；无支持的源必须明确拒绝。
     fn checkpoint(&self) -> ExploreResult<String> {
         Err(ExploreError::SourceError("探索源不支持持久进度".into()))
@@ -1150,6 +1156,16 @@ impl ExplorationController {
             .iter()
             .flat_map(|source| source.frontier_snapshot())
             .collect()
+    }
+
+    /// 当前选点的未排除前沿格数。
+    pub fn frontier_count(&self) -> usize {
+        self.sources.iter().map(|source| source.frontier_count()).sum()
+    }
+
+    /// 各探索源仍因失败排除的条目总数。
+    pub fn excluded_frontiers(&self) -> usize {
+        self.sources.iter().map(|source| source.excluded_frontiers()).sum()
     }
 
     /// controller diagnostics

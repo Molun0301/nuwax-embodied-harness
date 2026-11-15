@@ -295,10 +295,15 @@ fn default_no_frontier_stability_window_finishes_with_fresh_map_input() {
         .unwrap();
     assert!(first.goal.is_none());
     assert_eq!(first.status.phase, proto::ExplorationPhase::Running as i32);
+    assert!(first.status.stop_reason.is_empty());
+    assert!(!first.status.exploration_complete);
     explorer.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
     complete.meta.as_mut().unwrap().timestamp_ns = unix_ns();
     let done = explorer.tick(Some(pose()), Some(complete), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(done.status.phase, proto::ExplorationPhase::Succeeded as i32);
+    assert_eq!(done.status.stop_reason, "NoFrontierTimeout");
+    assert!(done.status.exploration_complete);
+    assert_eq!(done.status.message, "探索完成，没有剩余可达前沿");
     assert_eq!(
         explorer.stop_reason,
         Some(ExplorationStopReason::NoFrontierTimeout)
@@ -659,6 +664,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
         let update = explorer
             .tick(Some(position.clone()), Some(grid()), Ok(surface.clone()), Ok(()))
             .unwrap();
+        assert!(update.status.frontier_count > 1, "三维前沿数应统计未排除格子");
         let (_, target) = update.goal.expect("实际曲面源应产生目标");
         let target = target.pose.unwrap();
         assert!(
@@ -795,4 +801,34 @@ fn completion_return_does_not_query_unreachable_home_while_exploring() {
     assert!(update.goal.is_some());
     assert!(explorer.input_wait_since.is_none());
     assert!(!update.status.returning);
+}
+
+#[test]
+fn no_frontier_with_failed_exclusions_is_successful_but_incomplete() {
+    struct Excluded;
+    impl nuwax_exploration::ExplorationGoalSource for Excluded {
+        fn source_name(&self) -> std::borrow::Cow<'static, str> { "excluded".into() }
+        fn begin(&mut self) -> nuwax_exploration::ExploreResult<()> { Ok(()) }
+        fn end(&mut self) -> nuwax_exploration::ExploreResult<()> { Ok(()) }
+        fn poll_goal(&mut self, _: &ExplorationStateSnapshot<'_>) -> nuwax_exploration::ExploreResult<ExplorationPoll> { Ok(ExplorationPoll::NoFrontier) }
+        fn excluded_frontiers(&self) -> usize { 2 }
+        fn diagnostics(&self) -> nuwax_exploration::ExplorationSourceDiagnostics {
+            nuwax_exploration::ExplorationSourceDiagnostics { source_name: "excluded".into(), is_active: true, last_goal_id: None, last_error: None }
+        }
+    }
+    let mut explorer = started_with_max_goals(10);
+    explorer.controller.shutdown();
+    explorer.controller.add_source(Excluded);
+    explorer.controller.begin_exploration().unwrap();
+    explorer.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
+    let update = explorer.tick(Some(pose()), Some(grid()), Err("无曲面".into()), Ok(())).unwrap();
+    assert_eq!(update.status.phase, proto::ExplorationPhase::Succeeded as i32);
+    assert_eq!(update.status.excluded_frontiers, 2);
+    assert!(!update.status.exploration_complete);
+    assert_eq!(update.status.stop_reason, "NoFrontierTimeout");
+    assert_eq!(update.status.message, "探索结束，2 处前沿因导航失败未能到达");
+    let mut budget = started_with_max_goals(0);
+    let update = budget.tick(None, None, Err("无曲面".into()), Ok(())).unwrap();
+    assert_eq!(update.status.stop_reason, "MaxGoalsReached");
+    assert!(!update.status.exploration_complete);
 }

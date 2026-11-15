@@ -1053,6 +1053,8 @@ impl Session {
         if let Some(status) = &mut self.state.exploration {
             status.phase = ExplorationPhase::Failed as i32;
             status.message = reason;
+            status.stop_reason = "ConsecutiveFailuresExceeded".into();
+            status.exploration_complete = false;
         }
         self.state.phase = SessionPhase::Mapping as i32;
         if self

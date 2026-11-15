@@ -240,6 +240,11 @@ impl ExplorationSession {
         restored
     }
 
+    /// 只统计仍因导航失败排除的区域。
+    pub fn failed_exclusion_count(&self) -> usize {
+        self.blacklisted_goals.iter().filter(|entry| entry.failure_only).count()
+    }
+
     /// 当前 blacklist 区域数量。
     #[must_use]
     pub fn blacklist_count(&self) -> usize {

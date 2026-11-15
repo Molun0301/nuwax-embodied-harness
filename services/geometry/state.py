@@ -91,6 +91,9 @@ class ExplorationStatus:
     goals_completed: int
     returning: bool
     traveled_distance_m: float
+    stop_reason: str = ""
+    excluded_frontiers: int = 0
+    exploration_complete: bool = False
 
 
 @dataclass(frozen=True)

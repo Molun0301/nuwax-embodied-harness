@@ -66,6 +66,15 @@ impl DirtyBounds {
     }
 }
 
+// 脏范围只可能影响所在块及其半径覆盖的邻块。
+fn dirty_contains(blocks: &BTreeMap<[i32; 2], DirtyBounds>, cell: VoxelKey, radius: i64) -> bool {
+    let ring = (radius + 31) / 32;
+    let block = [i64::from(cell.0.div_euclid(32)), i64::from(cell.1.div_euclid(32))];
+    (block[0] - ring..=block[0] + ring).any(|x|
+        (block[1] - ring..=block[1] + ring).any(|y|
+            blocks.get(&[x as i32, y as i32]).is_some_and(|bounds| bounds.contains(cell))))
+}
+
 impl SurfaceSnapshot {
     /// 在环境快照上准备可复用的前沿几何；当前机体视图只重算局部变化。
     pub fn prepare_frontier_geometry(
@@ -149,8 +158,7 @@ impl SurfaceSnapshot {
         }
         if !changes.is_empty() {
             // 视线前瞻 + 坡阶侧向剖面 + 净空查询共同决定局部依赖范围，覆盖全部高度。
-            let radius = i64::from(self.frontier_lookahead() + self.data.profile_cells + 3)
-                + (self.config().wall_clearance_m / self.config().voxel_size).ceil() as i64;
+            let radius = self.frontier_dirty_radius();
             let blocks = cache.dirty.get_or_insert_with(BTreeMap::new);
             for &[x, y] in changes {
                 let block = [x.div_euclid(32), y.div_euclid(32)];
@@ -243,7 +251,7 @@ impl SurfaceSnapshot {
                 .seed
                 .gains
                 .iter()
-                .filter(|(cell, _)| !dirty.unwrap().values().any(|bounds| bounds.contains(**cell)))
+                .filter(|(cell, _)| !dirty_contains(dirty.unwrap(), **cell, self.frontier_dirty_radius()))
                 .map(|(&cell, &gain)| (cell, gain))
                 .collect()
         });
@@ -298,6 +306,11 @@ impl SurfaceSnapshot {
             evaluated_cells, retained_frontiers, incremental = dirty.is_some(),
             "前沿几何索引重建");
         index
+    }
+
+    fn frontier_dirty_radius(&self) -> i64 {
+        i64::from(self.frontier_lookahead() + self.data.profile_cells + 3)
+            + (self.config().wall_clearance_m / self.config().voxel_size).ceil() as i64
     }
 
     fn frontier_lookahead(&self) -> i32 {
@@ -430,7 +443,29 @@ mod tests;
 
 #[cfg(test)]
 mod bounds_tests {
-    use super::DirtyBounds;
+    use super::{DirtyBounds, dirty_contains};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn nearby_block_lookup_matches_all_dirty_bounds_at_negative_edges_and_multiple_rings() {
+        for radius in [0, 1, 31, 32, 33, 65] {
+            let mut blocks = BTreeMap::new();
+            for [x, y] in [[-65, -32], [-33, 31], [0, 0], [31, 32], [65, -65], [3200, 3200]] {
+                let bounds = DirtyBounds { min_x: x - radius, max_x: x + radius,
+                    min_y: y - radius, max_y: y + radius };
+                blocks.entry([(x as i32).div_euclid(32), (y as i32).div_euclid(32)])
+                    .and_modify(|old: &mut DirtyBounds| *old = old.union(bounds)).or_insert(bounds);
+            }
+            for x in -135..136 {
+                for y in -135..136 {
+                    let cell = (x, y, 3);
+                    assert_eq!(dirty_contains(&blocks, cell, radius), blocks.values().any(|bounds| bounds.contains(cell)),
+                        "半径{radius}，单元{cell:?}");
+                }
+            }
+        }
+    }
+
 
     #[test]
     fn inclusive_negative_bounds_and_broad_scan_fallback() {

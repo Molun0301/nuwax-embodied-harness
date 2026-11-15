@@ -3,7 +3,10 @@
 use nalgebra::{Isometry3, Point3};
 use thiserror::Error;
 
-use super::{relocation_pipeline_with_config, RelocalizationConfig, RelocalizationResult};
+use super::{
+    relocation_pipeline_cached, RelocalizationConfig, RelocalizationResult, SourceCloud,
+    TargetCache,
+};
 
 /// Configuration for one relocalization runtime owner.
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +75,7 @@ pub enum RelocalizationRuntimeError {
 pub struct RelocalizationRuntime {
     config: RelocalizationRuntimeConfig,
     global_map: Vec<Point3<f64>>,
+    target_cache: Option<TargetCache>,
     world_to_map: Option<Isometry3<f64>>,
     attempts: u64,
     accepted: u64,
@@ -108,6 +112,7 @@ impl RelocalizationRuntime {
         Ok(Self {
             config,
             global_map,
+            target_cache: None,
             world_to_map: None,
             attempts: 0,
             accepted: 0,
@@ -138,8 +143,11 @@ impl RelocalizationRuntime {
             };
         }
         self.attempts = self.attempts.saturating_add(1);
-        let result =
-            relocation_pipeline_with_config(local_map, &self.global_map, self.config.algorithm);
+        let target = self
+            .target_cache
+            .get_or_insert_with(|| TargetCache::new(&self.global_map, self.config.algorithm));
+        let source = SourceCloud::from_rays(local_map.iter().map(|p| (*p, Point3::origin())));
+        let result = relocation_pipeline_cached(&source, target, self.config.algorithm);
         self.accept_result(result)
     }
 
@@ -255,7 +263,6 @@ fn algorithm_config_is_valid(config: RelocalizationConfig) -> bool {
         && config.fine_voxel_size > 0.0
         && config.fine_correspondence_distance.is_finite()
         && config.fine_correspondence_distance > 0.0
-        && config.min_final_inliers >= 3
         && config.min_final_fitness.is_finite()
         && (0.0..=1.0).contains(&config.min_final_fitness)
         && config.icp.max_iterations > 0

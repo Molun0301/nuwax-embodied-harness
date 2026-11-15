@@ -57,6 +57,8 @@ async fn saved_pgo_map_load_uses_relocalization_and_new_mapping_keeps_pgo() {
         session.end_current().await.unwrap();
         session.load(LoadMapRequest { map_name: backend.into() }).await.unwrap();
         assert_eq!(session.phase(), SessionPhase::Loaded);
+        assert_eq!(session.saved_last_pose, saved.last_pose.as_ref().map(pose_isometry));
+        assert!(session.relocalization_target.is_none());
         assert_eq!(session.config.correction_backend, backend);
         let loaded = session.mapper().unwrap();
         assert_eq!(loaded.correction_backend(), "relocalization");
@@ -71,6 +73,8 @@ async fn saved_pgo_map_load_uses_relocalization_and_new_mapping_keeps_pgo() {
         assert!(result.succeeded, "{backend}: {}", result.message);
         assert_eq!(session.phase(), SessionPhase::Localized);
         session.end_current().await.unwrap();
+        assert!(session.relocalization_target.is_none());
+        assert!(session.saved_last_pose.is_none());
     }
     // 加载会话结束后再建新图，仍按原配置创建校正器。
     session.start_mapping(StartMappingRequest {
@@ -121,7 +125,7 @@ async fn recent_input_survives_end_and_load_for_immediate_relocalization() {
     session.nav.shutdown().await;
 }
 
-async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
+pub(super) async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
     let (router, _, _) = test_router(mapper.clone());
     let (route, _) = watch::channel(router.route.borrow().clone());
     let router = FrameRouter {
@@ -157,6 +161,9 @@ async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
         .await
         .unwrap(),
         explorer: None,
+        relocalization_target: None,
+        saved_last_pose: None,
+        localizer: None,
     }
 }
 #[tokio::test]

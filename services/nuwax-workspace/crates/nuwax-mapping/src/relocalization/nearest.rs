@@ -28,7 +28,8 @@ struct IndexedPoint {
     axis: usize,
 }
 
-pub(crate) struct NearestPointIndex {
+/// 可复用的三维点最近邻索引。
+pub struct NearestPointIndex {
     points: Vec<IndexedPoint>,
 }
 
@@ -47,7 +48,10 @@ impl NearestPointIndex {
             .collect()
     }
 
-    pub(crate) fn new(points: &[Point3<f64>]) -> Self {
+    /// 为目标点构建一次平衡索引。
+    pub fn new(points: &[Point3<f64>]) -> Self {
+        #[cfg(test)]
+        builds::record(points);
         let mut indexed: Vec<_> = points
             .iter()
             .enumerate()
@@ -71,7 +75,8 @@ impl NearestPointIndex {
         Self { points: indexed }
     }
 
-    pub(crate) fn nearest(&self, point: &Point3<f64>) -> Option<(usize, f64)> {
+    /// 查询最近目标点的原始索引与平方距离。
+    pub fn nearest(&self, point: &Point3<f64>) -> Option<(usize, f64)> {
         if point.coords.iter().any(|value| !value.is_finite()) {
             return None;
         }
@@ -233,5 +238,39 @@ mod tests {
         assert!(NearestPointIndex::new(&[])
             .nearest(&Point3::origin())
             .is_none());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod builds {
+    use super::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static WATCHED: RefCell<Vec<(String, Vec<Point3<f64>>, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn watch(clouds: Vec<(String, Vec<Point3<f64>>)>) {
+        WATCHED.with(|v| {
+            *v.borrow_mut() = clouds
+                .into_iter()
+                .map(|(name, points)| (name, points, 0))
+                .collect()
+        });
+    }
+    pub fn record(points: &[Point3<f64>]) {
+        WATCHED.with(|v| {
+            for (_, expected, count) in v.borrow_mut().iter_mut() {
+                if expected == points {
+                    *count += 1;
+                }
+            }
+        });
+    }
+    pub fn counts() -> Vec<(String, usize)> {
+        WATCHED.with(|v| {
+            v.borrow()
+                .iter()
+                .map(|(name, _, count)| (name.clone(), *count))
+                .collect()
+        })
     }
 }

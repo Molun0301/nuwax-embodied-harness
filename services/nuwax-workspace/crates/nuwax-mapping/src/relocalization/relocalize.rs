@@ -4,9 +4,10 @@ use super::nearest::NearestPointIndex;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 
 use super::features::{
-    compute_fpfh, match_fpfh, preprocess, voxel_downsample, FeatureConfig, FeatureMatch,
+    compute_fpfh, estimate_normals, match_fpfh_indexed, preprocess, voxel_downsample,
+    FeatureConfig, FeatureMatch, ProcessedCloud,
 };
-use super::ransac::{evaluate_alignment, ransac_align, AlignmentScore, RansacConfig};
+use super::ransac::{ransac_align, RansacConfig};
 
 /// ICP 配置
 #[derive(Debug, Clone, Copy)]
@@ -59,8 +60,12 @@ impl IcpSolver {
     /// `source` 与 `target` 是两组 3D 点；返回 source → target 的刚体变换。
     #[must_use]
     pub fn align(&self, source: &[Point3<f64>], target: &[Point3<f64>]) -> IcpResult {
-        if source.is_empty() || target.is_empty()
-            || source.iter().chain(target).any(|p| p.coords.iter().any(|v| !v.is_finite()))
+        if source.is_empty()
+            || target.is_empty()
+            || source
+                .iter()
+                .chain(target)
+                .any(|p| p.coords.iter().any(|v| !v.is_finite()))
         {
             return IcpResult {
                 transformation: Isometry3::identity(),
@@ -70,9 +75,16 @@ impl IcpSolver {
             };
         }
 
-        // 目标在本次匹配中不变；静态构建支持大量共轴的墙面、地面或重复采样点。
-        let tree = NearestPointIndex::new(target);
+        self.align_indexed(source, target, &NearestPointIndex::new(target))
+    }
 
+    /// 使用调用方已构建的目标索引运行配准。
+    pub fn align_indexed(
+        &self,
+        source: &[Point3<f64>],
+        target: &[Point3<f64>],
+        tree: &NearestPointIndex,
+    ) -> IcpResult {
         let mut current = Isometry3::identity();
         let mut prev_mse = f64::INFINITY;
 
@@ -277,6 +289,7 @@ pub fn ransac_align_stub(
     ransac_align(
         source,
         target,
+        &NearestPointIndex::new(target),
         &matches,
         RansacConfig {
             max_iterations: max_iters,
@@ -307,7 +320,8 @@ pub fn multiscale_icp(
         max_correspondence_distance: coarse_distance,
         ..IcpConfig::default()
     };
-    let coarse = IcpSolver::new(coarse_cfg).align(source, target);
+    let target_index = NearestPointIndex::new(target);
+    let coarse = IcpSolver::new(coarse_cfg).align_indexed(source, target, &target_index);
 
     // 阶段 2：用粗变换初始化 + 细尺度（max_corr = fine_distance）
     let fine_cfg = IcpConfig {
@@ -315,7 +329,7 @@ pub fn multiscale_icp(
         ..IcpConfig::default()
     };
     let transformed: Vec<Point3<f64>> = source.iter().map(|p| coarse.transformation * p).collect();
-    let fine = IcpSolver::new(fine_cfg).align(&transformed, target);
+    let fine = IcpSolver::new(fine_cfg).align_indexed(&transformed, target, &target_index);
 
     // 合并：total = fine * coarse
     IcpResult {
@@ -324,6 +338,189 @@ pub fn multiscale_icp(
         iterations: coarse.iterations + fine.iterations,
         converged: fine.converged,
     }
+}
+
+/// 同一次地图加载期间复用的目标数据。
+pub struct TargetCache {
+    /// 0.1米目标点。
+    pub points: Vec<Point3<f64>>,
+    /// 精细层最近邻索引。
+    pub index: NearestPointIndex,
+    /// 地图坐标中的0.1米占据体素。
+    pub occupied: std::collections::HashSet<[i64; 3]>,
+    scales: std::sync::OnceLock<Vec<ProcessedCloud>>,
+}
+impl TargetCache {
+    /// 每次加载的第一次重定位构建一次。
+    pub fn new(target: &[Point3<f64>], config: RelocalizationConfig) -> Self {
+        let points = voxel_downsample(target, config.fine_voxel_size);
+        let index = NearestPointIndex::new(&points);
+        let occupied = points.iter().map(voxel_key).collect();
+        Self {
+            points,
+            index,
+            occupied,
+            scales: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn global_scales(&self, config: RelocalizationConfig) -> &[ProcessedCloud] {
+        self.scales.get_or_init(|| {
+            config
+                .voxel_sizes
+                .into_iter()
+                .map(|size| {
+                    preprocess(
+                        &self.points,
+                        FeatureConfig::for_voxel(size, config.max_feature_neighbors),
+                    )
+                })
+                .collect()
+        })
+    }
+}
+
+fn voxel_key(point: &Point3<f64>) -> [i64; 3] {
+    [point.x, point.y, point.z].map(|v| (v / 0.1).floor() as i64)
+}
+
+/// 在里程计坐标中降采样的源点及其所属帧原点。
+pub struct SourceCloud {
+    /// 源点。
+    pub points: Vec<Point3<f64>>,
+    /// 与源点一一对应的射线原点。
+    pub origins: Vec<Point3<f64>>,
+    /// 源点在里程计坐标中的法线。
+    pub normals: Vec<Vector3<f64>>,
+    walls: Vec<bool>,
+}
+impl SourceCloud {
+    /// 每个0.1米体素保留首个实测点，原点来自该点所属帧。
+    pub fn from_rays(rays: impl IntoIterator<Item = (Point3<f64>, Point3<f64>)>) -> Self {
+        let mut voxels = std::collections::BTreeMap::new();
+        for (point, origin) in rays {
+            voxels.entry(voxel_key(&point)).or_insert((point, origin));
+        }
+        let (points, origins): (Vec<_>, Vec<_>) = voxels.into_values().unzip();
+        let normals = estimate_normals(&points, 0.2, 100);
+        let walls = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
+        Self {
+            points,
+            origins,
+            normals,
+            walls,
+        }
+    }
+}
+
+/// 局部和全局共用的墙面与自由空间评分。
+#[derive(Clone, Copy, Debug)]
+pub struct RelocalizationScore {
+    /// 墙面源点中0.15米内有目标点的比例。
+    pub wall_fitness: f64,
+    /// 射线中段穿过地图占据体素的比例。
+    pub penetration: f64,
+    /// 墙面内点均方根误差。
+    pub rmse: f64,
+}
+impl RelocalizationScore {
+    /// 按任务规定的四个条件判断结果。
+    pub fn accepts(&self, transform: &Isometry3<f64>) -> bool {
+        self.wall_fitness >= 0.45
+            && self.penetration <= 0.15
+            && is_upright(transform, GRAVITY_TILT_MAX_DEG)
+            && self.rmse.is_finite()
+    }
+}
+
+/// 对带所属帧射线原点的降采样源点评分。
+pub fn score_relocalization(
+    source: &SourceCloud,
+    transform: Isometry3<f64>,
+    target: &TargetCache,
+) -> RelocalizationScore {
+    let mut walls = 0_usize;
+    let mut inliers = 0_usize;
+    let mut squared_error = 0.0;
+    let mut rays = 0_usize;
+    let mut penetrated = 0_usize;
+    for ((point, origin), wall) in source.points.iter().zip(&source.origins).zip(&source.walls) {
+        if !wall {
+            continue;
+        }
+        walls += 1;
+        let point = transform * point;
+        if let Some((_, distance)) = target.index.nearest(&point) {
+            if distance <= 0.15_f64.powi(2) {
+                inliers += 1;
+                squared_error += distance;
+            }
+        }
+        let origin = transform * origin;
+        let direction = point - origin;
+        let length = direction.norm();
+        if length <= 0.8 {
+            continue;
+        }
+        rays += 1;
+        let direction = direction / length;
+        let mut distance = 0.5;
+        while distance < length - 0.3 {
+            if target
+                .occupied
+                .contains(&voxel_key(&(origin + direction * distance)))
+            {
+                penetrated += 1;
+                break;
+            }
+            distance += 0.1;
+        }
+    }
+    RelocalizationScore {
+        wall_fitness: inliers as f64 / walls.max(1) as f64,
+        penetration: penetrated as f64 / rays.max(1) as f64,
+        rmse: if inliers == 0 {
+            f64::INFINITY
+        } else {
+            (squared_error / inliers as f64).sqrt()
+        },
+    }
+}
+
+/// 只在初值下机器人周围水平30米内做点到平面配准。
+pub fn local_registration(
+    source: &SourceCloud,
+    target: &TargetCache,
+    initial: Isometry3<f64>,
+    odom: Isometry3<f64>,
+) -> Result<IcpResult, String> {
+    let position = (initial * odom).translation.vector;
+    let local_target: Vec<[f64; 3]> = target
+        .points
+        .iter()
+        .filter(|p| (p.x - position.x).powi(2) + (p.y - position.y).powi(2) <= 30.0_f64.powi(2))
+        .map(|p| [p.x, p.y, p.z])
+        .collect();
+    let seeded: Vec<[f64; 3]> = source
+        .points
+        .iter()
+        .map(|p| {
+            let p = initial * p;
+            [p.x, p.y, p.z]
+        })
+        .collect();
+    let result = nuwax_gtsam::point_to_plane(&seeded, &local_target, 0.8, 50)?;
+    let q = result.transformation.rotation_xyzw;
+    let delta = Isometry3::from_parts(
+        Translation3::from(result.transformation.translation),
+        UnitQuaternion::new_normalize(nalgebra::Quaternion::new(q[3], q[0], q[1], q[2])),
+    );
+    Ok(IcpResult {
+        transformation: delta * initial,
+        mse: result.mse,
+        iterations: result.iterations as usize,
+        converged: result.converged != 0,
+    })
 }
 
 /// Configuration for the complete feature/RANSAC/ICP relocalization pipeline.
@@ -341,9 +538,7 @@ pub struct RelocalizationConfig {
     pub fine_voxel_size: f64,
     /// Maximum residual used for final candidate scoring and ICP in metres.
     pub fine_correspondence_distance: f64,
-    /// Minimum final source-cloud inlier count.
-    pub min_final_inliers: usize,
-    /// Minimum final source-cloud inlier ratio.
+    /// RANSAC候选生成阶段的共识比例；最终接受由统一墙面评分决定。
     pub min_final_fitness: f64,
     /// ICP settings used for the final seeded local refinement.
     pub icp: IcpConfig,
@@ -360,7 +555,6 @@ impl Default for RelocalizationConfig {
             min_feature_matches: 3,
             fine_voxel_size,
             fine_correspondence_distance,
-            min_final_inliers: 3,
             min_final_fitness: 0.45,
             icp: IcpConfig {
                 max_correspondence_distance: fine_correspondence_distance,
@@ -379,8 +573,10 @@ pub struct RelocalizationResult {
     pub feature_matches: usize,
     /// Largest RANSAC geometric consensus observed at any configured scale.
     pub ransac_inliers: usize,
-    /// Final fine-scale inlier ratio.
+    /// 最终墙面适配度。
     pub fitness: f64,
+    /// 两个不同位置同样符合地图，调用方应报告歧义。
+    pub ambiguous: bool,
 }
 
 /// Run the complete multi-scale FPFH, deterministic RANSAC, and seeded ICP pipeline.
@@ -390,32 +586,44 @@ pub fn relocation_pipeline_with_config(
     target: &[Point3<f64>],
     config: RelocalizationConfig,
 ) -> RelocalizationResult {
-    if !valid_relocalization_config(config) || source.len() < 3 || target.len() < 3 {
-        return rejected_relocalization(0, 0, 0);
-    }
-    let fine_source = voxel_downsample(source, config.fine_voxel_size);
-    let fine_target = voxel_downsample(target, config.fine_voxel_size);
-    if fine_source.len() < 3 || fine_target.len() < 3 {
-        return rejected_relocalization(0, 0, 0);
-    }
+    let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+    relocation_pipeline_cached(&source, &TargetCache::new(target, config), config)
+}
 
+/// 已加载地图上的全局配准，目标预处理由会话持有。
+pub fn relocation_pipeline_cached(
+    source: &SourceCloud,
+    target: &TargetCache,
+    config: RelocalizationConfig,
+) -> RelocalizationResult {
+    let fine_source = &source.points;
+    if !valid_relocalization_config(config) || fine_source.len() < 3 || target.points.len() < 3 {
+        return rejected_relocalization(0, 0, 0);
+    }
     let mut maximum_feature_matches = 0;
     let mut maximum_ransac_inliers = 0;
     let mut ransac_iterations = 0;
-    let mut best_candidate: Option<(Isometry3<f64>, AlignmentScore)> = None;
+    let mut candidates = Vec::new();
 
-    for voxel_size in config.voxel_sizes {
+    for (voxel_size, target_features) in config
+        .voxel_sizes
+        .into_iter()
+        .zip(target.global_scales(config))
+    {
         let feature_config = FeatureConfig::for_voxel(voxel_size, config.max_feature_neighbors);
-        let source_features = preprocess(source, feature_config);
-        let target_features = preprocess(target, feature_config);
+        let source_features = preprocess(fine_source, feature_config);
         if source_features.descriptors.len() != source_features.points.len()
             || target_features.descriptors.len() != target_features.points.len()
         {
             continue;
         }
 
-        let feature_matches =
-            match_fpfh(&source_features.descriptors, &target_features.descriptors);
+        let feature_matches = match_fpfh_indexed(
+            &source_features.descriptors,
+            &target_features.descriptors,
+            &source_features.feature_index,
+            &target_features.feature_index,
+        );
         maximum_feature_matches = maximum_feature_matches.max(feature_matches.len());
         if feature_matches.len() < config.min_feature_matches {
             continue;
@@ -424,87 +632,113 @@ pub fn relocation_pipeline_with_config(
         let ransac = ransac_align(
             &source_features.points,
             &target_features.points,
+            &target_features.index,
             &feature_matches,
             RansacConfig {
                 max_iterations: config.ransac_iterations,
                 inlier_threshold: voxel_size * 1.5,
-                min_inliers: config.min_final_inliers.min(source_features.points.len()),
+                min_inliers: 3,
                 min_inlier_ratio: config.min_final_fitness.min(0.5),
                 ..RansacConfig::default()
             },
         );
         ransac_iterations += ransac.iterations;
         maximum_ransac_inliers = maximum_ransac_inliers.max(ransac.inlier_count);
-        if !ransac.converged || !is_upright(&ransac.transformation, GRAVITY_TILT_MAX_DEG) {
+        if !ransac.converged {
             continue;
         }
 
+        consider_candidate(source, target, ransac.transformation, &mut candidates);
         consider_candidate(
-            &fine_source,
-            &fine_target,
-            ransac.transformation,
-            config.fine_correspondence_distance,
-            &mut best_candidate,
-        );
-        consider_candidate(
-            &fine_source,
-            &fine_target,
+            source,
+            target,
             ransac.transformation * centroid_yaw_flip(&fine_source),
-            config.fine_correspondence_distance,
-            &mut best_candidate,
+            &mut candidates,
         );
     }
 
-    let Some((candidate, candidate_score)) = best_candidate else {
-        return rejected_relocalization(
-            maximum_feature_matches,
-            maximum_ransac_inliers,
-            ransac_iterations,
-        );
-    };
+    finish_global_candidates(
+        source,
+        target,
+        config,
+        candidates,
+        maximum_feature_matches,
+        maximum_ransac_inliers,
+        ransac_iterations,
+    )
+}
 
-    let seeded_source: Vec<Point3<f64>> =
-        fine_source.iter().map(|point| candidate * point).collect();
-    let mut icp_config = config.icp;
-    icp_config.max_correspondence_distance = icp_config
-        .max_correspondence_distance
-        .min(config.fine_correspondence_distance);
-    let refinement = IcpSolver::new(icp_config).align(&seeded_source, &fine_target);
-    let refined_transform = refinement.transformation * candidate;
-    let refined_score = evaluate_alignment(
-        &fine_source,
-        &fine_target,
-        refined_transform,
-        config.fine_correspondence_distance,
-    );
-    let (transformation, score) = if score_is_better(refined_score, candidate_score) {
-        (refined_transform, refined_score)
-    } else {
-        (candidate, candidate_score)
-    };
+fn different_positions(a: &Isometry3<f64>, b: &Isometry3<f64>) -> bool {
+    (a.translation.vector - b.translation.vector).norm() > 1.0
+        || (a.rotation.inverse() * b.rotation).angle().to_degrees() > 20.0
+}
 
-    let accepted = score.inlier_count >= config.min_final_inliers
-        && score.fitness >= config.min_final_fitness
-        && score.rmse.is_finite()
-        && is_upright(&transformation, GRAVITY_TILT_MAX_DEG);
-    if !accepted {
-        return rejected_relocalization(
-            maximum_feature_matches,
-            maximum_ransac_inliers,
-            ransac_iterations + refinement.iterations,
-        );
+fn sort_candidates(candidates: &mut [(Isometry3<f64>, RelocalizationScore)]) {
+    candidates.sort_by(|a, b| {
+        b.1.wall_fitness
+            .total_cmp(&a.1.wall_fitness)
+            .then(a.1.penetration.total_cmp(&b.1.penetration))
+    });
+}
+
+fn finish_global_candidates(
+    source: &SourceCloud,
+    target: &TargetCache,
+    config: RelocalizationConfig,
+    mut candidates: Vec<(Isometry3<f64>, RelocalizationScore)>,
+    feature_matches: usize,
+    ransac_inliers: usize,
+    mut iterations: usize,
+) -> RelocalizationResult {
+    sort_candidates(&mut candidates);
+    let Some(first) = candidates.first().copied() else {
+        return rejected_relocalization(feature_matches, ransac_inliers, iterations);
+    };
+    let second = candidates
+        .iter()
+        .skip(1)
+        .find(|candidate| different_positions(&first.0, &candidate.0))
+        .copied();
+    let mut refined = Vec::new();
+    for (candidate, _) in std::iter::once(first).chain(second) {
+        let seeded: Vec<_> = source.points.iter().map(|p| candidate * p).collect();
+        let mut icp = config.icp;
+        icp.max_correspondence_distance = icp
+            .max_correspondence_distance
+            .min(config.fine_correspondence_distance);
+        let refinement = IcpSolver::new(icp).align_indexed(&seeded, &target.points, &target.index);
+        iterations += refinement.iterations;
+        let transform = refinement.transformation * candidate;
+        refined.push((transform, score_relocalization(source, transform, target)));
     }
-
+    sort_candidates(&mut refined);
+    let (transformation, score) = refined[0];
+    if !score.accepts(&transformation) {
+        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+        result.fitness = score.wall_fitness;
+        return result;
+    }
+    if refined.get(1).is_some_and(|(second, runner_up)| {
+        different_positions(&transformation, second)
+            && runner_up.accepts(second)
+            && runner_up.wall_fitness >= score.wall_fitness * 0.9
+    }) {
+        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+        result.ambiguous = true;
+        result.fitness = score.wall_fitness;
+        return result;
+    }
     RelocalizationResult {
         registration: IcpResult {
             transformation,
             mse: score.rmse * score.rmse,
-            iterations: ransac_iterations + refinement.iterations,
+            iterations,
             converged: true,
         },
-        feature_matches: maximum_feature_matches,
-        ransac_inliers: maximum_ransac_inliers,
-        fitness: score.fitness,
+        feature_matches,
+        ransac_inliers,
+        fitness: score.wall_fitness,
+        ambiguous: false,
     }
 }
 
@@ -526,7 +760,6 @@ fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
         && config.fine_voxel_size > 0.0
         && config.fine_correspondence_distance.is_finite()
         && config.fine_correspondence_distance > 0.0
-        && config.min_final_inliers >= 3
         && config.min_final_fitness.is_finite()
         && (0.0..=1.0).contains(&config.min_final_fitness)
         && config.icp.max_iterations > 0
@@ -537,27 +770,15 @@ fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
 }
 
 fn consider_candidate(
-    source: &[Point3<f64>],
-    target: &[Point3<f64>],
+    source: &SourceCloud,
+    target: &TargetCache,
     transformation: Isometry3<f64>,
-    threshold: f64,
-    best: &mut Option<(Isometry3<f64>, AlignmentScore)>,
+    candidates: &mut Vec<(Isometry3<f64>, RelocalizationScore)>,
 ) {
-    if !is_upright(&transformation, GRAVITY_TILT_MAX_DEG) {
-        return;
-    }
-    let score = evaluate_alignment(source, target, transformation, threshold);
-    if best
-        .as_ref()
-        .is_none_or(|(_, current)| score_is_better(score, *current))
-    {
-        *best = Some((transformation, score));
-    }
-}
-
-fn score_is_better(candidate: AlignmentScore, current: AlignmentScore) -> bool {
-    candidate.inlier_count > current.inlier_count
-        || (candidate.inlier_count == current.inlier_count && candidate.rmse < current.rmse)
+    candidates.push((
+        transformation,
+        score_relocalization(source, transformation, target),
+    ));
 }
 
 fn centroid_yaw_flip(source: &[Point3<f64>]) -> Isometry3<f64> {
@@ -586,6 +807,7 @@ fn rejected_relocalization(
         feature_matches,
         ransac_inliers,
         fitness: 0.0,
+        ambiguous: false,
     }
 }
 
@@ -717,5 +939,246 @@ mod tests {
         let _coarse_res = IcpSolver::new(coarse).align(&pts, &pts);
         let _fine_res = IcpSolver::new(fine).align(&pts, &pts);
         // 两个尺度都能跑通：标记 multi-scale ICP 入口可用
+    }
+    #[test]
+    fn adjacent_identical_rooms_are_globally_ambiguous() {
+        let points = synthetic_room();
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        let a = Isometry3::translation(30.0, 20.0, 0.0);
+        let b = Isometry3::translation(42.0, 20.0, 0.0);
+        let target: Vec<_> = points.iter().flat_map(|p| [a * p, b * p]).collect();
+        let config = RelocalizationConfig::default();
+        let target = TargetCache::new(&target, config);
+        let result = relocation_pipeline_cached(&source, &target, config);
+        assert!(
+            !result.registration.converged && result.ambiguous,
+            "相同房间须报告歧义：{result:?}"
+        );
+        // 同一候选附近的重复结果不能挤掉另一个房间。
+        let candidates = [a, a, b]
+            .into_iter()
+            .map(|p| (p, score_relocalization(&source, p, &target)))
+            .collect();
+        let result = finish_global_candidates(&source, &target, config, candidates, 0, 0, 0);
+        assert!(result.ambiguous, "两个平移不同的房间须进入歧义出口");
+        let single = vec![(a, score_relocalization(&source, a, &target))];
+        assert!(
+            finish_global_candidates(&source, &target, config, single, 0, 0, 0)
+                .registration
+                .converged
+        );
+        assert!(!different_positions(
+            &a,
+            &(a * Isometry3::translation(1.0, 0.0, 0.0))
+        ));
+        assert!(different_positions(
+            &a,
+            &(a * Isometry3::translation(1.01, 0.0, 0.0))
+        ));
+        assert!(different_positions(
+            &a,
+            &(a * Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, 21_f64.to_radians())
+            ))
+        ));
+    }
+
+    #[test]
+    fn same_floor_and_ceiling_cannot_accept_a_room_with_different_walls() {
+        let points = synthetic_room();
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        let truth = Isometry3::translation(30.0, 20.0, 0.0);
+        let mut target: Vec<_> = points.iter().map(|p| truth * p).collect();
+        // 甲房间保留相同地面和天花板，墙面布局扩大，乙房间为实际观测。
+        target.extend(
+            points
+                .iter()
+                .filter(|p| p.z == -1.0 || p.z == 1.73)
+                .copied(),
+        );
+        target.extend(
+            points
+                .iter()
+                .filter(|p| p.z != -1.0 && p.z != 1.73)
+                .map(|p| Point3::new(p.x * 2.0, p.y * 2.0, p.z)),
+        );
+        let target = TargetCache::new(&target, RelocalizationConfig::default());
+        let wrong = score_relocalization(&source, Isometry3::identity(), &target);
+        let correct = score_relocalization(&source, truth, &target);
+        assert!(
+            wrong.wall_fitness < 0.45,
+            "错误房间不能靠水平面通过：{wrong:?}"
+        );
+        assert!(!wrong.accepts(&Isometry3::identity()));
+        assert!(correct.accepts(&truth), "乙房间真值应通过：{correct:?}");
+    }
+
+    #[test]
+    fn penetration_uses_each_frames_origin_and_excludes_both_ray_ends() {
+        let points: Vec<_> = (-12..=12)
+            .flat_map(|y| {
+                (-12..=12)
+                    .map(move |z| Point3::new(3.05, (y as f64 + 0.5) * 0.1, (z as f64 + 0.5) * 0.1))
+            })
+            .collect();
+        let mut target = points.clone();
+        target.extend(points.iter().map(|p| Point3::new(1.55, p.y, p.z)));
+        let target = TargetCache::new(&target, RelocalizationConfig::default());
+        let through = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        let score = score_relocalization(&through, Isometry3::identity(), &target);
+        assert_eq!(score.wall_fitness, 1.0);
+        assert!(score.penetration > 0.9, "完全贴墙仍须排除穿墙：{score:?}");
+        assert!(!score.accepts(&Isometry3::identity()));
+        let clear = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::new(2.0, p.y, p.z))));
+        let score = score_relocalization(&clear, Isometry3::identity(), &target);
+        assert!(
+            score.accepts(&Isometry3::identity()),
+            "帧原点改变后不经过内墙：{score:?}"
+        );
+        // 占据点只在0.5米起点排除段或0.3米终点排除段内。
+        let mut endpoints = points.clone();
+        endpoints.extend(points.iter().flat_map(|p| {
+            [
+                Point3::from(p.coords.normalize() * 0.2),
+                p - p.coords.normalize() * 0.1,
+            ]
+        }));
+        let endpoints = TargetCache::new(&endpoints, RelocalizationConfig::default());
+        let score = score_relocalization(&through, Isometry3::identity(), &endpoints);
+        assert_eq!(score.penetration, 0.0, "两端排除段不能计为穿透：{score:?}");
+    }
+
+    #[test]
+    fn source_downsampling_preserves_the_selected_frames_ray_origin() {
+        let a = Point3::new(0.01, 0.02, 0.03);
+        let b = Point3::new(0.08, 0.07, 0.06);
+        let c = Point3::new(0.15, 0.02, 0.03);
+        let source = SourceCloud::from_rays([
+            (a, Point3::new(1.0, 2.0, 3.0)),
+            (b, Point3::new(4.0, 5.0, 6.0)),
+            (c, Point3::new(7.0, 8.0, 9.0)),
+        ]);
+        assert_eq!(source.points, vec![a, c]);
+        assert_eq!(
+            source.origins,
+            vec![Point3::new(1.0, 2.0, 3.0), Point3::new(7.0, 8.0, 9.0)]
+        );
+    }
+
+    pub(crate) fn synthetic_room() -> Vec<Point3<f64>> {
+        let mut points = Vec::new();
+        for x in 0..47 {
+            for y in 0..32 {
+                let (x, y) = (-3.0 + x as f64 * 0.13, -2.0 + y as f64 * 0.13);
+                points.extend([Point3::new(x, y, -1.0), Point3::new(x, y, 1.73)]);
+            }
+        }
+        for z in 0..22 {
+            let z = -1.0 + z as f64 * 0.13;
+            for x in 0..47 {
+                let x = -3.0 + x as f64 * 0.13;
+                points.extend([Point3::new(x, -2.0, z), Point3::new(x, 2.03, z)]);
+            }
+            for y in 0..32 {
+                let y = -2.0 + y as f64 * 0.13;
+                points.extend([Point3::new(-3.0, y, z), Point3::new(2.98, y, z)]);
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn local_registration_leaves_global_features_unbuilt() {
+        let points = synthetic_room();
+        let config = RelocalizationConfig::default();
+        let target = TargetCache::new(&points, config);
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        assert!(target.scales.get().is_none());
+        for _ in 0..2 {
+            let local = local_registration(
+                &source,
+                &target,
+                Isometry3::identity(),
+                Isometry3::identity(),
+            )
+            .unwrap();
+            assert!(score_relocalization(&source, local.transformation, &target)
+                .accepts(&local.transformation));
+            assert!(target.scales.get().is_none());
+        }
+        let started = std::time::Instant::now();
+        let _ = relocation_pipeline_cached(&source, &target, config);
+        let first = target.scales.get().unwrap();
+        let _ = relocation_pipeline_cached(&source, &target, config);
+        assert!(std::ptr::eq(first, target.scales.get().unwrap()));
+        assert_eq!(first.len(), 3);
+        eprintln!(
+            "全局首次使用后缓存三个尺度，重复调用复用，验证耗时={:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn target_cache_builds_and_timing() {
+        use super::super::{features::descriptor_builds, nearest::builds};
+        let source = synthetic_room();
+        let truth = Isometry3::translation(30.0, 20.0, 0.0);
+        let mut target: Vec<_> = source.iter().map(|p| truth * p).collect();
+        target.extend(
+            source
+                .iter()
+                .map(|p| Point3::new(p.x * 0.7 + 42.0, p.y * 1.3 + 20.0, p.z)),
+        );
+        let config = RelocalizationConfig::default();
+        let fine = voxel_downsample(&target, 0.1);
+        let mut watched = vec![("精细点".into(), fine.clone())];
+        let mut descriptors = Vec::new();
+        for scale in config.voxel_sizes {
+            let cloud = preprocess(
+                &fine,
+                FeatureConfig::for_voxel(scale, config.max_feature_neighbors),
+            );
+            watched.push((format!("尺度{scale}"), cloud.points));
+            descriptors.push((format!("特征{scale}"), cloud.descriptors));
+        }
+        builds::watch(watched);
+        descriptor_builds::watch(descriptors);
+        let started = std::time::Instant::now();
+        let target = TargetCache::new(&target, config);
+        let created = started.elapsed();
+        assert_eq!(
+            builds::counts(),
+            vec![
+                ("精细点".into(), 1),
+                ("尺度0.2".into(), 0),
+                ("尺度0.3".into(), 0),
+                ("尺度0.8".into(), 0)
+            ]
+        );
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 0));
+        let source_cloud = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+        let result = relocation_pipeline_cached(&source_cloud, &target, config);
+        let cold = started.elapsed();
+        assert!(builds::counts().iter().all(|(_, n)| *n == 1));
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 1));
+        let started = std::time::Instant::now();
+        let source_cloud = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+        let _ = relocation_pipeline_cached(&source_cloud, &target, config);
+        eprintln!(
+            "源点={} 目标点={} 精细缓存创建={:?} 首次总耗时={:?} 复用总耗时={:?} 结果={} 点索引={:?} 特征索引={:?}",
+            source.len(),
+            12968,
+            created,
+            cold,
+            started.elapsed(),
+            result.registration.converged,
+            builds::counts(),
+            descriptor_builds::counts()
+        );
+        assert!(builds::counts().iter().all(|(_, n)| *n == 1));
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 1));
+        builds::watch(Vec::new());
+        descriptor_builds::watch(Vec::new());
     }
 }

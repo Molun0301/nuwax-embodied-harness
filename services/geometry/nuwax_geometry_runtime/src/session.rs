@@ -21,6 +21,9 @@ use tonic::Status;
 mod explorer_worker;
 use explorer_worker::ExplorerWorker;
 
+#[path = "localizer.rs"]
+mod localizer;
+
 fn trim_recent(recent: &mut VecDeque<(Instant, MappingFrame)>) {
     while recent.len() > 8
         || recent.front().is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))
@@ -234,6 +237,9 @@ impl SessionHandle {
             lio: lio_tx,
             nav,
             explorer: None,
+            relocalization_target: None,
+            saved_last_pose: None,
+            localizer: None,
         };
         tokio::spawn(actor.run(command_rx, fault_rx, nav_rx));
         Ok(Self {
@@ -404,6 +410,9 @@ struct Session {
     lio: watch::Sender<Option<Arc<Lio>>>,
     nav: NavBridge,
     explorer: Option<ExplorerWorker>,
+    relocalization_target: Option<Arc<nuwax_mapping::relocalization::TargetCache>>,
+    saved_last_pose: Option<nalgebra::Isometry3<f64>>,
+    localizer: Option<localizer::Localizer>,
 }
 impl Session {
     async fn run(
@@ -459,6 +468,17 @@ impl Session {
                             Ok(update) => self.exploration_update(update).await,
                             Err(reason) => self.fail_exploration(reason).await,
                         }
+                        self.publish();
+                    }
+                },
+                update = async {
+                    match &mut self.localizer {
+                        Some(localizer) => localizer.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(update) = update {
+                        self.localization_update(update);
                         self.publish();
                     }
                 },
@@ -525,6 +545,30 @@ impl Session {
             self.router.publish_pose(self.router.session_id(), pose);
         }
     }
+    fn start_localizer(&mut self, mapper: Arc<Mapper>) {
+        if self.state.info.as_ref().unwrap().pipeline == "lio_3d" {
+            let target = self.relocalization_target.as_ref().unwrap().clone();
+            self.localizer = Some(localizer::Localizer::start(self.router.clone(), mapper, target));
+        }
+    }
+    async fn stop_localizer(&mut self) {
+        if let Some(localizer) = self.localizer.take() {
+            localizer.stop().await;
+        }
+    }
+    fn localization_update(&mut self, update: localizer::TrackingUpdate) {
+        if update.bad_rounds >= 10 {
+            self.state.reason = format!("定位质量下降：最近扫描与地图吻合度为 {:.3}，建议重新定位", update.score.wall_fitness);
+        } else if update.bad_rounds == 0 && self.state.reason.starts_with("定位质量下降：") {
+            self.state.reason.clear();
+        }
+        self.state.localization_quality = Some(LocalizationQuality {
+            wall_fitness: update.score.wall_fitness,
+            penetration: update.score.penetration,
+            timestamp_ns: update.timestamp_ns,
+            bad_rounds: update.bad_rounds,
+        });
+    }
     async fn recover(&mut self) -> Result<(), Status> {
         let existing = self.lio.borrow().clone();
         let result = match existing {
@@ -544,6 +588,8 @@ impl Session {
         }
     }
     async fn end_current(&mut self) -> Result<(), Status> {
+        self.stop_localizer().await;
+        self.state.localization_quality = None;
         self.stop_explorer().await?;
         self.cancel("", GoalStatus::Cancelled).await?;
         let old = self.route.send_replace(None);
@@ -559,6 +605,8 @@ impl Session {
         } else {
             Ok(())
         };
+        self.relocalization_target = None;
+        self.saved_last_pose = None;
         self.save_sources.clear();
         self.explorer = None;
         self.state.phase = SessionPhase::Idle as i32;
@@ -682,6 +730,7 @@ impl Session {
             self.recover().await?;
         }
         self.end_current().await?;
+        self.saved_last_pose = seed.as_ref().map(pose_isometry);
         self.next_session = id;
         self.state.map_name = request.map_name.clone();
         self.save_sources.insert(request.map_name.clone());
@@ -771,6 +820,8 @@ impl Session {
         if mapper.planar_view_only() {
             return Err(Status::failed_precondition(PLANAR_VIEW_ONLY));
         }
+        self.stop_localizer().await;
+        self.state.localization_quality = None;
         let planar = self.state.info.as_ref().unwrap().pipeline == "slam_2d";
         let result = if planar {
             let seed = request.seed.map(|seed| {
@@ -801,7 +852,10 @@ impl Session {
             result.finished_at_ns = now_ns();
             result
         } else {
-            corrector::Corrector::relocalize(&mapper, self.router.recent_frames()).await?
+            corrector::Corrector::relocalize(
+                &mapper, self.router.recent_frames(), &mut self.relocalization_target,
+                self.saved_last_pose, request.seed,
+            ).await?
         };
         self.state.reason = if result.succeeded {
             String::new()
@@ -810,13 +864,16 @@ impl Session {
         };
         self.state.relocalization = Some(result.clone());
         self.install(
-            mapper,
+            mapper.clone(),
             if result.succeeded {
                 SessionPhase::Localized
             } else {
                 SessionPhase::Loaded
             },
         );
+        if result.succeeded {
+            self.start_localizer(mapper);
+        }
         Ok(result)
     }
     async fn goal(&mut self, goal: NavigationGoal) -> Result<SetGoalResponse, Status> {
@@ -1076,6 +1133,7 @@ impl Session {
         }
     }
     async fn fail(&mut self, reason: String) {
+        self.stop_localizer().await;
         tracing::error!(%reason, "Geometry 会话进入故障");
         let _ = self.stop_explorer().await;
         let _ = self.cancel("", GoalStatus::Cancelled).await;

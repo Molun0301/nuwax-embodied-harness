@@ -66,6 +66,7 @@ pub struct AlignmentScore {
 pub fn ransac_align(
     source: &[Point3<f64>],
     target: &[Point3<f64>],
+    target_tree: &NearestPointIndex,
     matches: &[FeatureMatch],
     config: RansacConfig,
 ) -> RansacResult {
@@ -80,7 +81,6 @@ pub fn ransac_align(
         return failed_result(0);
     }
 
-    let target_tree = point_tree(target);
     let mut generator = DeterministicGenerator::new(
         0x9e37_79b9_7f4a_7c15 ^ source.len() as u64 ^ ((target.len() as u64) << 32),
     );
@@ -114,7 +114,7 @@ pub fn ransac_align(
         }
 
         let transform = best_fit(&pairs);
-        let score = evaluate_with_tree(source, &target_tree, transform, config.inlier_threshold);
+        let score = evaluate_with_tree(source, target_tree, transform, config.inlier_threshold);
         if better_score(score, best.map(|(_, current)| current)) {
             best = Some((transform, score));
             iteration_limit = iteration_limit.min(required_iterations(
@@ -146,7 +146,7 @@ pub fn ransac_align(
     } else {
         best_transform
     };
-    let score = evaluate_with_tree(source, &target_tree, refined, config.inlier_threshold);
+    let score = evaluate_with_tree(source, target_tree, refined, config.inlier_threshold);
     let converged = score.inlier_count >= config.min_inliers
         && score.fitness >= config.min_inlier_ratio
         && score.rmse.is_finite();
@@ -170,18 +170,18 @@ fn finite_points(points: &[Point3<f64>]) -> bool {
 /// 计算现有变换的对应关系诊断，不负责结果提交。
 pub fn evaluate_alignment(
     source: &[Point3<f64>],
-    target: &[Point3<f64>],
+    target: &NearestPointIndex,
     transform: Isometry3<f64>,
     threshold: f64,
 ) -> AlignmentScore {
-    if source.is_empty() || target.is_empty() || !threshold.is_finite() || threshold <= 0.0 {
+    if source.is_empty() || !threshold.is_finite() || threshold <= 0.0 {
         return AlignmentScore {
             inlier_count: 0,
             fitness: 0.0,
             rmse: f64::INFINITY,
         };
     }
-    evaluate_with_tree(source, &point_tree(target), transform, threshold)
+    evaluate_with_tree(source, target, transform, threshold)
 }
 
 fn valid_config(config: RansacConfig) -> bool {
@@ -224,10 +224,6 @@ fn failed_result(iterations: usize) -> RansacResult {
     }
 }
 
-fn point_tree(points: &[Point3<f64>]) -> NearestPointIndex {
-    NearestPointIndex::new(points)
-}
-
 fn evaluate_with_tree(
     source: &[Point3<f64>],
     target_tree: &NearestPointIndex,
@@ -239,7 +235,9 @@ fn evaluate_with_tree(
     let mut squared_error = 0.0;
     for point in source {
         let transformed = transform * point;
-        let Some((_,distance))=target_tree.nearest(&transformed) else {continue;};
+        let Some((_, distance)) = target_tree.nearest(&transformed) else {
+            continue;
+        };
         if distance <= threshold_sq {
             inlier_count += 1;
             squared_error += distance;

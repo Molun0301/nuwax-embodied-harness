@@ -50,9 +50,10 @@ struct EdgeHash {
     return hash;
   }
 };
-// 同一冻结几何内的纯转移判定。键包含两端真实坐标，保留格内偏移、方向与层高。
+// 同一冻结几何内的纯转移判定与沿边软代价。键包含两端真实坐标，保留格内偏移、方向与层高。
+struct EdgeInfo { bool allowed; double soft=NAN; };
 struct SharedTransitions {
-  std::unordered_map<Edge,bool,EdgeHash> edges;
+  std::unordered_map<Edge,EdgeInfo,EdgeHash> edges;
   PctSearchStats stats{};
 };
 struct Column {
@@ -234,7 +235,14 @@ struct Planner {
     return false;
   }
   // 全姿态外包圆生成连续软代价，避免无朝向状态的二维搜索靠瞬时转向降低代价。
+  // 已做过转移判定的边复用沿边软代价；几何在一轮多目标评估内不变。
   double clearance_cost(const Edge& edge) const {
+    auto found=shared?shared->edges.find(edge):decltype(shared->edges.end()){};
+    if(!shared||found==shared->edges.end())return compute_clearance_cost(edge);
+    if(std::isnan(found->second.soft))found->second.soft=compute_clearance_cost(edge);
+    return found->second.soft;
+  }
+  double compute_clearance_cost(const Edge& edge) const {
     const double q=cfg.resolution,margin=std::max(0.05,q);
     const double radius=clearance_radius,range=2.*margin,reach=radius+range;
     double clearance=range;
@@ -300,7 +308,7 @@ struct Planner {
     const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
     if(shared) {
       auto found=shared->edges.find(edge);
-      if(found!=shared->edges.end()){++shared->stats.hits;return found->second;}
+      if(found!=shared->edges.end()){++shared->stats.hits;return found->second.allowed;}
     }
     auto check=[&] {
     const double h=std::hypot(bx-ax,by-ay),dh=std::abs(edge[5]-edge[2]);
@@ -327,7 +335,7 @@ struct Planner {
     return true;
     };
     const bool allowed=check();
-    if(shared){++shared->stats.checks;shared->edges.emplace(edge,allowed);}
+    if(shared){++shared->stats.checks;shared->edges.emplace(edge,EdgeInfo{allowed});}
     return allowed;
   }
   void add_points(const double* points,size_t count) {
@@ -608,10 +616,12 @@ struct SourceSearch {
   };
   struct Offset { int dx,dy; double distance; };
 
+  using Columns=std::unordered_map<XY,std::vector<Layer>,XYHash>;
   Planner& p;
   double q,sg,spacing,influence,height_limit;
   std::vector<Offset> offsets;
-  std::unordered_map<XY,std::vector<Layer>,XYHash> columns;
+  // 列节点与软代价只取决于层基准（起点地面高度）与冻结的原生地图，同一基准的单源搜索共用。
+  Columns& columns;
   std::unordered_map<Key,State,KeyHash> states;
   std::priority_queue<Entry,std::vector<Entry>,Later> open;
   uint64_t sequence=0;
@@ -622,7 +632,8 @@ struct SourceSearch {
   std::deque<std::pair<size_t,Key>> ready;
   size_t expanded=0;
 
-  SourceSearch(Planner& planner,double source_ground):p(planner),q(planner.cfg.resolution),sg(source_ground) {
+  SourceSearch(Planner& planner,double source_ground,Columns& cache)
+      :p(planner),q(planner.cfg.resolution),sg(source_ground),columns(cache) {
     spacing=std::max({p.cfg.robot_height,q,std::max(p.cfg.max_step,p.cfg.max_step_down)*2+1e-6});
     influence=p.clearance_radius+std::max(.05,q)+q;
     height_limit=std::max({p.cfg.max_step,p.cfg.max_step_down,std::tan(p.cfg.max_slope)*q*std::sqrt(2.0)})+1e-8;
@@ -763,6 +774,7 @@ struct SourceSearch {
 struct MultiGoalSearch {
   Planner& planner;
   SharedTransitions transitions;
+  std::unordered_map<uint64_t,SourceSearch::Columns> columns;
   std::unique_ptr<SourceSearch> source;
   explicit MultiGoalSearch(Planner& p):planner(p) {}
 };
@@ -809,7 +821,9 @@ extern "C" int pct_source_begin(void* search,const double* start,const double* g
     struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};s.planner.shared=&s.transitions;
     const auto began=std::chrono::steady_clock::now();
     ++s.transitions.stats.source_searches;
-    s.source=std::make_unique<SourceSearch>(s.planner,start[2]-s.planner.cfg.body_to_ground);
+    const double ground=start[2]-s.planner.cfg.body_to_ground;
+    uint64_t base;std::memcpy(&base,&ground,sizeof base);
+    s.source=std::make_unique<SourceSearch>(s.planner,ground,s.columns[base]);
     const bool ready=s.source->begin(start,goals,count,reachable);
     s.transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
     if(!ready){s.source.reset();error(err,cap,"PCT没有可搜索的实测起点");return 1;}
@@ -821,6 +835,7 @@ extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCo
                                CancelFn cancel,const void* user,char* err,size_t cap) {
   try {
     auto& s=*static_cast<MultiGoalSearch*>(search);
+    if(!s.source)return 1;
     struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};s.planner.shared=&s.transitions;
     const auto began=std::chrono::steady_clock::now();
     const size_t before=s.source->expanded;

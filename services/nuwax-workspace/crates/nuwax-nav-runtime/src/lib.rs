@@ -519,6 +519,8 @@ pub trait NavPlanner: Send + 'static {
     fn observe_measured_motion(&mut self, _motion: Option<MeasuredMotion>) {}
     /// 已准入的同帧 world 点云；None 撤销旧原帧，不借用最新定位补齐。
     fn observe_registered_frame(&mut self, _frame: Option<Arc<RegisteredFrame>>) {}
+    /// 清空近期观测后的路线失效须在等待新帧前交给原重规划链路。
+    fn has_pending_replan(&self) -> bool { false }
     /// 本次原算法执行周期结束，不是实际几何拒绝；只用于反馈原因分类。
     fn execution_cycle_complete(&self) -> bool { false }
     /// 等待轨迹或当拍命令受阻的原因；速度回执不覆盖该原因。
@@ -1259,7 +1261,9 @@ where
             self.publish_status(status_tx);
             return Ok(());
         }
-        if let Some(reason) = self.status.input_wait_reason.clone() {
+        if self.lease_active && self.current_execution_identity.is_some() && self.planner.has_pending_replan() {
+            self.control_tick(status_tx).await?;
+        } else if let Some(reason) = self.status.input_wait_reason.clone() {
             self.wait_for_fresh_input(status_tx, reason).await?;
         } else {
             if !self.lease_active {

@@ -116,7 +116,7 @@ struct TrackerSession {
   geometry_msgs::Twist raw;
   double phase=0.,reference_time=0.;
   std::optional<int64_t> reference_stamp;
-  bool install_pending=false;
+  bool install_pending=false,recovery_context=false;
   TrackerSession() {controller.cmd_vel_pub.sink=[this](const std::any& v){raw=std::any_cast<geometry_msgs::Twist>(v);};}
 };
 void errorText(char* out,size_t capacity,const std::exception& e) {if(capacity){std::strncpy(out,e.what(),capacity-1);out[capacity-1]=0;}}
@@ -242,8 +242,9 @@ extern "C" int nuwax_scan_motion_stopped(const ScanState* state) {
       &&std::hypot(state->velocity[0],state->velocity[1])<.02&&std::abs(state->yaw_rate)<.02;
 }
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
+extern "C" int nuwax_scan_tracker_recovery_active(const void* p){return static_cast<const TrackerSession*>(p)->recovery_context;}
 extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
-extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
+extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};static_cast<TrackerSession*>(p)->recovery_context=false;}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
     const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
@@ -260,7 +261,9 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
     const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
+    s.recovery_context=s.escape.active();
     if(s.escape.hasDecision(state->timestamp_ns)) {
+      s.recovery_context=true;
       s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,
           state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
       s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
@@ -270,6 +273,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(occupied!=0) {
       s.escape.observeOverlap();
       if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
+        s.recovery_context=true;
         s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
@@ -277,6 +281,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
     }
     s.escape.observeClear(position,state->timestamp_ns);
+    s.recovery_context=s.escape.active();
     ScanConfig terminal_config;
     if(std::isfinite(terminal_yaw)&&terminal_position&&c->max_reverse_velocity==0.) {
       terminal_config=*c;terminal_config.max_reverse_velocity=std::max(.04,c->min_executable_linear_mps);c=&terminal_config;

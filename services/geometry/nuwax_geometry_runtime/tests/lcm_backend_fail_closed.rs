@@ -161,6 +161,76 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// 与 `frame` 相同，另多一块加载后才出现的竖直障碍板。
+    async fn obstacle_frame(&mut self, stamp: u64) {
+        self.odom(stamp, 0.).await;
+        let mut request = points(stamp);
+        for y in 0..5 {
+            for z in 0..21 {
+                for value in [OBSTACLE_X, -0.4 + y as f32 * 0.05, z as f32 * 0.05] {
+                    request.points.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        request.point_count = (request.points.len() / 12) as u32;
+        self.client.publish_point_cloud(request).await.unwrap();
+    }
+    /// 二维物理栅格里障碍板所在处的障碍格数。
+    async fn obstacle_cells(&mut self) -> usize {
+        let grid = self
+            .client
+            .get_occupancy_grid(GetOccupancyGridRequest {
+                include_forbidden: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let meta = grid.meta.unwrap();
+        let resolution = f64::from(meta.resolution);
+        grid.data
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| {
+                let x = meta.origin_x + ((*index as u32 % meta.width) as f64 + 0.5) * resolution;
+                let y = meta.origin_y + ((*index as u32 / meta.width) as f64 + 0.5) * resolution;
+                **value == 100
+                    && (x - f64::from(OBSTACLE_X)).abs() <= 0.1
+                    && (-0.45..=-0.15).contains(&y)
+            })
+            .count()
+    }
+    /// 稠密点云里障碍板上、高出地面的点数。
+    async fn obstacle_points(&mut self) -> usize {
+        let (mut epoch, mut offset, mut count) = (String::new(), 0, 0);
+        loop {
+            let chunk = self
+                .client
+                .get_dense_cloud_chunk(DenseCloudChunkRequest {
+                    expected_epoch: epoch,
+                    offset_points: offset,
+                    max_points: 65_536,
+                    allow_delta: false,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            count += chunk
+                .xyz_f32_le
+                .chunks_exact(12)
+                .map(|bytes| {
+                    [0, 4, 8].map(|at| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+                })
+                .filter(|p| {
+                    (p[0] - OBSTACLE_X).abs() <= 0.05 && (-0.45..=-0.15).contains(&p[1]) && p[2] >= 0.2
+                })
+                .count();
+            offset += chunk.xyz_f32_le.len() as u64 / 12;
+            if offset >= chunk.total_points {
+                return count;
+            }
+            epoch = chunk.epoch;
+        }
+    }
     async fn map_ready(&mut self) {
         let start = tokio::time::Instant::now();
         loop {
@@ -213,6 +283,8 @@ impl Drop for Fixture {
         let _ = self.child.wait();
     }
 }
+/// 障碍板所在的 x：在建图时地面最近边（x=1）与原点之间，原图这里没有东西。
+const OBSTACLE_X: f32 = 0.6;
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -556,6 +628,58 @@ async fn relocalization_failure_then_success_and_continue() {
             .into_inner()
             .replaced
     );
+}
+
+#[tokio::test]
+async fn localized_map_writes_new_obstacle_and_overwritten_map_reloads_with_it() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("更新图").await;
+    f.client.stop_session(Empty {}).await.unwrap();
+    let load = LoadMapRequest {
+        map_name: "更新图".into(),
+    };
+    f.client.load_map(load.clone()).await.unwrap();
+    f.map_ready().await;
+    assert_eq!(f.obstacle_cells().await, 0);
+    assert_eq!(f.obstacle_points().await, 0);
+    // 障碍在加载前已摆好：加载后的每一帧都带着它。
+    let stamp = now();
+    f.obstacle_frame(stamp).await;
+    f.obstacle_frame(stamp + 100_000_000).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let matched = f
+        .client
+        .relocalize(RelocalizeRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
+    let started = tokio::time::Instant::now();
+    while f.obstacle_cells().await == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "已定位后新障碍未写入地图，状态{:?}，日志{}",
+            f.state().await,
+            fs::read_to_string(f.root.join("进程.log")).unwrap()
+        );
+        f.obstacle_frame(now()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let saved = f
+        .client
+        .save_map(SaveMapRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(saved.replaced);
+    assert_eq!(saved.map_name, "更新图");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
+    f.client.stop_session(Empty {}).await.unwrap();
+    f.client.load_map(load).await.unwrap();
+    f.map_ready().await;
+    assert!(f.obstacle_cells().await > 0, "重新加载的二维栅格应有新障碍");
+    assert!(f.obstacle_points().await > 0, "重新加载的稠密点云应有新障碍");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::{build, build_region, Tomogram, TomographyConfig};
+use crate::{ColumnCache, build, build_region, Tomogram, TomographyConfig};
 
 fn config() -> TomographyConfig {
     TomographyConfig {
@@ -224,4 +224,25 @@ fn rayon_thread_count_does_not_change_geometry() {
             .map(|b| (b.x, b.y, b.low, b.high))
             .collect::<Vec<_>>()
     );
+}
+#[test]
+fn column_cache_keeps_unchanged_columns_and_withdraws_recent_ground() {
+    let cfg = TomographyConfig {
+        resolution: 0.2, point_resolution: 0.05, slice_h0: 0., slice_dh: 0.6,
+    };
+    let mut cache = ColumnCache::default();
+    let mut points = [[0.1, 0.1, 0.01], [0.3, 0.1, 0.15]];
+    cache.replace_static(&points, cfg.resolution).unwrap();
+    assert_eq!(cache.update(&[], &cfg).unwrap().len(), 2);
+    cache.replace_static(&points, cfg.resolution).unwrap();
+    assert!(cache.update(&[], &cfg).unwrap().is_empty());
+    points[1][2] = 0.17;
+    cache.replace_static(&points, cfg.resolution).unwrap();
+    let changed = cache.update(&[], &cfg).unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].column, [1, 0]);
+    assert_eq!(cache.update(&[[0.3, 0.1, 0.19]], &cfg).unwrap().len(), 1);
+    let withdrawn = cache.update(&[], &cfg).unwrap();
+    assert_eq!(withdrawn.len(), 1);
+    assert_eq!(withdrawn[0].cells[0].ground, f64::from(0.17_f32));
 }

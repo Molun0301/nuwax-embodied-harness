@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 extern "C" {
 struct PctConfig {
@@ -33,6 +34,11 @@ using CancelFn = bool (*)(const void*);
 
 namespace {
 using XY = std::pair<int,int>;
+struct XYHash {
+  size_t operator()(const XY& xy) const {
+    return std::hash<uint64_t>{}((uint64_t(uint32_t(xy.first))<<32)|uint32_t(xy.second));
+  }
+};
 using Point = std::array<double, 2>;
 using Edge = std::array<double, 6>;
 struct EdgeHash {
@@ -56,7 +62,11 @@ struct SharedTransitions {
   std::array<double,3> requested_source{};
   bool complete=false;
 };
-struct Column { std::vector<PctCell> surfaces; std::vector<PctBand> occupied; };
+struct Column {
+  std::vector<PctCell> surfaces;
+  std::vector<PctBand> occupied;
+  size_t static_surfaces=0,static_bands=0;
+};
 bool inside(const std::vector<Point>& polygon, double x, double y) {
   if (polygon.empty()) return true;
   bool hit = false;
@@ -142,9 +152,14 @@ struct Planner {
   PctConfig cfg;
   std::vector<Point> footprint,boundary;
   double clearance_radius=0.;
-  std::map<XY,Column> columns;
+  std::unordered_map<XY,Column,XYHash> columns;
+  std::unordered_set<XY,XYHash> overlay_columns;
+  std::unordered_set<XY,XYHash> dirty_buckets;
+  // 请求矩阵保留容量，搜索只覆盖本轮所用区域。
+  Eigen::MatrixXd heights,cost,elevation;
+  std::vector<unsigned char> measured;
   // 粗桶只筛候选，桶内仍保留每个原分辨率占据区间和原足迹判定。
-  std::map<XY,std::vector<PctBand>> collision_buckets;
+  std::unordered_map<XY,std::vector<PctBand>,XYHash> collision_buckets;
   int bucket_cells=1;
   Astar astar;
   SharedTransitions* shared=nullptr;
@@ -165,10 +180,28 @@ struct Planner {
   }
   void build_collision_index() {
     bucket_cells=std::max(1,static_cast<int>(std::ceil(0.25/cfg.resolution)));
+    for(auto& column:columns) {
+      column.second.static_surfaces=column.second.surfaces.size();
+      column.second.static_bands=column.second.occupied.size();
+    }
     for(const auto& column:columns)for(auto band:column.second.occupied)
       collision_buckets[{bucket(band.x),bucket(band.y)}].push_back(band);
     for(auto& block:collision_buckets)std::sort(block.second.begin(),block.second.end(),
         [](const PctBand& a,const PctBand& b){return a.high<b.high;});
+  }
+  void dirty_column(XY key) { dirty_buckets.insert({bucket(key.first),bucket(key.second)}); }
+  void refresh_buckets() {
+    for(auto key:dirty_buckets) {
+      auto& bands=collision_buckets[key];bands.clear();
+      for(int x=key.first*bucket_cells;x<(key.first+1)*bucket_cells;++x)
+        for(int y=key.second*bucket_cells;y<(key.second+1)*bucket_cells;++y) {
+          auto column=columns.find({x,y});
+          if(column!=columns.end())bands.insert(bands.end(),column->second.occupied.begin(),column->second.occupied.end());
+        }
+      std::sort(bands.begin(),bands.end(),[](const PctBand& a,const PctBand& b){return a.high<b.high;});
+      if(bands.empty())collision_buckets.erase(key);
+    }
+    dirty_buckets.clear();
   }
   bool collision(double x, double y, double ground, double heading) const {
     if (!inside(boundary,x,y)) return true;
@@ -342,10 +375,10 @@ struct Planner {
     low=sg+std::floor((low-sg)/spacing)*spacing;
     const int layers=std::max(1,static_cast<int>(std::ceil((high-low)/spacing))+1);
     // 原PCT没有有效地面高度的格子不参与地表连通；不再用起终点补造参考面。
-    Eigen::MatrixXd heights=Eigen::MatrixXd::Constant(layers*ny,nx,-100.0);
-    Eigen::MatrixXd cost=Eigen::MatrixXd::Constant(layers*ny,nx,100.0);
-    Eigen::MatrixXd elevation=Eigen::MatrixXd::Zero(layers*ny,nx);
-    std::vector<unsigned char> measured(static_cast<size_t>(layers)*nx*ny,0);
+    heights.resize(layers*ny,nx);heights.setConstant(-100.0);
+    cost.resize(layers*ny,nx);cost.setConstant(100.0);
+    elevation.resize(layers*ny,nx);elevation.setZero();
+    measured.assign(static_cast<size_t>(layers)*nx*ny,0);
     auto key_index=[&](int l,int y,int x){return (static_cast<size_t>(l)*ny+y)*nx+x;};
     const double dx=goal[0]-start[0],dy=goal[1]-start[1];
     auto continuous_grade_sq=[&](XY key,double height) {
@@ -543,6 +576,42 @@ extern "C" void* pct_create(const PctConfig* config,const PctCell* cells,size_t 
     return p.release();
   }catch(const std::exception& e){error(err,cap,e.what());return nullptr;}
 }
+extern "C" void pct_replace_columns(void* planner,const int32_t* keys,size_t count,
+    const PctCell* cells,size_t ncells,const PctBand* bands,size_t nbands) {
+  auto& p=*static_cast<Planner*>(planner);
+  for(size_t i=0;i<count;++i) {
+    XY key{keys[2*i],keys[2*i+1]};auto& column=p.columns[key];
+    column.surfaces.clear();column.occupied.clear();column.static_surfaces=0;column.static_bands=0;
+    p.dirty_column(key);
+  }
+  for(size_t i=0;i<ncells;++i)p.columns[{cells[i].x,cells[i].y}].surfaces.push_back(cells[i]);
+  for(size_t i=0;i<nbands;++i)p.columns[{bands[i].x,bands[i].y}].occupied.push_back(bands[i]);
+  for(size_t i=0;i<count;++i) {
+    XY key{keys[2*i],keys[2*i+1]};auto& column=p.columns.at(key);
+    column.static_surfaces=column.surfaces.size();column.static_bands=column.occupied.size();
+    if(column.surfaces.empty()&&column.occupied.empty())p.columns.erase(key);
+  }
+}
+extern "C" void pct_replace_overlay(void* planner,const PctCell* cells,size_t ncells,
+    const PctBand* bands,size_t nbands) {
+  auto& p=*static_cast<Planner*>(planner);
+  for(auto key:p.overlay_columns) {
+    auto found=p.columns.find(key);
+    if(found==p.columns.end())continue;
+    auto& column=found->second;
+    column.surfaces.resize(column.static_surfaces);column.occupied.resize(column.static_bands);
+    if(column.surfaces.empty()&&column.occupied.empty())p.columns.erase(found);
+    p.dirty_column(key);
+  }
+  p.overlay_columns.clear();
+  for(size_t i=0;i<ncells;++i) {
+    XY key{cells[i].x,cells[i].y};p.columns[key].surfaces.push_back(cells[i]);p.overlay_columns.insert(key);p.dirty_column(key);
+  }
+  for(size_t i=0;i<nbands;++i) {
+    XY key{bands[i].x,bands[i].y};p.columns[key].occupied.push_back(bands[i]);p.overlay_columns.insert(key);p.dirty_column(key);
+  }
+  p.refresh_buckets();
+}
 extern "C" void pct_destroy(void* planner){delete static_cast<Planner*>(planner);}
 extern "C" void pct_result_free(PctResult* result){delete[] result->points;result->points=nullptr;}
 extern "C" int pct_plan(void* planner,const double* start,const double* goal,PctResult* result,
@@ -715,7 +784,12 @@ extern "C" void pct_geometry_sizes(const void* planner,size_t* ncells,size_t* nb
   }
 }
 extern "C" void pct_geometry_copy(const void* planner,PctCell* cells,PctBand* bands){
-  for(const auto& entry:static_cast<const Planner*>(planner)->columns){
+  const auto& columns=static_cast<const Planner*>(planner)->columns;
+  std::vector<XY> keys;keys.reserve(columns.size());
+  for(const auto& entry:columns)keys.push_back(entry.first);
+  std::sort(keys.begin(),keys.end());
+  for(auto key:keys){
+    const auto& entry=*columns.find(key);
     for(auto s:entry.second.surfaces)*cells++=s;
     for(auto b:entry.second.occupied)*bands++=b;
   }

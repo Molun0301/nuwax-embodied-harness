@@ -162,7 +162,7 @@ fn native_bridge_distinguishes_continuous_ramps_from_independent_steps() {
 
 /// 精细源只有体素占据与独立地面记录，地面高度取自高度场统计。
 /// `extra` 为非地面成员的占据体素，键为精细格坐标。
-fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: f64) -> SurfaceSnapshot {
+pub(super) fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: f64) -> SurfaceSnapshot {
     use nuwax_map_chunks::heightfield_observations::HeightfieldColumn;
     use nuwax_map_chunks::{ColumnGroundRecords, Domain, HeightfieldSurface, Receiver, Repository, Transfer, Writer};
     use nuwax_nav_mls_planner::surface::{SurfaceObservation, SurfaceObservations};

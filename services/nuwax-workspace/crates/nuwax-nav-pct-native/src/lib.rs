@@ -35,7 +35,7 @@ pub fn planning_cancelled() -> bool {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub resolution: f64,
     pub point_resolution: f64,
@@ -74,7 +74,7 @@ impl Default for Config {
 }
 /// XY格索引按Config.resolution，ground保存原实测高度；无顶面时ceiling为正无穷。
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     pub x: i32,
     pub y: i32,
@@ -83,7 +83,7 @@ pub struct Cell {
 }
 /// 同一XY列允许多个占据区间，端点为米制真实区间。
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Band {
     pub x: i32,
     pub y: i32,
@@ -165,6 +165,10 @@ unsafe extern "C" {
         err: *mut c_char,
         cap: usize,
     ) -> *mut c_void;
+    fn pct_replace_columns(planner: *mut c_void, columns: *const [i32; 2], count: usize,
+        cells: *const Cell, ncells: usize, bands: *const Band, nbands: usize);
+    fn pct_replace_overlay(planner: *mut c_void, cells: *const Cell, ncells: usize,
+        bands: *const Band, nbands: usize);
     fn pct_destroy(planner: *mut c_void);
     fn pct_geometry_sizes(planner: *const c_void, ncells: *mut usize, nbands: *mut usize);
     fn pct_geometry_copy(planner: *const c_void, cells: *mut Cell, bands: *mut Band);
@@ -310,6 +314,16 @@ impl Planner {
         NonNull::new(native)
             .map(|native| Self { native })
             .ok_or_else(|| native_error(&error))
+    }
+    /// 替换已变化的静态列；空列同时撤回旧地面与占据。
+    pub fn replace_columns(&mut self, columns: &[[i32; 2]], cells: &[Cell], bands: &[Band]) {
+        unsafe { pct_replace_columns(self.native.as_ptr(), columns.as_ptr(), columns.len(),
+            cells.as_ptr(), cells.len(), bands.as_ptr(), bands.len()) }
+    }
+    /// 近期地面与禁行、近期占据按规划输入整体替换，静态列继续保留。
+    pub fn replace_overlay(&mut self, cells: &[Cell], bands: &[Band]) {
+        unsafe { pct_replace_overlay(self.native.as_ptr(), cells.as_ptr(), cells.len(),
+            bands.as_ptr(), bands.len()) }
     }
     /// 导出相同原生实测分类结果供局部规划复用。
     pub fn geometry(&self) -> (Vec<Cell>, Vec<Band>) {

@@ -182,7 +182,7 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_fram
             .unwrap()
             .unwrap();
         let grid =
-            PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy)
+            PersistentOccupancyGrid::from_observation(&candidate.latest_frame_occupancy)
                 .unwrap();
         let committed_stamp = candidate.source_timestamp_ns;
         assert_eq!(committed_stamp, stamp);

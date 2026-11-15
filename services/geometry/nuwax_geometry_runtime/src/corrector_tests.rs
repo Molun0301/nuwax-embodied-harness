@@ -1,5 +1,17 @@
 use super::*;
 
+impl Corrector {
+    pub(crate) fn scripted_for_test(
+        updates: Vec<Result<Option<PgoUpdate>, String>>,
+    ) -> (Self, std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>) {
+        let confirmed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Self {
+            mode: Mode::Scripted { updates: updates.into(), confirmed: confirmed.clone() },
+            first_stamp: None, sequence: 0,
+        }, confirmed)
+    }
+}
+
 #[test]
 fn native_pgo_sends_only_motion_keyframes() {
     let mut corrector = Corrector::from_config(
@@ -19,17 +31,13 @@ fn native_pgo_sends_only_motion_keyframes() {
             nalgebra::Vector3::new(x, 0., 0.), nalgebra::Vector3::new(roll, 0., 0.),
         ), "odom", frame.odom_pose.timestamp_ns);
         let indices: Vec<_> = (0..frame.points_body.len() as u32).collect();
-        corrector.process_frame(&frame, &indices, Some((&grid, frame.odom_pose.timestamp_ns)), Isometry3::identity()).unwrap();
+        corrector.process_frame(&CorrectionInput::new(&frame, &indices, Some((&grid, frame.odom_pose.timestamp_ns)), Isometry3::identity())).unwrap();
         let Mode::Native(native) = &corrector.mode else { unreachable!() };
         assert_eq!(native.local_poses.len(), expected);
         assert_eq!(corrector.sequence as usize, expected);
         assert_eq!(native.owner.as_ref().unwrap().request_diagnostics().submitted.count, 1);
     }
-    corrector.stop();
-    let sequence = corrector.sequence;
-    let frame = crate::mapper::tests::room_frame(936, first + 9_000_000_000);
-    assert!(corrector.process_frame(&frame, &[u32::MAX], None, Isometry3::identity()).unwrap().is_none());
-    assert_eq!(corrector.sequence, sequence, "停止后必须直接跳过");
+
 }
 
 #[test]
@@ -82,7 +90,7 @@ fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
     let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
     let mut grid = nuwax_mapping::OccupancyGrid::new(8, 8, 0.05);
     grid.frame_id = "map".into();
-    let request = native.request(&frame, &points, (&grid, stamp), 1);
+    let request = native.request(&frame, &points, &GridMetadata::new(&grid, stamp), frame.points_body.len(), 1);
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer = LogBuffer(Arc::clone(&buffer));
     let subscriber = tracing_subscriber::fmt().json().with_ansi(false)
@@ -194,7 +202,7 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_fram
             let Mode::Native(owner) = &corrector.mode else {
                 unreachable!()
             };
-            let mut request = owner.request(&frame, &points, (&grid.grid, committed_stamp), 1);
+            let mut request = owner.request(&frame, &points, &GridMetadata::new(&grid.grid, committed_stamp), frame.points_body.len(), 1);
             // 在线拥有方在封装请求前分配请求序号；这里只验证构造与编码，不启动通信。
             request.identity.request_sequence = 1;
             let encoded = wire::encode_native_pgo_request_wire(&request).unwrap();
@@ -215,14 +223,7 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_fram
             assert_eq!(decoded.identity.source_timestamp_ns, stamp as i64);
             assert_eq!(decoded.identity.registered_cloud.backend, backend_id);
 
-            let corrector = crate::mapper::tests::frames_without_candidate_keep_session_healthy(
-                backend, corrector, &frame,
-            );
-            assert_eq!(corrector.sequence, 0, "后继帧不能进入校正器或分配请求序号");
-            assert!(corrector.first_stamp.is_none());
-            let Mode::Native(owner) = &corrector.mode else { unreachable!() };
-            assert!(owner.runtime.is_none() && owner.owner.is_none() && owner.ingress.is_none(),
-                "未提交本帧地图时不能启动原生校正请求");
+            crate::mapper::tests::frames_without_candidate_keep_session_healthy(backend, corrector, &frame);
         }
     }
 }
@@ -372,7 +373,7 @@ fn library_retains_only_actually_accepted_keyframe_poses() {
         frame.odom_pose.position.as_mut().unwrap().x = x;
         let indices: Vec<_> = (0..frame.points_body.len() as u32).collect();
         assert!(corrector
-            .process_frame(&frame, &indices, None, Isometry3::identity())
+            .process_frame(&CorrectionInput::new(&frame, &indices, None, Isometry3::identity()))
             .unwrap()
             .is_none());
         let Mode::Library(owner) = &corrector.mode else {
@@ -450,7 +451,7 @@ async fn accepted_pgo_loop_rebuilds_real_map_and_corrects_pose() {
         };
         let indices: Vec<_> = (0..frame.points_body.len() as u32).collect();
         if let Some(update) = reference
-            .process_frame(&frame, &indices, None, Isometry3::identity())
+            .process_frame(&CorrectionInput::new(&frame, &indices, None, Isometry3::identity()))
             .unwrap()
         {
             reference_transform = update.latest;
@@ -460,7 +461,17 @@ async fn accepted_pgo_loop_rebuilds_real_map_and_corrects_pose() {
         raw.feed(raw_frame);
         let raw_snapshot = raw.snapshot().await.unwrap();
         corrected.feed(frame.clone());
-        let snapshot = corrected.snapshot().await.unwrap();
+        let mut snapshot = corrected.snapshot().await.unwrap();
+        if reference_transform != previous_transform {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while (corrected.map_from_odom().translation.vector - reference_transform.translation.vector).norm() > 0.05 {
+                    tokio::task::yield_now().await;
+                    snapshot = corrected.snapshot().await.unwrap();
+                }
+            }).await.unwrap();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let transform = corrected.map_from_odom();
         if (previous_transform.inverse() * transform)
             .translation

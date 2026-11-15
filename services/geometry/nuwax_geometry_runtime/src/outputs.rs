@@ -57,6 +57,7 @@ impl Outputs {
                 let route = routes.borrow_and_update().clone();
                 if let Some(route) = route {
                     let mut recent = route.mapper.recent_cloud_rx();
+                    let mut cleared = 0;
                     loop {
                         tokio::select! {
                             changed=routes.changed()=>{if changed.is_err(){return;}break;},
@@ -64,8 +65,19 @@ impl Outputs {
                                 if changed.is_err(){break;}
                                 let bytes=recent.borrow_and_update().clone();
                                 if routes.borrow().as_ref().is_some_and(|current|current.id==route.id) {
-                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport, nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
-                                        nuwax_codec::lcm::recent_cloud::TYPE_NAME, bytes).await {recent_session.report_output_error(route.id, reason);}}
+                                    if let Some(value) = bytes {
+                                        if let Some((sequence, bytes)) = &value.clear {
+                                            if *sequence > cleared {
+                                                cleared = *sequence;
+                                                if let Err(reason) = publish(&recent_transport, nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+                                                    nuwax_codec::lcm::recent_cloud::TYPE_NAME, bytes.clone()).await { recent_session.report_output_error(route.id, reason); }
+                                            }
+                                        }
+                                        if let Some(bytes) = value.frame {
+                                            if let Err(reason)=publish(&recent_transport, nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+                                                nuwax_codec::lcm::recent_cloud::TYPE_NAME, bytes).await { recent_session.report_output_error(route.id, reason); }
+                                        }
+                                    }
                                 }
                             },
                         }

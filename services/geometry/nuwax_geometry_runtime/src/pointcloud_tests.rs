@@ -71,7 +71,7 @@ fn streamed_replay_matches_the_old_sensor_concatenation_and_stable_sort() {
         while let Some(scan) = reader.next_scan().unwrap() { expected.push(scan); }
     }
     expected.sort_by_key(|scan| scan.metadata.source_timestamp_ns);
-    let mut stream = map.replay_frames().unwrap();
+    let mut stream = ReplayFrames::new(map.session_id, &map.replay_prefix().unwrap(), &ReplayPosition::default()).unwrap();
     for scan in expected {
         let frame = stream.next().unwrap().unwrap();
         assert_eq!(frame.sensor_id, scan.metadata.sensor);

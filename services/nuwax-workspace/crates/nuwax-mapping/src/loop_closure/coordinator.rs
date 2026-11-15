@@ -341,6 +341,7 @@ pub struct LoopClosureCoordinator {
     pending_loop: Option<PendingLoop>,
     search_diagnostics: LoopSearchDiagnostics,
     last_search_report_timestamp: Option<f64>,
+    last_time_probe_timestamp: Option<f64>,
 }
 
 #[derive(Default)]
@@ -367,6 +368,7 @@ impl LoopClosureCoordinator {
             pending_loop: None,
             search_diagnostics: LoopSearchDiagnostics::default(),
             last_search_report_timestamp: None,
+            last_time_probe_timestamp: None,
         })
     }
 
@@ -395,15 +397,20 @@ impl LoopClosureCoordinator {
                 return Err(LoopClosurePipelineError::InvalidCorrectionTimeline);
             }
             let delta = last.local_pose.inverse() * local_pose;
+            let probe_from = self.last_time_probe_timestamp
+                .map_or(last.timestamp, |probe| last.timestamp.max(probe));
             let confirmation_due = self.pending_loop.is_some()
-                && timestamp - last.timestamp >= self.config.loop_confirmation_interval_secs;
+                && timestamp - probe_from >= self.config.loop_confirmation_interval_secs;
             let stationary_probe_due = self.keyframes.len() >= self.config.min_keyframes_for_loop_search
-                && timestamp - last.timestamp >= self.config.stationary_probe_interval_secs;
+                && timestamp - probe_from >= self.config.stationary_probe_interval_secs;
             time_only = delta.translation.vector.norm() < self.config.keyframe_translation
                 && delta.rotation.angle() < self.config.keyframe_rotation;
             if time_only && !confirmation_due && !stationary_probe_due {
                 return Ok(ProcessFrameResult::BelowKeyframeThreshold);
             }
+        }
+        if time_only {
+            self.last_time_probe_timestamp = Some(timestamp);
         }
 
         let previous = self
@@ -531,6 +538,7 @@ impl LoopClosureCoordinator {
         self.pending_loop = None;
         self.search_diagnostics = LoopSearchDiagnostics::default();
         self.last_search_report_timestamp = None;
+        self.last_time_probe_timestamp = None;
     }
 
     fn find_and_measure_loop(&mut self, current_id: u64) -> Option<LoopClosureRecord> {
@@ -1179,6 +1187,37 @@ fn has_valid_correction(before: &PoseGraph, after: &PoseGraph) -> bool {
 mod tests {
     use super::*;
     use nalgebra::UnitQuaternion;
+
+    #[test]
+    fn time_only_probes_keep_the_search_interval_after_node_rollback() {
+        for confirmation in [false, true] {
+            let mut owner = consistency_fixture();
+            let last = owner.keyframes.last_key_value().unwrap().1;
+            let pose = last.local_pose;
+            let points = last.points.clone();
+            let start = last.timestamp;
+            if confirmation {
+                owner.confirm_loop(Some(measured_loop(11, 5.5, 0.)), start);
+            }
+            // 四秒内不触发五秒汇总，直接统计既有诊断中的真实搜索次数。
+            owner.last_search_report_timestamp = Some(start);
+            owner.search_diagnostics = LoopSearchDiagnostics::default();
+            let steps_per_probe = if confirmation { 10 } else { 20 };
+            for step in 1..=40 {
+                assert!(matches!(owner.process_frame(start + step as f64 / 10., pose, &points).unwrap(),
+                    ProcessFrameResult::BelowKeyframeThreshold));
+                assert_eq!(owner.search_diagnostics.searches, step / steps_per_probe,
+                    "待确认={confirmation}，第{step}个0.1秒帧");
+                assert_eq!(owner.graph.num_nodes(), 12);
+                assert_eq!(owner.graph.num_edges(), 11);
+            }
+            owner.process_frame(start + 4.1, pose * Isometry3::translation(0.2, 0., 0.), &points).unwrap();
+            assert_eq!(owner.graph.num_nodes(), 13, "运动帧不受时间探测间隔限制");
+            assert_eq!(owner.last_time_probe_timestamp, Some(start + 4.));
+            owner.reset();
+            assert!(owner.last_time_probe_timestamp.is_none());
+        }
+    }
 
     #[test]
     fn time_only_probes_without_measurements_leave_graph_and_timeline_unchanged() {

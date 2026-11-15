@@ -390,6 +390,8 @@ pub struct SourceCloud {
     pub points: Vec<Point3<f64>>,
     /// 与源点一一对应的射线原点。
     pub origins: Vec<Point3<f64>>,
+    /// 源点在里程计坐标中的法线。
+    pub normals: Vec<Vector3<f64>>,
     walls: Vec<bool>,
 }
 impl SourceCloud {
@@ -400,10 +402,12 @@ impl SourceCloud {
             voxels.entry(voxel_key(&point)).or_insert((point, origin));
         }
         let (points, origins): (Vec<_>, Vec<_>) = voxels.into_values().unzip();
-        let walls = wall_subset_mask(&estimate_normals(&points, 0.2, 100), WALL_NORMAL_Z_MAX);
+        let normals = estimate_normals(&points, 0.2, 100);
+        let walls = wall_subset_mask(&normals, WALL_NORMAL_Z_MAX);
         Self {
             points,
             origins,
+            normals,
             walls,
         }
     }

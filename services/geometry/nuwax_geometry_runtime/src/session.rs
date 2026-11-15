@@ -21,6 +21,9 @@ use tonic::Status;
 mod explorer_worker;
 use explorer_worker::ExplorerWorker;
 
+#[path = "localizer.rs"]
+mod localizer;
+
 fn trim_recent(recent: &mut VecDeque<(Instant, MappingFrame)>) {
     while recent.len() > 8
         || recent.front().is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))

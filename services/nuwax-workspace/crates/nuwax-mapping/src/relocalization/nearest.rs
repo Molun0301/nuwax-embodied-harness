@@ -75,7 +75,8 @@ impl NearestPointIndex {
         Self { points: indexed }
     }
 
-    pub(crate) fn nearest(&self, point: &Point3<f64>) -> Option<(usize, f64)> {
+    /// 查询最近目标点的原始索引与平方距离。
+    pub fn nearest(&self, point: &Point3<f64>) -> Option<(usize, f64)> {
         if point.coords.iter().any(|value| !value.is_finite()) {
             return None;
         }

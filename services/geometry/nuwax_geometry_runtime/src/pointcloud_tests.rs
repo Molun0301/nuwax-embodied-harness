@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_continues() {
+    for stage in ["open", "scan", "progress"] {
+        let root = std::env::temp_dir().join(format!("g1-budget-{}", uuid::Uuid::new_v4()));
+        let mut map = CloudMap::new(940, None, None).unwrap();
+        map.raw_directory = Some(root.clone());
+        let mut frame = crate::mapper::tests::room_frame(940, 1_000_000_000);
+        if stage != "open" {
+            map.record(1, &frame, Isometry3::identity()).unwrap();
+        }
+        let source = root.join("source-0");
+        std::fs::create_dir_all(&source).unwrap();
+        let used: u64 = std::fs::read_dir(&source).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+        let filler = File::create(source.join("budget-used")).unwrap();
+        filler.set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+        let log_before = map.logs.values().next().map(|log| std::fs::metadata(&log.path).unwrap().len());
+        frame.odom_pose.timestamp_ns += if stage == "progress" { 1 } else { 1_000_000_000 };
+        let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
+        map.accumulate(2, &frame, &points, frame.ray_origin_body, Isometry3::identity())
+            .expect("预算耗尽不能使 accumulate 失败");
+        assert!(!map.recording, "{stage}");
+        assert!(map.take_recording_limit());
+        assert!(!map.take_recording_limit(), "预算停止只通知一次");
+        if let Some(before) = log_before {
+            assert_eq!(map.logs.values().next().unwrap().path.metadata().unwrap().len(), before);
+        }
+        std::fs::remove_file(source.join("budget-used")).unwrap();
+        frame.odom_pose.timestamp_ns += 2_000_000_000;
+        let before = map.scan_prefix().unwrap();
+        map.accumulate(3, &frame, &points, frame.ray_origin_body, Isometry3::identity()).unwrap();
+        assert_eq!(map.poses.len(), 2);
+        assert_eq!(map.scan_prefix().unwrap(), before, "释放空间后本会话也不恢复记录");
+    }
+}
+
+#[test]
+fn recording_keeps_other_io_errors_on_the_existing_failure_path() {
+    let path = std::env::temp_dir().join(format!("g1-record-io-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, b"not a directory").unwrap();
+    let mut map = CloudMap::new(941, None, None).unwrap();
+    map.raw_directory = Some(path.clone());
+    let frame = crate::mapper::tests::room_frame(941, 1_000_000_000);
+    assert!(map.record(1, &frame, Isometry3::identity()).is_err());
+    assert!(map.recording);
+    assert!(!map.take_recording_limit());
+    drop(map);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn display_removals_match_full_scan_for_every_frame() {
     let mut total_removed = 0;
     for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {

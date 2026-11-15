@@ -763,6 +763,9 @@ impl Worker {
             [origin.x, origin.y, origin.z],
             self.map_from_odom,
         )?;
+        if self.cloud.take_recording_limit() {
+            self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+        }
         if !frame.mapping_only {
             self.recent_cloud.send_replace(Some(encode_recent_cloud(
                 self.sequence,

@@ -52,6 +52,34 @@ fn rejected_native_correction_stops_once_and_mapping_continues() {
 }
 
 #[test]
+fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
+    let mut worker = Worker::new(
+        942, MapperConfig { correction_backend: "library_pgo".into(), ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    worker.frame(room_frame(942, 1_000_000_000)).unwrap();
+    let saved = worker.snapshot().unwrap();
+    let source = saved.scans[0].0.parent().unwrap();
+    let used: u64 = std::fs::read_dir(source).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+    let filler_path = source.join("budget-used");
+    std::fs::File::create(&filler_path).unwrap()
+        .set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+    let mut stopped = worker.correction_stopped.subscribe();
+    worker.frame(room_frame(942, 2_000_000_000)).unwrap();
+    assert_eq!(stopped.borrow_and_update().as_deref(), Some("扫描记录已达上限，回环校正已停止"));
+    std::fs::remove_file(filler_path).unwrap();
+    worker.frame(room_frame(942, 3_000_000_000)).unwrap();
+    let after = worker.snapshot().unwrap();
+    assert_eq!(after.scans, saved.scans);
+    assert!(after.cloud.revision > saved.cloud.revision);
+    assert_eq!(after.final_poses.len(), 3);
+    assert!(worker.failure.is_none());
+    assert!(!stopped.has_changed().unwrap());
+}
+
+#[test]
 fn failed_replay_or_publication_preserves_the_current_map() {
     for publication_failure in [false, true] {
         let mut worker = Worker::new(

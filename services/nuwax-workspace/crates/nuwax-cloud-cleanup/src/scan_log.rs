@@ -13,6 +13,8 @@ pub use save_policy::SavePolicy;
 pub use pose_spool::PoseSpool;
 const MAGIC: &[u8; 8] = b"NEHSCAN2";
 const MAX_POINTS: usize = 2_000_000;
+/// 目录预算耗尽的既有错误文本，供记录拥有方区分其它写入错误。
+pub const DIRECTORY_BUDGET_EXCEEDED: &str = "原始扫描暂存已达目录预算，当前会话后续扫描不再记录；请先保存并结束建图会话或清理已有暂存";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScanMetadata {
     pub source_timestamp_ns: u64,
@@ -125,7 +127,7 @@ fn reserve(root: &Path, additional: u64) -> Result<(), String> {
             Ok::<_, String>(sum.saturating_add(size))
         })?;
     if used.saturating_add(additional) > storage_budget_bytes()? {
-        return Err("原始扫描暂存已达目录预算，当前会话后续扫描不再记录；请先保存并结束建图会话或清理已有暂存".into());
+        return Err(DIRECTORY_BUDGET_EXCEEDED.into());
     }
     Ok(())
 }

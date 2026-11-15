@@ -70,6 +70,7 @@ pub(crate) struct CloudMap {
     save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy,
     poses: Vec<(u64, [f64; 16])>,
     recording: bool,
+    recording_limit_reached: bool,
     raw_directory: Option<PathBuf>,
     readonly_classifier: Option<FineCloud>,
     history_scans: Vec<(PathBuf, u64)>,
@@ -167,6 +168,7 @@ impl CloudMap {
             save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy::from_runtime()?,
             poses: Vec::new(),
             recording: true,
+            recording_limit_reached: false,
             raw_directory: None,
             readonly_classifier: None,
             history_scans: Vec::new(),
@@ -259,9 +261,7 @@ impl CloudMap {
         self.stamp = frame.odom_pose.timestamp_ns;
         self.poses
             .push((self.stamp, isometry_matrix(&(map_from_odom * odom))));
-        if self.recording {
-            self.record(sequence, frame, map_from_odom)?;
-        }
+        self.record(sequence, frame, map_from_odom)?;
         Ok((dynamic, indices, ground))
     }
     fn record(
@@ -270,57 +270,73 @@ impl CloudMap {
         frame: &MappingFrame,
         transform: Isometry3<f64>,
     ) -> Result<(), String> {
-        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-        let metadata = ScanMetadata {
-            source_timestamp_ns: frame.odom_pose.timestamp_ns,
-            source_sequence: sequence,
-            sensor: frame.sensor_id.clone(),
-            source_generation: 1,
-            odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
-            map_from_odom: isometry_matrix(&transform),
-            sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
-            observation_minimum_range_m: Some(
-                crate::dynamic_backend::online_params().min_range as f64,
-            ),
-            point_count: frame.points_body.len(),
-        };
-        let selected = self.save_policy.selects(self.last_recorded.get(&frame.sensor_id), &metadata);
-        if self.raw_directory.is_none() {
-            self.raw_directory = Some(
-                nuwax_cloud_cleanup::scan_log::scan_directory()
-                    .join(format!(".geometry-{}", uuid::Uuid::new_v4())),
-            );
+        if !self.recording {
+            return Ok(());
         }
-        if !self.logs.contains_key(&frame.sensor_id) {
-            let root = self
-                .raw_directory
-                .as_ref()
-                .unwrap()
-                .join(format!("source-{}", self.logs.len()));
-            self.logs.insert(
-                frame.sensor_id.clone(),
-                ScanLog::open(
-                    &root,
-                    Session {
-                        session_id: self.session_id.to_string(),
-                        generation: SCAN_LOG_GENERATION,
-                    },
-                )?,
-            );
+        let result: Result<(), String> = (|| {
+            use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+            let metadata = ScanMetadata {
+                source_timestamp_ns: frame.odom_pose.timestamp_ns,
+                source_sequence: sequence,
+                sensor: frame.sensor_id.clone(),
+                source_generation: 1,
+                odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
+                map_from_odom: isometry_matrix(&transform),
+                sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
+                observation_minimum_range_m: Some(
+                    crate::dynamic_backend::online_params().min_range as f64,
+                ),
+                point_count: frame.points_body.len(),
+            };
+            let selected = self.save_policy.selects(self.last_recorded.get(&frame.sensor_id), &metadata);
+            if self.raw_directory.is_none() {
+                self.raw_directory = Some(
+                    nuwax_cloud_cleanup::scan_log::scan_directory()
+                        .join(format!(".geometry-{}", uuid::Uuid::new_v4())),
+                );
+            }
+            if !self.logs.contains_key(&frame.sensor_id) {
+                let root = self
+                    .raw_directory
+                    .as_ref()
+                    .unwrap()
+                    .join(format!("source-{}", self.logs.len()));
+                self.logs.insert(
+                    frame.sensor_id.clone(),
+                    ScanLog::open(
+                        &root,
+                        Session {
+                            session_id: self.session_id.to_string(),
+                            generation: SCAN_LOG_GENERATION,
+                        },
+                    )?,
+                );
+            }
+            let log = self.logs.get_mut(&frame.sensor_id).unwrap();
+            if selected {
+                log.append(
+                    &metadata,
+                    frame.points_body.iter().map(|p| p.map(|v| v as f32)),
+                    None,
+                )?;
+            }
+            log.progress(frame.odom_pose.timestamp_ns, 0)?;
+            if selected {
+                self.last_recorded.insert(frame.sensor_id.clone(), metadata);
+            }
+            Ok(())
+        })();
+        match result {
+            Err(error) if error == nuwax_cloud_cleanup::scan_log::DIRECTORY_BUDGET_EXCEEDED => {
+                self.recording = false;
+                self.recording_limit_reached = true;
+                Ok(())
+            }
+            result => result,
         }
-        let log = self.logs.get_mut(&frame.sensor_id).unwrap();
-        if selected {
-            log.append(
-                &metadata,
-                frame.points_body.iter().map(|p| p.map(|v| v as f32)),
-                None,
-            )?;
-        }
-        log.progress(frame.odom_pose.timestamp_ns, 0)?;
-        if selected {
-            self.last_recorded.insert(frame.sensor_id.clone(), metadata);
-        }
-        Ok(())
+    }
+    pub(crate) fn take_recording_limit(&mut self) -> bool {
+        std::mem::take(&mut self.recording_limit_reached)
     }
     pub fn commit(&mut self, stamp: u64) -> Result<(), String> {
         if !self.dirty || self.stamp == 0 || stamp == 0 {

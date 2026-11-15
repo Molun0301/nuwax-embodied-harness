@@ -1,4 +1,45 @@
 use super::*;
+
+#[test]
+fn display_removals_match_full_scan_for_every_frame() {
+    let mut total_removed = 0;
+    for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {
+        let mut map = CloudMap::new(931, None, None).unwrap();
+        map.disable_recording();
+        map.voxel_size = size;
+        let transform = Isometry3::new(
+            nalgebra::Vector3::new(0.37, -0.19, 0.08),
+            nalgebra::Vector3::new(0.02, -0.03, 0.27),
+        );
+        for index in 0..8 {
+            let (body, _) = crate::dynamic_scene::tests::corridor(
+                (index < 2).then_some(0.), index as f64 * 0.3,
+            );
+            let frame = MappingFrame {
+                session_id: 931,
+                odom_pose: pose_from_isometry(Isometry3::identity(), "odom", index + 1),
+                points_body: body.iter().map(|p| [p.x, p.y, p.z]).collect(),
+                ray_origin_body: crate::dynamic_scene::tests::ORIGIN,
+                mapping_only: false, sensor_id: "主雷达".into(), registered_cloud: None,
+            };
+            let points: Vec<_> = body.iter().map(|p| transform * p).collect();
+            let origin = transform * Point3::from(frame.ray_origin_body);
+            let before = map.voxels.clone();
+            let (dynamic, _, _) = map.accumulate(index + 1, &frame, &points,
+                [origin.x, origin.y, origin.z], transform).unwrap();
+            let hits: VoxelIndex = points.iter()
+                .filter_map(|p| voxel_key([p.x, p.y, p.z], size)).collect();
+            // 保留旧实现的逐键判定作为独立对照，比较生产 accumulate 实际删除结果。
+            let expected: VoxelIndex = before.iter().copied().filter(|key| {
+                !hits.contains(key) && dynamic.clears(voxel_center_f64(*key, size))
+            }).collect();
+            let actual: VoxelIndex = before.difference(&map.voxels).copied().collect();
+            assert_eq!(actual, expected, "体素边长={size}，帧={index}");
+            total_removed += actual.len();
+        }
+    }
+    assert!(total_removed > 0, "必须实际覆盖历史展示体素清除");
+}
 #[test]
 fn dense_delta_returns_only_the_unread_surviving_tail() {
     let mut map = CloudMap::new(41, None, None).unwrap();

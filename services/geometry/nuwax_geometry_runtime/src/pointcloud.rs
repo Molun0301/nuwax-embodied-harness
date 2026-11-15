@@ -223,10 +223,10 @@ impl CloudMap {
             .iter()
             .filter_map(|p| voxel_key([p.x, p.y, p.z], self.voxel_size))
             .collect();
-        let removed: Vec<_> = self
-            .voxels
-            .iter()
-            .copied()
+        let removed: Vec<_> = dynamic
+            .candidate_grid_keys(f64::from(self.voxel_size), |key| self.voxels.contains(&key))
+            .expect("去动态后端提供规则格候选")
+            .into_iter()
             .filter(|key| {
                 !hits.contains(key) && dynamic.clears(voxel_center_f64(*key, self.voxel_size))
             })

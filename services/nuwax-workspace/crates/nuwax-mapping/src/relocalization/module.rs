@@ -69,16 +69,17 @@ mod tests {
     #[tokio::test]
     async fn module_relocalize_call() {
         let m = RelocalizationModule::default();
-        let target: Vec<Point3<f64>> = (0..4)
-            .flat_map(|x| {
-                (0..3).flat_map(move |y| {
-                    (0..2).map(move |z| {
-                        Point3::new(
-                            x as f64 * 0.41 + (y * y + z) as f64 * 0.013,
-                            y as f64 * 0.43 + (x * z + z * z) as f64 * 0.017,
-                            z as f64 * 0.37 + (x * x + y) as f64 * 0.011,
-                        )
-                    })
+        // 三个可见平面具有不同位置和边界，绕质心转半圈不能同样吻合。
+        let target: Vec<Point3<f64>> = (-10..=10)
+            .flat_map(|a| {
+                (0..=20).flat_map(move |b| {
+                    let u = a as f64 * 0.1;
+                    let v = b as f64 * 0.1;
+                    [
+                        Point3::new(3.0, u, v),
+                        Point3::new(u, 2.0, v),
+                        Point3::new(u, v, -0.5),
+                    ]
                 })
             })
             .collect();

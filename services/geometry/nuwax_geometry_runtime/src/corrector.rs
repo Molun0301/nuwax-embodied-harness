@@ -218,13 +218,15 @@ impl Corrector {
             }));
             let odom = pose_isometry(&frames.last().unwrap().odom_pose);
             let initials = relocalization_initials(initial, last_pose, seed, odom);
-            let (transform, fitness, succeeded) =
+            let (transform, fitness, succeeded, ambiguous) =
                 compute_relocalization(&source, &target_cache, &initials, odom)?;
             let last = frames.last().unwrap();
             let result = proto::RelocalizationResult {
                 succeeded,
                 message: if succeeded {
                     "重定位成功".into()
+                } else if ambiguous {
+                    "重定位有歧义：两个位置同样吻合，请转动或移动一小段后重试".into()
                 } else {
                     "重定位未匹配到已加载地图".into()
                 },
@@ -235,7 +237,7 @@ impl Corrector {
                         last.odom_pose.timestamp_ns,
                     )
                 }),
-                fitness: if fitness.is_finite() { fitness } else { 0. },
+                fitness,
                 frames_used: frames.len() as u32,
                 finished_at_ns: now_ns(),
             };
@@ -284,14 +286,14 @@ fn compute_relocalization(
     target: &TargetCache,
     initials: &[Isometry3<f64>],
     odom: Isometry3<f64>,
-) -> Result<(Isometry3<f64>, f64, bool), String> {
+) -> Result<(Isometry3<f64>, f64, bool, bool), String> {
     let config = RelocalizationConfig::default();
     for initial in initials {
         let local = local_registration(source, target, *initial, odom)?;
         let transform = local.transformation;
         let score = score_relocalization(source, transform, target);
         if score.accepts(&transform) {
-            return Ok((transform, score.wall_fitness, true));
+            return Ok((transform, score.wall_fitness, true, false));
         }
     }
     let global = relocation_pipeline_cached(source, target, config);
@@ -299,6 +301,7 @@ fn compute_relocalization(
         global.registration.transformation,
         global.fitness,
         global.registration.converged,
+        global.ambiguous,
     ))
 }
 

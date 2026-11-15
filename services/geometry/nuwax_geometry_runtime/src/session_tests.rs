@@ -1,6 +1,49 @@
 use super::*;
 
 #[tokio::test]
+async fn correction_event_moves_target_with_nearest_old_body_pose_and_resubmits_same_id_once() {
+    use crate::mapper::{CorrectedKeyframe, CorrectionEvent, pose_isometry};
+    use nalgebra::Isometry3;
+    let mapper = Mapper::start(958, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper.clone(), PathBuf::new()).await;
+    session.nav.shutdown().await;
+    let capture = Arc::new(crate::nav_bridge::tests::Capture::new());
+    let (statuses, _) = mpsc::unbounded_channel();
+    session.nav = NavBridge::with_transport(nuwax_transport::LcmTransport::new(capture.clone()), statuses).await.unwrap();
+    session.nav.set_input_ready(Ok(()));
+    capture.inject_status("", 17, nuwax_codec::lcm::schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    let target = pose_from_isometry(Isometry3::translation(10.5, 1., 0.), "map", 100);
+    let goal = NavigationGoal { pose: Some(target.clone()), motion_generation: 7,
+        allow_reverse: Some(true), position_tolerance_m: Some(0.2), yaw_tolerance_rad: Some(0.3) };
+    session.state.navigation = Some(NavigationStatus { goal_id: "原目标号".into(),
+        target: Some(target), status: GoalStatus::Executing as i32, ..Default::default() });
+    session.navigation_goal = Some((goal.clone(), vec![[0., 0.], [20., 0.], [20., 20.]]));
+    let event = CorrectionEvent { keyframes: vec![
+        CorrectedKeyframe { stamp: 1, local_pose: Isometry3::translation(10., 1., 0.),
+            old: Isometry3::translation(100., 0., 0.), new: Isometry3::translation(105., 0., 0.) },
+        CorrectedKeyframe { stamp: 2, local_pose: Isometry3::translation(0., 1., 0.),
+            old: Isometry3::translation(10., 0., 0.), new: Isometry3::translation(11., 2., 0.) },
+    ] };
+    session.apply_correction(event).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while capture.goals().is_empty() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let state = session.state.navigation.as_ref().unwrap();
+    assert_eq!(state.goal_id, "原目标号");
+    assert_eq!(pose_isometry(state.target.as_ref().unwrap()), Isometry3::translation(11.5, 3., 0.));
+    assert_eq!(session.last_correction.as_ref().unwrap().keyframes.len(), 2);
+    assert_eq!(capture.goals().len(), 1);
+    let decoded = nuwax_codec::lcm::schema::decode_navigation_goal_body(&capture.goals()[0].payload).unwrap();
+    assert_eq!(decoded.session_id, "原目标号");
+    assert_eq!(decoded.motion_generation, 7);
+    assert_eq!(decoded.goal.pose.position[0], 11.5);
+    assert_eq!(decoded.goal.pose.position[1], 3.);
+    assert_eq!(session.navigation_goal.as_ref().unwrap().0.allow_reverse, goal.allow_reverse);
+    session.nav.shutdown().await;
+    mapper.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn correction_stop_reason_is_forwarded_without_changing_mapping_phase() {
     let mapper = Mapper::start(939, MapperConfig {
         correction_backend: "native_pgo".into(), ..Default::default()
@@ -164,6 +207,8 @@ pub(super) async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
         relocalization_target: None,
         saved_last_pose: None,
         localizer: None,
+        last_correction: None,
+        navigation_goal: None,
     }
 }
 #[tokio::test]

@@ -77,6 +77,7 @@ pub(crate) struct CloudMap {
     dirty: bool,
 }
 impl CloudMap {
+    pub(crate) fn session_id(&self) -> u64 { self.session_id }
     pub fn new(
         session_id: u64,
         shm_path: Option<&Path>,
@@ -275,7 +276,7 @@ impl CloudMap {
         }
         let result: Result<(), String> = (|| {
             use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-            let metadata = ScanMetadata {
+            let mut metadata = ScanMetadata {
                 source_timestamp_ns: frame.odom_pose.timestamp_ns,
                 source_sequence: sequence,
                 sensor: frame.sensor_id.clone(),
@@ -314,11 +315,12 @@ impl CloudMap {
             }
             let log = self.logs.get_mut(&frame.sensor_id).unwrap();
             if selected {
-                log.append(
-                    &metadata,
-                    frame.points_body.iter().map(|p| p.map(|v| v as f32)),
-                    None,
-                )?;
+                let mut voxels = ahash::AHashSet::new();
+                let points: Vec<_> = frame.points_body.iter()
+                    .filter(|point| voxels.insert(point.map(|v| (v / 0.05).floor() as i64)))
+                    .map(|point| point.map(|v| v as f32)).collect();
+                metadata.point_count = points.len();
+                log.append(&metadata, points.into_iter(), None)?;
             }
             log.progress(frame.odom_pose.timestamp_ns, 0)?;
             if selected {
@@ -462,15 +464,12 @@ impl CloudMap {
     pub fn final_poses(&self) -> Vec<(u64, [f64; 16])> {
         self.poses.clone()
     }
-    pub fn replay_frames(&self) -> Result<ReplayFrames, String> {
-        let mut readers = Vec::new();
-        for log in self.logs.values() {
+    pub(crate) fn replay_prefix(&self) -> Result<Vec<ScanPrefix>, String> {
+        self.logs.values().map(|log| {
             log.sync()?;
-            let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&log.path)?;
-            let stamp = reader.peek_next_scan_timestamp()?;
-            readers.push((reader, stamp));
-        }
-        Ok(ReplayFrames { session_id: self.session_id, readers })
+            Ok(ScanPrefix { path: log.path.clone(), bytes: log.path.metadata().map_err(|e| e.to_string())?.len(),
+                scans: log.scan_count })
+        }).collect()
     }
     pub fn adopt_publication(&mut self, previous: &mut Self) -> Result<(), String> {
         // 重建地图首次封存就接续会话版本，根几何与全部块版本一起推进。
@@ -537,20 +536,56 @@ impl CloudMap {
         Ok(result)
     }
 }
+#[derive(Clone, Debug)]
+pub(crate) struct ScanPrefix {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub scans: u64,
+}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReplayPosition(pub std::collections::BTreeMap<PathBuf, (u64, u64)>);
+impl ReplayPosition {
+    pub fn remaining(&self, prefixes: &[ScanPrefix]) -> u64 {
+        prefixes.iter().map(|prefix| prefix.scans - self.0.get(&prefix.path).map_or(0, |v| v.1)).sum()
+    }
+}
 pub(crate) struct ReplayFrames {
     session_id: u64,
-    readers: Vec<(nuwax_cloud_cleanup::scan_log::ScanReader, Option<u64>)>,
+    readers: Vec<(PathBuf, nuwax_cloud_cleanup::scan_log::ScanReader, Option<u64>, u64)>,
+}
+impl ReplayFrames {
+    pub fn new(session_id: u64, prefixes: &[ScanPrefix], position: &ReplayPosition) -> Result<Self, String> {
+        let readers = prefixes.iter().map(|prefix| {
+            let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&prefix.path)?;
+            reader.set_prefix(prefix.bytes);
+            let mut count = 0;
+            if let Some((bytes, scans)) = position.0.get(&prefix.path) {
+                reader.resume_at(*bytes)?;
+                count = *scans;
+            }
+            let stamp = reader.peek_next_scan_timestamp()?;
+            Ok((prefix.path.clone(), reader, stamp, count))
+        }).collect::<Result<_, String>>()?;
+        Ok(Self { session_id, readers })
+    }
+    pub fn position(&mut self) -> Result<ReplayPosition, String> {
+        let mut result = ReplayPosition::default();
+        for (path, reader, _, count) in &mut self.readers {
+            result.0.insert(path.clone(), (reader.position()?, *count));
+        }
+        Ok(result)
+    }
 }
 impl Iterator for ReplayFrames {
     type Item = Result<MappingFrame, String>;
     fn next(&mut self) -> Option<Self::Item> {
-        // 同时间戳沿传感器日志原顺序，和旧的稳定排序结果一致。
         let (index, _) = self.readers.iter().enumerate()
-            .filter_map(|(index, (_, stamp))| stamp.map(|stamp| (index, stamp)))
+            .filter_map(|(index, (_, _, stamp, _))| stamp.map(|stamp| (index, stamp)))
             .min_by_key(|(index, stamp)| (*stamp, *index))?;
         Some((|| {
-            let (reader, stamp) = &mut self.readers[index];
+            let (_, reader, stamp, count) = &mut self.readers[index];
             let scan = reader.next_scan()?.expect("已预读完整扫描元数据");
+            *count += 1;
             *stamp = reader.peek_next_scan_timestamp()?;
             Ok(MappingFrame {
                 session_id: self.session_id,
@@ -558,9 +593,7 @@ impl Iterator for ReplayFrames {
                     "odom", scan.metadata.source_timestamp_ns),
                 points_body: scan.points.into_iter().map(|p| p.map(f64::from)).collect(),
                 ray_origin_body: scan.metadata.sensor_origin_body.ok_or("扫描缺少雷达原点")?.map(f64::from),
-                mapping_only: false,
-                sensor_id: scan.metadata.sensor,
-                registered_cloud: None,
+                mapping_only: false, sensor_id: scan.metadata.sensor, registered_cloud: None,
             })
         })())
     }

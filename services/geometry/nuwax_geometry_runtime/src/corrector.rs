@@ -15,13 +15,52 @@ use nuwax_mapping::relocalization::{
 };
 use std::sync::Arc;
 
+/// 校正线程只持有静态机体点及请求必需的栅格元数据，不复制整张栅格。
+pub(crate) struct CorrectionInput {
+    pub frame: MappingFrame,
+    pub points: Vec<Point3<f64>>,
+    pub source_point_count: usize,
+    pub grid: Option<GridMetadata>,
+    pub anchor: Isometry3<f64>,
+}
+impl CorrectionInput {
+    pub(crate) fn new(frame: &MappingFrame, indices: &[u32],
+        grid: Option<(&nuwax_mapping::OccupancyGrid, u64)>, anchor: Isometry3<f64>) -> Self {
+        Self {
+            frame: MappingFrame { session_id: frame.session_id, odom_pose: frame.odom_pose.clone(),
+                points_body: Vec::new(), ray_origin_body: frame.ray_origin_body,
+                mapping_only: frame.mapping_only, sensor_id: frame.sensor_id.clone(), registered_cloud: None },
+            points: indices.iter().map(|i| Point3::from(frame.points_body[*i as usize])).collect(),
+            source_point_count: frame.points_body.len(),
+            grid: grid.map(|(grid, stamp)| GridMetadata::new(grid, stamp)), anchor,
+        }
+    }
+}
+pub(crate) struct GridMetadata {
+    pub source_timestamp_ns: u64,
+    pub width: u32,
+    pub height: u32,
+    pub resolution: f64,
+    pub origin: [f64; 3],
+    pub frame_id: String,
+}
+impl GridMetadata {
+    pub(crate) fn new(grid: &nuwax_mapping::OccupancyGrid, stamp: u64) -> Self {
+        Self { source_timestamp_ns: stamp, width: grid.width, height: grid.height,
+            resolution: grid.resolution, origin: grid.origin, frame_id: grid.frame_id.clone() }
+    }
+}
 pub struct Corrector {
     mode: Mode,
     first_stamp: Option<u64>,
     sequence: u64,
 }
 enum Mode {
-    Stopped,
+    #[cfg(test)]
+    Scripted {
+        updates: std::collections::VecDeque<Result<Option<PgoUpdate>, String>>,
+        confirmed: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    },
     Relocalization,
     Library(LoopClosureCoordinator),
     Native(Native),
@@ -108,12 +147,11 @@ impl Corrector {
     }
     pub(crate) fn process_frame(
         &mut self,
-        frame: &MappingFrame,
-        indices: &[u32],
-        grid: Option<(&nuwax_mapping::OccupancyGrid, u64)>,
-        anchor: Isometry3<f64>,
+        input: &CorrectionInput,
     ) -> Result<Option<PgoUpdate>, String> {
-        if matches!(self.mode, Mode::Relocalization | Mode::Stopped) {
+        let frame = &input.frame;
+        let anchor = input.anchor;
+        if matches!(self.mode, Mode::Relocalization) {
             return Ok(None);
         }
         if let Mode::Native(owner) = &self.mode {
@@ -125,14 +163,11 @@ impl Corrector {
         self.sequence += 1;
         let time = frame.odom_pose.timestamp_ns.saturating_sub(first) as f64 / 1e9;
         let odom = pose_isometry(&frame.odom_pose);
-        let points: Vec<_> = indices
-            .iter()
-            .map(|i| Point3::from(frame.points_body[*i as usize]))
-            .collect();
+        let points = &input.points;
         match &mut self.mode {
             Mode::Library(owner) => {
                 let result = owner
-                    .process_frame(time, odom, &points)
+                    .process_frame(time, odom, points)
                     .map_err(|e| e.to_string())?;
                 if !matches!(result, ProcessFrameResult::LoopClosed { .. }) {
                     return Ok(None);
@@ -156,15 +191,21 @@ impl Corrector {
                 }))
             }
             Mode::Native(owner) => {
-                let Some(grid) = grid else { return Ok(None) };
-                owner.process(frame, &points, grid, self.sequence, anchor, first)
+                let Some(grid) = input.grid.as_ref() else { return Ok(None) };
+                owner.process(frame, points, grid, input.source_point_count, self.sequence, anchor, first)
             }
-            Mode::Relocalization | Mode::Stopped => Ok(None),
+            Mode::Relocalization => Ok(None),
+            #[cfg(test)]
+            Mode::Scripted { updates, confirmed } => {
+                let result = updates.pop_front().unwrap_or(Ok(None));
+                if matches!(result, Ok(Some(_))) {
+                    *confirmed.lock().unwrap() = Some(std::time::Instant::now());
+                }
+                result
+            }
         }
     }
-    pub(crate) fn stop(&mut self) {
-        self.mode = Mode::Stopped;
-    }
+
     pub async fn relocalize(
         mapper: &Mapper,
         frames: Vec<MappingFrame>,
@@ -355,7 +396,8 @@ impl Native {
         &mut self,
         frame: &MappingFrame,
         points: &[Point3<f64>],
-        grid: (&nuwax_mapping::OccupancyGrid, u64),
+        grid: &GridMetadata,
+        source_point_count: usize,
         sequence: u64,
         anchor: Isometry3<f64>,
         first: u64,
@@ -386,7 +428,7 @@ impl Native {
             frame.odom_pose.timestamp_ns,
             pose_isometry(&frame.odom_pose),
         );
-        let request = self.request(frame, points, grid, sequence);
+        let request = self.request(frame, points, grid, source_point_count, sequence);
         let response = self.submit(request)?;
         match response.disposition() {
             nuwax_nav_pgo_bridge::ValidatedOnlinePgoDisposition::Correction => {
@@ -467,11 +509,12 @@ impl Native {
         &self,
         frame: &MappingFrame,
         points: &[Point3<f64>],
-        grid: (&nuwax_mapping::OccupancyGrid, u64),
+        grid: &GridMetadata,
+        source_point_count: usize,
         sequence: u64,
     ) -> nuwax_codec::lcm::native_pgo::NativePgoRequest {
         use nuwax_codec::lcm::native_pgo as wire;
-        let (grid, source_timestamp_ns) = grid;
+
         let pose = pose_isometry(&frame.odom_pose);
         let p = pose.translation.vector;
         let q = pose.rotation.quaternion();
@@ -501,7 +544,7 @@ impl Native {
                 runtime_generation: frame.session_id as i64,
                 source_sequence: sequence as i64,
                 source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-                source_point_count: frame.points_body.len() as i64,
+                source_point_count: source_point_count as i64,
                 point_count: points.len() as i64,
             },
             correlated_odom: wire::NativePgoCorrelatedOdomProof {
@@ -512,7 +555,7 @@ impl Native {
             },
             committed_map: wire::NativePgoCommittedMapProof {
                 // 来源属于已提交地图，不能经浮点秒恢复，也不能替换为当前帧时间。
-                source_timestamp_ns: source_timestamp_ns as i64,
+                source_timestamp_ns: grid.source_timestamp_ns as i64,
                 width: grid.width as i64,
                 height: grid.height as i64,
                 resolution_m: grid.resolution,

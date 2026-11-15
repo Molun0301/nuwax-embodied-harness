@@ -29,6 +29,70 @@ fn config() -> MapperConfig {
     }
 }
 
+pub(crate) fn benchmark_frame(stamp: u64) -> MappingFrame {
+    let x = (stamp / 1_000_000_000 - 1) as f64 * 0.001;
+    let points_body = (0..12).flat_map(|a| (0..12).flat_map(move |b| {
+        let u = 1. + a as f64 * 0.1;
+        let v = b as f64 * 0.1;
+        [[5. - x, u, v], [u - x, 4., v], [u - x, v, -1.]]
+    })).collect();
+    MappingFrame {
+        session_id: 957,
+        odom_pose: pose_from_isometry(Isometry3::translation(x, 0., 0.), "odom", stamp),
+        points_body, ray_origin_body: [0.3, 0., 0.6],
+        mapping_only: false, sensor_id: "基准雷达".into(), registered_cloud: None,
+    }
+}
+
+#[test]
+#[ignore = "G2千帧后台重放耗时对比，手动执行"]
+fn g2_replay_latency_benchmark() {
+    let mut worker = Worker::new(
+        957, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    for i in 1..=1000 { worker.frame(benchmark_frame(i * 1_000_000_000)).unwrap(); }
+    let prefix = worker.cloud.scan_prefix().unwrap();
+    let archive = PathBuf::from(std::env::var_os("NUWAX_G2_BENCHMARK_DIR").unwrap());
+    std::fs::create_dir_all(&archive).unwrap();
+    let saved = archive.join("千帧扫描.scan");
+    let bytes = std::fs::read(&prefix[0].0).unwrap();
+    if saved.exists() { assert_eq!(std::fs::read(&saved).unwrap(), bytes); }
+    else { std::fs::write(&saved, &bytes).unwrap(); }
+    let (corrector, confirmed) = Corrector::scripted_for_test(vec![Ok(Some(
+        PgoUpdate::constant_for_test(1_000_000_000, Isometry3::translation(0.2, 0., 0.))
+    ))]);
+    worker.corrector = Some(CorrectionWorker::start(worker.session_id, worker.config.clone(), corrector).unwrap());
+    let mut max_frame = Duration::ZERO;
+    let mut processed = 0;
+    let started = Instant::now();
+    while worker.map_from_odom == Isometry3::identity() {
+        let frame_start = Instant::now();
+        worker.frame(benchmark_frame((1001 + processed) * 1_000_000_000)).unwrap();
+        max_frame = max_frame.max(frame_start.elapsed());
+        processed += 1;
+        assert!(started.elapsed() < Duration::from_secs(30));
+        std::thread::yield_now();
+    }
+    let total = confirmed.lock().unwrap().unwrap().elapsed();
+    let replayed = worker.built_until / 1_000_000_000;
+    assert!(replayed > 1000, "后台重放必须包含期间记录");
+    let poses = worker.cloud.final_poses();
+    for stamp in 1..=replayed {
+        assert!(poses.iter().any(|(time, _)| *time == stamp * 1_000_000_000), "漏放扫描{stamp}");
+    }
+    let metrics = serde_json::json!({
+        "初始扫描帧": 1000, "扫描日志字节": bytes.len(), "期间处理帧": processed,
+        "替换时已重放帧": replayed,
+        "最长单帧毫秒": max_frame.as_secs_f64() * 1000.,
+        "校正到替换毫秒": total.as_secs_f64() * 1000.,
+    });
+    std::fs::write(archive.join("后台重放结果.json"), serde_json::to_vec_pretty(&metrics).unwrap()).unwrap();
+    eprintln!("G2基准：{metrics}");
+}
+
 #[test]
 fn rejected_native_correction_stops_once_and_mapping_continues() {
     let mut worker = Worker::new(
@@ -42,6 +106,7 @@ fn rejected_native_correction_stops_once_and_mapping_continues() {
     rejected.points_body.truncate(3);
     worker.frame(rejected).expect("原生拒绝本帧时建图仍成功");
     assert!(worker.failure.is_none());
+    while !stopped.has_changed().unwrap() { worker.poll_correction(); std::thread::yield_now(); }
     assert!(stopped.has_changed().unwrap());
     assert!(stopped.borrow_and_update().as_ref().unwrap().contains("回环校正已停止："));
     let revision = worker.cloud.snapshot().revision;
@@ -230,6 +295,53 @@ fn replayed_timeline_keeps_centimeter_updates_small_after_robot_motion() {
 }
 
 #[test]
+fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_before_next_cloud() {
+    let mut worker = Worker::new(
+        949, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    assert_eq!(worker.built_corrections, vec![(0, Isometry3::identity())]);
+    worker.frame(room_frame(949, 1_000_000_000)).unwrap();
+    let old = worker.cloud.snapshot();
+    let old_transform = worker.map_from_odom;
+    let update = PgoUpdate::constant_for_test(1_000_000_000, Isometry3::translation(0.2, 0., 0.));
+    let mut rebuilt = Rebuilt::new(949, config(), update).unwrap();
+    rebuilt.replay(&worker.cloud.replay_prefix().unwrap(), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert_eq!(worker.cloud.snapshot().revision, old.revision);
+    assert_eq!(worker.map_from_odom, old_transform, "后台重放不修改活动地图或变换");
+    worker.adopt_rebuilt(rebuilt).unwrap();
+    assert_eq!(worker.cloud.snapshot().revision, old.revision + 1);
+    assert_eq!(worker.map_from_odom, Isometry3::translation(0.2, 0., 0.));
+    let clear = worker.recent_cloud.borrow().clone().unwrap();
+    assert!(clear.frame.is_none());
+    let clear_packet = nuwax_codec::lcm::recent_cloud::decode_body(&clear).unwrap();
+    assert!(clear_packet.cloud.is_none());
+    let event = worker.correction_receiver.as_mut().unwrap().try_recv().unwrap();
+    assert_eq!(event.keyframes.len(), 1);
+    assert_eq!(event.keyframes[0].stamp, 1_000_000_000);
+    assert_eq!(event.keyframes[0].old, old_transform);
+    assert_eq!(event.keyframes[0].new, worker.map_from_odom);
+    worker.frame(room_frame(949, 2_000_000_000)).unwrap();
+    let publication = worker.recent_cloud.borrow().clone().unwrap();
+    let clear_again = publication.clear.as_ref().unwrap();
+    assert_eq!(clear_again.0 as i64, clear_packet.sequence);
+    let current = nuwax_codec::lcm::recent_cloud::decode_body(publication.frame.as_ref().unwrap()).unwrap();
+    assert!(current.cloud.is_some());
+    assert!(current.sequence > clear_packet.sequence);
+    let snapshot = worker.snapshot().unwrap();
+    let loaded = Worker::new(
+        950, config(), Some(snapshot), true,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    assert_eq!(loaded.built_corrections, vec![(0, loaded.map_from_odom)]);
+    assert!(loaded.corrector.is_none());
+}
+
+#[test]
 fn pgo_replay_threshold_combines_rotation_and_translation_and_checks_every_keyframe() {
     for early_large_change in [false, true] {
         let mut worker = Worker::new(
@@ -257,14 +369,14 @@ pub(crate) fn frames_without_candidate_keep_session_healthy(
     backend: MappingBackendSpec,
     corrector: Corrector,
     frame: &MappingFrame,
-) -> Corrector {
+) {
     let mut worker = Worker::new(
         frame.session_id, MapperConfig { backend, ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
-    worker.corrector = corrector;
+    worker.corrector = Some(CorrectionWorker::start(worker.session_id, worker.config.clone(), corrector).unwrap());
     // 辅助帧先真实提交地图，但不调用校正器；后继主帧必须跳过旧地图。
     let mut seed = frame.clone();
     seed.mapping_only = true;
@@ -277,7 +389,7 @@ pub(crate) fn frames_without_candidate_keep_session_healthy(
     assert_eq!(worker.grid_stamp, frame.odom_pose.timestamp_ns);
     assert!(worker.failure.is_none());
     assert!(worker.snapshot().unwrap().occupancy.is_some(), "会话仍可保存地图");
-    worker.corrector
+    assert!(worker.corrector.as_ref().unwrap().next().is_none(), "未提交帧没有校正结果");
 }
 
 #[tokio::test]
@@ -997,4 +1109,22 @@ async fn forbidden_zone_poll_detects_two_writes_with_the_same_mtime() {
         assert_eq!(maps.borrow_and_update().as_ref().unwrap().data, expected);
     }
     mapper.shutdown().await.unwrap();
+}
+
+impl Worker {
+    pub(crate) fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
+        if self.is_small(&update) { self.apply_small(update); return Ok(()); }
+        let before = self.cloud.snapshot().revision;
+        let (corrector, _) = Corrector::scripted_for_test(vec![Ok(Some(update))]);
+        self.corrector = Some(CorrectionWorker::start(self.session_id, self.config.clone(), corrector)?);
+        let frame = self.last_input.as_ref().map(|input| room_frame(self.session_id, input.source_timestamp_ns)).unwrap();
+        self.corrector.as_ref().unwrap().submit(CorrectionInput::new(&frame, &[], None, self.base_anchor));
+        while self.cloud.snapshot().revision == before {
+            self.poll_correction();
+            if let Some(reason) = self.correction_stopped.borrow().clone() { return Err(reason); }
+            std::thread::yield_now();
+        }
+        self.corrector.take();
+        Ok(())
+    }
 }

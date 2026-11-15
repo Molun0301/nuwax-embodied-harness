@@ -1,6 +1,6 @@
 //! 当前会话的地图拥有方；实时帧直达本对象，控制操作用自身队列形成检查点。
 use crate::{
-    corrector::{Corrector, PgoUpdate},
+    corrector::{CorrectionInput, Corrector, PgoUpdate},
     mapping_backend::{
         self, MappingBackendComputeConfig, MappingBackendInput, MappingBackendKind,
         MappingBackendSpec, MappingKernel,
@@ -17,6 +17,10 @@ use std::{
 };
 use tokio::sync::{oneshot, watch};
 use tonic::Status;
+
+#[path = "correction_worker.rs"]
+mod correction_worker;
+use correction_worker::{CorrectionWorker, Rebuilt};
 
 #[derive(Clone, Debug)]
 pub struct MappingFrame {
@@ -115,6 +119,26 @@ pub struct MapPublication {
     pub fine: Option<Arc<nuwax_map_chunks::SealedMap>>,
     pub forbidden: Option<proto::OccupancyGrid>,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct CorrectedKeyframe {
+    pub stamp: u64,
+    pub local_pose: Isometry3<f64>,
+    pub old: Isometry3<f64>,
+    pub new: Isometry3<f64>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct CorrectionEvent { pub keyframes: Vec<CorrectedKeyframe> }
+#[derive(Clone, Default)]
+pub(crate) struct RecentPublication {
+    pub clear: Option<(u64, Vec<u8>)>,
+    pub frame: Option<Vec<u8>>,
+}
+impl std::ops::Deref for RecentPublication {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.frame.as_deref().unwrap_or_else(|| &self.clear.as_ref().unwrap().1)
+    }
+}
 #[derive(Clone)]
 pub struct Mapper {
     session_id: u64,
@@ -126,11 +150,12 @@ pub struct Mapper {
     fine_root: watch::Receiver<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     errors: watch::Receiver<Option<String>>,
     correction_stopped: watch::Receiver<Option<String>>,
+    correction_events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<CorrectionEvent>>>,
     transform: watch::Receiver<Isometry3<f64>>,
     config: MapperConfig,
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
     forbidden_status: watch::Receiver<Result<(), String>>,
-    recent_cloud: watch::Receiver<Option<Vec<u8>>>,
+    recent_cloud: watch::Receiver<Option<RecentPublication>>,
     raw_grid: watch::Receiver<Option<proto::OccupancyGrid>>,
     worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
@@ -220,9 +245,11 @@ impl Mapper {
             attach_shared,
         )?;
         let correction_stopped = worker.correction_stopped.subscribe();
+        let correction_events = Arc::new(tokio::sync::Mutex::new(worker.correction_receiver.take().unwrap()));
         let worker_handle = std::thread::Builder::new()
             .name(format!("geometry-map-{session_id}"))
             .spawn(move || loop {
+                worker.poll_correction();
                 worker.poll_forbidden();
                 let command = match receiver.recv_timeout(Duration::from_millis(50)) {
                     Ok(command) => command,
@@ -230,6 +257,7 @@ impl Mapper {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 if matches!(command, Command::Shutdown) {
+                    worker.corrector.take();
                     break;
                 }
                 let result = if matches!(command, Command::InputReady) {
@@ -261,6 +289,7 @@ impl Mapper {
             fine_root,
             errors,
             correction_stopped,
+            correction_events,
             transform,
             config,
             forbidden,
@@ -302,6 +331,9 @@ impl Mapper {
     }
     pub fn error_rx(&self) -> watch::Receiver<Option<String>> {
         self.errors.clone()
+    }
+    pub(crate) async fn next_correction_event(&self) -> Option<CorrectionEvent> {
+        self.correction_events.lock().await.recv().await
     }
     pub(crate) fn correction_stopped_rx(&self) -> watch::Receiver<Option<String>> {
         self.correction_stopped.clone()
@@ -347,7 +379,7 @@ impl Mapper {
     pub fn correction_backend(&self) -> &str {
         &self.config.correction_backend
     }
-    pub fn recent_cloud_rx(&self) -> watch::Receiver<Option<Vec<u8>>> {
+    pub fn recent_cloud_rx(&self) -> watch::Receiver<Option<RecentPublication>> {
         self.recent_cloud.clone()
     }
     pub fn forbidden_mask(&self) -> Option<proto::OccupancyGrid> {
@@ -436,8 +468,10 @@ struct Worker {
     maps: watch::Sender<Option<proto::MapUpdate>>,
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     transform: watch::Sender<Isometry3<f64>>,
-    corrector: Corrector,
+    corrector: Option<CorrectionWorker>,
     correction_stopped: watch::Sender<Option<String>>,
+    correction_events: tokio::sync::mpsc::UnboundedSender<CorrectionEvent>,
+    correction_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<CorrectionEvent>>,
     sequence: u64,
     forbidden_path: Option<PathBuf>,
     forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
@@ -451,7 +485,7 @@ struct Worker {
     forbidden_metadata: Option<(SystemTime, u64)>,
     forbidden_checked_at: Instant,
     forbidden_status: watch::Sender<Result<(), String>>,
-    recent_cloud: watch::Sender<Option<Vec<u8>>>,
+    recent_cloud: watch::Sender<Option<RecentPublication>>,
     last_input: Option<MappingBackendInput>,
     raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
     grid_stamp: u64,
@@ -469,7 +503,7 @@ impl Worker {
         fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
         transform: watch::Sender<Isometry3<f64>>,
         forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
-        recent_cloud: watch::Sender<Option<Vec<u8>>>,
+        recent_cloud: watch::Sender<Option<RecentPublication>>,
         raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
         forbidden_status: watch::Sender<Result<(), String>>,
         attach_shared: bool,
@@ -518,7 +552,14 @@ impl Worker {
             .map(PersistentOccupancyGrid::from_grid)
             .transpose()
             .map_err(Status::unavailable)?;
-        let corrector = Corrector::new(&config.correction_backend).map_err(Status::unavailable)?;
+        let corrector = if matches!(config.correction_backend.as_str(), "none" | "relocalization") {
+            None
+        } else {
+            Some(CorrectionWorker::start(session_id, config.clone(),
+                Corrector::new(&config.correction_backend).map_err(Status::unavailable)?)
+                .map_err(Status::unavailable)?)
+        };
+        let (correction_events, correction_receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut value = Self {
             session_id,
             config,
@@ -533,6 +574,8 @@ impl Worker {
             transform,
             corrector,
             correction_stopped: watch::channel(None).0,
+            correction_events,
+            correction_receiver: Some(correction_receiver),
             sequence: 0,
             forbidden_path: None,
             forbidden,
@@ -541,7 +584,7 @@ impl Worker {
             base_anchor: map_from_odom,
             built_timeline: None,
             built_until: 0,
-            built_corrections: Vec::new(),
+            built_corrections: vec![(0, map_from_odom)],
             forbidden_zones: Vec::new(),
             forbidden_metadata: None,
             forbidden_checked_at: Instant::now(),
@@ -707,6 +750,7 @@ impl Worker {
         if frame.session_id != self.session_id {
             return Ok(());
         }
+        self.poll_correction();
         if !self.anchored && !self.read_only {
             let odom = pose_isometry(&frame.odom_pose);
             let (_, _, yaw) = odom.rotation.euler_angles();
@@ -751,7 +795,7 @@ impl Worker {
                 self.map_from_odom,
             )?;
             if !frame.mapping_only {
-                self.recent_cloud.send_replace(Some(encode_recent_cloud(
+                self.publish_recent(encode_recent_cloud(
                     self.sequence,
                     &frame,
                     &points,
@@ -759,7 +803,7 @@ impl Worker {
                     map_from_body,
                     [origin.x, origin.y, origin.z],
                     &self.config,
-                )?));
+                )?);
             }
             return Ok(());
         }
@@ -774,7 +818,7 @@ impl Worker {
             self.stop_correction("扫描记录已达上限，回环校正已停止".into());
         }
         if !frame.mapping_only {
-            self.recent_cloud.send_replace(Some(encode_recent_cloud(
+            self.publish_recent(encode_recent_cloud(
                 self.sequence,
                 &frame,
                 &points,
@@ -782,7 +826,7 @@ impl Worker {
                 map_from_body,
                 [origin.x, origin.y, origin.z],
                 &self.config,
-            )?));
+            )?);
         }
         let input = MappingBackendInput {
             source_timestamp_ns: stamp,
@@ -812,25 +856,55 @@ impl Worker {
         }
         self.last_input = Some(input);
         if committed_this_frame && !frame.mapping_only {
-            let result = self.corrector.process_frame(
-                &frame,
-                &pgo,
-                self.grid.as_ref().map(|g| (&g.grid, self.grid_stamp)),
-                self.base_anchor,
-            ).and_then(|update| {
-                if let Some(update) = update { self.apply_pgo(update)?; }
-                Ok(())
-            });
-            if let Err(error) = result {
-                self.stop_correction(format!("回环校正已停止：{error}"));
+            if let Some(corrector) = &self.corrector {
+                corrector.submit(CorrectionInput::new(&frame, &pgo,
+                    self.grid.as_ref().map(|g| (&g.grid, self.grid_stamp)), self.base_anchor));
             }
         }
         Ok(())
     }
+    fn publish_recent(&self, bytes: Vec<u8>) {
+        let clear = self.recent_cloud.borrow().as_ref().and_then(|value| value.clear.clone());
+        self.recent_cloud.send_replace(Some(RecentPublication { clear, frame: Some(bytes) }));
+    }
     fn stop_correction(&mut self, reason: String) {
         tracing::error!(%reason, "回环校正已停止");
-        self.corrector.stop();
+        if let Some(corrector) = &self.corrector { corrector.request_stop(); }
         self.correction_stopped.send_replace(Some(reason));
+    }
+    fn poll_correction(&mut self) {
+        while let Some(update) = self.corrector.as_ref().and_then(|worker| worker.next()) {
+            let result = match update {
+                correction_worker::Update::Correction(update, reply) => {
+                    if self.is_small(&update) {
+                        self.apply_small(update);
+                        let _ = reply.send(correction_worker::Reply::Adopted);
+                        Ok(())
+                    } else {
+                        self.cloud.replay_prefix().map(|prefix| {
+                            let _ = reply.send(correction_worker::Reply::Replay(prefix));
+                        })
+                    }
+                }
+                correction_worker::Update::Prefix(reply) => self.cloud.replay_prefix().map(|prefix| { let _ = reply.send(prefix); }),
+                correction_worker::Update::Rebuilt(mut rebuilt, reply) => {
+                    self.cloud.replay_prefix().and_then(|prefix| {
+                        if rebuilt.position.remaining(&prefix) > 5 {
+                            let _ = reply.send(correction_worker::Reply::CatchUp(rebuilt, prefix));
+                            return Ok(());
+                        }
+                        rebuilt.replay(&prefix, &std::sync::atomic::AtomicBool::new(false))?;
+                        self.adopt_rebuilt(*rebuilt)?;
+                        let _ = reply.send(correction_worker::Reply::Adopted);
+                        Ok(())
+                    })
+                }
+                correction_worker::Update::Stopped(reason) => Err(reason),
+            };
+            if let Err(reason) = result {
+                self.stop_correction(format!("回环校正已停止：{reason}"));
+            }
+        }
     }
     fn building_correction(&self, stamp: u64) -> Isometry3<f64> {
         if let Some(timeline) = &self.built_timeline {
@@ -841,84 +915,46 @@ impl Worker {
         self.built_corrections.iter().rev()
             .find(|(start, _)| *start <= stamp).unwrap().1
     }
-    fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
-        let small = update.local_poses().all(|(stamp, local_pose)| {
+    fn is_small(&self, update: &PgoUpdate) -> bool {
+        update.local_poses().all(|(stamp, local_pose)| {
             let optimized = update.correction_at(stamp) * local_pose;
             let built = self.building_correction(stamp) * local_pose;
             let delta = built.inverse() * optimized;
             delta.translation.vector.norm() + 10.0 * delta.rotation.angle() < 0.05
-        });
-        if small {
-            self.map_from_odom = update.latest;
-            self.built_corrections.push((self.last_input.as_ref().unwrap().source_timestamp_ns, update.latest));
-            self.transform.send_replace(update.latest);
-            self.publish_pose();
-            return Ok(());
-        }
-        // 原始扫描按优化后的关键帧轨迹逐帧重建，数值内核仍为同一组内核。
-        let frames = self.cloud.replay_frames()?;
-        let mut rebuilt = CloudMap::new(self.session_id, None, None)?;
-        rebuilt.disable_recording();
-        let mut kernel = self
-            .config
-            .backend
-            .into_kernel(self.config.compute.window_capacity);
-        let mut persistent = None;
-        let mut stamp = 0;
-        for (index, frame) in frames.enumerate() {
-            let frame = frame?;
-            stamp = frame.odom_pose.timestamp_ns;
-            let correction = update.correction_at(frame.odom_pose.timestamp_ns);
-            let body = correction * pose_isometry(&frame.odom_pose);
-            let points: Vec<_> = frame
-                .points_body
-                .iter()
-                .map(|p| body * Point3::from(*p))
-                .collect();
-            let origin = body * Point3::from(frame.ray_origin_body);
-            let (dynamic, _, _) = rebuilt.accumulate(
-                index as u64 + 1,
-                &frame,
-                &points,
-                [origin.x, origin.y, origin.z],
-                correction,
-            )?;
-            let input = MappingBackendInput {
-                source_timestamp_ns: frame.odom_pose.timestamp_ns,
-                received_at_ns: frame.odom_pose.timestamp_ns,
-                registered_frame_id: self.config.map_frame_id.clone(),
-                sensor_origin_map: [origin.x, origin.y, origin.z],
-                dynamic_frame: Some(dynamic),
-                registered_points_map: points,
-            };
-            if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
-                &mut kernel,
-                &input,
-                self.config.compute,
-                0,
-            )? {
-                persistent = Some(PersistentOccupancyGrid::stage_observation(
-                    persistent.as_ref(),
-                    &candidate.latest_frame_occupancy,
-                )?);
-            }
-        }
-        rebuilt.adopt_publication(&mut self.cloud)?;
-        self.cloud = rebuilt;
-        self.fine_root.send_replace(self.cloud.surface());
-        self.kernel = Some(kernel);
-        self.grid = persistent;
-        self.grid_stamp = stamp;
+        })
+    }
+    fn apply_small(&mut self, update: PgoUpdate) {
         self.map_from_odom = update.latest;
-        self.built_until = stamp;
+        self.built_corrections.push((self.last_input.as_ref().unwrap().source_timestamp_ns, update.latest));
+        self.transform.send_replace(update.latest);
+        self.publish_pose();
+    }
+    fn adopt_rebuilt(&mut self, mut rebuilt: Rebuilt) -> Result<(), String> {
+        let event = CorrectionEvent { keyframes: rebuilt.update.local_poses().map(|(stamp, local_pose)| {
+            CorrectedKeyframe { stamp, local_pose, old: self.building_correction(stamp),
+                new: rebuilt.update.correction_at(stamp) }
+        }).collect() };
+        rebuilt.cloud.adopt_publication(&mut self.cloud)?;
+        self.cloud = rebuilt.cloud;
+        self.fine_root.send_replace(self.cloud.surface());
+        self.kernel = Some(rebuilt.kernel);
+        self.grid = rebuilt.grid;
+        self.grid_stamp = rebuilt.stamp;
+        self.map_from_odom = rebuilt.update.latest;
+        self.built_until = rebuilt.stamp;
         self.built_corrections.clear();
-        self.built_corrections.push((stamp, update.latest));
-        self.built_timeline = Some(update);
+        self.built_corrections.push((rebuilt.stamp, self.map_from_odom));
+        self.built_timeline = Some(rebuilt.update);
         self.transform.send_replace(self.map_from_odom);
         self.publish_pose();
         if let Err(error) = self.publish_grid() {
             tracing::warn!(%error,"禁行区尚未刷新，等待输入");
         }
+        self.sequence += 1;
+        let bytes = nuwax_codec::lcm::recent_cloud::encode_borrowed(
+            &self.session_id.to_string(), self.sequence as i64, None, None, &[]).map_err(|e| e.to_string())?;
+        self.recent_cloud.send_replace(Some(RecentPublication { clear: Some((self.sequence, bytes)), frame: None }));
+        let _ = self.correction_events.send(event);
         Ok(())
     }
     fn publish_pose(&self) {
@@ -1006,6 +1042,9 @@ impl Worker {
         }));
         Ok(())
     }
+}
+impl Drop for Worker {
+    fn drop(&mut self) { self.corrector.take(); }
 }
 pub fn pose_isometry(pose: &proto::Pose) -> Isometry3<f64> {
     let p = pose.position.clone().unwrap_or_default();

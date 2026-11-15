@@ -61,6 +61,7 @@ pub struct ScanLog {
     pub path: PathBuf,
     session: Session,
     last_stamp: u64,
+    pub scan_count: u64,
 }
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -196,6 +197,7 @@ impl ScanLog {
             .map_err(error)?;
         lock(&file, libc::LOCK_EX | libc::LOCK_NB)?;
         let mut last_stamp = 0;
+        let mut scan_count = 0;
         if file.metadata().map_err(error)?.len() == 0 {
             reserve(root, header.len() as u64 + 64)?;
             file.write_all(&header).map_err(error)?;
@@ -207,6 +209,7 @@ impl ScanLog {
             }
             while let Some(frame) = reader.next_scan()? {
                 last_stamp = frame.metadata.source_timestamp_ns;
+                scan_count += 1;
             }
             if reader.truncated {
                 file.set_len(reader.valid_bytes).map_err(error)?;
@@ -222,6 +225,7 @@ impl ScanLog {
             path,
             session,
             last_stamp,
+            scan_count,
         })
     }
     fn record(&mut self, header: &Record, bytes: &[u8]) -> Result<(), String> {
@@ -283,6 +287,7 @@ impl ScanLog {
             &bytes,
         )?;
         self.last_stamp = metadata.source_timestamp_ns;
+        self.scan_count += 1;
         Ok(())
     }
     pub fn progress(
@@ -312,6 +317,7 @@ pub struct ScanReader {
     pub dropped_frames: u64,
     pub truncated: bool,
     pub valid_bytes: u64,
+    limit: u64,
 }
 impl ScanReader {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -335,7 +341,20 @@ impl ScanReader {
             dropped_frames: 0,
             truncated: false,
             valid_bytes,
+            limit: u64::MAX,
         })
+    }
+    /// 固定扫描前缀，后台重放期间的追加留待下一次追赶。
+    pub fn set_prefix(&mut self, bytes: u64) {
+        self.limit = bytes;
+    }
+    pub fn position(&mut self) -> Result<u64, String> {
+        self.file.stream_position().map_err(error)
+    }
+    pub fn resume_at(&mut self, bytes: u64) -> Result<(), String> {
+        self.file.seek(SeekFrom::Start(bytes)).map_err(error)?;
+        self.valid_bytes = bytes;
+        Ok(())
     }
     pub fn next_scan(&mut self) -> Result<Option<LoggedScan>, String> {
         loop {
@@ -351,7 +370,7 @@ impl ScanReader {
         loop {
             let position = self.file.stream_position().map_err(error)?;
             let Some(size) = self.next_record_size()? else { return Ok(None) };
-            if position + 4 + size as u64 + 32 > self.file.get_ref().metadata().map_err(error)?.len() {
+            if position + 4 + size as u64 + 32 > self.file.get_ref().metadata().map_err(error)?.len().min(self.limit) {
                 self.file.seek(SeekFrom::Start(position)).map_err(error)?;
                 self.next_record()?;
                 return Ok(None);
@@ -424,6 +443,7 @@ impl ScanReader {
         }
     }
     fn next_record_size(&mut self) -> Result<Option<usize>, String> {
+        if self.file.stream_position().map_err(error)? >= self.limit { return Ok(None); }
         let mut size = [0; 4];
         let first = self.file.read(&mut size[..1]).map_err(error)?;
         if first == 0 {
@@ -610,6 +630,32 @@ mod v2_tests {
         assert!(reader.next_scan().unwrap().is_none());
         assert_eq!(reader.observed_until_ns, 30);
         assert!(!reader.truncated);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixed_prefix_and_resume_read_only_newly_committed_scans() {
+        let root = folder("prefix");
+        let mut log = ScanLog::open(&root, Session { session_id: "prefix".into(), generation: 1 }).unwrap();
+        log.append(&metadata(10), [[1., 2., 3.]; 2].into_iter(), None).unwrap();
+        log.progress(10, 0).unwrap();
+        log.sync().unwrap();
+        let prefix = log.path.metadata().unwrap().len();
+        let mut reader = ScanReader::open(&log.path).unwrap();
+        reader.set_prefix(prefix);
+        log.append(&metadata(20), [[4., 5., 6.]; 2].into_iter(), None).unwrap();
+        log.progress(20, 0).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.scan_count, 2);
+        assert_eq!(reader.next_scan().unwrap().unwrap().metadata.source_timestamp_ns, 10);
+        assert!(reader.next_scan().unwrap().is_none());
+        assert_eq!(reader.position().unwrap(), prefix);
+        let mut resumed = ScanReader::open(&log.path).unwrap();
+        resumed.set_prefix(log.path.metadata().unwrap().len());
+        resumed.resume_at(prefix).unwrap();
+        assert_eq!(resumed.next_scan().unwrap().unwrap().metadata.source_timestamp_ns, 20);
+        assert!(resumed.next_scan().unwrap().is_none());
         drop(log);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -903,7 +903,6 @@ impl Worker {
                 )?);
             }
         }
-        let publication = self.prepare_grid(persistent.as_ref(), stamp)?;
         rebuilt.adopt_publication(&mut self.cloud)?;
         self.cloud = rebuilt;
         self.fine_root.send_replace(self.cloud.surface());
@@ -917,7 +916,9 @@ impl Worker {
         self.built_timeline = Some(update);
         self.transform.send_replace(self.map_from_odom);
         self.publish_pose();
-        self.send_grid(publication);
+        if let Err(error) = self.publish_grid() {
+            tracing::warn!(%error,"禁行区尚未刷新，等待输入");
+        }
         Ok(())
     }
     fn publish_pose(&self) {
@@ -975,18 +976,12 @@ impl Worker {
         })
     }
     fn publish_grid(&mut self) -> Result<(), String> {
-        let publication = self.prepare_grid(self.grid.as_ref(), self.grid_stamp)?;
-        self.send_grid(publication);
-        Ok(())
-    }
-    fn prepare_grid(&self, grid: Option<&PersistentOccupancyGrid>, stamp: u64)
-        -> Result<Option<(proto::OccupancyGrid, proto::OccupancyGrid, proto::MapUpdate)>, String>
-    {
-        let Some(grid) = grid else {
-            return Ok(None);
+        let Some(grid) = self.grid.as_ref() else {
+            return Ok(());
         };
         let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
-        raw.meta.as_mut().unwrap().timestamp_ns = stamp;
+        raw.meta.as_mut().unwrap().timestamp_ns = self.grid_stamp;
+        self.raw_grid.send_replace(Some(raw.clone()));
         let mut data = raw.data.clone();
         let mut mask = vec![0; data.len()];
         self.forbidden_status.borrow().clone()?;
@@ -998,25 +993,18 @@ impl Worker {
                 }
             }
         }
-        let forbidden = proto::OccupancyGrid {
+        self.forbidden.send_replace(Some(proto::OccupancyGrid {
             map_name: raw.map_name.clone(),
             meta: raw.meta.clone(),
             data: mask,
-        };
-        let map = proto::MapUpdate {
-            map_name: raw.map_name.clone(),
-            meta: raw.meta.clone(),
+        }));
+        self.maps.send_replace(Some(proto::MapUpdate {
+            map_name: raw.map_name,
+            meta: raw.meta,
             data,
-            raw_data: raw.data.clone(),
-        };
-        Ok(Some((raw, forbidden, map)))
-    }
-    fn send_grid(&self, publication: Option<(proto::OccupancyGrid, proto::OccupancyGrid, proto::MapUpdate)>) {
-        if let Some((raw, forbidden, map)) = publication {
-            self.raw_grid.send_replace(Some(raw));
-            self.forbidden.send_replace(Some(forbidden));
-            self.maps.send_replace(Some(map));
-        }
+            raw_data: raw.data,
+        }));
+        Ok(())
     }
 }
 pub fn pose_isometry(pose: &proto::Pose) -> Isometry3<f64> {

@@ -80,32 +80,76 @@ fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
 }
 
 #[test]
-fn failed_replay_or_publication_preserves_the_current_map() {
-    for publication_failure in [false, true] {
-        let mut worker = Worker::new(
-            938, config(), None, false,
-            watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
-        ).unwrap();
-        worker.frame(room_frame(938, 1_000_000_000)).unwrap();
-        let before = worker.snapshot().unwrap();
-        if publication_failure {
-            let _ = worker.forbidden_status.send_replace(Err("测试发布准备失败".into()));
-        } else {
-            let (path, _) = &before.scans[0];
-            let mut bytes = std::fs::read(path).unwrap();
-            *bytes.last_mut().unwrap() ^= 1;
-            std::fs::write(path, bytes).unwrap();
+fn failed_replay_preserves_the_current_map() {
+    let mut worker = Worker::new(
+        938, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    worker.frame(room_frame(938, 1_000_000_000)).unwrap();
+    let before = worker.snapshot().unwrap();
+    let (path, _) = &before.scans[0];
+    let mut bytes = std::fs::read(path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    assert!(worker.apply_pgo(PgoUpdate::constant_for_test(1_000_000_000,
+        Isometry3::translation(0.2, 0., 0.))).is_err());
+    assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
+    assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+    assert_eq!(isometry_matrix(&worker.map_from_odom), before.map_from_odom);
+    assert_eq!(worker.maps.borrow().as_ref().unwrap().raw_data,
+        before.occupancy.as_ref().unwrap().data);
+}
+
+#[test]
+fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates() {
+    use std::{io::Write, sync::{Arc, Mutex}};
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
         }
-        assert!(worker.apply_pgo(PgoUpdate::constant_for_test(1_000_000_000,
-            Isometry3::translation(0.2, 0., 0.))).is_err());
-        assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
-        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
-        assert_eq!(isometry_matrix(&worker.map_from_odom), before.map_from_odom);
-        assert_eq!(worker.maps.borrow().as_ref().unwrap().raw_data,
-            before.occupancy.as_ref().unwrap().data);
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
+    let mut worker = Worker::new(
+        948, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    worker.frame(room_frame(948, first)).unwrap();
+    let before = worker.cloud.snapshot().revision;
+    let mut physical = worker.raw_grid.subscribe();
+    let _ = worker.forbidden_status.send_replace(Err("测试禁行区读取失败".into()));
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogBuffer(buffer.clone());
+    let subscriber = tracing_subscriber::fmt().json().with_ansi(false)
+        .with_writer(move || writer.clone()).finish();
+    tracing::subscriber::with_default(subscriber, || {
+        worker.apply_pgo(PgoUpdate::constant_for_test(first,
+            Isometry3::translation(0.2, 0., 0.)))
+    }).expect("禁行区发布失败不能使已完成重建的校正失败");
+    assert_eq!(worker.cloud.snapshot().revision, before + 1);
+    assert_eq!(worker.map_from_odom, Isometry3::translation(0.2, 0., 0.));
+    assert!(physical.has_changed().unwrap());
+    let mut expected = kernel_grid_to_proto(&worker.grid.as_ref().unwrap().grid, &worker.config.map_name);
+    expected.meta.as_mut().unwrap().timestamp_ns = worker.grid_stamp;
+    assert_eq!(physical.borrow_and_update().as_ref(), Some(&expected));
+    assert!(worker.correction_stopped.borrow().is_none());
+    let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let warnings: Vec<serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|row: &serde_json::Value| row["fields"]["message"] == "禁行区尚未刷新，等待输入").collect();
+    assert_eq!(warnings.len(), 1, "重放后只记录一次禁行区警告：{text}");
+    assert_eq!(warnings[0]["level"], "WARN");
+    worker.frame(room_frame(948, first + 1_000_000_000)).unwrap();
+    assert!(physical.has_changed().unwrap(), "后续在线帧也须先更新物理栅格");
+    assert_eq!(physical.borrow().as_ref().unwrap().meta.as_ref().unwrap().timestamp_ns,
+        first + 1_000_000_000);
+    assert!(worker.failure.is_none());
 }
 
 #[test]

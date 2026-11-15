@@ -141,6 +141,7 @@ impl FrameRouter {
 }
 
 pub(crate) enum SessionIssue {
+    Correction(crate::mapper::CorrectionEvent),
     Fault(String),
     Output(String),
 }
@@ -234,6 +235,8 @@ impl SessionHandle {
             lio: lio_tx,
             nav,
             explorer: None,
+            last_correction: None,
+            navigation_goal: None,
         };
         tokio::spawn(actor.run(command_rx, fault_rx, nav_rx));
         Ok(Self {
@@ -404,6 +407,8 @@ struct Session {
     lio: watch::Sender<Option<Arc<Lio>>>,
     nav: NavBridge,
     explorer: Option<ExplorerWorker>,
+    last_correction: Option<crate::mapper::CorrectionEvent>,
+    navigation_goal: Option<(NavigationGoal, Vec<[f64; 2]>)>,
 }
 impl Session {
     async fn run(
@@ -436,6 +441,7 @@ impl Session {
                 Some((id, issue)) = faults.recv() => {
                     if id != self.router.session_id() { continue; }
                     match issue {
+                        SessionIssue::Correction(event) => self.apply_correction(event).await,
                         SessionIssue::Fault(reason) => self.fail(reason).await,
                         SessionIssue::Output(reason)
                             if self.phase() != SessionPhase::Fault
@@ -509,6 +515,7 @@ impl Session {
             .ok_or_else(|| Status::unavailable("输入子系统未运行"))
     }
     fn install(&mut self, mapper: Arc<Mapper>, phase: SessionPhase) {
+        self.last_correction = None;
         self.state.phase = phase as i32;
         self.state.view_only = mapper.planar_view_only();
         self.route.send_replace(Some(Route {
@@ -849,11 +856,34 @@ impl Session {
         if let Err(reason) = &refreshed {
             self.state.navigation.as_mut().unwrap().message = reason.clone();
         }
+        self.navigation_goal = Some((goal.clone(), Vec::new()));
         if let Err(error) = self.nav.submit(id.clone(), goal, false).await {
             self.navigation_failed(error.message().into());
         }
         self.nav.set_input_ready(self.navigation_input_status(&mapper, true, refreshed));
         Ok(SetGoalResponse { goal_id: id })
+    }
+    async fn apply_correction(&mut self, event: crate::mapper::CorrectionEvent) {
+        self.last_correction = Some(event.clone());
+        let Some(status) = self.state.navigation.as_mut().filter(|status| !terminal(status.status)) else { return };
+        let target = status.target.as_ref().unwrap();
+        let position = crate::mapper::pose_isometry(target).translation.vector;
+        let nearest = event.keyframes.iter().min_by(|a, b| {
+            let distance = |keyframe: &crate::mapper::CorrectedKeyframe| {
+                ((keyframe.old * keyframe.local_pose).translation.vector - position).norm_squared()
+            };
+            distance(a).total_cmp(&distance(b))
+        }).unwrap();
+        let pose = crate::mapper::pose_from_isometry(
+            nearest.new * nearest.old.inverse() * crate::mapper::pose_isometry(target),
+            &target.frame_id, target.timestamp_ns);
+        status.target = Some(pose.clone());
+        let (goal, boundary) = self.navigation_goal.as_mut().unwrap();
+        goal.pose = Some(pose);
+        if let Err(error) = self.nav.submit_with_boundary(status.goal_id.clone(), goal.clone(),
+            status.exploration_child, boundary.clone()).await {
+            self.navigation_failed(error.message().into());
+        }
     }
     fn replace_navigation(&mut self) {
         if let Some(old) = self.state.navigation.as_mut() {
@@ -1012,6 +1042,7 @@ impl Session {
                 exploration_child: true,
                 ..Default::default()
             });
+            self.navigation_goal = Some((goal.clone(), update.boundary.clone()));
             if let Err(error) = self
                 .nav
                 .submit_with_boundary(id, goal, true, update.boundary)
@@ -1158,6 +1189,11 @@ async fn forward_maps(
                     changed = errors.changed() => {
                         if changed.is_err() { break; }
                         if let Some(reason) = errors.borrow_and_update().clone() { let _ = faults.send((route.id, SessionIssue::Fault(reason))); }
+                    },
+                    event = route.mapper.next_correction_event() => {
+                        if let Some(event) = event {
+                            let _ = faults.send((route.id, SessionIssue::Correction(event)));
+                        }
                     },
                     changed = correction_stopped.changed() => {
                         if changed.is_err() { break; }

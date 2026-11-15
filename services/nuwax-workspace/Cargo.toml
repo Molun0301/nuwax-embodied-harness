@@ -32,9 +32,6 @@ members = [
     "crates/nuwax-exploration",
     "crates/nuwax-explore-routing",
     "crates/nuwax-explore-wavefront",
-    "crates/nuwax-explore-tare-bridge",
-    "crates/nuwax-explore-terrain-bridge",
-    "crates/nuwax-explore-terrain-map-bridge",
     # 导航协议、原生进程运行器与测试夹具
     "crates/nuwax-nav-types-messages",
     "crates/nuwax-nav-base",

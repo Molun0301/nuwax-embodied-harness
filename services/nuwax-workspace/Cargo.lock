@@ -1622,13 +1622,10 @@ name = "nuwax-exploration"
 version = "0.1.0"
 dependencies = [
  "nuwax-explore-routing",
- "nuwax-explore-tare-bridge",
- "nuwax-explore-terrain-map-bridge",
  "nuwax-explore-wavefront",
  "nuwax-map-chunks",
  "nuwax-nav-base",
  "nuwax-nav-mls-planner",
- "nuwax-nav-native-runner",
  "nuwax-nav-patrolling",
  "nuwax-nav-pct-native",
  "nuwax-nav-runtime",
@@ -1645,48 +1642,6 @@ name = "nuwax-explore-routing"
 version = "0.1.0"
 dependencies = [
  "nuwax-nav-types-messages",
- "serde",
-]
-
-[[package]]
-name = "nuwax-explore-tare-bridge"
-version = "0.1.0"
-dependencies = [
- "nuwax-nav-base",
- "nuwax-nav-native-runner",
- "nuwax-nav-test-fixtures",
- "nuwax-nav-types-messages",
- "pretty_assertions",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nuwax-explore-terrain-bridge"
-version = "0.1.0"
-dependencies = [
- "nuwax-nav-base",
- "nuwax-nav-native-runner",
- "nuwax-nav-test-fixtures",
- "nuwax-nav-types-messages",
- "pretty_assertions",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nuwax-explore-terrain-map-bridge"
-version = "0.1.0"
-dependencies = [
- "nuwax-nav-terrain-map-ext",
  "serde",
 ]
 
@@ -2117,9 +2072,6 @@ dependencies = [
  "nuwax-codec",
  "nuwax-config",
  "nuwax-core",
- "nuwax-exploration",
- "nuwax-explore-tare-bridge",
- "nuwax-explore-terrain-bridge",
  "nuwax-explore-wavefront",
  "nuwax-map-chunks",
  "nuwax-motion-safety-guard",

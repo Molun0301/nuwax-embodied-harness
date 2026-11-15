@@ -1,7 +1,7 @@
 //! `FrontierGoal` -> 导航 / patrolling 类型 唯一转换入口(方案 §8.3)
 //!
 //! 跨导航转换统一放在 `nuwax-exploration::conversions`;`nuwax-explore-wavefront`
-//! 与 `nuwax-explore-tare-bridge` 都不依赖 `nuwax-nav-patrolling`。
+//! 不依赖 `nuwax-nav-patrolling`。
 //!
 //! 由于 Rust orphan rule,`FrontierGoal` 与 `NavigationGoal` / `FrontierGoalInput`
 //! 都定义在 `nuwax-nav-types-messages`,所以**不能**实现 `impl From<FrontierGoal>`。

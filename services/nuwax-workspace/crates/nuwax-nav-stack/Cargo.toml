@@ -55,7 +55,7 @@ replanning-astar = [
 # `native-runner` 是 `nuwax-nav-native-runner` 的显式 feature 名称,
 # 供源码内 `#[cfg(feature = "native-runner")]` 引用;真正的 binary spec 类型
 # 仍由 `dep:nuwax-nav-native-runner` 显式打开。
-native-runner = ["dep:nuwax-nav-native-runner", "dep:nuwax-exploration"]
+native-runner = ["dep:nuwax-nav-native-runner"]
 native-far = [
     "native-runner",
     "dep:nuwax-nav-far-planner-bridge",
@@ -71,14 +71,6 @@ native-path-follower = [
 native-pgo = [
     "native-runner",
     "dep:nuwax-nav-pgo-bridge",
-]
-native-terrain = [
-    "native-runner",
-    "dep:nuwax-explore-terrain-bridge",
-]
-native-tare = [
-    "native-runner",
-    "dep:nuwax-explore-tare-bridge",
 ]
 
 # ---- 行为层 crate(可选)----
@@ -103,8 +95,6 @@ explore = [
     "native-local",
     "native-path-follower",
     "native-pgo",
-    "native-terrain",
-    "native-tare",
     "movement-manager",
     "dep:nuwax-nav-terrain-map-ext",
     "dep:nuwax-explore-wavefront",
@@ -114,7 +104,6 @@ cmu-native = [
     "native-local",
     "native-path-follower",
     "native-pgo",
-    "native-terrain",
     "movement-manager",
     "dep:nuwax-nav-terrain-map-ext",
 ]
@@ -156,7 +145,6 @@ nuwax-transport = { path = "../nuwax-transport", optional = true }
 
 # ---- 现有可选任务的依赖 ----
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
-nuwax-exploration = { path = "../nuwax-exploration", optional = true, features = ["spec-summary"] }
 nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true, features = ["runtime"] }
 
 # ---- Pure Rust 算法类(可选)----
@@ -172,8 +160,6 @@ nuwax-nav-path-follower-bridge = { path = "../nuwax-nav-path-follower-bridge", o
 nuwax-nav-pgo-bridge = { path = "../nuwax-nav-pgo-bridge", optional = true }
 
 # ---- Explore bridge(可选,typed native spec 来源)----
-nuwax-explore-terrain-bridge = { path = "../nuwax-explore-terrain-bridge", optional = true }
-nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }
 
 # ---- 行为层 crate(可选)----
 nuwax-nav-basic-path-follower = { path = "../nuwax-nav-basic-path-follower", optional = true }

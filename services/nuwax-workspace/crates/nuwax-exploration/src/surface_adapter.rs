@@ -11,12 +11,7 @@ use nuwax_nav_types_messages::visual::FrontierGoal;
 use crate::{
     ExplorationBoundary, ExplorationGoalFeedback, ExplorationGoalSource, ExplorationPoll,
     ExplorationSourceDiagnostics, ExplorationStateSnapshot, ExploreError, ExploreResult,
-    PreparedExplorationPoll,
 };
-
-#[path = "surface_selection_qualification.rs"]
-mod selection_qualification;
-pub use selection_qualification::SurfaceSelectionQualification;
 
 /// 根拥有方注入的几何引用；地图身份、真实时效及域切换仍由注入方负责。
 #[derive(Clone, Default)]
@@ -77,9 +72,8 @@ impl SurfaceInputReceiver {
         self.freeze().map(|input| input.snapshot)
     }
 
-    /// Freeze the original source and its exact notification atomically. Keep this
-    /// value for planning and qualification rather than re-reading the receiver.
-    pub fn freeze(&self) -> ExploreResult<FrozenSurfaceInput> {
+    /// 在同一把读锁下取得曲面和观测通知，供本次同步选点使用。
+    fn freeze(&self) -> ExploreResult<FrozenSurfaceInput> {
         let current = self.current.read().map_err(|_| input_lock_error())?;
         Ok(FrozenSurfaceInput {
             snapshot: current.clone(),
@@ -100,86 +94,9 @@ fn input_lock_error() -> ExploreError {
 /// Original source and notification sampled under one receiver read lock.
 /// Cloning this value does not refresh source time or consume an observation.
 #[derive(Clone, Debug)]
-pub struct FrozenSurfaceInput {
+struct FrozenSurfaceInput {
     snapshot: Option<Arc<SurfaceSnapshot>>,
     notification: u64,
-}
-
-impl FrozenSurfaceInput {
-    /// The original immutable input, never a private planning fork.
-    pub fn snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
-        self.snapshot.as_ref()
-    }
-
-    /// Exact captured observation counter, retained until the proposal is resolved.
-    pub fn notification(&self) -> u64 {
-        self.notification
-    }
-
-    /// Bind this exact source/notification pair to a private planning-cache fork.
-    /// No arbitrary query snapshot can be substituted into the resulting input.
-    pub fn fork_for_planning(&self) -> FrozenSurfacePlanningInput {
-        FrozenSurfacePlanningInput {
-            original: self.clone(),
-            native_cache: Arc::new(NativeFrontierCache::default()),
-            revalidation_advice: false,
-            selection_qualification: Arc::new(Mutex::new(None)),
-            query_view: self
-                .snapshot
-                .as_ref()
-                .map(|snapshot| Arc::new(snapshot.fork_for_planning())),
-        }
-    }
-
-    /// Compare only Explore's derived query inputs. Raw evidence and captured
-    /// notifications may differ; source identity and lifecycle checks stay separate.
-    pub fn same_planning_query_view(&self, other: &Self) -> bool {
-        self.planning_query_change(other).is_none()
-    }
-
-    /// 保留原查询相等规则，供事务拥有方区分具体失效组成。
-    pub fn planning_query_change(&self, other: &Self) -> Option<&'static str> {
-        match (&self.snapshot, &other.snapshot) {
-            (Some(left), Some(right)) => left.planning_query_change(right),
-            (None, None) => None,
-            _ => Some("surface_presence"),
-        }
-    }
-
-    /// Compare original source evidence without confusing a receipt refresh with
-    /// changed geometry, observations, current-body support, or ground evidence.
-    pub fn same_source_view(&self, other: &Self) -> bool {
-        match (&self.snapshot, &other.snapshot) {
-            (Some(left), Some(right)) => left.same_body_query_view(right),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-}
-
-/// An opaque original-input/private-query pair for one captured observation.
-/// 首次只能由 [`FrozenSurfaceInput::fork_for_planning`] 构造；后续仅允许
-/// [`Self::rebind_original`] 重新绑定查询等价的源，私有字段仍禁止注入无关查询图。
-///
-/// ```
-/// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
-/// let original = SurfaceInputReceiver::new().freeze().unwrap();
-/// let planning: FrozenSurfacePlanningInput = original.fork_for_planning();
-/// assert_eq!(planning.original_input().notification(), original.notification());
-/// ```
-///
-/// ```compile_fail
-/// use nuwax_exploration::surface_adapter::{FrozenSurfacePlanningInput, SurfaceInputReceiver};
-/// let original = SurfaceInputReceiver::new().freeze().unwrap();
-/// let forged = FrozenSurfacePlanningInput { original, query_view: None };
-/// ```
-#[derive(Clone, Debug)]
-pub struct FrozenSurfacePlanningInput {
-    original: FrozenSurfaceInput,
-    query_view: Option<Arc<SurfaceSnapshot>>,
-    native_cache: Arc<NativeFrontierCache>,
-    revalidation_advice: bool,
-    selection_qualification: Arc<Mutex<Option<SurfaceSelectionQualification>>>,
 }
 
 #[derive(Clone)]
@@ -258,50 +175,7 @@ impl NativeFrontierCache {
     }
 }
 
-impl FrozenSurfacePlanningInput {
-    /// 查询等价的源可复用私有查询，但必须保留本次捕获的来源和通知。
-    /// 私有查询仍含旧冻结 raw 证据；最新 raw 证据须从 original_input 读取。
-    /// 不读取接收器或源缓存；配置/生命周期资格仍由唯一查询拥有方负责。
-    pub fn rebind_original(&self, captured: &FrozenSurfaceInput) -> Option<Self> {
-        if self.query_view.is_none() || !self.original.same_planning_query_view(captured) {
-            return None;
-        }
-        Some(Self {
-            original: captured.clone(),
-            query_view: self.query_view.clone(),
-            native_cache: Arc::clone(&self.native_cache),
-            revalidation_advice: self.revalidation_advice,
-            selection_qualification: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    /// 原事务仍须结算；唯一计算拥有方可在新源上优先重核不含结论的搜索提示。
-    /// 普通准备/丢弃调用默认不启用，保留其重复计算与事务副作用合同。
-    pub fn with_revalidation_advice(mut self) -> Self {
-        self.revalidation_advice = true;
-        self
-    }
-
-    /// Qualify against the captured ORIGINAL source, never the private query fork.
-    /// This borrow cannot change the source or captured notification.
-    pub fn original_input(&self) -> &FrozenSurfaceInput {
-        &self.original
-    }
-
-    /// Read the same private query owner used for selection, for related route advice.
-    /// After a qualified rebind its raw evidence can remain older than original_input.
-    pub fn query_snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
-        self.query_view.as_ref()
-    }
-
-    /// 只有实际完成当前候选完整路线复核的来源才会产生这份提交依据。
-    pub fn selection_qualification(&self) -> Option<SurfaceSelectionQualification> {
-        self.selection_qualification.lock().unwrap().clone()
-    }
-}
-
-// A field is absent when the old sequential poll would not have touched it.
-// History and regional service rounds are feedback-only and are never cloned.
+// 同步计算只记录本次实际变化的字段，反馈历史不参与复制。
 #[derive(Default)]
 struct SurfacePollDelta {
     next_goal_id: Option<u64>,
@@ -318,8 +192,6 @@ struct SurfacePollDelta {
     frontier_count: Option<usize>,
     last_error: Option<Option<String>>,
     regional: Option<nuwax_explore_routing::RegionalPresenceDelta>,
-    // 仅是下一次搜索的顺序，不写入控制器历史或提交检查点。
-    next_search_offset: Option<usize>,
 }
 
 impl SurfacePollDelta {
@@ -374,20 +246,6 @@ impl SurfacePollDelta {
     }
 }
 
-struct PendingSurfacePoll {
-    outcome: ExploreResult<ExplorationPoll>,
-    delta: SurfacePollDelta,
-    search_hint: Option<SurfaceSearchHint>,
-}
-
-/// 不含路线、收益、负面结论或许可的有界工作提示，原地图仅保留弱引用。
-#[derive(Clone)]
-struct SurfaceSearchHint {
-    source: Weak<SurfaceSnapshot>,
-    candidate: Option<([f64; 3], [f64; 4])>,
-    next_offset: usize,
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GoalHistory {
@@ -436,8 +294,6 @@ pub struct SurfaceGoalSourceAdapter {
     last_frontiers: Vec<FrontierGoal>,
     frontier_count: usize,
     last_error: Option<String>,
-    prepared_poll: Option<PendingSurfacePoll>,
-    search_hint: Option<SurfaceSearchHint>,
 }
 
 impl SurfaceGoalSourceAdapter {
@@ -479,8 +335,6 @@ impl SurfaceGoalSourceAdapter {
             last_frontiers: Vec::new(),
             frontier_count: 0,
             last_error: None,
-            prepared_poll: None,
-            search_hint: None,
         })
     }
 
@@ -489,14 +343,12 @@ impl SurfaceGoalSourceAdapter {
         &mut self,
         model: nuwax_nav_types_messages::ObservationModel,
     ) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         model.validate().map_err(ExploreError::SourceError)?;
         if model.kind != nuwax_nav_types_messages::ObservationKind::Volume {
             return Err(ExploreError::SourceError("三维源要求空间观察标定".into()));
         }
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         self.observation_model = Some(model);
         self.last_no_frontier = false;
         self.last_snapshot = None;
@@ -510,7 +362,6 @@ impl SurfaceGoalSourceAdapter {
         max_navigation_retries: u32,
         blacklist_radius_m: f64,
     ) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         if !blacklist_radius_m.is_finite() || blacklist_radius_m < 0.0 {
             return Err(ExploreError::SourceError(
                 "surface blacklist radius must be finite and nonnegative".into(),
@@ -518,7 +369,6 @@ impl SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         self.boundary = boundary;
         self.max_navigation_retries = max_navigation_retries;
         self.blacklist_radius_m = blacklist_radius_m;
@@ -530,73 +380,25 @@ impl SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    fn ensure_no_prepared_poll(&self) -> ExploreResult<()> {
-        if self.prepared_poll.is_some() {
-            Err(ExploreError::PreparedPollBusy)
-        } else {
-            Ok(())
+    fn poll_current_input(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExploreResult<ExplorationPoll> {
+        if !self.active {
+            let reason = "surface source is not active".to_string();
+            self.last_error = Some(reason.clone());
+            self.last_frontiers.clear();
+            return Ok(ExplorationPoll::SourceUnavailable(reason));
         }
-    }
-
-    /// Evaluate only this atomically frozen source/notification pair. The live
-    /// receiver is never consulted again, including at commit.
-    pub fn prepare_poll_with_input(
-        &mut self,
-        state: &ExplorationStateSnapshot<'_>,
-        input: &FrozenSurfaceInput,
-    ) -> ExploreResult<PreparedExplorationPoll> {
-        self.ensure_no_prepared_poll()?;
+        if self.selected.is_some() { return Ok(ExplorationPoll::Pending); }
+        let input = self.receiver.freeze()?;
         let mut delta = SurfacePollDelta::default();
-        let outcome = self.evaluate_poll(state, input, None, &mut delta);
-        Ok(self.stage_poll(outcome, delta, false))
-    }
-
-    fn stage_poll(
-        &mut self,
-        outcome: ExploreResult<ExplorationPoll>,
-        delta: SurfacePollDelta,
-        retain_hint: bool,
-    ) -> PreparedExplorationPoll {
-        let preview = PreparedExplorationPoll::new(outcome.clone());
-        let search_hint = if retain_hint { delta.last_snapshot.as_ref().and_then(|source| source.clone()).and_then(|source| {
-            let candidate = match &outcome {
-                Ok(ExplorationPoll::Goal(goal)) => delta.selected.as_ref().and_then(|selected| selected.as_ref()).map(|selected| {
-                    let q=goal.pose.pose.orientation;
-                    (selected.support_xyz, [q.x,q.y,q.z,q.w])
-                }),
-                Ok(ExplorationPoll::Pending) => None,
-                _ => return None,
-            };
-            let next_offset=if matches!(outcome,Ok(ExplorationPoll::Pending)) {
-                delta.deferred_route.as_ref().and_then(|route|route.as_ref())
-                    .map(|route|route.rotation_offset+route.resume_cursor)
-                    .or(delta.next_search_offset).unwrap_or(0)
-            } else {delta.next_search_offset.unwrap_or(0)};
-            Some(SurfaceSearchHint { source, candidate, next_offset })
-        }) } else { None };
-        self.prepared_poll = Some(PendingSurfacePoll { outcome, delta, search_hint });
-        preview
-    }
-
-    /// Evaluate a private fork bound to its original source and exact notification.
-    /// The opaque input prevents accidental injection of an unrelated query map;
-    /// current-source qualification must use its `original_input()` accessor.
-    pub fn prepare_poll_with_planning_input(
-        &mut self,
-        state: &ExplorationStateSnapshot<'_>,
-        input: &FrozenSurfacePlanningInput,
-    ) -> ExploreResult<PreparedExplorationPoll> {
-        self.ensure_no_prepared_poll()?;
-        let mut delta = SurfacePollDelta::default();
-        let outcome = self.evaluate_poll(state, &input.original, Some(input), &mut delta);
-        Ok(self.stage_poll(outcome, delta, input.revalidation_advice))
+        let outcome = self.evaluate_poll(state, &input, &mut delta);
+        delta.commit(self);
+        outcome
     }
 
     fn evaluate_poll(
         &self,
         state: &ExplorationStateSnapshot<'_>,
         input: &FrozenSurfaceInput,
-        planning: Option<&FrozenSurfacePlanningInput>,
         delta: &mut SurfacePollDelta,
     ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
@@ -642,14 +444,6 @@ impl SurfaceGoalSourceAdapter {
                             .max(source_snapshot.config().voxel_size),
                     )
         });
-        let search_hint = self.search_hint.as_ref().filter(|hint| {
-            planning.is_some_and(|input|input.revalidation_advice)
-                // 失败反馈只保留重试优先级，不撤销换图后的未完成搜索顺序。
-                // 提示不携带旧可达结论，下面仍以当前输入重核候选及完整路线。
-                && deferred.is_none()
-                && (hint.candidate.is_some() || hint.source.upgrade().is_none_or(|previous|
-                    !previous.same_planning_query_view(source_snapshot)))
-        });
         let continuing =
             (!new_snapshot && same_query && self.route_cursor > 0) || deferred.is_some();
         let selecting = new_snapshot || continuing || deferred.is_some();
@@ -663,20 +457,11 @@ impl SurfaceGoalSourceAdapter {
                 .map(|point| [point.x, point.y])
                 .collect()
         });
-        // Existing synchronous callers retain their cache behavior. A compute owner
-        // may supply private caches, but all identity tests and consumption stamps
-        // still refer to the original frozen source, never its planning fork.
-        let query_view = planning.and_then(FrozenSurfacePlanningInput::query_snapshot);
-        let snapshot = query_view.unwrap_or(source_snapshot);
+        let snapshot = source_snapshot;
         let compute_started = std::time::Instant::now();
-        // An unchanged-input wait cannot select a frontier. Its private fork
-        // will be discarded, so only retain the required body/support checks
-        // below. Synchronous callers keep their original cache behavior.
-        if query_view.is_none() || selecting || self.retry_support.is_some() {
-            snapshot
-                .prepare_frontier_geometry(&boundary)
-                .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        }
+        snapshot
+            .prepare_frontier_geometry(&boundary)
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let geometry_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
         let current_body = ([position.x, position.y, position.z], quaternion);
         // This is only a calibrated planning reference. It neither inserts a
@@ -719,8 +504,7 @@ impl SurfaceGoalSourceAdapter {
         let native_started = std::time::Instant::now();
         // 前沿路线使用与导航相同的原生实测层与占据输入，缺测不补造可通行节点。
         let uncached = NativeFrontierCache::default();
-        let cache = planning.map_or(&uncached, |input| input.native_cache.as_ref());
-        let native = cache
+        let native = uncached
             .get(snapshot, self.body_to_support_z_m, &boundary)
             .map_err(ExploreError::SourceError)?;
         for candidate in &mut candidates {
@@ -788,25 +572,12 @@ impl SurfaceGoalSourceAdapter {
         let native_ms = native_started.elapsed().as_secs_f64() * 1000.0;
         let ranking_started = std::time::Instant::now();
         let mut evaluated_candidate_count = 0;
-        // 提示的核验也计入原128候选和64查询，不额外增加额度。
+        // 保留原128候选和64次路线查询额度。
         let mut route_budget = FrontierRouteBudget { reserved: 1, ..Default::default() };
-        if let Some((support, orientation)) = search_hint.and_then(|hint| hint.candidate) {
-            let key=|point:[f64;3]| point.map(|value|(value/f64::from(snapshot.config().voxel_size)).floor() as i32);
-            if let Some(candidate)=candidates.iter().find(|candidate|key(candidate.support_xyz)==key(support)) {
-                evaluated_candidate_count += 1;
-                if let Some(goal)=self.revalidate_candidate(state,snapshot,current_body,robot_support,
-                    candidate.clone(),orientation,&observation_targets,&boundary,vertical_radius,
-                    &mut planner_guard,&route_budget,delta,planning,&native)? {
-                    return Ok(ExplorationPoll::Goal(goal));
-                }
-            }
-        }
-        let hint_exact_queries=route_budget.queries.get();
-        let mut route_query_count = hint_exact_queries;
+        let mut route_query_count = 0;
         let mut admissible = Vec::new();
         let mut accepted_regions = std::collections::BTreeSet::new();
-        let rotation_offset = deferred.map(|route|route.rotation_offset)
-            .or_else(||search_hint.map(|hint|hint.next_offset)).unwrap_or(0)
+        let rotation_offset = deferred.map(|route|route.rotation_offset).unwrap_or(0)
             % candidates.len().max(1);
         candidates.rotate_left(rotation_offset);
         let mut search = planner_guard.multi_goal_search().map_err(ExploreError::SourceError)?;
@@ -827,7 +598,6 @@ impl SurfaceGoalSourceAdapter {
         delta.deferred_route = Some(None);
         for (ordinal, mut candidate) in candidates.into_iter().enumerate().skip(cursor) {
             examined_route_cursor = ordinal + 1;
-            delta.next_search_offset = Some(rotation_offset + examined_route_cursor);
             if nuwax_nav_pct_native::planning_cancelled() {
                 return Err(ExploreError::SourceError(
                     "frontier planning cancelled".into(),
@@ -1021,20 +791,6 @@ impl SurfaceGoalSourceAdapter {
                     <= f64::from(snapshot.config().voxel_size) * 0.25
             })
         });
-        #[cfg(test)]
-        tests::VIEW_TRANSFER.with(|counts| {
-            counts.set((
-                admissible.len(),
-                admissible
-                    .iter()
-                    .filter(|(_, _, view)| view.as_ref().is_some_and(|v| !v.cells.is_empty()))
-                    .count(),
-                admissible
-                    .iter()
-                    .map(|(_, _, view)| view.as_ref().map_or(0, |v| v.cells.len()))
-                    .sum(),
-            ))
-        });
         let observed: Vec<_> = admissible
             .iter()
             .map(|(_, _, view)| {
@@ -1124,7 +880,7 @@ impl SurfaceGoalSourceAdapter {
         let mut goal=self.make_candidate_goal(state,&candidate,(body,candidate_quaternion),view.as_ref(),travel,delta)?;
         for (key,value) in [
             ("route_cost_basis","full_transition_source_tree_then_selected_astar".into()),
-            ("route_exact_queries",(search.stats().exact_queries+hint_exact_queries).to_string()),
+            ("route_exact_queries",(search.stats().exact_queries).to_string()),
             ("route_source_searches",search.stats().source_searches.to_string()),
             ("route_query_count",route_budget.queries.get().to_string()),
             ("candidate_route_query_count",route_query_count.to_string()),
@@ -1148,15 +904,6 @@ impl SurfaceGoalSourceAdapter {
             candidates=geometric_candidate_count, targets=observation_targets.len(),
             route_queries=route_budget.queries.get(), expanded=route_budget.expanded.get(),
             "完整前沿评估阶段耗时");
-        // 完整查询已对最终候选执行同一精确A*；提交资格只依赖所选路线与目标。
-        if let Some(planning) = planning {
-            *planning.selection_qualification.lock().unwrap() = Some(
-                SurfaceSelectionQualification::new(
-                    snapshot, &native, candidate.clone(), &goal, self.observation_model.clone(),
-                    current_body.0,
-                ),
-            );
-        }
         Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,delta))
     }
 
@@ -1243,151 +990,6 @@ impl SurfaceGoalSourceAdapter {
         ExplorationPoll::Goal(goal)
     }
 
-    /// 旧候选只是提示；地面、机体、收益、路线均重新取本次原始输入。
-    fn revalidate_candidate(
-        &self,
-        state: &ExplorationStateSnapshot<'_>,
-        snapshot: &SurfaceSnapshot,
-        current: BodyPose,
-        robot_support: [f64; 3],
-        mut candidate: FrontierCandidate,
-        mut orientation: [f64; 4],
-        targets: &[nuwax_explore_routing::observation::ObservationTarget],
-        boundary: &[[f64; 2]],
-        vertical_radius: f64,
-        planner: &mut nuwax_nav_pct_native::Planner,
-        budget: &FrontierRouteBudget,
-        delta: &mut SurfacePollDelta,
-        planning: Option<&FrozenSurfacePlanningInput>,
-        native: &CachedFrontierPlanner,
-    ) -> ExploreResult<Option<FrontierGoal>> {
-        let started = std::time::Instant::now();
-        let minimum = f64::from(
-            snapshot
-                .config()
-                .goal_tolerance
-                .max(snapshot.config().voxel_size),
-        );
-        if self.excluded(candidate.support_xyz, vertical_radius)
-            || distance(robot_support, candidate.support_xyz) <= minimum
-        {
-            return Ok(None);
-        }
-        let body = snapshot
-            .body_position_from_support(
-                candidate.support_xyz,
-                orientation,
-                self.body_to_support_z_m,
-            )
-            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        if !inside_boundary([body[0], body[1]], boundary)
-            || snapshot.body_envelope().is_some()
-                && snapshot.validate_body_pose(body, orientation).is_err()
-            || budget.exhausted()
-        {
-            return Ok(None);
-        }
-        budget.queries.set(budget.queries.get() + 1);
-        let route = match planner.plan(current.0, body) {
-            Ok(route) => route,
-            Err(_) => return Ok(None),
-        };
-        if nuwax_nav_pct_native::planning_cancelled() {
-            return Err(ExploreError::SourceError(
-                "frontier planning cancelled".into(),
-            ));
-        }
-        budget.expanded.set(budget.expanded.get() + route.expanded);
-        let Some(&endpoint) = route.path.last() else {
-            return Ok(None);
-        };
-        if route.path.len() < 2
-            || distance(endpoint, body) > f64::from(snapshot.config().voxel_size) * 0.25
-        {
-            return Ok(None);
-        }
-        if !self
-            .observation_model
-            .as_ref()
-            .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6)
-        {
-            let previous = route.path[route.path.len() - 2];
-            let yaw = (endpoint[1] - previous[1]).atan2(endpoint[0] - previous[0]);
-            orientation = [0., 0., (yaw * 0.5).sin(), (yaw * 0.5).cos()];
-        }
-        if snapshot.body_envelope().is_some()
-            && snapshot.validate_body_pose(endpoint, orientation).is_err()
-        {
-            return Ok(None);
-        }
-        let frontier = candidate.clone();
-        candidate.support_xyz = snapshot
-            .support_position_from_body(endpoint, orientation, self.body_to_support_z_m)
-            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        let view = self
-            .observation_model
-            .as_ref()
-            .map(|model| snapshot.estimate_observation_view(model, endpoint, orientation, targets))
-            .transpose()
-            .map_err(ExploreError::SourceError)?;
-        if view.as_ref().is_some_and(|view| view.cells.is_empty())
-            || self.excluded(candidate.support_xyz, vertical_radius)
-        {
-            return Ok(None);
-        }
-        if let Some(view) = &view {
-            candidate.gain =
-                view.cells.len() as f64 * f64::from(snapshot.config().voxel_size).powi(2);
-        }
-        let travel = route
-            .path
-            .windows(2)
-            .map(|pair| distance(pair[0], pair[1]))
-            .sum::<f64>();
-        let mut goal = self.make_candidate_goal(
-            state,
-            &candidate,
-            (endpoint, orientation),
-            view.as_ref(),
-            travel,
-            delta,
-        )?;
-        for (key, value) in [
-            ("route_cost_basis", "current_input_selected_astar".into()),
-            ("route_exact_queries", "1".into()),
-            ("route_source_searches", "0".into()),
-            ("route_query_count", budget.queries.get().to_string()),
-            ("candidate_route_query_count", "1".into()),
-            (
-                "route_expanded_successes",
-                budget.expanded.get().to_string(),
-            ),
-            ("route_budget_limited", "false".into()),
-            ("evaluated_candidate_count", "1".into()),
-            ("admissible_candidate_count", "1".into()),
-            ("selection_method", "current_map_revalidation".into()),
-        ] {
-            goal.metadata.insert(key.into(), value);
-        }
-        if let Some(planning) = planning {
-            *planning.selection_qualification.lock().unwrap() = Some(
-                SurfaceSelectionQualification::new(
-                    snapshot, native, frontier, &goal, self.observation_model.clone(),
-                    current.0,
-                ),
-            );
-        }
-        tracing::info!(target:"navigation.exploration.compute",event="exploration.candidate.revalidated",
-            elapsed_ms=started.elapsed().as_secs_f64()*1000.0,expanded=route.expanded,
-            "旧候选已在当前输入完成独立完整路线核验");
-        let ExplorationPoll::Goal(goal) =
-            self.stage_selected_goal(goal, candidate.support_xyz, vertical_radius, delta)
-        else {
-            unreachable!()
-        };
-        Ok(Some(goal))
-    }
-
     fn excluded(&self, point: [f64; 3], vertical_radius: f64) -> bool {
         self.history.iter().any(|history| {
             history.contains(point, self.blacklist_radius_m, vertical_radius)
@@ -1450,7 +1052,6 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             .map_err(|e| ExploreError::SourceError(e.to_string()))
     }
     fn restore_checkpoint(&mut self, payload: &str) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         if self.selected.is_some() || payload.len() > 1_048_576 {
             return Err(ExploreError::SourceError(
                 "三维探索恢复时已有目标或载荷过大".into(),
@@ -1477,7 +1078,6 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         self.history = history;
         self.regional_schedule = schedule;
         self.last_snapshot = None;
@@ -1491,10 +1091,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     }
 
     fn begin(&mut self) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         self.active = true;
         self.selected = None;
         self.history.clear();
@@ -1512,10 +1110,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     }
 
     fn end(&mut self) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         self.active = false;
         self.selected = None;
         self.retry_support = None;
@@ -1526,62 +1122,12 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    fn poll_goal(
-        &mut self,
-        state: &ExplorationStateSnapshot<'_>,
-    ) -> ExploreResult<ExplorationPoll> {
-        self.prepare_poll(state)?;
-        let outcome = self.commit_prepared_poll()?;
+    fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExploreResult<ExplorationPoll> {
+        let outcome = self.poll_current_input(state)?;
         if outcome == ExplorationPoll::NoFrontier && self.reintroduce_failed_frontiers() {
-            self.prepare_poll(state)?;
-            return self.commit_prepared_poll();
+            return self.poll_current_input(state);
         }
         Ok(outcome)
-    }
-
-    fn supports_prepared_poll(&self) -> bool {
-        true
-    }
-
-    fn prepare_poll(
-        &mut self,
-        state: &ExplorationStateSnapshot<'_>,
-    ) -> ExploreResult<PreparedExplorationPoll> {
-        self.ensure_no_prepared_poll()?;
-        // Match the old short-circuit order, including a poisoned/unavailable input
-        // receiver while inactive or while awaiting exact goal feedback.
-        if !self.active {
-            let mut delta = SurfacePollDelta::default();
-            let outcome = Ok(delta.unavailable("surface source is not active"));
-            return Ok(self.stage_poll(outcome, delta, false));
-        }
-        if self.selected.is_some() {
-            return Ok(self.stage_poll(Ok(ExplorationPoll::Pending), SurfacePollDelta::default(), false));
-        }
-        if let Some(input) = state.frozen_surface_input {
-            return self.prepare_poll_with_planning_input(state, input);
-        }
-        match self.receiver.freeze() {
-            Ok(input) => self.prepare_poll_with_input(state, &input),
-            // Input read failures are algorithm outcomes, not transactional API errors.
-            Err(error) => Ok(self.stage_poll(Err(error), SurfacePollDelta::default(), false)),
-        }
-    }
-
-    fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
-        let pending = self
-            .prepared_poll
-            .take()
-            .ok_or(ExploreError::NoPreparedPoll)?;
-        self.search_hint=pending.search_hint;
-        pending.delta.commit(self);
-        pending.outcome
-    }
-
-    fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
-        let pending=self.prepared_poll.take().ok_or(ExploreError::NoPreparedPoll)?;
-        self.search_hint=pending.search_hint;
-        Ok(())
     }
 
     fn report_goal_feedback(
@@ -1589,7 +1135,6 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         goal_id: &str,
         feedback: ExplorationGoalFeedback,
     ) -> ExploreResult<()> {
-        self.ensure_no_prepared_poll()?;
         if self
             .selected
             .as_ref()
@@ -1599,7 +1144,6 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
-        self.search_hint = None;
         let selected = self.selected.take().expect("goal identity was checked");
         self.retry_support = None;
         self.last_no_frontier = false;
@@ -1810,7 +1354,6 @@ fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    mod continuous_map_tests { include!("surface_continuous_map_tests.rs"); }
 
     use super::*;
     use crate::{ExplorationArbitrationPolicy, ExplorationController};
@@ -1868,64 +1411,12 @@ mod tests {
         source
     }
 
-    fn comparable_surface_outcome(
-        outcome: &ExploreResult<ExplorationPoll>,
-    ) -> Result<ExplorationPoll, String> {
-        outcome.clone().map_err(|error| error.to_string())
-    }
 
     fn goal(poll: ExplorationPoll) -> FrontierGoal {
         let ExplorationPoll::Goal(goal) = poll else {
             panic!("预期三维前沿目标，实际{poll:?}");
         };
         goal
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct CommittedSurfaceState {
-        checkpoint: String,
-        diagnostics: ExplorationSourceDiagnostics,
-        next_goal_id: u64,
-        route_cursor: usize,
-        deferred_route: Option<([f64; 3], [f64; 4], usize)>,
-        selected: Option<(FrontierGoal, [f64; 3], f64)>,
-        source_anchor: Option<*const SurfaceSnapshot>,
-        notification: Option<u64>,
-        body: Option<[f64; 3]>,
-        orientation: Option<[f64; 4]>,
-        no_frontier: bool,
-        retry: Option<[f64; 3]>,
-        frontiers: Vec<FrontierGoal>,
-    }
-
-    fn committed(source: &SurfaceGoalSourceAdapter) -> CommittedSurfaceState {
-        CommittedSurfaceState {
-            checkpoint: source.checkpoint().unwrap(),
-            diagnostics: source.diagnostics(),
-            next_goal_id: source.next_goal_id,
-            route_cursor: source.route_cursor,
-            deferred_route: source.deferred_route.as_ref().map(|deferred| {
-                (
-                    deferred.start_body,
-                    deferred.start_orientation,
-                    deferred.resume_cursor,
-                )
-            }),
-            selected: source.selected.as_ref().map(|selected| {
-                (
-                    selected.goal.clone(),
-                    selected.support_xyz,
-                    selected.vertical_radius_m,
-                )
-            }),
-            source_anchor: source.last_snapshot.as_ref().map(Weak::as_ptr),
-            notification: source.last_notification,
-            body: source.last_query_body,
-            orientation: source.last_query_orientation,
-            no_frontier: source.last_no_frontier,
-            retry: source.retry_support,
-            frontiers: source.frontier_snapshot(),
-        }
     }
 
     fn volume_model() -> nuwax_nav_types_messages::ObservationModel {
@@ -1971,1431 +1462,25 @@ mod tests {
         assert!(!source.reintroduce_failed_frontiers());
     }
 
-    #[test]
-    fn prepared_goal_discard_preserves_history_stamps_and_identifier() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut source = source(receiver, 1);
-        source.record_feedback([30.0, 30.0, 0.1], 0.3, true);
-        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
-        let before = committed(&source);
-        let state = state(0.4, 11);
-        let preview = source.prepare_poll(&state).unwrap();
-        let expected = preview.outcome().as_ref().unwrap().clone();
-        assert!(matches!(expected, ExplorationPoll::Goal(_)));
-        assert_eq!(committed(&source), before);
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), before);
-        assert!(matches!(
-            source.commit_prepared_poll(),
-            Err(ExploreError::NoPreparedPoll)
-        ));
-        // Identical source, pose, timestamp and notification must still produce its goal.
-        assert_eq!(source.poll_goal(&state).unwrap(), expected);
-        assert_eq!(source.next_goal_id, 1);
-        assert_eq!(source.history.len(), 1);
-        assert!(source.history[0].reached);
-        assert_eq!(source.regional_schedule.completed_rounds(), 1);
-    }
 
-    #[test]
-    fn prepared_accept_matches_immediate_poll_and_feedback_history() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut prepared = source(receiver.clone(), 1);
-        let mut immediate = source(receiver, 1);
-        for source in [&mut prepared, &mut immediate] {
-            source.record_feedback([30.0, 30.0, 0.1], 0.3, false);
-            source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
-        }
-        let current = state(0.4, 12);
-        let expected = immediate.poll_goal(&current).unwrap();
-        let before = committed(&prepared);
-        let preview = prepared.prepare_poll(&current).unwrap();
-        assert_eq!(preview.outcome().as_ref().unwrap(), &expected);
-        assert_eq!(committed(&prepared), before);
-        let accepted = prepared.commit_prepared_poll().unwrap();
-        assert_eq!(accepted, expected);
-        assert_eq!(committed(&prepared), committed(&immediate));
-        let selected = goal(accepted);
-        for source in [&mut prepared, &mut immediate] {
-            source
-                .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
-                .unwrap();
-        }
-        assert_eq!(committed(&prepared), committed(&immediate));
-    }
 
-    #[test]
-    fn prepared_no_frontier_and_unavailable_have_no_effect_until_commit() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut source = source(receiver.clone(), 1);
-        let boundary = ExplorationBoundary::from_vertices(vec![
-            Point2::new(0.5, 0.5),
-            Point2::new(1.5, 0.5),
-            Point2::new(1.5, 1.5),
-            Point2::new(0.5, 1.5),
-        ])
-        .unwrap();
-        source
-            .configure_constraints(Some(boundary), 1, 0.3)
-            .unwrap();
-        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
-        source.last_error = Some("previous failure".into());
-        source.retry_support = Some([30.0, 30.0, 0.1]);
-        let before = committed(&source);
-        assert!(matches!(
-            source.prepare_poll(&state(0.4, 1)).unwrap().outcome(),
-            Ok(ExplorationPoll::NoFrontier)
-        ));
-        assert_eq!(committed(&source), before);
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), before);
-        source.prepare_poll(&state(0.4, 1)).unwrap();
-        assert_eq!(
-            source.commit_prepared_poll().unwrap(),
-            ExplorationPoll::NoFrontier
-        );
-        assert!(source.last_no_frontier);
-        assert_eq!(source.retry_support, None);
-        assert_eq!(source.last_error, None);
-        assert_ne!(source.checkpoint().unwrap(), before.checkpoint);
-        assert_eq!(source.regional_schedule.completed_rounds(), 1);
 
-        receiver.clear().unwrap();
-        let no_frontier = committed(&source);
-        assert!(matches!(
-            source.prepare_poll(&state(0.4, 2)).unwrap().outcome(),
-            Ok(ExplorationPoll::SourceUnavailable(_))
-        ));
-        assert_eq!(committed(&source), no_frontier);
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), no_frontier);
-        source.prepare_poll(&state(0.4, 2)).unwrap();
-        assert!(matches!(
-            source.commit_prepared_poll().unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-        assert!(source.last_error.is_some());
-        assert!(source.active);
-        assert_eq!(source.next_goal_id, 0);
-    }
 
-    #[test]
-    fn prepared_error_retains_accepted_partial_query_and_regional_effects() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let notification = receiver.freeze().unwrap().notification();
-        let mut source = source(receiver, 1);
-        source.next_goal_id = u64::MAX;
-        source.retry_support = Some([30.0, 30.0, 0.1]);
-        source.last_error = Some("original error".into());
-        source.record_feedback([30.0, 30.0, 0.1], 0.3, true);
-        source.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
-        let before = committed(&source);
-        let current = state(0.4, 9);
-        let preview = source.prepare_poll(&current).unwrap();
-        assert!(
-            matches!(preview.outcome(), Err(ExploreError::SourceError(message))
-            if message.contains("identifier exhausted"))
-        );
-        assert_eq!(committed(&source), before);
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), before);
-        source.prepare_poll(&current).unwrap();
-        assert!(
-            matches!(source.commit_prepared_poll(), Err(ExploreError::SourceError(message))
-            if message.contains("identifier exhausted"))
-        );
-        assert_eq!(source.next_goal_id, u64::MAX);
-        assert_eq!(source.last_notification, Some(notification));
-        assert_eq!(source.last_query_body, Some([1.05, 1.05, 0.4]));
-        assert!(Weak::ptr_eq(
-            source.last_snapshot.as_ref().unwrap(),
-            &Arc::downgrade(&snapshot)
-        ));
-        assert_eq!(source.retry_support, None);
-        assert_eq!(source.last_error, Some("original error".into()));
-        assert!(source.last_frontiers.is_empty());
-        assert!(source.selected.is_none());
-        assert_eq!(source.history.len(), 1);
-        assert!(source.history[0].reached);
-        assert_ne!(source.checkpoint().unwrap(), before.checkpoint);
-        assert_eq!(
-            source.poll_goal(&current).unwrap(),
-            ExplorationPoll::Pending
-        );
-    }
 
-    #[test]
-    fn pending_poll_rejects_feedback_lifecycle_configuration_and_restore() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut source = source(receiver, 1);
-        let selected = goal(source.poll_goal(&state(0.4, 1)).unwrap());
-        let before = committed(&source);
-        assert!(matches!(
-            source.prepare_poll(&state(0.4, 2)).unwrap().outcome(),
-            Ok(ExplorationPoll::Pending)
-        ));
-        assert!(matches!(
-            source.prepare_poll(&state(0.4, 2)),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(
-            source.poll_goal(&state(0.4, 2)),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(
-            source.report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(source.end(), Err(ExploreError::PreparedPollBusy)));
-        assert!(matches!(
-            source.begin(),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(
-            source.configure_constraints(None, 0, 0.1),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(
-            source.set_observation_model(volume_model()),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert!(matches!(
-            source.restore_checkpoint(&before.checkpoint),
-            Err(ExploreError::PreparedPollBusy)
-        ));
-        assert_eq!(committed(&source), before);
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), before);
-        source
-            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
-            .unwrap();
-        assert_eq!(source.history.len(), 1);
-        assert_eq!(source.regional_schedule.completed_rounds(), 1);
-    }
 
-    #[test]
-    fn frozen_poll_keeps_original_time_and_leaves_new_observation_unconsumed() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let frozen = receiver.freeze().unwrap();
-        let mut source = source(receiver.clone(), 1);
-        source
-            .prepare_poll_with_input(&state(0.4, 1), &frozen)
-            .unwrap();
-        receiver.observe(snapshot.clone()).unwrap();
-        let refreshed = receiver.freeze().unwrap();
-        assert!(frozen.same_source_view(&refreshed));
-        assert_ne!(frozen.notification(), refreshed.notification());
-        let selected = goal(source.commit_prepared_poll().unwrap());
-        assert_eq!(selected.stamp, Timestamp::from_unix(1, 0));
-        assert_eq!(selected.pose.stamp, Timestamp::from_unix(1, 0));
-        assert_eq!(source.last_notification, Some(frozen.notification()));
-        assert_eq!(source.last_query_body, Some([1.05, 1.05, 0.4]));
-        source
-            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Reached)
-            .unwrap();
-        assert!(matches!(
-            source.poll_goal(&state(0.4, 3)).unwrap(),
-            ExplorationPoll::Goal(_)
-        ));
-        assert_eq!(source.last_notification, Some(refreshed.notification()));
-    }
 
-    #[test]
-    fn frozen_input_is_not_retargeted_to_the_live_receiver() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let frozen = receiver.freeze().unwrap();
-        let mut source = source(receiver.clone(), 1);
-        receiver.clear().unwrap();
-        assert!(receiver.freeze().unwrap().snapshot().is_none());
-        assert!(Arc::ptr_eq(frozen.snapshot().unwrap(), &snapshot));
-        let prepared = source
-            .prepare_poll_with_input(&state(0.4, 1), &frozen)
-            .unwrap();
-        assert!(matches!(prepared.outcome(), Ok(ExplorationPoll::Goal(_))));
-        let selected = goal(source.commit_prepared_poll().unwrap());
-        assert_eq!(source.last_notification, Some(frozen.notification()));
-        assert!(Weak::ptr_eq(
-            source.last_snapshot.as_ref().unwrap(),
-            &Arc::downgrade(&snapshot)
-        ));
-        source
-            .report_goal_feedback(&selected.id, ExplorationGoalFeedback::Cancelled)
-            .unwrap();
-        assert!(matches!(
-            source.poll_goal(&state(0.4, 2)).unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-    }
 
-    #[test]
-    fn controller_prepare_preserves_captured_absence_when_live_source_arrives() {
-        let receiver = SurfaceInputReceiver::new();
-        let captured = receiver.freeze().unwrap().fork_for_planning();
-        receiver.observe(map()).unwrap();
-        let mut controller =
-            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
-        controller.add_source(source(receiver, 1));
-        controller.begin_exploration().unwrap();
-        let original = state(0.4, 1);
-        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
-        sampled.frozen_surface_input = Some(&captured);
-        assert!(matches!(
-            controller
-                .prepare_poll_with_deferred_stop(&sampled, false)
-                .unwrap()
-                .outcome(),
-            Ok(ExplorationPoll::SourceUnavailable(_))
-        ));
-        assert!(matches!(
-            controller.commit_prepared_poll().unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-        assert!(matches!(
-            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
-            ExplorationPoll::Goal(_)
-        ));
-    }
 
-    #[test]
-    fn controller_prepare_uses_frozen_source_after_live_receiver_changes() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let captured = receiver.freeze().unwrap().fork_for_planning();
-        let mut expected_source = source(receiver.clone(), 1);
-        let expected = expected_source.poll_goal(&state(0.4, 1)).unwrap();
-        let mut controller =
-            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
-        controller.add_source(source(receiver.clone(), 1));
-        controller.begin_exploration().unwrap();
-        let before = serde_json::to_value(controller.checkpoint().unwrap()).unwrap();
-        receiver.clear().unwrap();
-        let original = state(0.4, 1);
-        let mut sampled = ExplorationStateSnapshot::new(original.robot_pose, original.now);
-        sampled.frozen_surface_input = Some(&captured);
-        let prepared = controller
-            .prepare_poll_with_deferred_stop(&sampled, false)
-            .unwrap();
-        assert_eq!(prepared.outcome().as_ref().unwrap(), &expected);
-        controller.discard_prepared_poll().unwrap();
-        assert_eq!(
-            serde_json::to_value(controller.checkpoint().unwrap()).unwrap(),
-            before
-        );
-        controller
-            .prepare_poll_with_deferred_stop(&sampled, false)
-            .unwrap();
-        let accepted = controller.commit_prepared_poll().unwrap();
-        assert_eq!(accepted, expected);
-        controller
-            .report_goal_feedback(&goal(accepted).id, ExplorationGoalFeedback::Cancelled)
-            .unwrap();
-        assert!(matches!(
-            controller.poll_next_goal(&state(0.4, 2)).unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-    }
 
-    #[test]
-    fn private_query_fork_preserves_original_anchor_and_same_source_retry() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let frozen = receiver.freeze().unwrap();
-        let planning_input = frozen.fork_for_planning();
-        let query_view = planning_input.query_view.as_ref().unwrap();
-        assert!(!query_view.same_body_query_view(&snapshot));
-        assert!(Arc::ptr_eq(
-            planning_input.original_input().snapshot().unwrap(),
-            &snapshot
-        ));
-        assert_eq!(
-            planning_input.original_input().notification(),
-            frozen.notification()
-        );
-        let mut source = source(receiver.clone(), 1);
-        let expected = {
-            let mut direct = super::tests::source(receiver.clone(), 1);
-            direct.poll_goal(&state(0.4, 1)).unwrap()
-        };
-        let prepared = source
-            .prepare_poll_with_planning_input(&state(0.4, 1), &planning_input)
-            .unwrap();
-        assert_eq!(prepared.outcome().as_ref().unwrap(), &expected);
-        let selected = goal(source.commit_prepared_poll().unwrap());
-        assert!(Weak::ptr_eq(
-            source.last_snapshot.as_ref().unwrap(),
-            &Arc::downgrade(&snapshot)
-        ));
-        assert!(!Weak::ptr_eq(
-            source.last_snapshot.as_ref().unwrap(),
-            &Arc::downgrade(query_view)
-        ));
-        source
-            .report_goal_feedback(
-                &selected.id,
-                ExplorationGoalFeedback::Failed("retry".into()),
-            )
-            .unwrap();
-        let before_retry = committed(&source);
-        let retry = source
-            .prepare_poll_with_planning_input(&state(0.4, 2), &planning_input)
-            .unwrap();
-        let retry = goal(retry.outcome().as_ref().unwrap().clone());
-        assert_eq!(retry.pose.pose.position, selected.pose.pose.position);
-        assert_eq!(
-            retry.metadata.get("selection_method").map(String::as_str),
-            Some("navigation_retry")
-        );
-        source.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&source), before_retry);
-        source
-            .prepare_poll_with_planning_input(&state(0.4, 2), &planning_input)
-            .unwrap();
-        assert_eq!(
-            source.commit_prepared_poll().unwrap(),
-            ExplorationPoll::Goal(retry.clone())
-        );
-        source
-            .report_goal_feedback(&retry.id, ExplorationGoalFeedback::Cancelled)
-            .unwrap();
-        assert_eq!(
-            source.poll_goal(&state(0.4, 3)).unwrap(),
-            ExplorationPoll::Pending
-        );
-        receiver.observe(snapshot).unwrap();
-        assert!(matches!(
-            source.poll_goal(&state(0.4, 4)).unwrap(),
-            ExplorationPoll::Goal(_)
-        ));
-    }
 
-    #[test]
-    fn planning_rebind_keeps_new_capture_and_rejects_changed_planning_query_view() {
-        let receiver = SurfaceInputReceiver::new();
-        let observations =
-            Arc::new(nuwax_nav_mls_planner::SurfaceObservations::new(0.1, 32).unwrap());
-        let snapshot = Arc::new(map().with_observations(Some(observations.clone())));
-        receiver.observe(snapshot.clone()).unwrap();
-        let captured = receiver.freeze().unwrap();
-        let planning = captured.fork_for_planning();
-        let receipt = Arc::new(snapshot.as_ref().clone());
-        receiver.observe(receipt.clone()).unwrap();
-        let refreshed = receiver.freeze().unwrap();
-        let rebound = planning.rebind_original(&refreshed).unwrap();
-        assert_eq!(
-            rebound.original_input().notification(),
-            captured.notification() + 1
-        );
-        assert!(Arc::ptr_eq(
-            rebound.original_input().snapshot().unwrap(),
-            &receipt
-        ));
-        assert!(Arc::ptr_eq(
-            planning.query_snapshot().unwrap(),
-            rebound.query_snapshot().unwrap()
-        ));
-        assert_eq!(
-            planning.original_input().notification(),
-            captured.notification()
-        );
-        assert!(!Arc::ptr_eq(planning.query_snapshot().unwrap(), &snapshot));
 
-        // Deliberate contract migration: a new raw observations Arc with the same
-        // planning inputs is positive, while same_source_view stays strict.
-        let same_values =
-            Arc::new(snapshot.with_observations(Some(Arc::new(observations.as_ref().clone()))));
-        receiver.observe(same_values.clone()).unwrap();
-        let same_capture = receiver.freeze().unwrap();
-        assert!(!captured.same_source_view(&same_capture));
-        assert!(!snapshot.same_body_query_view(&same_values));
-        assert!(captured.same_planning_query_view(&same_capture));
-        assert!(snapshot.same_planning_query_view(&same_values));
-        let same_rebound = planning.rebind_original(&same_capture).unwrap();
-        assert_eq!(
-            same_rebound.original_input().notification(),
-            same_capture.notification()
-        );
-        assert!(Arc::ptr_eq(
-            same_rebound.original_input().snapshot().unwrap(),
-            &same_values
-        ));
-        assert!(Arc::ptr_eq(
-            same_rebound.query_snapshot().unwrap(),
-            planning.query_snapshot().unwrap()
-        ));
-        let mut changed_membership = observations.as_ref().clone();
-        changed_membership
-            .replace_block(
-                [0, 0, 0],
-                std::collections::BTreeMap::from([(
-                    [10, 10, 0],
-                    nuwax_nav_mls_planner::SurfaceObservation {
-                        observed_ns: 1,
-                        hits: 1,
-                    },
-                )]),
-            )
-            .unwrap();
-        let mut points: Vec<_> = [0.0_f32, 3.0]
-            .into_iter()
-            .flat_map(|level| {
-                (0..20).flat_map(move |x| {
-                    (0..20).map(move |y| {
-                        ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, level + 0.05)
-                    })
-                })
-            })
-            .collect();
-        let mut config = snapshot.config().clone();
-        config.wall_buffer_weight = 0.25;
-        let changed_config = Arc::new(
-            SurfaceSnapshot::from_points(&points, config, 0.1)
-                .unwrap()
-                .with_observations(Some(observations.clone())),
-        );
-        points.push((1.05, 1.05, 0.55));
-        let changed_geometry = Arc::new(
-            SurfaceSnapshot::from_points(&points, snapshot.config().clone(), 0.1)
-                .unwrap()
-                .with_observations(Some(observations.clone())),
-        );
-        let changed = vec![
-            map(),
-            changed_geometry,
-            changed_config,
-            Arc::new(snapshot.as_ref().clone().with_ground_evidence(
-                nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume,
-            )),
-            Arc::new(snapshot.with_observations(Some(Arc::new(changed_membership)))),
-            Arc::new(snapshot.with_observations(None)),
-            Arc::new(
-                snapshot
-                    .with_recent_obstacle_points(
-                        1,
-                        1,
-                        0,
-                        &[],
-                        std::iter::empty::<(u32, [f64; 3])>(),
-                    )
-                    .unwrap(),
-            ),
-            Arc::new(
-                snapshot
-                    .with_virtual_obstacles([0.0, 0.0], 0.1, 20, 20, &vec![false; 400])
-                    .unwrap(),
-            ),
-            Arc::new(
-                snapshot
-                    .as_ref()
-                    .clone()
-                    .with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
-                        fixed_collision: None,
-                        footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
-                        z_bounds_m: [-0.05, 0.2],
-                        body_to_support_z_m: 0.3,
-                        max_step_up_m: 0.2,
-                        max_step_down_m: 0.2,
-                        max_cross_slope_deg: 15.0,
-                        support_uncertainty_m: 0.0,
-                    })
-                    .unwrap(),
-            ),
-        ];
-        for source in changed {
-            receiver.observe(source).unwrap();
-            let changed = receiver.freeze().unwrap();
-            assert!(!captured.same_source_view(&changed));
-            assert!(!captured.same_planning_query_view(&changed));
-            assert!(!snapshot.same_planning_query_view(changed.snapshot().unwrap()));
-            assert!(planning.rebind_original(&changed).is_none());
-            let cold = changed.fork_for_planning();
-            assert!(!Arc::ptr_eq(
-                planning.query_snapshot().unwrap(),
-                cold.query_snapshot().unwrap()
-            ));
-        }
-        receiver.clear().unwrap();
-        let absent = receiver.freeze().unwrap();
-        assert!(!captured.same_planning_query_view(&absent));
-        assert!(!absent.same_planning_query_view(&captured));
-        assert!(absent.same_planning_query_view(&absent));
-        assert!(planning.rebind_original(&absent).is_none());
-        assert!(absent
-            .fork_for_planning()
-            .rebind_original(&absent)
-            .is_none());
-        assert!(snapshot.frontier_cache_stats().is_none());
-    }
-
-    #[test]
-    fn planning_query_lives_only_with_its_pair_and_rebound_clones() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let planning = receiver.freeze().unwrap().fork_for_planning();
-        let weak_query = Arc::downgrade(planning.query_snapshot().unwrap());
-        receiver.observe(snapshot).unwrap();
-        let rebound = planning
-            .rebind_original(&receiver.freeze().unwrap())
-            .unwrap();
-        drop(planning);
-        assert!(weak_query.upgrade().is_some());
-        drop(rebound);
-        assert!(weak_query.upgrade().is_none());
-    }
-
-    #[test]
-    fn paired_planning_input_cannot_retarget_source_or_notification() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let captured = receiver.freeze().unwrap();
-        let planning = captured.fork_for_planning();
-        let mut adapter = source(receiver.clone(), 1);
-        let expected = {
-            let mut direct = source(receiver.clone(), 1);
-            direct.poll_goal(&state(0.4, 1)).unwrap()
-        };
-        receiver.observe(map()).unwrap();
-        let unrelated = receiver.freeze().unwrap();
-        assert!(!planning.original_input().same_source_view(&unrelated));
-        assert!(planning.original_input().same_source_view(&captured));
-        assert_eq!(
-            planning.original_input().notification(),
-            captured.notification()
-        );
-        assert_ne!(
-            planning.original_input().notification(),
-            unrelated.notification()
-        );
-        // Even a cloned opaque pair retains the same source and exact notification.
-        let retained = planning.clone();
-        receiver.clear().unwrap();
-        let preview = adapter
-            .prepare_poll_with_planning_input(&state(0.4, 1), &retained)
-            .unwrap();
-        assert_eq!(preview.outcome().as_ref().unwrap(), &expected);
-        assert_eq!(adapter.commit_prepared_poll().unwrap(), expected);
-        assert_eq!(adapter.last_notification, Some(captured.notification()));
-        assert!(Weak::ptr_eq(
-            adapter.last_snapshot.as_ref().unwrap(),
-            &Arc::downgrade(&snapshot)
-        ));
-
-        let absent = receiver.freeze().unwrap().fork_for_planning();
-        assert!(absent.original_input().snapshot().is_none());
-        assert!(absent.query_view.is_none());
-        let selected = adapter.selected.as_ref().unwrap().goal.id.clone();
-        adapter
-            .report_goal_feedback(&selected, ExplorationGoalFeedback::Cancelled)
-            .unwrap();
-        assert!(matches!(
-            adapter
-                .prepare_poll_with_planning_input(&state(0.4, 2), &absent)
-                .unwrap()
-                .outcome(),
-            Ok(ExplorationPoll::SourceUnavailable(_))
-        ));
-        adapter.discard_prepared_poll().unwrap();
-    }
 
     // EXP-level oracle: real public production queries, never a reimplementation of
     // collision, support, interpolation, or motion algorithms. The GEO Writer /
     // wire / Reader tests separately prove source admission and sample provenance.
-    mod planning_query_warm_cold_tests {
-        use super::*;
-        use nuwax_nav_mls_planner::surface::{
-            BodyFailureWitness, BodyRejection, GroundQuery, GroundQueryState, OccupancySource,
-        };
-        use nuwax_nav_mls_planner::{
-            SurfaceBodyEnvelope, SurfaceError, SurfaceObservation, SurfaceObservations,
-        };
-        use std::collections::BTreeMap;
 
-        type Pose = ([f64; 3], [f64; 4]);
-        type PoseBits = ([u64; 3], [u64; 4]);
-        type Blocks = BTreeMap<[i32; 3], BTreeMap<[i32; 3], SurfaceObservation>>;
-        type WitnessBits = (PoseBits, [i32; 3], OccupancySource, [u64; 2], Option<u64>);
-        const Q: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
-        const CLEAR: Pose = ([-1.0, 0.05, 0.5], Q);
-        const NEXT: Pose = ([-0.8, 0.05, 0.5], Q);
-        const BLOCKED: Pose = ([0.05, 0.05, 0.5], Q);
-        const FAR: Pose = ([20.05, 0.05, 0.5], Q);
-        const FINE_CLEAR: Pose = ([1.4, 0.05, 0.5], Q);
-        const FINE_BLOCKED: Pose = ([2.25, 0.05, 0.5], Q);
-        const FINE_KEY: [i32; 3] = [22, 0, 5];
 
-        #[derive(Debug, PartialEq, Eq)]
-        struct GroundBits {
-            state: GroundQueryState,
-            height: Option<u64>,
-            normal: Option<[u64; 3]>,
-            sources: Vec<[i32; 3]>,
-            radius_m: u64,
-            max_residual_m: Option<u64>,
-        }
 
-        fn ground_bits(query: GroundQuery) -> GroundBits {
-            // Exhaustive destructuring makes a newly added output field visible.
-            let GroundQuery {
-                state,
-                height,
-                normal,
-                sources,
-                radius_m,
-                max_residual_m,
-            } = query;
-            GroundBits {
-                state,
-                height: height.map(f64::to_bits),
-                normal: normal.map(|normal| normal.map(f64::to_bits)),
-                sources,
-                radius_m: radius_m.to_bits(),
-                max_residual_m: max_residual_m.map(f64::to_bits),
-            }
-        }
-
-        fn pose_bits(pose: Pose) -> PoseBits {
-            (pose.0.map(f64::to_bits), pose.1.map(f64::to_bits))
-        }
-
-        fn witness_bits(witness: Option<BodyFailureWitness>) -> Option<WitnessBits> {
-            witness.map(|witness| {
-                let BodyFailureWitness { pose, rejection } = witness;
-                match rejection {
-                    BodyRejection::Occupancy {
-                        cell,
-                        source,
-                        z_bounds,
-                        ground_height,
-                    } => (
-                        pose_bits(pose),
-                        cell,
-                        source,
-                        z_bounds.map(f64::to_bits),
-                        ground_height.map(f64::to_bits),
-                    ),
-                }
-            })
-        }
-
-        fn poison_witness() -> Option<BodyFailureWitness> {
-            Some(BodyFailureWitness {
-                pose: ([999.0; 3], [1.0; 4]),
-                rejection: BodyRejection::Occupancy {
-                    cell: [999, 998, 997],
-                    source: OccupancySource::CoarseFallback,
-                    z_bounds: [-0.0, 1.0],
-                    ground_height: Some(-0.0),
-                },
-            })
-        }
-
-        fn assert_result<T: std::fmt::Debug + PartialEq>(
-            actual: &Result<T, SurfaceError>,
-            expected: &Result<T, SurfaceError>,
-            label: &str,
-        ) {
-            assert_eq!(actual, expected, "complete Ok/Err and payload: {label}");
-            if let (
-                Err(SurfaceError::InsufficientResolution {
-                    source_m: a,
-                    planner_m: b,
-                }),
-                Err(SurfaceError::InsufficientResolution {
-                    source_m: c,
-                    planner_m: d,
-                }),
-            ) = (actual, expected)
-            {
-                assert_eq!(
-                    [a.to_bits(), b.to_bits()],
-                    [c.to_bits(), d.to_bits()],
-                    "{label}"
-                );
-            }
-        }
-
-        fn fresh(input: &FrozenSurfaceInput, warm: &SurfaceSnapshot) -> FrozenSurfacePlanningInput {
-            let cold = input.fork_for_planning();
-            // Public fork construction creates independent disposable query caches.
-            // Source-owned legacy_reference_cache is intentionally shared, so this
-            // is not a claim that every source-owned memo is globally cold/reset.
-            assert!(!warm.same_body_query_view(cold.query_snapshot().unwrap()));
-            cold
-        }
-
-        fn fixture() -> (Arc<SurfaceSnapshot>, SurfaceObservations, Blocks) {
-            // Existing MLS body::tests::scene/model dimensions; all exact fine
-            // occupied cells are present and explicitly re-marked complete after
-            // every admitted block replacement. No cfg(test) TTL/quality API.
-            let mut points: Vec<_> = (-30..30)
-                .flat_map(|x| {
-                    (-30..30).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.025))
-                })
-                .collect();
-            // This persistent obstacle enters both the coarse point cloud and
-            // complete fine observations. Its voxel starts at x=2.2, beyond the
-            // original Recent sweep's maximal body extent x=1.55.
-            points.push((2.25, 0.05, 0.55));
-            let mut config = map().config().clone();
-            config.robot_height = 0.25;
-            config.wall_clearance_m = 0.01;
-            config.wall_buffer_m = 0.0;
-            config.step_threshold_m = 0.21;
-            config.min_step_tread_depth_m = 0.2;
-            let model = SurfaceBodyEnvelope {
-                fixed_collision: None,
-                footprint_xy_m: vec![[-0.55, -0.14], [0.55, -0.14], [0.55, 0.14], [-0.55, 0.14]],
-                z_bounds_m: [-0.1, 0.25],
-                body_to_support_z_m: 0.4,
-                max_step_up_m: 0.2,
-                max_step_down_m: 0.1,
-                max_cross_slope_deg: 10.0,
-                support_uncertainty_m: 0.0,
-            };
-            let mut blocks = Blocks::new();
-            for &(x, y, z) in &points {
-                let key = [x, y, z].map(|v| (f64::from(v) / f64::from(0.1_f32)).floor() as i32);
-                blocks
-                    .entry(key.map(|v| v.div_euclid(32)))
-                    .or_default()
-                    .insert(
-                        key,
-                        SurfaceObservation {
-                            observed_ns: 100,
-                            hits: 1,
-                        },
-                    );
-            }
-            let mut observations = SurfaceObservations::new(0.1, 32).unwrap();
-            for (block, values) in &blocks {
-                observations.replace_block(*block, values.clone()).unwrap();
-            }
-            observations.mark_complete_geometry_source();
-            let source = SurfaceSnapshot::from_points(&points, config, 0.1)
-                .unwrap()
-                .with_body_envelope(model)
-                .unwrap()
-                .with_observations(Some(Arc::new(observations.clone())))
-                .with_recent_obstacle_points(1, 100, 0, &[], [(0, [0.05, 0.05, 0.55])])
-                .unwrap();
-            (Arc::new(source), observations, blocks)
-        }
-
-        fn assert_queries(warm: &SurfaceSnapshot, input: &FrozenSurfaceInput) {
-            assert!(warm.observations().unwrap().is_complete_geometry_source());
-            assert!(input
-                .snapshot()
-                .unwrap()
-                .observations()
-                .unwrap()
-                .is_complete_geometry_source());
-            for (xy, reference, expected_state) in [
-                ([-0.95, 0.05], 0.1, GroundQueryState::LegacyGeometry),
-                ([0.05, 0.05], 0.1, GroundQueryState::LegacyGeometry),
-                ([20.05, 0.05], 0.1, GroundQueryState::Unknown),
-                ([f64::NAN, 0.05], 0.1, GroundQueryState::Unknown),
-            ] {
-                let cold = fresh(input, warm);
-                let expected =
-                    ground_bits(cold.query_snapshot().unwrap().query_ground(xy, reference));
-                assert_eq!(
-                    expected.state, expected_state,
-                    "fixture must exercise known and unknown ground"
-                );
-                for _ in 0..3 {
-                    assert_eq!(ground_bits(warm.query_ground(xy, reference)), expected);
-                }
-            }
-
-            for (label, pose, expected_result, has_witness) in [
-                ("clear pose", CLEAR, Ok(()), false),
-                (
-                    "real recent collision",
-                    BLOCKED,
-                    Err(SurfaceError::InsufficientClearance),
-                    true,
-                ),
-                ("unknown ground is not collision", FAR, Ok(()), false),
-                (
-                    "invalid quaternion",
-                    (CLEAR.0, [0.0; 4]),
-                    Err(SurfaceError::InvalidPose),
-                    false,
-                ),
-            ] {
-                let cold = fresh(input, warm);
-                let mut expected_witness = poison_witness();
-                let expected = cold
-                    .query_snapshot()
-                    .unwrap()
-                    .validate_body_pose_with_witness(pose.0, pose.1, &mut expected_witness);
-                assert_result(&expected, &expected_result, label);
-                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
-                if has_witness {
-                    assert!(matches!(
-                        expected_witness.unwrap().rejection,
-                        BodyRejection::Occupancy {
-                            source: OccupancySource::Recent,
-                            ..
-                        }
-                    ));
-                }
-                // Also check the legacy API on its own fresh owner, not on the
-                // just-populated cold witness cache.
-                let legacy_cold = fresh(input, warm);
-                assert_result(
-                    &legacy_cold
-                        .query_snapshot()
-                        .unwrap()
-                        .validate_body_pose(pose.0, pose.1),
-                    &expected,
-                    label,
-                );
-                for _ in 0..3 {
-                    let mut actual_witness = poison_witness();
-                    assert_result(
-                        &warm.validate_body_pose_with_witness(pose.0, pose.1, &mut actual_witness),
-                        &expected,
-                        label,
-                    );
-                    assert_eq!(
-                        witness_bits(actual_witness),
-                        witness_bits(expected_witness),
-                        "{label}"
-                    );
-                    assert_result(&warm.validate_body_pose(pose.0, pose.1), &expected, label);
-                }
-            }
-
-            let wide = [[-1.7, -0.3], [-0.2, -0.3], [-0.2, 0.3], [-1.7, 0.3]];
-            let excludes_destination = [[-1.2, -0.3], [-0.9, -0.3], [-0.9, 0.3], [-1.2, 0.3]];
-            let malformed = [[-1.2, -0.3], [-0.9, -0.3]];
-            let quarter_turn = [
-                0.0,
-                0.0,
-                std::f64::consts::FRAC_PI_4.sin(),
-                std::f64::consts::FRAC_PI_4.cos(),
-            ];
-            let motions: Vec<(
-                &str,
-                Pose,
-                Pose,
-                &[[f64; 2]],
-                Result<(), SurfaceError>,
-                bool,
-            )> = vec![
-                ("clear translation", CLEAR, NEXT, &[], Ok(()), false),
-                (
-                    "clear rotation",
-                    CLEAR,
-                    (CLEAR.0, quarter_turn),
-                    &[],
-                    Ok(()),
-                    false,
-                ),
-                (
-                    "intermediate collision",
-                    CLEAR,
-                    ([1.0, 0.05, 0.5], Q),
-                    &[],
-                    Err(SurfaceError::InsufficientClearance),
-                    true,
-                ),
-                (
-                    "zero motion still collides",
-                    BLOCKED,
-                    BLOCKED,
-                    &[],
-                    Err(SurfaceError::InsufficientClearance),
-                    true,
-                ),
-                (
-                    "same motion with admitted boundary",
-                    CLEAR,
-                    NEXT,
-                    &wide,
-                    Ok(()),
-                    false,
-                ),
-                (
-                    "same motion with rejecting boundary",
-                    CLEAR,
-                    NEXT,
-                    &excludes_destination,
-                    Err(SurfaceError::InvalidBoundary),
-                    false,
-                ),
-                (
-                    "malformed boundary",
-                    CLEAR,
-                    NEXT,
-                    &malformed,
-                    Err(SurfaceError::InvalidBoundary),
-                    false,
-                ),
-            ];
-            for (label, from, to, boundary, expected_result, has_witness) in motions {
-                let cold = fresh(input, warm);
-                let mut expected_witness = poison_witness();
-                let expected = cold
-                    .query_snapshot()
-                    .unwrap()
-                    .validate_body_motion_with_witness(from, to, boundary, &mut expected_witness);
-                assert_result(&expected, &expected_result, label);
-                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
-                if has_witness {
-                    assert!(matches!(
-                        expected_witness.unwrap().rejection,
-                        BodyRejection::Occupancy {
-                            source: OccupancySource::Recent,
-                            ..
-                        }
-                    ));
-                }
-                let legacy_cold = fresh(input, warm);
-                assert_result(
-                    &legacy_cold
-                        .query_snapshot()
-                        .unwrap()
-                        .validate_body_motion(from, to, boundary),
-                    &expected,
-                    label,
-                );
-                for _ in 0..3 {
-                    let mut actual_witness = poison_witness();
-                    assert_result(
-                        &warm.validate_body_motion_with_witness(
-                            from,
-                            to,
-                            boundary,
-                            &mut actual_witness,
-                        ),
-                        &expected,
-                        label,
-                    );
-                    assert_eq!(
-                        witness_bits(actual_witness),
-                        witness_bits(expected_witness),
-                        "{label}"
-                    );
-                    assert_result(
-                        &warm.validate_body_motion(from, to, boundary),
-                        &expected,
-                        label,
-                    );
-                }
-            }
-            // Boundary checks above must not poison or inherit the cached no-boundary permission.
-            assert_eq!(warm.validate_body_motion(CLEAR, NEXT, &[]), Ok(()));
-
-            // The updated raw record is now this actual rejecting obstacle, not
-            // an unrelated floor sample. It is strictly inside the coarse XY
-            // bounds at FINE_BLOCKED, so the real intersection must be Fine.
-            // Verify the motion's start independently; keep each oracle API on
-            // a separate fresh owner, as in the other query controls above.
-            let clear = fresh(input, warm);
-            assert_eq!(
-                clear
-                    .query_snapshot()
-                    .unwrap()
-                    .validate_body_pose(FINE_CLEAR.0, FINE_CLEAR.1),
-                Ok(())
-            );
-            for from in [None, Some(FINE_CLEAR)] {
-                let label = if from.is_some() {
-                    "motion into updated fine obstacle"
-                } else {
-                    "updated fine obstacle pose"
-                };
-                let query = |snapshot: &SurfaceSnapshot, slot: &mut Option<BodyFailureWitness>| {
-                    match from {
-                        Some(from) => snapshot.validate_body_motion_with_witness(
-                            from,
-                            FINE_BLOCKED,
-                            &[],
-                            slot,
-                        ),
-                        None => snapshot.validate_body_pose_with_witness(
-                            FINE_BLOCKED.0,
-                            FINE_BLOCKED.1,
-                            slot,
-                        ),
-                    }
-                };
-                let legacy = |snapshot: &SurfaceSnapshot| match from {
-                    Some(from) => snapshot.validate_body_motion(from, FINE_BLOCKED, &[]),
-                    None => snapshot.validate_body_pose(FINE_BLOCKED.0, FINE_BLOCKED.1),
-                };
-                let cold = fresh(input, warm);
-                let mut expected_witness = poison_witness();
-                let expected = query(cold.query_snapshot().unwrap(), &mut expected_witness);
-                assert_result(&expected, &Err(SurfaceError::InsufficientClearance), label);
-                let witness =
-                    expected_witness.expect("actual fine intersection must retain its witness");
-                let BodyRejection::Occupancy { cell, source, .. } = witness.rejection;
-                assert_eq!(source, OccupancySource::Fine, "{label}");
-                assert_eq!(
-                    cell, FINE_KEY,
-                    "must reject the exact raw key being refreshed"
-                );
-                assert_eq!(pose_bits(witness.pose), pose_bits(FINE_BLOCKED), "{label}");
-                let legacy_cold = fresh(input, warm);
-                assert_result(
-                    &legacy(legacy_cold.query_snapshot().unwrap()),
-                    &expected,
-                    label,
-                );
-                for _ in 0..3 {
-                    let mut actual_witness = poison_witness();
-                    assert_result(&query(warm, &mut actual_witness), &expected, label);
-                    assert_eq!(
-                        witness_bits(actual_witness),
-                        witness_bits(expected_witness),
-                        "{label}"
-                    );
-                    assert_result(&legacy(warm), &expected, label);
-                }
-            }
-
-            for (label, from, xy, yaw, expected_error, has_witness) in [
-                (
-                    "project clear translation",
-                    CLEAR,
-                    [NEXT.0[0], NEXT.0[1]],
-                    0.0,
-                    None,
-                    false,
-                ),
-                (
-                    "project identity",
-                    CLEAR,
-                    [CLEAR.0[0], CLEAR.0[1]],
-                    0.0,
-                    None,
-                    false,
-                ),
-                (
-                    "project into obstacle",
-                    CLEAR,
-                    [BLOCKED.0[0], BLOCKED.0[1]],
-                    0.0,
-                    Some(SurfaceError::InsufficientClearance),
-                    true,
-                ),
-                (
-                    "project blocked identity",
-                    BLOCKED,
-                    [BLOCKED.0[0], BLOCKED.0[1]],
-                    0.0,
-                    Some(SurfaceError::InsufficientClearance),
-                    true,
-                ),
-                (
-                    "project unknown ground",
-                    FAR,
-                    [20.25, 0.05],
-                    0.25,
-                    None,
-                    false,
-                ),
-                (
-                    "project invalid coordinate",
-                    CLEAR,
-                    [f64::NAN, 0.05],
-                    0.0,
-                    Some(SurfaceError::InvalidPose),
-                    false,
-                ),
-            ] {
-                let cold = fresh(input, warm);
-                let mut expected_witness = poison_witness();
-                let expected = cold
-                    .query_snapshot()
-                    .unwrap()
-                    .body_pose_after_motion_with_witness(from, xy, yaw, &mut expected_witness)
-                    .map(pose_bits);
-                assert_eq!(expected.as_ref().err(), expected_error.as_ref(), "{label}");
-                assert_eq!(expected_witness.is_some(), has_witness, "{label}");
-                if has_witness {
-                    assert!(matches!(
-                        expected_witness.unwrap().rejection,
-                        BodyRejection::Occupancy {
-                            source: OccupancySource::Recent,
-                            ..
-                        }
-                    ));
-                }
-                let legacy_cold = fresh(input, warm);
-                assert_result(
-                    &legacy_cold
-                        .query_snapshot()
-                        .unwrap()
-                        .body_pose_after_motion(from, xy, yaw)
-                        .map(pose_bits),
-                    &expected,
-                    label,
-                );
-                for _ in 0..3 {
-                    let mut actual_witness = poison_witness();
-                    assert_result(
-                        &warm
-                            .body_pose_after_motion_with_witness(from, xy, yaw, &mut actual_witness)
-                            .map(pose_bits),
-                        &expected,
-                        label,
-                    );
-                    assert_eq!(
-                        witness_bits(actual_witness),
-                        witness_bits(expected_witness),
-                        "{label}"
-                    );
-                    assert_result(
-                        &warm.body_pose_after_motion(from, xy, yaw).map(pose_bits),
-                        &expected,
-                        label,
-                    );
-                }
-            }
-        }
-
-        #[test]
-        fn planning_rebound_raw_metadata_matches_fresh_cold_queries_and_witnesses() {
-            let (snapshot, mut observations, mut blocks) = fixture();
-            let receiver = SurfaceInputReceiver::new();
-            receiver.observe(snapshot.clone()).unwrap();
-            let captured = receiver.freeze().unwrap();
-            let mut planning = captured.fork_for_planning();
-            let original_query = planning.query_snapshot().unwrap().clone();
-            let key = FINE_KEY;
-            let original_evidence = snapshot.observations().unwrap().get(key).unwrap();
-            assert_queries(&original_query, &captured); // warm successes, errors, projections and full witnesses
-            for revision in 2_u16..=4 {
-                let expected = SurfaceObservation {
-                    observed_ns: u64::from(revision) * 100,
-                    hits: revision,
-                };
-                *blocks.get_mut(&[0, 0, 0]).unwrap().get_mut(&key).unwrap() = expected;
-                let changed = observations
-                    .replace_block_with_geometry_changes([0, 0, 0], blocks[&[0, 0, 0]].clone())
-                    .unwrap();
-                assert!(changed.is_empty());
-                observations.mark_complete_geometry_source();
-                let latest =
-                    Arc::new(snapshot.with_observations(Some(Arc::new(observations.clone()))));
-                receiver.observe(latest.clone()).unwrap();
-                let current = receiver.freeze().unwrap();
-                assert_eq!(
-                    current.notification(),
-                    captured.notification() + u64::from(revision - 1)
-                );
-                assert!(!Arc::ptr_eq(
-                    snapshot.observations().unwrap(),
-                    latest.observations().unwrap()
-                ));
-                assert!(
-                    !captured.same_source_view(&current),
-                    "strict source qualification remains unchanged"
-                );
-                assert!(
-                    !snapshot.same_body_query_view(&latest),
-                    "global body-cache contract remains strict"
-                );
-                assert!(captured.same_planning_query_view(&current));
-                assert!(snapshot.same_planning_query_view(&latest));
-                let rebound = planning
-                    .rebind_original(&current)
-                    .expect("query-equivalent raw evidence keeps the private owner");
-                assert!(Arc::ptr_eq(
-                    rebound.query_snapshot().unwrap(),
-                    &original_query
-                ));
-                assert!(Arc::ptr_eq(
-                    rebound.original_input().snapshot().unwrap(),
-                    &latest
-                ));
-                assert_eq!(
-                    rebound.original_input().notification(),
-                    current.notification()
-                );
-                assert_eq!(
-                    rebound
-                        .original_input()
-                        .snapshot()
-                        .unwrap()
-                        .observations()
-                        .unwrap()
-                        .get(key),
-                    Some(expected)
-                );
-                assert_eq!(
-                    original_query.observations().unwrap().get(key),
-                    Some(original_evidence)
-                );
-                assert_eq!(
-                    snapshot.observations().unwrap().get(key),
-                    Some(original_evidence)
-                );
-                assert_queries(rebound.query_snapshot().unwrap(), &current);
-                planning = rebound; // also exercise successive rebinds, not only the first capture
-            }
-        }
-    }
-
-    #[test]
-    fn frozen_source_comparison_rejects_truthful_observation_metadata_change() {
-        use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
-        use std::collections::BTreeMap;
-        let original = map();
-        let mut observations = SurfaceObservations::new(0.1, 32).unwrap();
-        observations
-            .replace_block(
-                [0, 0, 0],
-                BTreeMap::from([(
-                    [10, 10, 0],
-                    SurfaceObservation {
-                        observed_ns: 1,
-                        hits: 1,
-                    },
-                )]),
-            )
-            .unwrap();
-        let old = Arc::new(original.with_observations(Some(Arc::new(observations.clone()))));
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(old.clone()).unwrap();
-        let captured = receiver.freeze().unwrap();
-        receiver.observe(old).unwrap();
-        assert!(captured.same_source_view(&receiver.freeze().unwrap()));
-        observations
-            .replace_block(
-                [0, 0, 0],
-                BTreeMap::from([(
-                    [10, 10, 0],
-                    SurfaceObservation {
-                        observed_ns: 2,
-                        hits: 2,
-                    },
-                )]),
-            )
-            .unwrap();
-        receiver
-            .observe(Arc::new(
-                original.with_observations(Some(Arc::new(observations))),
-            ))
-            .unwrap();
-        let current = receiver.freeze().unwrap();
-        assert!(!captured.same_source_view(&current));
-        assert_ne!(captured.notification(), current.notification());
-    }
-
-    #[test]
-    fn discard_a_b_a_preserves_ties_regional_order_and_calibrated_ray_budget() {
-        fn tied_map() -> Arc<SurfaceSnapshot> {
-            let points: Vec<_> = [0.0_f32, 3.0]
-                .into_iter()
-                .flat_map(|level| {
-                    (-10..10).flat_map(move |x| {
-                        (-10..10).map(move |y| {
-                            ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, level + 0.05)
-                        })
-                    })
-                })
-                .collect();
-            Arc::new(SurfaceSnapshot::from_points(&points, map().config().clone(), 0.1).unwrap())
-        }
-        let mut current = state(0.4, 1);
-        current.robot_pose.pose.position.x = 0.05;
-        current.robot_pose.pose.position.y = 0.05;
-        let mut other_floor = current.clone();
-        other_floor.robot_pose.pose.position.z = 3.4;
-        other_floor.now = Timestamp::from_unix(2, 0);
-        for calibrated in [false, true] {
-            let receiver = SurfaceInputReceiver::new();
-            let a = tied_map();
-            receiver.observe(a.clone()).unwrap();
-            let frozen_a = receiver.freeze().unwrap();
-            let mut source = source(receiver.clone(), 1);
-            let mut direct = super::tests::source(receiver.clone(), 1);
-            for adapter in [&mut source, &mut direct] {
-                // Give an old reachable region priority while leaving the symmetric
-                // map's first-candidate ties and regional representatives intact.
-                adapter
-                    .regional_schedule
-                    .record_outcome([-0.95, -0.95, 0.1]);
-                for _ in 0..8 {
-                    adapter.regional_schedule.record_outcome([30.0, 30.0, 0.1]);
-                }
-                if calibrated {
-                    adapter.set_observation_model(volume_model()).unwrap();
-                }
-            }
-            let before = committed(&source);
-            let expected = direct.poll_goal(&current).unwrap();
-            let expected_goal = goal(expected.clone());
-            assert!(
-                expected_goal.metadata["available_regions"]
-                    .parse::<usize>()
-                    .unwrap()
-                    >= 2
-            );
-            let first = source.prepare_poll_with_input(&current, &frozen_a).unwrap();
-            assert_eq!(first.outcome().as_ref().unwrap(), &expected);
-            source.discard_prepared_poll().unwrap();
-            receiver.observe(tied_map()).unwrap();
-            source.prepare_poll(&other_floor).unwrap();
-            source.discard_prepared_poll().unwrap();
-            assert_eq!(committed(&source), before);
-            let last = source.prepare_poll_with_input(&current, &frozen_a).unwrap();
-            assert_eq!(last.outcome().as_ref().unwrap(), &expected);
-            assert_eq!(source.commit_prepared_poll().unwrap(), expected);
-            assert_eq!(committed(&source), committed(&direct));
-            if calibrated {
-                let selected = source.selected.as_ref().unwrap();
-                let rays: usize = selected.goal.metadata["visibility_rays"].parse().unwrap();
-                assert!(rays <= volume_model().max_rays);
-            }
-        }
-    }
-
-    #[test]
-    fn input_read_error_is_prepared_and_legacy_short_circuits_are_preserved() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut source = source(receiver.clone(), 1);
-        let before = committed(&source);
-        let shared = receiver.current.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = shared.write().unwrap();
-            panic!("poison input for transactional error test");
-        })
-        .join();
-        let preview = source.prepare_poll(&state(0.4, 1)).unwrap();
-        assert!(
-            matches!(preview.outcome(), Err(ExploreError::SourceError(message)) if message.contains("poisoned"))
-        );
-        assert_eq!(committed(&source), before);
-        assert!(matches!(
-            source.commit_prepared_poll(),
-            Err(ExploreError::SourceError(_))
-        ));
-        assert_eq!(committed(&source), before);
-        source.end().unwrap();
-        assert!(matches!(
-            source.poll_goal(&state(0.4, 2)).unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-    }
 
     #[test]
     fn blind_start_selects_a_goal_without_inserting_observed_ground() {
@@ -4215,7 +2300,7 @@ mod tests {
             )
             .unwrap();
         let mut controller =
-            ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+            ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         controller.add_source(source);
         controller.begin_exploration().unwrap();
         assert!(matches!(
@@ -4327,60 +2412,8 @@ mod tests {
         assert!(frontier_route_cost(&mut search, [0.05,0.05,0.4], [2.15,0.05,0.4], &FrontierRouteBudget::default()).is_some());
     }
 
-    #[test]
-    fn native_frontier_cancelled_prepare_does_not_commit_feedback_state() {
-        let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
-        let mut adapter = source(receiver, 1);
-        let before = committed(&adapter);
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let prepared = nuwax_nav_pct_native::with_planning_cancellation(flag, || {
-            adapter.prepare_poll(&state(0.4, 1))
-        })
-        .unwrap();
-        assert!(prepared.outcome().is_err());
-        adapter.discard_prepared_poll().unwrap();
-        assert_eq!(committed(&adapter), before);
-    }
 
-    #[test]
-    fn native_planner_cache_rebinds_same_query_and_changes_with_boundary_or_offset() {
-        let receiver = SurfaceInputReceiver::new();
-        let snapshot = map();
-        receiver.observe(snapshot.clone()).unwrap();
-        let planning = receiver.freeze().unwrap().fork_for_planning();
-        let first = planning
-            .native_cache
-            .get(planning.query_snapshot().unwrap(), 0.3, &[])
-            .unwrap();
-        receiver.observe(snapshot).unwrap();
-        let rebound = planning
-            .rebind_original(&receiver.freeze().unwrap())
-            .unwrap();
-        let reused = rebound
-            .native_cache
-            .get(rebound.query_snapshot().unwrap(), 0.3, &[])
-            .unwrap();
-        assert!(Arc::ptr_eq(&first.planner, &reused.planner));
-        let boundary = [[-1.0, -1.0], [4.0, -1.0], [4.0, 4.0], [-1.0, 4.0]];
-        let bounded = rebound
-            .native_cache
-            .get(rebound.query_snapshot().unwrap(), 0.3, &boundary)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&first.planner, &bounded.planner));
-        let changed = rebound
-            .native_cache
-            .get(rebound.query_snapshot().unwrap(), 0.4, &boundary)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&bounded.planner, &changed.planner));
-        let weak = Arc::downgrade(&changed.planner);
-        drop(changed);
-        drop(planning);
-        drop(rebound);
-        assert!(weak.upgrade().is_none());
-    }
 
-    include!("surface_view_ownership_tests.rs");
 
     #[test]
     fn reachable_frontier_batch_only_exactly_checks_the_selected_goal() {

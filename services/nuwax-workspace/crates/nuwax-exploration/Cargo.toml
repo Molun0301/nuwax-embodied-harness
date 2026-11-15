@@ -16,16 +16,8 @@ path = "src/lib.rs"
 default = []
 wavefront = ["dep:nuwax-explore-wavefront"]
 surface = ["dep:nuwax-nav-mls-planner", "dep:nuwax-nav-pct-native", "dep:nuwax-nav-runtime"]
-tare = ["dep:nuwax-explore-tare-bridge"]
-terrain-map-ext = ["dep:nuwax-explore-terrain-map-bridge"]
 runtime = ["dep:tokio"]
 patrolling-conversions = ["dep:nuwax-nav-patrolling"]
-# Phase E6 板块 3 整合点:暴露 typed native spec summary
-spec-summary = [
-    "dep:nuwax-nav-native-runner",
-    "terrain-map-ext",
-    "tare",
-]
 
 [dependencies]
 serde_json = { workspace = true }
@@ -34,9 +26,6 @@ nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true
 nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner", optional = true }
 nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native", optional = true }
 nuwax-nav-runtime = { path = "../nuwax-nav-runtime", optional = true }
-nuwax-explore-tare-bridge = { path = "../nuwax-explore-tare-bridge", optional = true }
-nuwax-explore-terrain-map-bridge = { path = "../nuwax-explore-terrain-map-bridge", optional = true }
-nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }
 nuwax-nav-patrolling = { path = "../nuwax-nav-patrolling", optional = true }
 nuwax-nav-base = { path = "../nuwax-nav-base" }

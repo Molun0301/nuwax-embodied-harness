@@ -1,22 +1,6 @@
-//! `nuwax-exploration`:板块 3 探索 orchestration facade
+//! 探索控制器、二维波前和三维曲面目标源。
 //!
-//! ## 职责
-//!
-//! - 统一多个 heterogeneous exploration goal source(`Vec<Box<dyn ExplorationGoalSource>>`)
-//!   的 lifecycle 与 arbitration;具体 source 由 `nuwax-explore-wavefront` 与
-//!   `nuwax-explore-tare-bridge` 通过具体 adapter 提供。
-//! - 提供 `FrontierGoal -> NavigationGoal` / `FrontierGoal -> FrontierGoalInput`
-//!   的唯一转换入口(`conversions` 模块)。
-//! - `runtime` feature 下提供最小 sink contract 与具体 source adapter。
-//!
-//! ## 不做事项
-//!
-//! - 不重新定义 `FrontierGoal` / `NavigationGoal` / `FrontierGoalInput` 等强类型。
-//! - 不直接管理 TARE / Terrain Analysis 原生进程生命周期(归属各自 `BridgeSupervisor`)。
-//! - topic-only `nuwax-explore-terrain-bridge` 不作为 facade dependency,
-//!   `terrain_map` topic 由 stack wiring 单独管理。
-//!
-//! 详见 `docs/子任务/探索模块重写/探索模块重写方案.md` §8。
+//! 同步轮询选择目标，导航终态反馈推动历史；目标到导航的转换由 conversions 提供。
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -36,22 +20,12 @@ pub mod mission;
 
 #[cfg(feature = "surface")]
 pub mod surface_adapter;
-#[cfg(feature = "surface")]
-pub use surface_adapter::{FrozenSurfaceInput, FrozenSurfacePlanningInput};
 
-#[cfg(all(feature = "runtime", feature = "tare"))]
-pub mod tare_adapter;
 #[cfg(all(feature = "runtime", feature = "wavefront"))]
 pub mod wavefront_adapter;
 
 #[cfg(feature = "runtime")]
 pub mod runtime;
-
-/// Phase E6 板块 3 整合点:typed native spec summary
-#[cfg(feature = "spec-summary")]
-pub mod spec_summary;
-#[cfg(feature = "spec-summary")]
-pub use spec_summary::NativeSpecSummary;
 
 /// `nuwax-exploration` facade 操作结果
 pub type ExploreResult<T> = Result<T, ExploreError>;
@@ -62,18 +36,6 @@ pub type ExploreResult<T> = Result<T, ExploreError>;
 /// 收敛为字符串 variant,避免 facade 暴露具体 crate 的 typed error 类型。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExploreError {
-    /// This source does not implement transactional polling.
-    #[error("exploration source does not support prepared polling")]
-    PreparedPollUnsupported,
-    /// Finalization changed the prepared logical outcome; this controller is poisoned.
-    #[error("prepared exploration protocol fault: {0}")]
-    PreparedPollProtocol(String),
-    /// Resolve the existing prepared poll before another mutation.
-    #[error("exploration prepared poll is unresolved")]
-    PreparedPollBusy,
-    /// No prepared poll exists to resolve.
-    #[error("no exploration prepared poll exists")]
-    NoPreparedPoll,
     /// controller 没有注册任何 goal source
     #[error("no exploration goal sources registered")]
     NoSources,
@@ -86,7 +48,7 @@ pub enum ExploreError {
     /// 具体 source adapter 返回的 source-level 错误(诊断信息透传)
     #[error("exploration source error: {0}")]
     SourceError(String),
-    /// 类型 / 数值 / 协议转换错误(如 `TareWaypoint::validate` 失败)
+    /// 类型、数值或协议转换错误
     #[error("exploration conversion error: {0}")]
     Conversion(String),
     /// 导航 / patrolling 侧错误(写入 sink 时透传)
@@ -355,8 +317,7 @@ fn segments_intersect(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
 pub enum ExplorationPoll {
     /// 当前 source 已经选择出 frontier goal
     Goal(FrontierGoal),
-    /// 当前 source 暂时没有可用 goal(`HighestScore` 与 `FirstAvailable` 之下
-    /// 会继续 fallback 或继续扫描其它 source)
+    /// 当前源仍在计算，等待后续轮询。
     Pending,
     /// 已检查有效输入，当前没有可达且未排除的前沿目标。
     NoFrontier,
@@ -365,25 +326,6 @@ pub enum ExplorationPoll {
     Stop(ExplorationStopReason),
     /// 当前 source 当前不可用(包含错误诊断);按 pending 处理,policy 可 fallback
     SourceUnavailable(String),
-}
-
-/// A provisional poll projection. Its goal IDs are not committed dispatch identities.
-/// Resolve it through its source/controller before publishing or sending feedback.
-/// An algorithm error is retained here with its source's semantic delta; an outer
-/// `prepare_poll` error instead denotes unsupported/busy API use.
-#[derive(Debug, Clone)]
-pub struct PreparedExplorationPoll {
-    outcome: ExploreResult<ExplorationPoll>,
-}
-impl PreparedExplorationPoll {
-    /// Wrap a prepared algorithm outcome without committing its semantic changes.
-    pub fn new(outcome: ExploreResult<ExplorationPoll>) -> Self {
-        Self { outcome }
-    }
-    /// Inspect advice only; this is not a committed frontier or terminal outcome.
-    pub fn outcome(&self) -> &ExploreResult<ExplorationPoll> {
-        &self.outcome
-    }
 }
 
 /// controller 与 source adapter 之间共享的 explore-time 状态快照
@@ -397,10 +339,6 @@ pub struct ExplorationStateSnapshot<'a> {
     pub robot_pose: PoseStamped,
     /// 全局 costmap(若有)
     pub global_costmap: Option<&'a OccupancyGrid2D>,
-    /// Optional immutable source/query pair captured before asynchronous work.
-    /// Surface sources must not read their live input receiver when supplied.
-    #[cfg(feature = "surface")]
-    pub frozen_surface_input: Option<&'a FrozenSurfacePlanningInput>,
     /// controller 当前已发布但尚未到达的 navigation goal
     pub active_goal: Option<nuwax_nav_types_messages::goal::NavigationGoal>,
     /// 最近选出的 frontier goal(用于 cancel / dedup)
@@ -416,8 +354,6 @@ impl<'a> ExplorationStateSnapshot<'a> {
         Self {
             robot_pose,
             global_costmap: None,
-            #[cfg(feature = "surface")]
-            frozen_surface_input: None,
             active_goal: None,
             latest_frontier_goal: None,
             now,
@@ -498,28 +434,6 @@ pub trait ExplorationGoalSource: Send {
     fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>)
         -> ExploreResult<ExplorationPoll>;
 
-    /// Explicit capability; checkpoint support does not imply transactional polling.
-    fn supports_prepared_poll(&self) -> bool {
-        false
-    }
-    /// Prepare one poll without committing semantic history or allocating a goal ID.
-    fn prepare_poll(
-        &mut self,
-        _state: &ExplorationStateSnapshot<'_>,
-    ) -> ExploreResult<PreparedExplorationPoll> {
-        Err(ExploreError::PreparedPollUnsupported)
-    }
-    /// Commit the exact pending poll once, including its accepted error-path changes.
-    /// The logical outcome must equal its preview except for deferred goal ID allocation.
-    /// Controller resolution treats any other difference as a terminal protocol fault.
-    fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
-        Err(ExploreError::PreparedPollUnsupported)
-    }
-    /// Discard the exact pending poll without semantic history/notification effects.
-    fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
-        Err(ExploreError::PreparedPollUnsupported)
-    }
-
     /// 将 child navigation 终态反馈回 source。无状态 source 可使用默认 no-op。
     fn report_goal_feedback(
         &mut self,
@@ -553,39 +467,18 @@ pub trait ExplorationGoalSource: Send {
     fn diagnostics(&self) -> ExplorationSourceDiagnostics;
 }
 
-/// source arbitration policy
-///
-/// 方案 §8.2 矩阵:`Goal` 可选;`Pending` 可 fallback(`Prefer*` / `FirstAvailable`);
-/// `SourceUnavailable` 视 pending 处理;`Stop` 立即结束。
+/// 生产使用的目标源优先顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExplorationArbitrationPolicy {
     /// 优先 wavefront;pending / unavailable 时 fallback 到其它 source
     PreferWavefront,
-    /// 优先 TARE;pending / unavailable 时 fallback 到其它 source
-    PreferTare,
-    /// 在所有 source 中选 score 最高的 `Goal`;无 `Goal` 时返回 `Pending`
-    HighestScore,
-    /// 顺序扫描,返回第一个 non-pending 的 `Goal`
-    FirstAvailable,
 }
 
 /// exploration controller:多 source 仲裁 + 统一 lifecycle / diagnostics
 ///
 /// 标准 controller 持有 `Vec<Box<dyn ExplorationGoalSource>>`,以支持
 /// heterogeneous source(纯算法 + native bridge adapter)。
-struct PreparedControllerPoll {
-    visited: Vec<(usize, ExploreResult<ExplorationPoll>)>,
-    defer_stop: bool,
-}
-struct CommittedSourcePoll {
-    index: usize,
-    outcome: ExploreResult<ExplorationPoll>,
-    diagnostics: ExplorationSourceDiagnostics,
-}
-
 pub struct ExplorationController {
-    prepared: Option<PreparedControllerPoll>,
-    prepared_fault: Option<String>,
     sources: Vec<Box<dyn ExplorationGoalSource>>,
     arbitration: ExplorationArbitrationPolicy,
     active: bool,
@@ -597,9 +490,6 @@ pub struct ExplorationController {
 impl ExplorationController {
     /// 由原任务在确认停止后取得所有源的版本化进度。
     pub fn checkpoint(&self) -> ExploreResult<Vec<mission::SourceCheckpoint>> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
         self.sources
             .iter()
             .map(|source| {
@@ -619,12 +509,6 @@ impl ExplorationController {
         &mut self,
         states: &[mission::SourceCheckpoint],
     ) -> ExploreResult<()> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
-        if self.prepared.is_some() {
-            return Err(ExploreError::PreparedPollBusy);
-        }
         if !self.active || states.len() != self.sources.len() || states.len() > 16 {
             return Err(ExploreError::SourceError("探索恢复源集合不匹配".into()));
         }
@@ -648,8 +532,6 @@ impl ExplorationController {
     pub fn new(arbitration: ExplorationArbitrationPolicy) -> Self {
         Self {
             sources: Vec::new(),
-            prepared: None,
-            prepared_fault: None,
             arbitration,
             active: false,
             last_stop_reason: None,
@@ -675,19 +557,11 @@ impl ExplorationController {
     where
         T: ExplorationGoalSource + 'static,
     {
-        assert!(
-            self.prepared.is_none(),
-            "resolve prepared poll before changing sources"
-        );
         self.sources.push(Box::new(source));
     }
 
     /// 注册任意满足 trait object 的 source(便于 trait-object-only 调用方)
     pub fn add_source_boxed(&mut self, source: Box<dyn ExplorationGoalSource>) {
-        assert!(
-            self.prepared.is_none(),
-            "resolve prepared poll before changing sources"
-        );
         self.sources.push(source);
     }
 
@@ -697,13 +571,6 @@ impl ExplorationController {
         self.sources.len()
     }
 
-    /// Whether every registered source explicitly supports prepare/commit polling.
-    /// This capability read does not poll, begin, or mutate a source. Empty-source
-    /// admission remains the responsibility of `begin_exploration`.
-    #[must_use]
-    pub fn supports_prepared_poll(&self) -> bool {
-        self.sources.iter().all(|source| source.supports_prepared_poll())
-    }
 
     /// 启动 exploration。
     ///
@@ -713,12 +580,6 @@ impl ExplorationController {
     ///
     /// `active == true` 时返回 `AlreadyActive`(保持状态)。
     pub fn begin_exploration(&mut self) -> ExploreResult<()> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
-        if self.prepared.is_some() {
-            return Err(ExploreError::PreparedPollBusy);
-        }
         if self.active {
             return Err(ExploreError::AlreadyActive);
         }
@@ -757,9 +618,6 @@ impl ExplorationController {
 
     /// 以明确原因结束 exploration，并按 reverse order 释放全部 source。
     pub fn stop_with_reason(&mut self, reason: ExplorationStopReason) -> ExploreResult<()> {
-        if self.prepared.is_some() {
-            self.discard_prepared_poll()?;
-        }
         if self.active {
             for source in self.sources.iter_mut().rev() {
                 let _ = source.end();
@@ -777,9 +635,6 @@ impl ExplorationController {
 
     /// 关闭 controller 并丢弃所有 source(state)
     pub fn shutdown(&mut self) {
-        if self.prepared.is_some() {
-            let _ = self.discard_prepared_poll();
-        }
         if self.active {
             for source in self.sources.iter_mut().rev() {
                 let _ = source.end();
@@ -802,185 +657,19 @@ impl ExplorationController {
         self.poll_next_goal_with_deferred_stop(state, false)
     }
 
-    /// 父任务需要完成返航时保留源和控制器，终态由原父任务明确收尾。
-    /// Prepare one whole arbitration without committing any visited source's semantic delta.
-    /// Unsupported sources are rejected before any source is polled. A returned
-    /// algorithm error remains part of the pending transaction until resolution.
-    pub fn prepare_poll_with_deferred_stop(
-        &mut self,
-        state: &ExplorationStateSnapshot<'_>,
-        defer_stop: bool,
-    ) -> ExploreResult<PreparedExplorationPoll> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
-        if self.prepared.is_some() {
-            return Err(ExploreError::PreparedPollBusy);
-        }
-        if self.sources.iter().any(|s| !s.supports_prepared_poll()) {
-            return Err(ExploreError::PreparedPollUnsupported);
-        }
-        let mut visited: Vec<(usize, ExploreResult<ExplorationPoll>)> = Vec::new();
-        let mut best_goal: Option<FrontierGoal> = None;
-        let mut pending = false;
-        let mut no_frontier = false;
-        let mut unavailable = None;
-        let mut immediate = None;
-        if self.active {
-            for index in self.arbitration_order() {
-                let prepared = match self.sources[index].prepare_poll(state) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let mut detail = format!(
-                            "source `{}` rejected preparation: {error}",
-                            self.sources[index].source_name()
-                        );
-                        for (prior, _) in &visited {
-                            if let Err(discard) = self.sources[*prior].discard_prepared_poll() {
-                                detail.push_str(&format!(
-                                    "; source `{}` failed discard: {discard}",
-                                    self.sources[*prior].source_name()
-                                ));
-                            }
-                        }
-                        return Err(self.poison_prepared_protocol(detail));
-                    }
-                };
-                visited.push((index, prepared.outcome().clone()));
-                match prepared.outcome() {
-                    Err(error) => {
-                        unavailable =
-                            Some(format!("{}: {error}", self.sources[index].source_name()))
-                    }
-                    Ok(ExplorationPoll::Goal(goal)) => {
-                        if self.arbitration == ExplorationArbitrationPolicy::HighestScore {
-                            if best_goal
-                                .as_ref()
-                                .is_none_or(|best| goal.score > best.score)
-                            {
-                                best_goal = Some(goal.clone());
-                            }
-                        } else {
-                            immediate = Some(ExplorationPoll::Goal(goal.clone()));
-                            break;
-                        }
-                    }
-                    Ok(ExplorationPoll::Pending) => pending = true,
-                    Ok(ExplorationPoll::NoFrontier) => no_frontier = true,
-                    Ok(ExplorationPoll::SourceUnavailable(reason)) => {
-                        unavailable = Some(reason.clone())
-                    }
-                    Ok(ExplorationPoll::Stop(reason)) => {
-                        immediate = Some(ExplorationPoll::Stop(*reason));
-                        break;
-                    }
-                }
-            }
-        } else {
-            immediate = Some(ExplorationPoll::SourceUnavailable(
-                "controller not active".into(),
-            ));
-        }
-        let outcome = immediate.unwrap_or_else(|| {
-            if let Some(goal) = best_goal {
-                ExplorationPoll::Goal(goal)
-            } else if let Some(reason) = unavailable {
-                if pending {
-                    ExplorationPoll::Pending
-                } else {
-                    ExplorationPoll::SourceUnavailable(reason)
-                }
-            } else if pending {
-                ExplorationPoll::Pending
-            } else if no_frontier {
-                ExplorationPoll::NoFrontier
-            } else {
-                ExplorationPoll::Pending
-            }
-        });
-        self.prepared = Some(PreparedControllerPoll {
-            visited,
-            defer_stop,
-        });
-        Ok(PreparedExplorationPoll::new(Ok(outcome)))
-    }
-
-    /// Accept the exact pending arbitration. ID allocation and source end calls happen here.
-    pub fn commit_prepared_poll(&mut self) -> ExploreResult<ExplorationPoll> {
-        let prepared = self.prepared.take().ok_or(ExploreError::NoPreparedPoll)?;
-        let mut committed = Vec::with_capacity(prepared.visited.len());
-        let mut visited = prepared.visited.into_iter();
-        while let Some((index, expected)) = visited.next() {
-            let outcome = self.sources[index].commit_prepared_poll();
-            let diagnostics = self.sources[index].diagnostics();
-            if !prepared_outcome_matches(&expected, &outcome) {
-                let mut detail = format!(
-                    "source `{}` changed its prepared logical outcome",
-                    self.sources[index].source_name()
-                );
-                for (remaining, _) in visited {
-                    if let Err(error) = self.sources[remaining].discard_prepared_poll() {
-                        detail.push_str(&format!("; discard failed: {error}"));
-                    }
-                }
-                return Err(self.poison_prepared_protocol(detail));
-            }
-            committed.push(CommittedSourcePoll {
-                index,
-                outcome,
-                diagnostics,
-            });
-        }
-        self.poll_next_goal_impl(None, prepared.defer_stop, Some(committed))
-    }
-
-    /// Retire all visited-source patches, including losing goals and partial errors.
-    pub fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
-        let prepared = self.prepared.take().ok_or(ExploreError::NoPreparedPoll)?;
-        let mut first_error = None;
-        for (index, _) in prepared.visited {
-            if let Err(error) = self.sources[index].discard_prepared_poll() {
-                first_error.get_or_insert(error);
-            }
-        }
-        match first_error {
-            Some(error) => {
-                Err(self.poison_prepared_protocol(format!("prepared discard failed: {error}")))
-            }
-            None => Ok(()),
-        }
-    }
-
-    fn poison_prepared_protocol(&mut self, detail: String) -> ExploreError {
-        self.prepared_fault = Some(detail.clone());
-        self.active = false;
-        self.last_stop_reason = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-        for source in self.sources.iter_mut().rev() {
-            let _ = source.end();
-        }
-        ExploreError::PreparedPollProtocol(detail)
-    }
-
-    /// Synchronously arbitrate and apply source effects; prepared transactions must be resolved first.
+    /// 同步选择并应用源状态；父任务返航时由父任务结束控制器。
     pub fn poll_next_goal_with_deferred_stop(
         &mut self,
         state: &ExplorationStateSnapshot<'_>,
         defer_stop: bool,
     ) -> ExploreResult<ExplorationPoll> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
-        if self.prepared.is_some() {
-            return Err(ExploreError::PreparedPollBusy);
-        }
-        self.poll_next_goal_impl(Some(state), defer_stop, None)
+        self.poll_next_goal_impl(state, defer_stop)
     }
 
     fn poll_next_goal_impl(
         &mut self,
-        state: Option<&ExplorationStateSnapshot<'_>>,
+        state: &ExplorationStateSnapshot<'_>,
         defer_stop: bool,
-        committed: Option<Vec<CommittedSourcePoll>>,
     ) -> ExploreResult<ExplorationPoll> {
         if !self.active {
             return Ok(ExplorationPoll::SourceUnavailable(
@@ -991,8 +680,6 @@ impl ExplorationController {
         self.last_source_diag.clear();
 
         let order = self.arbitration_order();
-        let mut committed = committed.map(Vec::into_iter);
-        let mut best_goal: Option<(f32, usize, FrontierGoal)> = None;
         let mut any_pending = false;
         let mut any_no_frontier = false;
         let mut any_unavailable = false;
@@ -1000,31 +687,14 @@ impl ExplorationController {
 
         for &idx in &order {
             let source_name = self.sources[idx].source_name();
-            let mut saved_diagnostics = None;
-            let outcome = if let Some(committed) = committed.as_mut() {
-                let Some(entry) = committed.next() else {
-                    return Err(self.poison_prepared_protocol(
-                        "prepared arbitration exhausted before its logical outcome".into(),
-                    ));
-                };
-                if entry.index != idx {
-                    return Err(self.poison_prepared_protocol(
-                        "prepared arbitration source order changed".into(),
-                    ));
-                }
-                saved_diagnostics = Some(entry.diagnostics);
-                entry.outcome
-            } else {
-                self.sources[idx].poll_goal(state.expect("synchronous poll state"))
-            };
+            let outcome = self.sources[idx].poll_goal(state);
             let poll = match outcome {
                 Ok(p) => p,
                 Err(e) => {
                     any_unavailable = true;
                     last_unavailable = Some(format!("{source_name}: {e}"));
-                    self.last_source_diag.push(diag_for_saved(
+                    self.last_source_diag.push(diag_for(
                         &*self.sources[idx],
-                        saved_diagnostics.as_ref(),
                         None,
                         Some(format!("{e}")),
                     ));
@@ -1033,51 +703,22 @@ impl ExplorationController {
             };
             match poll {
                 ExplorationPoll::Goal(goal) => {
-                    // HighestScore 比较;其它 policy 取首个
-                    match self.arbitration {
-                        ExplorationArbitrationPolicy::HighestScore => {
-                            let score = goal.score;
-                            let replace = match &best_goal {
-                                None => true,
-                                Some((best, _, _)) => score > *best,
-                            };
-                            if replace {
-                                best_goal = Some((score, idx, goal.clone()));
-                                self.last_selected = Some(source_name.to_string());
-                                self.last_source_diag.push(diag_for_saved(
-                                    &*self.sources[idx],
-                                    saved_diagnostics.as_ref(),
-                                    Some(goal.id.clone()),
-                                    None,
-                                ));
-                            }
-                        }
-                        _ => {
-                            self.last_selected = Some(source_name.to_string());
-                            self.last_source_diag.push(diag_for_saved(
-                                &*self.sources[idx],
-                                saved_diagnostics.as_ref(),
-                                Some(goal.id.clone()),
-                                None,
-                            ));
-                            return Ok(ExplorationPoll::Goal(goal));
-                        }
-                    }
+                    self.last_selected = Some(source_name.to_string());
+                    self.last_source_diag.push(diag_for(&*self.sources[idx], Some(goal.id.clone()), None));
+                    return Ok(ExplorationPoll::Goal(goal));
                 }
                 ExplorationPoll::Pending => {
                     any_pending = true;
-                    self.last_source_diag.push(diag_for_saved(
+                    self.last_source_diag.push(diag_for(
                         &*self.sources[idx],
-                        saved_diagnostics.as_ref(),
                         None,
                         None,
                     ));
                 }
                 ExplorationPoll::NoFrontier => {
                     any_no_frontier = true;
-                    self.last_source_diag.push(diag_for_saved(
+                    self.last_source_diag.push(diag_for(
                         &*self.sources[idx],
-                        saved_diagnostics.as_ref(),
                         None,
                         None,
                     ));
@@ -1085,9 +726,8 @@ impl ExplorationController {
                 ExplorationPoll::SourceUnavailable(reason) => {
                     any_unavailable = true;
                     last_unavailable = Some(reason);
-                    self.last_source_diag.push(diag_for_saved(
+                    self.last_source_diag.push(diag_for(
                         &*self.sources[idx],
-                        saved_diagnostics.as_ref(),
                         None,
                         last_unavailable.clone(),
                     ));
@@ -1107,10 +747,6 @@ impl ExplorationController {
             }
         }
 
-        if let Some((_, idx, goal)) = best_goal {
-            let _ = idx;
-            return Ok(ExplorationPoll::Goal(goal));
-        }
 
         if any_unavailable {
             if any_pending {
@@ -1137,12 +773,6 @@ impl ExplorationController {
         goal_id: &str,
         feedback: ExplorationGoalFeedback,
     ) -> ExploreResult<()> {
-        if let Some(error) = &self.prepared_fault {
-            return Err(ExploreError::PreparedPollProtocol(error.clone()));
-        }
-        if self.prepared.is_some() {
-            return Err(ExploreError::PreparedPollBusy);
-        }
         for source in &mut self.sources {
             source.report_goal_feedback(goal_id, feedback.clone())?;
         }
@@ -1195,92 +825,11 @@ impl ExplorationController {
         }
     }
 
-    /// 按 arbitration policy 计算 source 顺序。
-    ///
-    /// - `PreferWavefront` / `PreferTare`:同名 source 不存在时退化为 source insertion order。
-    ///   否则 preferred source 优先,其余按 insertion order。
-    /// - `HighestScore` / `FirstAvailable`:按 insertion order(全部 source 平等)。
-    ///
-    /// duplicate source name 时由插入顺序保留 deterministic tie-break。
+    /// 优先选择波前源，其余源保持登记顺序。
     pub fn arbitration_order(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.sources.len()).collect();
-        match self.arbitration {
-            ExplorationArbitrationPolicy::PreferWavefront
-            | ExplorationArbitrationPolicy::PreferTare => {
-                let preferred = match self.arbitration {
-                    ExplorationArbitrationPolicy::PreferWavefront => "wavefront",
-                    ExplorationArbitrationPolicy::PreferTare => "tare",
-                    _ => unreachable!(),
-                };
-                order.sort_by_key(|&idx| {
-                    let name = self.sources[idx].source_name();
-                    if name.eq_ignore_ascii_case(preferred) {
-                        0u8
-                    } else {
-                        1u8
-                    }
-                });
-                // stable_sort 保留相同 key 内 insertion order
-                order.sort_by_key(|&idx| {
-                    let name = self.sources[idx].source_name();
-                    if name.eq_ignore_ascii_case(preferred) {
-                        0u8
-                    } else {
-                        1u8
-                    }
-                });
-            }
-            ExplorationArbitrationPolicy::HighestScore
-            | ExplorationArbitrationPolicy::FirstAvailable => {
-                // 已按 insertion order
-            }
-        }
+        order.sort_by_key(|&idx| !self.sources[idx].source_name().eq_ignore_ascii_case("wavefront"));
         order
-    }
-}
-
-fn prepared_outcome_matches(
-    expected: &ExploreResult<ExplorationPoll>,
-    actual: &ExploreResult<ExplorationPoll>,
-) -> bool {
-    match (expected, actual) {
-        (Ok(ExplorationPoll::Goal(a)), Ok(ExplorationPoll::Goal(b))) => {
-            let position = |g: &FrontierGoal| {
-                let p = g.pose.pose.position;
-                [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
-            };
-            let orientation = |g: &FrontierGoal| {
-                let q = g.pose.pose.orientation;
-                [q.x.to_bits(), q.y.to_bits(), q.z.to_bits(), q.w.to_bits()]
-            };
-            position(a) == position(b)
-                && orientation(a) == orientation(b)
-                && a.pose.frame_id == b.pose.frame_id
-                && a.pose.stamp == b.pose.stamp
-                && a.score.to_bits() == b.score.to_bits()
-                && a.information_gain.map(f32::to_bits) == b.information_gain.map(f32::to_bits)
-                && a.distance_cost.map(f32::to_bits) == b.distance_cost.map(f32::to_bits)
-                && a.frontier_area_m2.map(f32::to_bits) == b.frontier_area_m2.map(f32::to_bits)
-                && a.producer == b.producer
-                && a.stamp == b.stamp
-                && a.metadata == b.metadata
-        }
-        _ => expected == actual,
-    }
-}
-
-fn diag_for_saved(
-    source: &dyn ExplorationGoalSource,
-    saved: Option<&ExplorationSourceDiagnostics>,
-    last_goal_id: Option<String>,
-    last_error: Option<String>,
-) -> ExplorationSourceDiagnostics {
-    let base = saved.cloned().unwrap_or_else(|| source.diagnostics());
-    ExplorationSourceDiagnostics {
-        source_name: base.source_name,
-        is_active: base.is_active,
-        last_goal_id: last_goal_id.or(base.last_goal_id),
-        last_error: last_error.or(base.last_error),
     }
 }
 
@@ -1381,7 +930,7 @@ mod tests {
             ),
         ] {
             let mut controller =
-                ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+                ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
             let mut first = DummySource::new("first");
             first.poll = ExplorationPoll::NoFrontier;
             let mut second = DummySource::new("second");
@@ -1394,25 +943,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn arbitration_order_first_available_keeps_insertion_order() {
-        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
-        ctrl.add_source(DummySource::new("tare"));
-        ctrl.add_source(DummySource::new("wavefront"));
-        let order = ctrl.arbitration_order();
-        assert_eq!(order, vec![0, 1]);
-    }
 
     #[test]
     fn begin_no_sources_returns_error() {
-        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         let err = ctrl.begin_exploration().unwrap_err();
         assert!(matches!(err, ExploreError::NoSources));
     }
 
     #[test]
     fn begin_already_active_returns_already_active_error() {
-        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         ctrl.add_source(DummySource::new("wavefront"));
         ctrl.begin_exploration().unwrap();
         let err = ctrl.begin_exploration().unwrap_err();
@@ -1421,7 +962,7 @@ mod tests {
 
     #[test]
     fn end_when_inactive_is_noop() {
-        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
+        let mut ctrl = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         // inactive -> no-op
         ctrl.end_exploration().unwrap();
         assert!(!ctrl.is_active());
@@ -1576,6 +1117,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod prepared_tests;

@@ -276,18 +276,19 @@ impl Corrector {
             }));
             let odom = pose_isometry(&frames.last().unwrap().odom_pose);
             let initials = relocalization_initials(initial, last_pose, seed, odom);
-            let (transform, fitness, succeeded, ambiguous) =
+            let (transform, fitness, outcome) =
                 compute_relocalization(&source, &target_cache, &initials, odom);
+            let succeeded = outcome == Outcome::Accepted;
             let last = frames.last().unwrap();
             let result = proto::RelocalizationResult {
                 succeeded,
-                message: if succeeded {
-                    "重定位成功".into()
-                } else if ambiguous {
-                    "重定位有歧义：两个位置同样吻合，请转动或移动一小段后重试".into()
-                } else {
-                    "重定位未匹配到已加载地图".into()
-                },
+                message: match outcome {
+                    Outcome::Accepted => "重定位成功",
+                    Outcome::OneDirection => "重定位无法确定位置：周围只有一个方向的墙面，沿墙方向的位置不确定。请移动到能看到拐角或其它方向结构的位置后重试，或给出大致位置",
+                    Outcome::Ambiguous => "重定位有歧义：两个位置同样吻合，请转动或移动一小段后重试",
+                    Outcome::Unmatched => "重定位未匹配到已加载地图",
+                }
+                .into(),
                 pose: succeeded.then(|| {
                     pose_from_isometry(
                         transform * pose_isometry(&last.odom_pose),
@@ -318,15 +319,16 @@ impl Corrector {
         Ok(result)
     }
 }
+/// 局部阶段的初值；第二项为真表示自动得到（当前 map→odom、保存的最后位姿），结果要求水平约束度。
 fn relocalization_initials(
     current: Isometry3<f64>,
     last_pose: Option<Isometry3<f64>>,
     seed: Option<proto::PlanarSeed>,
     odom: Isometry3<f64>,
-) -> Vec<Isometry3<f64>> {
-    let mut initials = vec![current];
+) -> Vec<(Isometry3<f64>, bool)> {
+    let mut initials = vec![(current, true)];
     if let Some(saved) = last_pose {
-        initials.push(saved * odom.inverse());
+        initials.push((saved * odom.inverse(), true));
     }
     if let Some(seed) = seed {
         let (roll, pitch, _) = odom.rotation.euler_angles();
@@ -334,35 +336,55 @@ fn relocalization_initials(
             Translation3::new(seed.x, seed.y, last_pose.map_or(0.0, |p| p.translation.z)),
             UnitQuaternion::from_euler_angles(roll, pitch, seed.yaw),
         );
-        initials.push(body_pose * odom.inverse());
+        // 调用方给的初值：位置由调用方决定，配准只负责对齐，不要求水平约束度。
+        initials.push((body_pose * odom.inverse(), false));
     }
     initials
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outcome {
+    Accepted,
+    /// 没有结果被接受，且有自动结果只差水平约束度。
+    OneDirection,
+    Ambiguous,
+    Unmatched,
 }
 
 fn compute_relocalization(
     source: &SourceCloud,
     target: &TargetCache,
-    initials: &[Isometry3<f64>],
+    initials: &[(Isometry3<f64>, bool)],
     odom: Isometry3<f64>,
-) -> (Isometry3<f64>, f64, bool, bool) {
+) -> (Isometry3<f64>, f64, Outcome) {
     let config = RelocalizationConfig::default();
-    for initial in initials {
+    let mut one_direction = false;
+    for (initial, automatic) in initials {
         let Ok(local) = local_registration(source, target, *initial, odom) else {
             continue;
         };
         let transform = local.transformation;
         let score = score_relocalization(source, transform, target);
-        if score.accepts(&transform) {
-            return (transform, score.wall_fitness, true, false);
+        if !score.accepts(&transform) {
+            continue;
         }
+        if *automatic && !score.constrained() {
+            one_direction = true;
+            continue;
+        }
+        return (transform, score.wall_fitness, Outcome::Accepted);
     }
     let global = relocation_pipeline_cached(source, target, config);
-    (
-        global.registration.transformation,
-        global.fitness,
-        global.registration.converged,
-        global.ambiguous,
-    )
+    let outcome = if global.registration.converged {
+        Outcome::Accepted
+    } else if one_direction || global.one_direction {
+        Outcome::OneDirection
+    } else if global.ambiguous {
+        Outcome::Ambiguous
+    } else {
+        Outcome::Unmatched
+    };
+    (global.registration.transformation, global.fitness, outcome)
 }
 
 #[cfg(test)]

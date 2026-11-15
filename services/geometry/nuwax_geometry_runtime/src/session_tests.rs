@@ -951,7 +951,7 @@ async fn localized_map_follows_tracking_quality_and_saves_in_place_or_as_new_map
     assert!(written > loaded_revision, "重定位成功后写入地图");
     assert!(fine_voxels_at_obstacle(&loaded.surface_map().await.unwrap().unwrap()) > 0);
     // 某一轮吻合差：回到只读，近期点云照发。
-    let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1. };
+    let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1., horizontal_constraint: 0. };
     session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 1, timestamp_ns: 0 });
     let mut recent = loaded.recent_cloud_rx();
     recent.borrow_and_update();

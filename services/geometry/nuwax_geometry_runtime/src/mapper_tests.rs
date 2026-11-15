@@ -109,7 +109,7 @@ fn failed_replay_or_publication_preserves_the_current_map() {
 }
 
 #[test]
-fn small_pgo_updates_compare_against_the_poses_that_built_the_current_map() {
+fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map() {
     let mut worker = Worker::new(
         945, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
@@ -118,25 +118,71 @@ fn small_pgo_updates_compare_against_the_poses_that_built_the_current_map() {
     ).unwrap();
     let first = 1_000_000_000;
     worker.frame(room_frame(945, first)).unwrap();
-    let original = worker.snapshot().unwrap();
-    for offset in [0.01, 0.04, 0.049] {
-        worker.apply_pgo(PgoUpdate::constant_for_test(first + 100,
+    for (index, offset) in [0.01, 0.04, 0.049].into_iter().enumerate() {
+        worker.frame(room_frame(945, first + (index as u64 + 1) * 1_000_000_000)).unwrap();
+        let before = worker.snapshot().unwrap();
+        worker.apply_pgo(PgoUpdate::constant_for_test(first,
             Isometry3::translation(offset, 0., 0.))).unwrap();
-        assert_eq!(worker.cloud.snapshot().revision, original.cloud.revision);
-        assert_eq!(worker.cloud.snapshot().display, original.cloud.display);
-        assert_eq!(worker.cloud.final_poses(), original.final_poses);
+        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+        assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
+        assert_eq!(worker.cloud.final_poses(), before.final_poses);
         assert!((worker.poses.borrow().as_ref().unwrap().position.as_ref().unwrap().x - offset).abs() < 1e-12);
         assert_eq!(worker.map_from_odom, Isometry3::translation(offset, 0., 0.));
     }
+    let before_replay = worker.cloud.snapshot().revision;
     worker.apply_pgo(PgoUpdate::constant_for_test(first,
         Isometry3::translation(0.051, 0., 0.))).unwrap();
     let rebuilt_revision = worker.cloud.snapshot().revision;
-    assert_eq!(rebuilt_revision, original.cloud.revision + 1,
+    assert_eq!(rebuilt_revision, before_replay + 1,
         "连续小校正相对建图位姿累计超过阈值时必须重放");
     worker.apply_pgo(PgoUpdate::constant_for_test(first,
         Isometry3::translation(0.075, 0., 0.))).unwrap();
     assert_eq!(worker.cloud.snapshot().revision, rebuilt_revision,
         "重放后应比较更新后的建图位姿");
+}
+
+#[test]
+fn replayed_timeline_keeps_centimeter_updates_small_after_robot_motion() {
+    let mut worker = Worker::new(
+        947, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let first = 1_000_000_000;
+    assert!(worker.built_timeline.is_none());
+    assert_eq!(worker.built_until, 0);
+    worker.frame(room_frame(947, first)).unwrap();
+    let mut moving = room_frame(947, first + 1_000_000_000);
+    moving.odom_pose.position.as_mut().unwrap().x = 1.;
+    worker.frame(moving).unwrap();
+    let trajectory = |offset, latest: f64| {
+        PgoUpdate::corrected_trajectory_for_test(first, [0., 0.45, 1., latest].into_iter()
+            .filter(|time| *time < latest).chain(std::iter::once(latest))
+            .map(|time| (time, Isometry3::translation(time, 0., 0.),
+                Isometry3::translation(offset, 0., 0.))).collect())
+    };
+    let update = trajectory(0.2, 1.);
+    let latest = update.latest;
+    worker.apply_pgo(update).unwrap();
+    assert_eq!(worker.built_until, first + 1_000_000_000);
+    assert_eq!(worker.built_corrections, vec![(worker.built_until, latest)]);
+    assert!(!worker.cloud.final_poses().iter().any(|(stamp, _)| *stamp == first + 450_000_000),
+        "关键帧时刻不在重放扫描位姿表中");
+    for (time, offset) in [(2., 0.21), (3., 0.22)] {
+        let mut moving = room_frame(947, first + (time * 1e9) as u64);
+        moving.odom_pose.position.as_mut().unwrap().x = time;
+        worker.frame(moving).unwrap();
+        let before = worker.snapshot().unwrap();
+        worker.apply_pgo(trajectory(offset, time)).unwrap();
+        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+        assert_eq!(worker.cloud.final_poses(), before.final_poses);
+        assert_eq!(worker.built_until, first + 1_000_000_000, "小校正不推进重放时刻");
+    }
+    for (time, expected) in [(0.45, 0.2), (1., 0.2), (1.5, 0.2), (2., 0.21), (3., 0.22)] {
+        let correction = worker.building_correction(first + (time * 1e9) as u64);
+        assert!((correction.translation.vector.x - expected).abs() < 1e-12);
+    }
 }
 
 #[test]

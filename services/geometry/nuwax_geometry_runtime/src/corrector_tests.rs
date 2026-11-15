@@ -110,6 +110,17 @@ fn native_pgo_timeout_logs_request_stages_and_child_output_tail() {
 }
 
 impl PgoUpdate {
+    pub(crate) fn corrected_trajectory_for_test(
+        first_stamp: u64,
+        poses: Vec<(f64, Isometry3<f64>, Isometry3<f64>)>,
+    ) -> Self {
+        let keyframes = poses.into_iter().map(|(timestamp, local_pose, correction)| CorrectionKeyframe {
+            timestamp, local_pose, optimized_pose: correction * local_pose,
+        }).collect();
+        let timeline = CorrectionTimeline::new(keyframes).unwrap();
+        let latest = timeline.correction_at(timeline.keyframes().last().unwrap().timestamp).unwrap();
+        Self { latest, timeline, first_stamp }
+    }
     pub(crate) fn timeline_for_test(first_stamp: u64, poses: Vec<(f64, Isometry3<f64>)>) -> Self {
         let keyframes = poses.into_iter().map(|(timestamp, optimized_pose)| CorrectionKeyframe {
             timestamp, local_pose: Isometry3::identity(), optimized_pose,

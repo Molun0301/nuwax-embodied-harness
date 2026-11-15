@@ -462,10 +462,6 @@ impl CloudMap {
     pub fn final_poses(&self) -> Vec<(u64, [f64; 16])> {
         self.poses.clone()
     }
-    pub(crate) fn building_pose(&self, stamp: u64) -> Option<Isometry3<f64>> {
-        self.poses.iter().min_by_key(|(time, _)| time.abs_diff(stamp))
-            .map(|(_, pose)| matrix_isometry(pose))
-    }
     pub fn replay_frames(&self) -> Result<ReplayFrames, String> {
         let mut readers = Vec::new();
         for log in self.logs.values() {

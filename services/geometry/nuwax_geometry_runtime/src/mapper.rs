@@ -444,6 +444,9 @@ struct Worker {
     failure: Option<String>,
     anchored: bool,
     base_anchor: Isometry3<f64>,
+    built_timeline: Option<PgoUpdate>,
+    built_until: u64,
+    built_corrections: Vec<(u64, Isometry3<f64>)>,
     forbidden_zones: Vec<crate::forbidden_zones::ForbiddenZone>,
     forbidden_metadata: Option<(SystemTime, u64)>,
     forbidden_checked_at: Instant,
@@ -536,6 +539,9 @@ impl Worker {
             failure: None,
             anchored: snapshot.is_some(),
             base_anchor: map_from_odom,
+            built_timeline: None,
+            built_until: 0,
+            built_corrections: Vec::new(),
             forbidden_zones: Vec::new(),
             forbidden_metadata: None,
             forbidden_checked_at: Instant::now(),
@@ -710,6 +716,7 @@ impl Worker {
                 rotation,
             );
             self.base_anchor = self.map_from_odom;
+            self.built_corrections.push((frame.odom_pose.timestamp_ns, self.map_from_odom));
             self.anchored = true;
             self.transform.send_replace(self.map_from_odom);
         }
@@ -825,15 +832,25 @@ impl Worker {
         self.corrector.stop();
         self.correction_stopped.send_replace(Some(reason));
     }
+    fn building_correction(&self, stamp: u64) -> Isometry3<f64> {
+        if let Some(timeline) = &self.built_timeline {
+            if stamp <= self.built_until {
+                return timeline.correction_at(stamp);
+            }
+        }
+        self.built_corrections.iter().rev()
+            .find(|(start, _)| *start <= stamp).unwrap().1
+    }
     fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
-        let small = update.optimized_poses().all(|(stamp, optimized)| {
-            self.cloud.building_pose(stamp).is_some_and(|built| {
-                let delta = built.inverse() * optimized;
-                delta.translation.vector.norm() + 10.0 * delta.rotation.angle() < 0.05
-            })
+        let small = update.local_poses().all(|(stamp, local_pose)| {
+            let optimized = update.correction_at(stamp) * local_pose;
+            let built = self.building_correction(stamp) * local_pose;
+            let delta = built.inverse() * optimized;
+            delta.translation.vector.norm() + 10.0 * delta.rotation.angle() < 0.05
         });
         if small {
             self.map_from_odom = update.latest;
+            self.built_corrections.push((self.last_input.as_ref().unwrap().source_timestamp_ns, update.latest));
             self.transform.send_replace(update.latest);
             self.publish_pose();
             return Ok(());
@@ -894,7 +911,11 @@ impl Worker {
         self.grid = persistent;
         self.grid_stamp = stamp;
         self.map_from_odom = update.latest;
-        self.transform.send_replace(update.latest);
+        self.built_until = stamp;
+        self.built_corrections.clear();
+        self.built_corrections.push((stamp, update.latest));
+        self.built_timeline = Some(update);
+        self.transform.send_replace(self.map_from_odom);
         self.publish_pose();
         self.send_grid(publication);
         Ok(())

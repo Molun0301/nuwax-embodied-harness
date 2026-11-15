@@ -39,10 +39,10 @@ pub(crate) struct PgoUpdate {
     first_stamp: u64,
 }
 impl PgoUpdate {
-    pub(crate) fn optimized_poses(&self) -> impl Iterator<Item = (u64, Isometry3<f64>)> + '_ {
+    pub(crate) fn local_poses(&self) -> impl Iterator<Item = (u64, Isometry3<f64>)> + '_ {
         self.timeline.keyframes().iter().map(|keyframe| (
             self.first_stamp + (keyframe.timestamp * 1e9).round() as u64,
-            keyframe.optimized_pose,
+            keyframe.local_pose,
         ))
     }
     pub fn correction_at(&self, stamp: u64) -> Isometry3<f64> {

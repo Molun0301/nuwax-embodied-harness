@@ -410,9 +410,9 @@ fn mission_active_goal_reserves_current_return_route_before_limit() {
     );
 }
 #[test]
-fn mission_unreachable_home_fails_without_return_dispatch() {
+fn mission_unreachable_home_waits_with_original_thirty_second_limit() {
     let mut explorer = started_with_max_goals(10);
-    enable_mission(&mut explorer, None);
+    enable_mission(&mut explorer, Some(100.0));
     explorer.mission = Some(
         MissionProgress::new(MissionPose {
             position: [7., 7., 0.],
@@ -420,9 +420,14 @@ fn mission_unreachable_home_fails_without_return_dispatch() {
         })
         .unwrap(),
     );
-    let failed = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
+    let waiting = explorer.tick(Some(pose()), Some(grid()), Err("无曲面".into()), Ok(())).unwrap();
+    assert_eq!(waiting.status.phase, proto::ExplorationPhase::Running as i32);
+    assert!(waiting.status.message.starts_with("等待回程路线："));
+    explorer.input_wait_since = Some(Instant::now() - Duration::from_secs(31));
+    let failed = explorer.tick(Some(pose()), Some(grid()), Err("无曲面".into()), Ok(())).unwrap();
     assert_eq!(failed.status.phase, proto::ExplorationPhase::Failed as i32);
-    assert!(failed.goal.is_none() && explorer.child.is_none());
+    assert_eq!(explorer.stop_reason, Some(ExplorationStopReason::PlanningResourceLimited));
+    assert!(failed.goal.is_none());
 }
 #[test]
 fn mission_return_failures_exhaust_original_retry_budget() {
@@ -777,4 +782,17 @@ fn geometry_input_failure_does_not_count_frontier_or_return_failures() {
         input_unavailable: true, ..Default::default()
     }).unwrap();
     assert_eq!(explorer.return_failures, 0);
+}
+
+#[test]
+fn completion_return_does_not_query_unreachable_home_while_exploring() {
+    let mut explorer = started_with_max_goals(10);
+    enable_mission(&mut explorer, None);
+    explorer.mission = Some(MissionProgress::new(MissionPose {
+        position: [7., 7., 0.], orientation_xyzw: [0., 0., 0., 1.],
+    }).unwrap());
+    let update = explorer.tick(Some(pose()), Some(grid()), Err("无曲面".into()), Ok(())).unwrap();
+    assert!(update.goal.is_some());
+    assert!(explorer.input_wait_since.is_none());
+    assert!(!update.status.returning);
 }

@@ -491,7 +491,6 @@ impl Explorer {
                 return self.wait_input(reason);
             }
         }
-        self.input_wait_since = None;
         let robot = to_pose(&pose)?;
         let location = mission_pose(&pose)?;
         if self.mission.is_none() {
@@ -499,7 +498,7 @@ impl Explorer {
         }
         self.mission.as_mut().expect("探索行程").observe(&location, pose.timestamp_ns);
         let grid = grid.as_ref().map(to_grid).transpose()?;
-        let route = if config.return_policy.enabled() {
+        let route = if config.return_policy.maximum_distance_m.is_some() {
             Some(match (&surface, &self.surface_config) {
                 (Ok(map), Some(surface_config)) => MissionRoutes::Surface {
                     map: map.clone(),
@@ -522,14 +521,7 @@ impl Explorer {
                 let home = match route.query(&location, &mission.home, home_goal_options(), None) {
                     Ok(home) => home,
                     Err(error) => {
-                        return self.fail_exploration(
-                            if error.is_inconclusive() {
-                                ExplorationStopReason::PlanningResourceLimited
-                            } else {
-                                ExplorationStopReason::ConsecutiveFailuresExceeded
-                            },
-                            &error.to_string(),
-                        )
+                        return self.wait_input(&format!("等待回程路线：{error}"));
                     }
                 };
                 if config
@@ -540,6 +532,7 @@ impl Explorer {
                 }
             }
         }
+        self.input_wait_since = None;
         if let Some(reason) = stop {
             cancel_goal = self.child.take().map(|child| {
                 if !child.returning {

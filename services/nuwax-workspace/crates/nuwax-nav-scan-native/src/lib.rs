@@ -62,7 +62,6 @@ pub struct MotionState {
     pub planning_velocity: [f64; 3],
     pub yaw: f64,
     pub yaw_rate: f64,
-    pub route_progress: f64,
     pub timestamp_ns: i64,
     pub measured_velocity: u32,
     pub measured_yaw_rate: u32,

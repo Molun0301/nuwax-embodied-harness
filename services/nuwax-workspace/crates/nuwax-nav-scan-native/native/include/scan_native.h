@@ -25,7 +25,7 @@ typedef struct {
     uint32_t replanned, execution_cycle_complete, execution_failed, motion_boundary_sources[3];
 } ScanOutput;
 typedef struct {
-    double position[3], velocity[3], planning_velocity[3], yaw, yaw_rate, route_progress;
+    double position[3], velocity[3], planning_velocity[3], yaw, yaw_rate;
     int64_t timestamp_ns;
     uint32_t measured_velocity, measured_yaw_rate;
 } ScanState;

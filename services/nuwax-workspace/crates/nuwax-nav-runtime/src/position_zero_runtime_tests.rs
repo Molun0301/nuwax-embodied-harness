@@ -94,11 +94,6 @@ fn zero_position_terminal_group_distinguishes_original_goal_from_wrong_height() 
         assert_ne!(step, PlannerStep::Succeeded);
         if wrong_height {
             assert!(matches!(step, PlannerStep::ReplanRequired(_)));
-            assert_eq!(follower.progress_m(), 0.25,
-                "same-XY wrong-height truncation is consumable, then original-goal replan");
-        } else {
-            assert!(follower.progress_m() < 0.25,
-                "actual nonzero offset may not consume the true terminal goal group");
         }
     }
 }

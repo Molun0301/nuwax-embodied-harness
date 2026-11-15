@@ -212,6 +212,16 @@ message GeometryState {
   NavigationStatus previous_navigation = 9;
   // 已加载的故障保存图缺少二维定位图，仅可查看。
   bool view_only = 10;
+  // 三维跟踪最近一轮的质量；本次会话尚无跟踪采样时不设置。
+  LocalizationQuality localization_quality = 11;
+}
+
+// 最近一轮三维跟踪的观测质量，不改变阶段或导航受理。
+message LocalizationQuality {
+  double wall_fitness = 1;
+  double penetration = 2;
+  uint64 timestamp_ns = 3;
+  uint32 bad_rounds = 4;
 }
 
 // 静态信息。替代 v2 HealthCheck 中输入桥与显示需要的字段（见待决问题 Q2）。

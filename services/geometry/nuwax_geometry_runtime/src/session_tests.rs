@@ -130,6 +130,7 @@ async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
         explorer: None,
         relocalization_target: None,
         saved_last_pose: None,
+        localizer: None,
     }
 }
 #[tokio::test]

@@ -13,7 +13,7 @@ from services.geometry.proto_gen import geometry_runtime_pb2 as pb
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as rpc
 from services.geometry.state import (
     ExplorationPhase, ExplorationStatus, GeometrySnapshot, GoalStatus, MapUpdate,
-    NavigationStatus, OccupancyGrid, Pose, RelocalizationResult, RuntimeInfo, SessionPhase,
+    NavigationStatus, OccupancyGrid, Pose, RelocalizationResult, RuntimeInfo, SessionPhase, LocalizationQuality,
 )
 
 
@@ -137,6 +137,11 @@ def _snapshot(value) -> GeometrySnapshot:
                     info.planar_input_config_json, info.planar_unix_offset_ns),
         _navigation(value.previous_navigation) if value.HasField("previous_navigation") else None,
         view_only=value.view_only,
+        localization_quality=(LocalizationQuality(value.localization_quality.wall_fitness,
+                              value.localization_quality.penetration,
+                              value.localization_quality.timestamp_ns,
+                              value.localization_quality.bad_rounds)
+                              if value.HasField("localization_quality") else None),
     )
 
 

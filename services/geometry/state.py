@@ -114,6 +114,14 @@ class RuntimeInfo:
 
 
 @dataclass(frozen=True)
+class LocalizationQuality:
+    wall_fitness: float
+    penetration: float
+    timestamp_ns: int
+    bad_rounds: int
+
+
+@dataclass(frozen=True)
 class GeometrySnapshot:
     phase: SessionPhase
     reason: str
@@ -125,6 +133,7 @@ class GeometrySnapshot:
     info: RuntimeInfo
     previous_navigation: Optional[NavigationStatus] = None
     view_only: bool = False
+    localization_quality: Optional[LocalizationQuality] = None
 
     @property
     def can_navigate(self) -> bool:

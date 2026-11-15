@@ -21,7 +21,7 @@ pub(super) type CacheSlot = Mutex<Option<CachedFrontiers>>;
 #[derive(Clone)]
 pub(super) struct CachedFrontiers {
     seed: Arc<FrontierIndex>,
-    dirty: Option<DirtyBounds>,
+    dirty: Option<BTreeMap<[i32; 2], DirtyBounds>>,
 }
 
 pub(super) struct FrontierIndex {
@@ -123,7 +123,7 @@ impl SurfaceSnapshot {
 
     /// 继承同一构建链的前沿索引。`changes`必须列全自旧快照以来变化的物理列。
     /// 仅供拥有完整列差异的构建器调用；配置/禁区不一致则放弃继承。
-    /// 连续更新仅合并一个失效包围盒，实际视线计算延后至前沿查询，不保留快照链。
+    /// 按变化块累计局部失效范围，视线计算延后至查询，不保留快照链。
     pub fn inherit_frontier_cache(&self, previous: &Self, changes: &[[i32; 2]]) {
         if Arc::ptr_eq(&self.data, &previous.data)
             || self
@@ -151,13 +151,15 @@ impl SurfaceSnapshot {
             // 视线前瞻 + 坡阶侧向剖面 + 净空查询共同决定局部依赖范围，覆盖全部高度。
             let radius = i64::from(self.frontier_lookahead() + self.data.profile_cells + 3)
                 + (self.config().wall_clearance_m / self.config().voxel_size).ceil() as i64;
-            let dirty = DirtyBounds {
-                min_x: changes.iter().map(|p| i64::from(p[0])).min().unwrap() - radius,
-                max_x: changes.iter().map(|p| i64::from(p[0])).max().unwrap() + radius,
-                min_y: changes.iter().map(|p| i64::from(p[1])).min().unwrap() - radius,
-                max_y: changes.iter().map(|p| i64::from(p[1])).max().unwrap() + radius,
-            };
-            cache.dirty = Some(cache.dirty.map_or(dirty, |old| old.union(dirty)));
+            let blocks = cache.dirty.get_or_insert_with(BTreeMap::new);
+            for &[x, y] in changes {
+                let block = [x.div_euclid(32), y.div_euclid(32)];
+                let bounds = DirtyBounds {
+                    min_x: i64::from(x) - radius, max_x: i64::from(x) + radius,
+                    min_y: i64::from(y) - radius, max_y: i64::from(y) + radius,
+                };
+                blocks.entry(block).and_modify(|old| *old = old.union(bounds)).or_insert(bounds);
+            }
         }
         let mut current = self
             .data
@@ -235,13 +237,13 @@ impl SurfaceSnapshot {
                 return Arc::clone(&cache.seed);
             }
         }
-        let dirty = cache.as_ref().and_then(|cache| cache.dirty);
+        let dirty = cache.as_ref().and_then(|cache| cache.dirty.as_ref());
         let mut gains: BTreeMap<_, _> = cache.as_ref().map_or_else(BTreeMap::new, |cache| {
             cache
                 .seed
                 .gains
                 .iter()
-                .filter(|(cell, _)| !dirty.unwrap().contains(**cell))
+                .filter(|(cell, _)| !dirty.unwrap().values().any(|bounds| bounds.contains(**cell)))
                 .map(|(&cell, &gain)| (cell, gain))
                 .collect()
         });
@@ -254,29 +256,24 @@ impl SurfaceSnapshot {
                 gains.insert(cell, gain);
             }
         };
-        if let Some((xs, ys)) =
-            dirty.and_then(|bounds| bounds.column_ranges(self.data.graph.cells.slot_capacity()))
-        {
-            for x in xs {
-                for y in ys.clone() {
-                    for &z in self
-                        .data
-                        .graph
-                        .surface_lookup
-                        .get(&(x, y))
-                        .into_iter()
-                        .flatten()
-                    {
-                        evaluate((x, y, z));
+        if let Some(blocks) = dirty {
+            let mut affected = std::collections::BTreeSet::new();
+            for bounds in blocks.values() {
+                if let Some((xs, ys)) = bounds.column_ranges(self.data.graph.cells.slot_capacity()) {
+                    for x in xs {
+                        for y in ys.clone() {
+                            for &z in self.data.graph.surface_lookup.get(&(x, y)).into_iter().flatten() {
+                                affected.insert((x, y, z));
+                            }
+                        }
                     }
+                } else {
+                    affected.extend(self.cell_keys().filter(|cell| bounds.contains(*cell)));
                 }
             }
+            for cell in affected { evaluate(cell); }
         } else {
-            for cell in self.cell_keys() {
-                if dirty.is_none_or(|bounds| bounds.contains(cell)) {
-                    evaluate(cell);
-                }
-            }
+            for cell in self.cell_keys() { evaluate(cell); }
         }
         let index = Arc::new(FrontierIndex {
             boundary: boundary.to_vec(),

@@ -116,7 +116,8 @@ def _exploration(value) -> ExplorationStatus:
     return ExplorationStatus(value.exploration_id,
                              ExplorationPhase(pb.ExplorationPhase.Name(value.phase)[len("EXPLORATION_PHASE_"):].lower()),
                              value.message, value.frontier_count, value.goals_completed,
-                             value.returning, value.traveled_distance_m)
+                             value.returning, value.traveled_distance_m,
+                             value.stop_reason, value.excluded_frontiers, value.exploration_complete)
 
 
 def _relocalization(value) -> RelocalizationResult:

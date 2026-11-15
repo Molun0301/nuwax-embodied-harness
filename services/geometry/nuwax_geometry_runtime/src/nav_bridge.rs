@@ -291,7 +291,10 @@ async fn dispatch_pending(
             Ok(())
         }
         Err(error) => {
-            let _ = status_tx.send(goal.status(proto::GoalStatus::Failed, error.message()));
+            let _ = status_tx.send(proto::NavigationStatus {
+                input_unavailable: true,
+                ..goal.status(proto::GoalStatus::Failed, error.message())
+            });
             Err(error)
         }
     }
@@ -324,7 +327,10 @@ fn reply_disconnected(
     let error = Status::unavailable(format!("导航通道重建失败：{reason}"));
     match command {
         Command::Submit(goal, reply) => {
-            let _ = status_tx.send(goal.status(proto::GoalStatus::Failed, error.message()));
+            let _ = status_tx.send(proto::NavigationStatus {
+                input_unavailable: true,
+                ..goal.status(proto::GoalStatus::Failed, error.message())
+            });
             let _ = reply.send(Err(error));
         }
         Command::Cancel(_, reply) => {

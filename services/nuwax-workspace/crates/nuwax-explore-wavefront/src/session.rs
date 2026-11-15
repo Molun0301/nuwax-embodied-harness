@@ -11,6 +11,7 @@ use crate::grid::occupancy_value;
 struct GoalFailureRecord {
     point: Point2,
     failures: u32,
+    reintroduced: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -18,6 +19,7 @@ struct GoalFailureRecord {
 struct BlacklistedGoal {
     point: Point2,
     radius_m: f64,
+    failure_only: bool,
 }
 
 /// 2D 单位方向(可为零;`from_delta` 拒绝零长度 / NaN)。
@@ -171,6 +173,7 @@ impl ExplorationSession {
             self.failed_goals.push(GoalFailureRecord {
                 point: goal,
                 failures: 1,
+                reintroduced: false,
             });
             1
         };
@@ -186,6 +189,7 @@ impl ExplorationSession {
         self.blacklisted_goals.push(BlacklistedGoal {
             point: goal,
             radius_m,
+            failure_only: true,
         });
         true
     }
@@ -203,6 +207,7 @@ impl ExplorationSession {
         self.blacklisted_goals.push(BlacklistedGoal {
             point: goal,
             radius_m,
+            failure_only: false,
         });
     }
 
@@ -212,6 +217,32 @@ impl ExplorationSession {
         self.blacklisted_goals
             .iter()
             .any(|record| point_distance(record.point, point) <= record.radius_m)
+    }
+
+    /// 无前沿之前，将从未到达且只因失败超限排除的区域放回一次。
+    pub fn reintroduce_failed_frontiers(&mut self) -> bool {
+        let mut restored = false;
+        self.blacklisted_goals.retain(|blocked| {
+            if blocked.failure_only
+                && !self.explored_goals.iter().any(|point| point_distance(*point, blocked.point) <= blocked.radius_m)
+            {
+                if let Some(record) = self.failed_goals.iter_mut().find(|record|
+                    !record.reintroduced && point_distance(record.point, blocked.point) <= blocked.radius_m.max(1e-6))
+                {
+                    record.failures = 0;
+                    record.reintroduced = true;
+                    restored = true;
+                    return false;
+                }
+            }
+            true
+        });
+        restored
+    }
+
+    /// 只统计仍因导航失败排除的区域。
+    pub fn failed_exclusion_count(&self) -> usize {
+        self.blacklisted_goals.iter().filter(|entry| entry.failure_only).count()
     }
 
     /// 当前 blacklist 区域数量。

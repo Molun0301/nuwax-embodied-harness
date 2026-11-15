@@ -1018,6 +1018,7 @@ impl Session {
                 .await
             {
                 self.navigation_failed(error.message().into());
+                self.state.navigation.as_mut().unwrap().input_unavailable = true;
                 if let (Some(explorer), Some(status)) = (&self.explorer, &self.state.navigation) {
                     explorer.feedback(status.clone());
                 }
@@ -1052,6 +1053,8 @@ impl Session {
         if let Some(status) = &mut self.state.exploration {
             status.phase = ExplorationPhase::Failed as i32;
             status.message = reason;
+            status.stop_reason = "ConsecutiveFailuresExceeded".into();
+            status.exploration_complete = false;
         }
         self.state.phase = SessionPhase::Mapping as i32;
         if self

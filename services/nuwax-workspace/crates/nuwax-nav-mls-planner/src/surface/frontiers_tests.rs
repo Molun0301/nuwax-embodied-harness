@@ -221,3 +221,27 @@ fn sparse_widely_separated_dirty_columns_match_full_frontiers() {
         input.len()
     );
 }
+
+#[test]
+fn separated_dirty_blocks_match_full_rebuild_without_recomputing_between_them() {
+    let mut input: BTreeSet<_> = [0, 30].into_iter()
+        .flat_map(|z| (-64..384).flat_map(move |x| (-16..16).map(move |y| (x, y, z))))
+        .collect();
+    let mut builder = SurfaceMapBuilder::new(config());
+    let first = builder.build(&points(&input), 0.1).unwrap().snapshot;
+    first.frontier_index(&[]);
+    let full_work = first.frontier_cache_stats().unwrap().evaluated_cells;
+    for insert in [false, true] {
+        let mut last = None;
+        for cell in [(-50, 0, 0), (360, 0, 30)] {
+            if insert { input.insert(cell); } else { input.remove(&cell); }
+            last = Some(builder.build(&points(&input), 0.1).unwrap().snapshot);
+        }
+        let updated = last.unwrap();
+        let full = SurfaceSnapshot::from_points(&points(&input), config(), 0.1).unwrap();
+        assert_eq!(updated.frontier_index(&[]).gains, full.frontier_index(&[]).gains);
+        let stats = updated.frontier_cache_stats().unwrap();
+        assert!(stats.incremental && stats.evaluated_cells < full_work / 3, "{stats:?}");
+        assert!(stats.retained_frontiers > 0);
+    }
+}

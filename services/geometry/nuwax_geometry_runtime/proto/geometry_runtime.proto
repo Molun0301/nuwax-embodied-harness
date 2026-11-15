@@ -274,6 +274,7 @@ message NavigationStatus {
   repeated Vec3 planned_path = 7;     // 当前规划路径（地图坐标）；终态为空
   // 本目标由探索派发（不是 SetGoal）。导航任务只看自己的 goal_id，网页据此区分显示。
   bool exploration_child = 8;
+  bool input_unavailable = 9;         // Geometry 本地通道失败，探索反馈不计导航失败次数
 }
 
 // ============================================================================
@@ -346,7 +347,10 @@ message ExplorationStatus {
   uint32 frontier_count = 4;        // 剩余前沿数
   uint32 goals_completed = 5;       // 已到达的子目标数
   bool returning = 6;               // 正在返航（启用返航策略时）
-  double traveled_distance_m = 7;   // 已行驶路程（启用行程预算时）
+  double traveled_distance_m = 7;   // 已行驶路程
+  string stop_reason = 8;           // ExplorationStopReason 名称，运行中为空
+  uint32 excluded_frontiers = 9;    // 仍因导航失败排除的前沿条目数
+  bool exploration_complete = 10;   // 因无前沿结束且没有失败排除条目
 }
 
 // ============================================================================

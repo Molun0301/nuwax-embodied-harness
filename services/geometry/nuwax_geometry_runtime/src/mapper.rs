@@ -828,7 +828,12 @@ impl Worker {
             self.evidence_from_odom,
         )?;
         if self.cloud.take_recording_limit() {
-            self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            if self.corrector.is_some() {
+                self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            } else {
+                // 没有校正线程（加载的会话、不校正的配置）：只经同一通知通道写进会话原因。
+                self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
+            }
         }
         if !frame.mapping_only {
             self.publish_recent(encode_recent_cloud(

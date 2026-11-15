@@ -218,6 +218,40 @@ fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
 }
 
 #[test]
+fn full_scan_budget_without_correction_only_reports_that_scans_stop() {
+    let mut source = Worker::new(
+        953, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    source.frame(room_frame(953, 1_000_000_000)).unwrap();
+    let mut loaded = Worker::new(
+        954, config(), Some(source.snapshot().unwrap()), true,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    assert!(loaded.corrector.is_none(), "加载的会话没有校正线程");
+    loaded.command(Command::Writing(true)).unwrap();
+    loaded.frame(room_frame(954, 2_000_000_000)).unwrap();
+    let own = loaded.snapshot().unwrap().scans.last().unwrap().0.parent().unwrap().to_path_buf();
+    let used: u64 = std::fs::read_dir(&own).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+    let filler_path = own.join("budget-used");
+    std::fs::File::create(&filler_path).unwrap()
+        .set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+    let mut stopped = loaded.correction_stopped.subscribe();
+    loaded.frame(room_frame(954, 3_000_000_000)).unwrap();
+    assert_eq!(stopped.borrow_and_update().as_deref(), Some("扫描记录已达上限，后续扫描不再记录"));
+    std::fs::remove_file(filler_path).unwrap();
+    let revision = loaded.cloud.snapshot().revision;
+    loaded.frame(room_frame(954, 4_000_000_000)).unwrap();
+    assert!(loaded.cloud.snapshot().revision > revision, "扫描不再记录后地图照常更新");
+    assert!(loaded.failure.is_none());
+    assert!(!stopped.has_changed().unwrap(), "只通知一次");
+}
+
+#[test]
 fn failed_replay_preserves_the_current_map() {
     let mut worker = Worker::new(
         938, config(), None, false,

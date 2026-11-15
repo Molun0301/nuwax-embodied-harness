@@ -4,7 +4,8 @@ use super::nearest::NearestPointIndex;
 use nalgebra::{Isometry3, Matrix3, Point3, Translation3, UnitQuaternion, Vector3};
 
 use super::features::{
-    compute_fpfh, match_fpfh, preprocess, voxel_downsample, FeatureConfig, FeatureMatch,
+    compute_fpfh, match_fpfh_indexed, preprocess, voxel_downsample, FeatureConfig, FeatureMatch,
+    ProcessedCloud,
 };
 use super::ransac::{evaluate_alignment, ransac_align, AlignmentScore, RansacConfig};
 
@@ -59,8 +60,12 @@ impl IcpSolver {
     /// `source` 与 `target` 是两组 3D 点；返回 source → target 的刚体变换。
     #[must_use]
     pub fn align(&self, source: &[Point3<f64>], target: &[Point3<f64>]) -> IcpResult {
-        if source.is_empty() || target.is_empty()
-            || source.iter().chain(target).any(|p| p.coords.iter().any(|v| !v.is_finite()))
+        if source.is_empty()
+            || target.is_empty()
+            || source
+                .iter()
+                .chain(target)
+                .any(|p| p.coords.iter().any(|v| !v.is_finite()))
         {
             return IcpResult {
                 transformation: Isometry3::identity(),
@@ -70,9 +75,16 @@ impl IcpSolver {
             };
         }
 
-        // 目标在本次匹配中不变；静态构建支持大量共轴的墙面、地面或重复采样点。
-        let tree = NearestPointIndex::new(target);
+        self.align_indexed(source, target, &NearestPointIndex::new(target))
+    }
 
+    /// 使用调用方已构建的目标索引运行配准。
+    pub fn align_indexed(
+        &self,
+        source: &[Point3<f64>],
+        target: &[Point3<f64>],
+        tree: &NearestPointIndex,
+    ) -> IcpResult {
         let mut current = Isometry3::identity();
         let mut prev_mse = f64::INFINITY;
 
@@ -277,6 +289,7 @@ pub fn ransac_align_stub(
     ransac_align(
         source,
         target,
+        &NearestPointIndex::new(target),
         &matches,
         RansacConfig {
             max_iterations: max_iters,
@@ -307,7 +320,8 @@ pub fn multiscale_icp(
         max_correspondence_distance: coarse_distance,
         ..IcpConfig::default()
     };
-    let coarse = IcpSolver::new(coarse_cfg).align(source, target);
+    let target_index = NearestPointIndex::new(target);
+    let coarse = IcpSolver::new(coarse_cfg).align_indexed(source, target, &target_index);
 
     // 阶段 2：用粗变换初始化 + 细尺度（max_corr = fine_distance）
     let fine_cfg = IcpConfig {
@@ -315,7 +329,7 @@ pub fn multiscale_icp(
         ..IcpConfig::default()
     };
     let transformed: Vec<Point3<f64>> = source.iter().map(|p| coarse.transformation * p).collect();
-    let fine = IcpSolver::new(fine_cfg).align(&transformed, target);
+    let fine = IcpSolver::new(fine_cfg).align_indexed(&transformed, target, &target_index);
 
     // 合并：total = fine * coarse
     IcpResult {
@@ -324,6 +338,99 @@ pub fn multiscale_icp(
         iterations: coarse.iterations + fine.iterations,
         converged: fine.converged,
     }
+}
+
+/// 同一次地图加载期间复用的目标数据。
+pub struct TargetCache {
+    /// 0.1米目标点。
+    pub points: Vec<Point3<f64>>,
+    /// 精细层最近邻索引。
+    pub index: NearestPointIndex,
+    /// 地图坐标中的0.1米占据体素。
+    pub occupied: std::collections::HashSet<[i64; 3]>,
+    scales: Vec<ProcessedCloud>,
+}
+impl TargetCache {
+    /// 每次加载的第一次重定位构建一次。
+    pub fn new(target: &[Point3<f64>], config: RelocalizationConfig) -> Self {
+        let points = voxel_downsample(target, config.fine_voxel_size);
+        let index = NearestPointIndex::new(&points);
+        let occupied = points.iter().map(voxel_key).collect();
+        let scales = config
+            .voxel_sizes
+            .into_iter()
+            .map(|size| {
+                preprocess(
+                    target,
+                    FeatureConfig::for_voxel(size, config.max_feature_neighbors),
+                )
+            })
+            .collect();
+        Self {
+            points,
+            index,
+            occupied,
+            scales,
+        }
+    }
+}
+fn voxel_key(point: &Point3<f64>) -> [i64; 3] {
+    [point.x, point.y, point.z].map(|v| (v / 0.1).floor() as i64)
+}
+
+/// 在里程计坐标中降采样的源点及其所属帧原点。
+pub struct SourceCloud {
+    /// 源点。
+    pub points: Vec<Point3<f64>>,
+    /// 与源点一一对应的射线原点。
+    pub origins: Vec<Point3<f64>>,
+}
+impl SourceCloud {
+    /// 每个0.1米体素保留首个实测点，原点来自该点所属帧。
+    pub fn from_rays(rays: impl IntoIterator<Item = (Point3<f64>, Point3<f64>)>) -> Self {
+        let mut voxels = std::collections::BTreeMap::new();
+        for (point, origin) in rays {
+            voxels.entry(voxel_key(&point)).or_insert((point, origin));
+        }
+        let (points, origins) = voxels.into_values().unzip();
+        Self { points, origins }
+    }
+}
+
+/// 只在初值下机器人周围水平30米内做点到平面配准。
+pub fn local_registration(
+    source: &SourceCloud,
+    target: &TargetCache,
+    initial: Isometry3<f64>,
+    odom: Isometry3<f64>,
+) -> Result<IcpResult, String> {
+    let position = (initial * odom).translation.vector;
+    let local_target: Vec<[f64; 3]> = target
+        .points
+        .iter()
+        .filter(|p| (p.x - position.x).powi(2) + (p.y - position.y).powi(2) <= 30.0_f64.powi(2))
+        .map(|p| [p.x, p.y, p.z])
+        .collect();
+    let seeded: Vec<[f64; 3]> = source
+        .points
+        .iter()
+        .map(|p| {
+            let p = initial * p;
+            [p.x, p.y, p.z]
+        })
+        .collect();
+    let result = nuwax_gtsam::point_to_plane(&seeded, &local_target, 0.8, 50)?;
+    let q = result.transformation.rotation_xyzw;
+    let delta = Isometry3::from_parts(
+        Translation3::from(result.transformation.translation),
+        UnitQuaternion::new_normalize(nalgebra::Quaternion::new(q[3], q[0], q[1], q[2])),
+    );
+    Ok(IcpResult {
+        transformation: delta * initial,
+        mse: result.mse,
+        iterations: result.iterations as usize,
+        converged: result.converged != 0,
+    })
 }
 
 /// Configuration for the complete feature/RANSAC/ICP relocalization pipeline.
@@ -390,32 +497,41 @@ pub fn relocation_pipeline_with_config(
     target: &[Point3<f64>],
     config: RelocalizationConfig,
 ) -> RelocalizationResult {
-    if !valid_relocalization_config(config) || source.len() < 3 || target.len() < 3 {
-        return rejected_relocalization(0, 0, 0);
-    }
-    let fine_source = voxel_downsample(source, config.fine_voxel_size);
-    let fine_target = voxel_downsample(target, config.fine_voxel_size);
-    if fine_source.len() < 3 || fine_target.len() < 3 {
-        return rejected_relocalization(0, 0, 0);
-    }
+    let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+    relocation_pipeline_cached(&source, &TargetCache::new(target, config), config)
+}
 
+/// 已加载地图上的全局配准，目标预处理由会话持有。
+pub fn relocation_pipeline_cached(
+    source: &SourceCloud,
+    target: &TargetCache,
+    config: RelocalizationConfig,
+) -> RelocalizationResult {
+    let fine_source = &source.points;
+    let fine_target = &target.points;
+    if !valid_relocalization_config(config) || fine_source.len() < 3 || fine_target.len() < 3 {
+        return rejected_relocalization(0, 0, 0);
+    }
     let mut maximum_feature_matches = 0;
     let mut maximum_ransac_inliers = 0;
     let mut ransac_iterations = 0;
     let mut best_candidate: Option<(Isometry3<f64>, AlignmentScore)> = None;
 
-    for voxel_size in config.voxel_sizes {
+    for (voxel_size, target_features) in config.voxel_sizes.into_iter().zip(&target.scales) {
         let feature_config = FeatureConfig::for_voxel(voxel_size, config.max_feature_neighbors);
-        let source_features = preprocess(source, feature_config);
-        let target_features = preprocess(target, feature_config);
+        let source_features = preprocess(fine_source, feature_config);
         if source_features.descriptors.len() != source_features.points.len()
             || target_features.descriptors.len() != target_features.points.len()
         {
             continue;
         }
 
-        let feature_matches =
-            match_fpfh(&source_features.descriptors, &target_features.descriptors);
+        let feature_matches = match_fpfh_indexed(
+            &source_features.descriptors,
+            &target_features.descriptors,
+            &source_features.feature_index,
+            &target_features.feature_index,
+        );
         maximum_feature_matches = maximum_feature_matches.max(feature_matches.len());
         if feature_matches.len() < config.min_feature_matches {
             continue;
@@ -424,6 +540,7 @@ pub fn relocation_pipeline_with_config(
         let ransac = ransac_align(
             &source_features.points,
             &target_features.points,
+            &target_features.index,
             &feature_matches,
             RansacConfig {
                 max_iterations: config.ransac_iterations,
@@ -441,14 +558,14 @@ pub fn relocation_pipeline_with_config(
 
         consider_candidate(
             &fine_source,
-            &fine_target,
+            &target.index,
             ransac.transformation,
             config.fine_correspondence_distance,
             &mut best_candidate,
         );
         consider_candidate(
             &fine_source,
-            &fine_target,
+            &target.index,
             ransac.transformation * centroid_yaw_flip(&fine_source),
             config.fine_correspondence_distance,
             &mut best_candidate,
@@ -469,11 +586,12 @@ pub fn relocation_pipeline_with_config(
     icp_config.max_correspondence_distance = icp_config
         .max_correspondence_distance
         .min(config.fine_correspondence_distance);
-    let refinement = IcpSolver::new(icp_config).align(&seeded_source, &fine_target);
+    let refinement =
+        IcpSolver::new(icp_config).align_indexed(&seeded_source, fine_target, &target.index);
     let refined_transform = refinement.transformation * candidate;
     let refined_score = evaluate_alignment(
         &fine_source,
-        &fine_target,
+        &target.index,
         refined_transform,
         config.fine_correspondence_distance,
     );
@@ -538,7 +656,7 @@ fn valid_relocalization_config(config: RelocalizationConfig) -> bool {
 
 fn consider_candidate(
     source: &[Point3<f64>],
-    target: &[Point3<f64>],
+    target: &NearestPointIndex,
     transformation: Isometry3<f64>,
     threshold: f64,
     best: &mut Option<(Isometry3<f64>, AlignmentScore)>,
@@ -717,5 +835,92 @@ mod tests {
         let _coarse_res = IcpSolver::new(coarse).align(&pts, &pts);
         let _fine_res = IcpSolver::new(fine).align(&pts, &pts);
         // 两个尺度都能跑通：标记 multi-scale ICP 入口可用
+    }
+    #[test]
+    fn source_downsampling_preserves_the_selected_frames_ray_origin() {
+        let a = Point3::new(0.01, 0.02, 0.03);
+        let b = Point3::new(0.08, 0.07, 0.06);
+        let c = Point3::new(0.15, 0.02, 0.03);
+        let source = SourceCloud::from_rays([
+            (a, Point3::new(1.0, 2.0, 3.0)),
+            (b, Point3::new(4.0, 5.0, 6.0)),
+            (c, Point3::new(7.0, 8.0, 9.0)),
+        ]);
+        assert_eq!(source.points, vec![a, c]);
+        assert_eq!(
+            source.origins,
+            vec![Point3::new(1.0, 2.0, 3.0), Point3::new(7.0, 8.0, 9.0)]
+        );
+    }
+
+    pub(crate) fn synthetic_room() -> Vec<Point3<f64>> {
+        let mut points = Vec::new();
+        for x in 0..47 {
+            for y in 0..32 {
+                let (x, y) = (-3.0 + x as f64 * 0.13, -2.0 + y as f64 * 0.13);
+                points.extend([Point3::new(x, y, -1.0), Point3::new(x, y, 1.73)]);
+            }
+        }
+        for z in 0..22 {
+            let z = -1.0 + z as f64 * 0.13;
+            for x in 0..47 {
+                let x = -3.0 + x as f64 * 0.13;
+                points.extend([Point3::new(x, -2.0, z), Point3::new(x, 2.03, z)]);
+            }
+            for y in 0..32 {
+                let y = -2.0 + y as f64 * 0.13;
+                points.extend([Point3::new(-3.0, y, z), Point3::new(2.98, y, z)]);
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn target_cache_builds_and_timing() {
+        use super::super::{features::descriptor_builds, nearest::builds};
+        let source = synthetic_room();
+        let truth = Isometry3::translation(30.0, 20.0, 0.0);
+        let mut target: Vec<_> = source.iter().map(|p| truth * p).collect();
+        target.extend(
+            source
+                .iter()
+                .map(|p| Point3::new(p.x * 0.7 + 42.0, p.y * 1.3 + 20.0, p.z)),
+        );
+        let config = RelocalizationConfig::default();
+        let mut watched = vec![("精细点".into(), voxel_downsample(&target, 0.1))];
+        let mut descriptors = Vec::new();
+        for scale in config.voxel_sizes {
+            let cloud = preprocess(
+                &target,
+                FeatureConfig::for_voxel(scale, config.max_feature_neighbors),
+            );
+            watched.push((format!("尺度{scale}"), cloud.points));
+            descriptors.push((format!("特征{scale}"), cloud.descriptors));
+        }
+        builds::watch(watched);
+        descriptor_builds::watch(descriptors);
+        let started = std::time::Instant::now();
+        let target = TargetCache::new(&target, config);
+        let source_cloud = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+        let result = relocation_pipeline_cached(&source_cloud, &target, config);
+        let cold = started.elapsed();
+        assert!(builds::counts().iter().all(|(_, n)| *n == 1));
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 1));
+        let started = std::time::Instant::now();
+        let _ = relocation_pipeline_cached(&source_cloud, &target, config);
+        eprintln!(
+            "源点={} 目标点={} 首次总耗时={:?} 复用总耗时={:?} 结果={} 点索引={:?} 特征索引={:?}",
+            source.len(),
+            12968,
+            cold,
+            started.elapsed(),
+            result.registration.converged,
+            builds::counts(),
+            descriptor_builds::counts()
+        );
+        assert!(builds::counts().iter().all(|(_, n)| *n == 1));
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 1));
+        builds::watch(Vec::new());
+        descriptor_builds::watch(Vec::new());
     }
 }

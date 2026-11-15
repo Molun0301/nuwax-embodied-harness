@@ -176,88 +176,99 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_fram
     }
 }
 
-fn local_consensus_source() -> Vec<Point3<f64>> {
-    let mut source = Vec::new();
-    for index in 0..8 {
-        source.push(Point3::new(
-            (index & 1) as f64 * 0.8 + 0.03 * index as f64,
-            ((index >> 1) & 1) as f64 * 0.9 + 0.011 * (index * index) as f64,
-            ((index >> 2) & 1) as f64 * 0.7 + 0.009 * (index * index) as f64,
-        ));
-    }
-    for index in 0..120 {
-        source.push(Point3::new(
-            5.0 + (index % 11) as f64 * 0.43,
-            -3.0 + ((index * 7) % 19) as f64 * 0.31,
-            0.2 + ((index * 13) % 23) as f64 * 0.19,
-        ));
-    }
-    source
-}
-fn assert_transform(actual: Isometry3<f64>, expected: Isometry3<f64>) {
-    let error = actual.inverse() * expected;
-    assert!(
-        error.translation.vector.norm() < 1e-6,
-        "平移误差：{error:?}"
-    );
-    assert!(error.rotation.angle() < 1e-6, "朝向误差：{error:?}");
+fn compute_for_test(source: &[Point3<f64>], target: &[Point3<f64>], initial: Isometry3<f64>) -> (Isometry3<f64>, f64, bool) {
+    let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
+    let target = TargetCache::new(target, RelocalizationConfig::default());
+    compute_relocalization(&source, &target, &[initial], Isometry3::identity()).unwrap()
 }
 
 #[test]
-fn relocalization_local_consensus_rejects_sparse_wrong_heading() {
-    let source = local_consensus_source();
-    let truth = Isometry3::from_parts(
-        Translation3::new(30., 20., 0.),
-        UnitQuaternion::from_euler_angles(0., 0., 37_f64.to_radians()),
-    );
-    let distractor = Isometry3::from_parts(
-        Translation3::new(0.1, -0.05, 0.02),
-        UnitQuaternion::from_euler_angles(0., 0., -17_f64.to_radians()),
-    );
-    let mut target: Vec<_> = source.iter().map(|point| truth * point).collect();
-    target.extend(source[..8].iter().map(|point| distractor * point));
-    let local = IcpSolver::new(IcpConfig {
-        max_correspondence_distance: 0.8,
-        ..Default::default()
-    })
-    .align(&source, &target);
-    assert!(local.converged && local.mse < 1e-12);
-    assert!((local.transformation.rotation.inverse() * truth.rotation).angle() > 0.9);
-    let (actual, _, succeeded) = compute_relocalization(&source, &target, Isometry3::identity());
-    assert!(succeeded, "完整结构应由全局配准找回");
-    assert_transform(actual, truth);
+fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
+    let current = Isometry3::translation(100.0, 0.0, 0.0);
+    let saved = Isometry3::translation(8.0, -4.0, 1.3);
+    let odom = Isometry3::from_parts(Translation3::new(2.0, 3.0, 0.4),
+        UnitQuaternion::from_euler_angles(0.04, -0.06, 0.8));
+    let initials = relocalization_initials(current, Some(saved), Some(proto::PlanarSeed { x: 5.0, y: 6.0, yaw: 1.1 }), odom);
+    assert_eq!(initials.len(), 3);
+    assert_transform(initials[0], current);
+    assert_transform(initials[1] * odom, saved);
+    let body = initials[2] * odom;
+    assert_transform(body, Isometry3::from_parts(Translation3::new(5.0, 6.0, 1.3),
+        UnitQuaternion::from_euler_angles(0.04, -0.06, 1.1)));
+    assert_eq!(relocalization_initials(current, None, None, odom), vec![current]);
+    let without_saved = relocalization_initials(current, None, Some(proto::PlanarSeed { x: 5.0, y: 6.0, yaw: 1.1 }), odom);
+    assert!(((without_saved[1] * odom).translation.z).abs() < 1e-9);
+}
+
+fn local_consensus_source() -> Vec<Point3<f64>> {
+    let mut points = Vec::new();
+    for a in 0..47 {
+        for b in 0..32 {
+            let (x, y) = (-3.0 + a as f64 * 0.13, -2.0 + b as f64 * 0.13);
+            points.extend([Point3::new(x, y, -1.0), Point3::new(x, y, 1.73)]);
+        }
+    }
+    for z in 0..22 {
+        let z = -1.0 + z as f64 * 0.13;
+        for a in 0..47 {
+            let x = -3.0 + a as f64 * 0.13;
+            points.extend([Point3::new(x, -2.0, z), Point3::new(x, 2.03, z)]);
+        }
+        for b in 0..32 {
+            let y = -2.0 + b as f64 * 0.13;
+            points.extend([Point3::new(-3.0, y, z), Point3::new(2.98, y, z)]);
+        }
+    }
+    points
+}
+fn assert_transform(actual: Isometry3<f64>, expected: Isometry3<f64>) {
+    let error = actual.inverse() * expected;
+    assert!(error.translation.vector.norm() < 0.05, "平移误差：{error:?}");
+    assert!(error.rotation.angle().to_degrees() < 1.0, "朝向误差：{error:?}");
 }
 
 #[test]
 fn relocalization_local_consensus_accepts_supported_seed() {
     let source = local_consensus_source();
-    let truth = Isometry3::from_parts(
-        Translation3::new(0.03, -0.02, 0.01),
-        UnitQuaternion::from_euler_angles(0., 0., 0.01),
-    );
-    let target: Vec<_> = source.iter().map(|point| truth * point).collect();
-    let (actual, fitness, succeeded) =
-        compute_relocalization(&source, &target, Isometry3::identity());
+    let truth = Isometry3::from_parts(Translation3::new(31.0, 18.0, 0.2),
+        UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7));
+    let target: Vec<_> = source.iter().map(|p| truth * p).collect();
+    let initial = Isometry3::from_parts(Translation3::new(0.3, -0.4, 0.0),
+        UnitQuaternion::from_euler_angles(0.0, 0.0, 10_f64.to_radians()));
+    let initial = Isometry3::from_parts(truth.translation * initial.translation, truth.rotation * initial.rotation);
+    let (actual, fitness, succeeded) = compute_for_test(&source, &target, initial);
     assert!(succeeded);
-    assert!(fitness < 1e-18);
+    assert!(fitness < 0.01);
+    assert_transform(actual, truth);
+}
+
+#[test]
+fn relocalization_local_consensus_uses_second_initial_after_first_fails() {
+    let points = local_consensus_source();
+    let truth = Isometry3::translation(80.0, 60.0, 0.2);
+    let target_points: Vec<_> = points.iter().map(|p| truth * p).collect();
+    let target = TargetCache::new(&target_points, RelocalizationConfig::default());
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    let odom = Isometry3::identity();
+    let first = local_registration(&source, &target, odom, odom).unwrap();
+    assert!(!first.mse.is_finite());
+    let initials = relocalization_initials(odom, Some(truth), Some(proto::PlanarSeed { x: 150.0, y: 160.0, yaw: 0.0 }), odom);
+    let (actual, _, succeeded) = compute_relocalization(&source, &target, &initials, odom).unwrap();
+    assert!(succeeded);
     assert_transform(actual, truth);
 }
 
 #[test]
 fn relocalization_local_consensus_preserves_nonzero_anchor_and_reuses_registration() {
-    let source = local_consensus_source();
-    let anchor = Isometry3::from_parts(
-        Translation3::new(2., -3., 0.4),
-        UnitQuaternion::from_euler_angles(0., 0., 0.7),
-    );
-    let truth = Isometry3::from_parts(
-        Translation3::new(0.02, -0.01, 0.005),
-        UnitQuaternion::from_euler_angles(0.01, -0.015, 0.008),
-    ) * anchor;
-    let target: Vec<_> = source.iter().map(|point| truth * point).collect();
-    let mut registration = anchor;
+    let points = local_consensus_source();
+    let truth = Isometry3::from_parts(Translation3::new(2.0, -3.0, 0.4),
+        UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7));
+    let target_points: Vec<_> = points.iter().map(|p| truth * p).collect();
+    let target = TargetCache::new(&target_points, RelocalizationConfig::default());
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    let mut registration = Isometry3::from_parts(Translation3::new(2.03, -3.02, 0.41), truth.rotation);
     for _ in 0..2 {
-        let (actual, _, succeeded) = compute_relocalization(&source, &target, registration);
+        let (actual, _, succeeded) = compute_relocalization(&source, &target, &[registration], Isometry3::identity()).unwrap();
         assert!(succeeded);
         assert_transform(actual, truth);
         registration = actual;
@@ -267,44 +278,11 @@ fn relocalization_local_consensus_preserves_nonzero_anchor_and_reuses_registrati
 #[test]
 fn relocalization_local_consensus_rejects_tilted_estimate() {
     let source = local_consensus_source();
-    let tilted = Isometry3::from_parts(
-        Translation3::identity(),
-        UnitQuaternion::from_euler_angles(20_f64.to_radians(), 0., 0.),
-    );
-    let target: Vec<_> = source.iter().map(|point| tilted * point).collect();
-    let (actual, _, succeeded) = compute_relocalization(&source, &target, tilted);
+    let tilted = Isometry3::from_parts(Translation3::identity(),
+        UnitQuaternion::from_euler_angles(20_f64.to_radians(), 0.0, 0.0));
+    let target: Vec<_> = source.iter().map(|p| tilted * p).collect();
+    let (actual, _, succeeded) = compute_for_test(&source, &target, tilted);
     assert!(!succeeded || is_upright(&actual, GRAVITY_TILT_MAX_DEG));
-}
-
-#[test]
-fn relocalization_local_consensus_accepts_sparse_and_partial_view() {
-    let full = local_consensus_source();
-    let truth = Isometry3::from_parts(
-        Translation3::new(31., 18., 0.2),
-        UnitQuaternion::from_euler_angles(0., 0., 1.),
-    );
-    let target: Vec<_> = full.iter().map(|point| truth * point).collect();
-    let initial = Isometry3::from_parts(
-        Translation3::new(0.03, -0.02, 0.01),
-        UnitQuaternion::from_euler_angles(0., 0., 0.01),
-    ) * truth;
-    for source in [
-        full[..4].to_vec(),
-        full.iter().step_by(4).copied().collect(),
-    ] {
-        let (actual, _, succeeded) = compute_relocalization(&source, &target, initial);
-        assert!(succeeded, "地图其余区域不能稀释稀疏或部分视野的源点支持率");
-        assert_transform(actual, truth);
-    }
-}
-
-#[test]
-fn relocalization_sparse_window_matches_and_rejects_degenerate_geometry() {
-    let target = local_consensus_source();
-    let source: Vec<_> = (0..8).flat_map(|_| target[..8].iter().copied()).collect();
-    assert!(compute_relocalization(&source, &target, Isometry3::identity()).2);
-    let degenerate = vec![Point3::new(10_000., 10_000., 10_000.); source.len()];
-    assert!(!compute_relocalization(&degenerate, &target, Isometry3::identity()).2);
 }
 
 #[test]

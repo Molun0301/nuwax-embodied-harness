@@ -257,25 +257,30 @@ async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
     source.shutdown().await.unwrap();
     let loaded = Mapper::load(26, config(), baseline.clone(), true).unwrap();
     let (router, _, _) = crate::session::test_router(loaded.clone());
-    let missing = Corrector::relocalize(&loaded, router.recent_frames())
+    let mut cache = None;
+    let missing = Corrector::relocalize(&loaded, router.recent_frames(), &mut cache, None, None)
         .await
         .unwrap();
     assert!(!missing.succeeded);
     assert_eq!(missing.frames_used, 0);
     router.publish_frame(room_frame(26, 2_000_000_000));
     loaded.snapshot().await.unwrap();
-    let matched = Corrector::relocalize(&loaded, router.recent_frames())
+    let matched = Corrector::relocalize(&loaded, router.recent_frames(), &mut cache, None, None)
         .await
         .unwrap();
     assert!(matched.succeeded, "真实同场景匹配失败：{}", matched.message);
     assert_eq!(matched.frames_used, 1);
     assert_eq!(matched.pose.unwrap().frame_id, "map");
+    let first_cache = cache.clone().unwrap();
+    let matched_again = Corrector::relocalize(&loaded, router.recent_frames(), &mut cache, None, None).await.unwrap();
+    assert!(matched_again.succeeded);
+    assert!(Arc::ptr_eq(&first_cache, cache.as_ref().unwrap()));
     loaded.shutdown().await.unwrap();
     let mut pgo = config();
     pgo.correction_backend = "library_pgo".into();
     let loaded = Mapper::load(27, pgo, baseline, true).unwrap();
     assert_eq!(
-        Corrector::relocalize(&loaded, router.recent_frames())
+        Corrector::relocalize(&loaded, router.recent_frames(), &mut cache, None, None)
             .await
             .unwrap_err()
             .code(),

@@ -10,9 +10,11 @@ use nuwax_mapping::loop_closure::{
     ProcessFrameResult,
 };
 use nuwax_mapping::relocalization::{
-    evaluate_alignment, is_upright, relocation_pipeline_with_config, IcpConfig, IcpSolver,
-    RelocalizationConfig, GRAVITY_TILT_MAX_DEG,
+    evaluate_alignment, is_upright, relocation_pipeline_cached, local_registration,
+    RelocalizationConfig, SourceCloud, TargetCache, GRAVITY_TILT_MAX_DEG,
 };
+use std::sync::Arc;
+
 pub struct Corrector {
     mode: Mode,
     first_stamp: Option<u64>,
@@ -149,6 +151,9 @@ impl Corrector {
     pub async fn relocalize(
         mapper: &Mapper,
         frames: Vec<MappingFrame>,
+        cache: &mut Option<Arc<TargetCache>>,
+        last_pose: Option<Isometry3<f64>>,
+        seed: Option<proto::PlanarSeed>,
     ) -> Result<proto::RelocalizationResult, tonic::Status> {
         let backend = mapper.correction_backend();
         if matches!(backend, "library_pgo" | "native_pgo") {
@@ -161,50 +166,60 @@ impl Corrector {
             .await
             .map_err(tonic::Status::unavailable)?;
         let initial = mapper.map_from_odom();
+        let cached = cache.clone();
         let result = tokio::task::spawn_blocking(move || {
             let Some(target) = target else {
-                return Ok((failed("已加载地图没有可匹配的点云", 0), None));
+                return Ok((failed("已加载地图没有可匹配的点云", 0), None, cached));
             };
             if frames.is_empty() {
-                return Ok((failed("最近两秒没有可用雷达帧", 0), None));
+                return Ok((failed("最近两秒没有可用雷达帧", 0), None, cached));
             }
-            let mut receiver = nuwax_map_chunks::Receiver::new(target.repository.clone());
-            let mut target_points = Vec::new();
-            let size = f64::from(target.manifest().voxel_size_m);
-            for reference in &target.manifest().blocks {
-                let block = receiver.block(reference)?;
-                if (target_points.len() + block.len()) * std::mem::size_of::<Point3<f64>>()
-                    > 120 * 1024 * 1024
-                {
-                    return Err("重定位目标点云超过原120MiB预算".into());
+            let target_cache = match cached {
+                Some(cache) => cache,
+                None => {
+                    let mut receiver = nuwax_map_chunks::Receiver::new(target.repository.clone());
+                    let mut target_points = Vec::new();
+                    let size = f64::from(target.manifest().voxel_size_m);
+                    for reference in &target.manifest().blocks {
+                        let block = receiver.block(reference)?;
+                        if (target_points.len() + block.len()) * std::mem::size_of::<Point3<f64>>()
+                            > 120 * 1024 * 1024
+                        {
+                            return Err("重定位目标点云超过原120MiB预算".into());
+                        }
+                        target_points.extend(
+                            block
+                                .keys()
+                                .map(|key| nuwax_map_chunks::global_key(reference.key, *key))
+                                .collect::<Result<Vec<_>, _>>()?
+                                .into_iter()
+                                .map(|key| {
+                                    Point3::new(
+                                        (f64::from(key[0]) + 0.5) * size,
+                                        (f64::from(key[1]) + 0.5) * size,
+                                        (f64::from(key[2]) + 0.5) * size,
+                                    )
+                                }),
+                        );
+                    }
+                    Arc::new(TargetCache::new(
+                        &target_points,
+                        RelocalizationConfig::default(),
+                    ))
                 }
-                target_points.extend(
-                    block
-                        .keys()
-                        .map(|key| nuwax_map_chunks::global_key(reference.key, *key))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .map(|key| {
-                            Point3::new(
-                                (f64::from(key[0]) + 0.5) * size,
-                                (f64::from(key[1]) + 0.5) * size,
-                                (f64::from(key[2]) + 0.5) * size,
-                            )
-                        }),
-                );
-            }
-            let source: Vec<_> = frames
-                .iter()
-                .flat_map(|frame| {
-                    let odom = pose_isometry(&frame.odom_pose);
-                    frame
-                        .points_body
-                        .iter()
-                        .map(move |p| odom * Point3::from(*p))
-                })
-                .collect();
+            };
+            let source = SourceCloud::from_rays(frames.iter().flat_map(|frame| {
+                let odom = pose_isometry(&frame.odom_pose);
+                let origin = odom * Point3::from(frame.ray_origin_body);
+                frame
+                    .points_body
+                    .iter()
+                    .map(move |p| (odom * Point3::from(*p), origin))
+            }));
+            let odom = pose_isometry(&frames.last().unwrap().odom_pose);
+            let initials = relocalization_initials(initial, last_pose, seed, odom);
             let (transform, fitness, succeeded) =
-                compute_relocalization(&source, &target_points, initial);
+                compute_relocalization(&source, &target_cache, &initials, odom)?;
             let last = frames.last().unwrap();
             let result = proto::RelocalizationResult {
                 succeeded,
@@ -224,12 +239,13 @@ impl Corrector {
                 frames_used: frames.len() as u32,
                 finished_at_ns: now_ns(),
             };
-            Ok::<_, String>((result, succeeded.then_some(transform)))
+            Ok::<_, String>((result, succeeded.then_some(transform), Some(target_cache)))
         })
         .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?
         .map_err(tonic::Status::unavailable)?;
-        let (mut result, transform) = result;
+        let (mut result, transform, cached) = result;
+        *cache = cached;
         if let Some(transform) = transform {
             mapper
                 .set_map_from_odom(transform)
@@ -242,40 +258,58 @@ impl Corrector {
         Ok(result)
     }
 }
-fn compute_relocalization(
-    source: &[Point3<f64>],
-    target: &[Point3<f64>],
-    initial: Isometry3<f64>,
-) -> (Isometry3<f64>, f64, bool) {
-    let config = RelocalizationConfig::default();
-    let seeded: Vec<_> = source.iter().map(|point| initial * point).collect();
-    let local = IcpSolver::new(IcpConfig {
-        max_correspondence_distance: config.voxel_sizes.into_iter().fold(0., f64::max),
-        ..config.icp
-    })
-    .align(&seeded, target);
-    let local_transform = local.transformation * initial;
-    let score = evaluate_alignment(
-        source,
-        target,
-        local_transform,
-        config.fine_correspondence_distance,
-    );
-    if local.mse.is_finite()
-        && score.inlier_count >= config.min_final_inliers
-        && score.fitness >= config.min_final_fitness
-        && score.rmse.is_finite()
-        && is_upright(&local_transform, GRAVITY_TILT_MAX_DEG)
-    {
-        (local_transform, score.rmse * score.rmse, true)
-    } else {
-        let global = relocation_pipeline_with_config(source, target, config);
-        (
-            global.registration.transformation,
-            global.registration.mse,
-            global.registration.converged,
-        )
+fn relocalization_initials(
+    current: Isometry3<f64>,
+    last_pose: Option<Isometry3<f64>>,
+    seed: Option<proto::PlanarSeed>,
+    odom: Isometry3<f64>,
+) -> Vec<Isometry3<f64>> {
+    let mut initials = vec![current];
+    if let Some(saved) = last_pose {
+        initials.push(saved * odom.inverse());
     }
+    if let Some(seed) = seed {
+        let (roll, pitch, _) = odom.rotation.euler_angles();
+        let body_pose = Isometry3::from_parts(
+            Translation3::new(seed.x, seed.y, last_pose.map_or(0.0, |p| p.translation.z)),
+            UnitQuaternion::from_euler_angles(roll, pitch, seed.yaw),
+        );
+        initials.push(body_pose * odom.inverse());
+    }
+    initials
+}
+
+fn compute_relocalization(
+    source: &SourceCloud,
+    target: &TargetCache,
+    initials: &[Isometry3<f64>],
+    odom: Isometry3<f64>,
+) -> Result<(Isometry3<f64>, f64, bool), String> {
+    let config = RelocalizationConfig::default();
+    for initial in initials {
+        let local = local_registration(source, target, *initial, odom)?;
+        let transform = local.transformation;
+        let score = evaluate_alignment(
+            &source.points,
+            &target.index,
+            transform,
+            config.fine_correspondence_distance,
+        );
+        if local.mse.is_finite()
+            && score.inlier_count >= config.min_final_inliers
+            && score.fitness >= config.min_final_fitness
+            && score.rmse.is_finite()
+            && is_upright(&transform, GRAVITY_TILT_MAX_DEG)
+        {
+            return Ok((transform, score.rmse * score.rmse, true));
+        }
+    }
+    let global = relocation_pipeline_cached(source, target, config);
+    Ok((
+        global.registration.transformation,
+        global.registration.mse,
+        global.registration.converged,
+    ))
 }
 
 #[cfg(test)]

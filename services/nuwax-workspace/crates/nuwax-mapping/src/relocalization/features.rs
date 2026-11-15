@@ -53,10 +53,12 @@ impl Default for FeatureConfig {
     }
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct ProcessedCloud {
     pub(crate) points: Vec<Point3<f64>>,
     pub(crate) descriptors: Vec<FpfhDescriptor>,
+    pub(crate) normals: Vec<Vector3<f64>>,
+    pub(crate) index: NearestPointIndex,
+    pub(crate) feature_index: DescriptorTree,
 }
 
 /// Deterministically voxel-downsample a cloud by averaging points in each cell.
@@ -116,7 +118,15 @@ pub fn estimate_normals(
         return Vec::new();
     }
 
-    let tree = point_tree(points);
+    estimate_normals_indexed(points, &point_tree(points), radius, max_neighbors)
+}
+
+fn estimate_normals_indexed(
+    points: &[Point3<f64>],
+    tree: &NearestPointIndex,
+    radius: f64,
+    max_neighbors: usize,
+) -> Vec<Vector3<f64>> {
     let radius_sq = radius * radius;
     let query_count = max_neighbors.min(points.len()).max(3);
 
@@ -124,12 +134,13 @@ pub fn estimate_normals(
         .iter()
         .enumerate()
         .map(|(point_index, point)| {
-            let nearest = tree
-                .nearest_n(point, query_count);
+            let nearest = tree.nearest_n(point, query_count);
             let mut neighbours: Vec<usize> = nearest
                 .iter()
                 .filter(|neighbour| {
-                    neighbour.0 != point_index && points[neighbour.0] != *point && neighbour.1 <= radius_sq
+                    neighbour.0 != point_index
+                        && points[neighbour.0] != *point
+                        && neighbour.1 <= radius_sq
                 })
                 .map(|neighbour| neighbour.0)
                 .collect();
@@ -173,19 +184,29 @@ pub fn compute_fpfh(
         return Vec::new();
     }
 
-    let tree = point_tree(points);
+    compute_fpfh_indexed(points, normals, &point_tree(points), radius, max_neighbors)
+}
+
+fn compute_fpfh_indexed(
+    points: &[Point3<f64>],
+    normals: &[Vector3<f64>],
+    tree: &NearestPointIndex,
+    radius: f64,
+    max_neighbors: usize,
+) -> Vec<FpfhDescriptor> {
     let radius_sq = radius * radius;
     let query_count = max_neighbors.min(points.len()).max(3);
     let neighbours: Vec<Vec<(usize, f64)>> = points
         .iter()
         .enumerate()
         .map(|(point_index, point)| {
-            let nearest = tree
-                .nearest_n(point, query_count);
+            let nearest = tree.nearest_n(point, query_count);
             let mut within: Vec<(usize, f64)> = nearest
                 .iter()
                 .filter(|neighbour| {
-                    neighbour.0 != point_index && points[neighbour.0] != *point && neighbour.1 <= radius_sq
+                    neighbour.0 != point_index
+                        && points[neighbour.0] != *point
+                        && neighbour.1 <= radius_sq
                 })
                 .map(|neighbour| (neighbour.0, neighbour.1.sqrt()))
                 .collect();
@@ -230,19 +251,30 @@ pub fn compute_fpfh(
 /// Match two FPFH sets with reciprocal nearest-neighbour filtering.
 #[must_use]
 pub fn match_fpfh(source: &[FpfhDescriptor], target: &[FpfhDescriptor]) -> Vec<FeatureMatch> {
+    match_fpfh_indexed(
+        source,
+        target,
+        &DescriptorTree::new(source),
+        &DescriptorTree::new(target),
+    )
+}
+
+pub(crate) fn match_fpfh_indexed(
+    source: &[FpfhDescriptor],
+    target: &[FpfhDescriptor],
+    source_tree: &DescriptorTree,
+    target_tree: &DescriptorTree,
+) -> Vec<FeatureMatch> {
     if source.is_empty() || target.is_empty() {
         return Vec::new();
     }
-
-    let target_tree = DescriptorTree::new(target);
-    let source_tree = DescriptorTree::new(source);
     let source_to_target: Vec<_> = source
         .iter()
-        .map(|descriptor| target_tree.nearest(descriptor))
+        .map(|descriptor| target_tree.nearest(target, descriptor))
         .collect();
     let target_to_source: Vec<_> = target
         .iter()
-        .map(|descriptor| source_tree.nearest(descriptor))
+        .map(|descriptor| source_tree.nearest(source, descriptor))
         .collect();
 
     let mut matches: Vec<FeatureMatch> = source_to_target
@@ -268,16 +300,23 @@ pub fn match_fpfh(source: &[FpfhDescriptor], target: &[FpfhDescriptor]) -> Vec<F
 
 pub(crate) fn preprocess(points: &[Point3<f64>], config: FeatureConfig) -> ProcessedCloud {
     let points = voxel_downsample(points, config.voxel_size);
-    let normals = estimate_normals(&points, config.normal_radius, config.max_neighbors);
-    let descriptors = compute_fpfh(
+    let index = point_tree(&points);
+    let normals =
+        estimate_normals_indexed(&points, &index, config.normal_radius, config.max_neighbors);
+    let descriptors = compute_fpfh_indexed(
         &points,
         &normals,
+        &index,
         config.feature_radius,
         config.max_neighbors,
     );
+    let feature_index = DescriptorTree::new(&descriptors);
     ProcessedCloud {
         points,
         descriptors,
+        normals,
+        index,
+        feature_index,
     }
 }
 
@@ -383,23 +422,23 @@ fn normalize_histograms(descriptor: &mut FpfhDescriptor) {
     }
 }
 
-struct DescriptorTree<'a> {
-    descriptors: &'a [FpfhDescriptor],
+pub(crate) struct DescriptorTree {
     root: DescriptorNode,
 }
 
-impl<'a> DescriptorTree<'a> {
-    fn new(descriptors: &'a [FpfhDescriptor]) -> Self {
+impl DescriptorTree {
+    fn new(descriptors: &[FpfhDescriptor]) -> Self {
+        #[cfg(test)]
+        descriptor_builds::record(descriptors);
         let indices: Vec<usize> = (0..descriptors.len()).collect();
         Self {
-            descriptors,
             root: DescriptorNode::build(descriptors, indices),
         }
     }
 
-    fn nearest(&self, query: &FpfhDescriptor) -> (usize, f64) {
+    fn nearest(&self, descriptors: &[FpfhDescriptor], query: &FpfhDescriptor) -> (usize, f64) {
         let mut best = (usize::MAX, f64::INFINITY);
-        self.root.search(self.descriptors, query, &mut best);
+        self.root.search(descriptors, query, &mut best);
         (best.0, best.1 * best.1)
     }
 }
@@ -499,13 +538,55 @@ mod planar_index_tests {
     use super::*;
     #[test]
     fn dense_exact_plane_normals_and_features_do_not_overflow_axis_bucket() {
-        let points:Vec<_>=(0..100).flat_map(|x|(0..100).map(move|y|Point3::new(x as f64*0.03,y as f64*0.03,0.0))).collect();
-        let normals=estimate_normals(&points,0.15,32);
-        assert_eq!(normals.len(),points.len());
-        assert!(normals.iter().all(|n|n.z.abs()>0.999));
-        let features=compute_fpfh(&points,&normals,0.2,32);
-        assert_eq!(features.len(),points.len());
-        let score=super::super::ransac::evaluate_alignment(&points,&points,nalgebra::Isometry3::identity(),0.01);
-        assert_eq!(score.inlier_count,points.len());assert_eq!(score.rmse,0.0);
+        let points: Vec<_> = (0..100)
+            .flat_map(|x| (0..100).map(move |y| Point3::new(x as f64 * 0.03, y as f64 * 0.03, 0.0)))
+            .collect();
+        let normals = estimate_normals(&points, 0.15, 32);
+        assert_eq!(normals.len(), points.len());
+        assert!(normals.iter().all(|n| n.z.abs() > 0.999));
+        let features = compute_fpfh(&points, &normals, 0.2, 32);
+        assert_eq!(features.len(), points.len());
+        let score = super::super::ransac::evaluate_alignment(
+            &points,
+            &NearestPointIndex::new(&points),
+            nalgebra::Isometry3::identity(),
+            0.01,
+        );
+        assert_eq!(score.inlier_count, points.len());
+        assert_eq!(score.rmse, 0.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod descriptor_builds {
+    use super::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static WATCHED: RefCell<Vec<(String, Vec<FpfhDescriptor>, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn watch(clouds: Vec<(String, Vec<FpfhDescriptor>)>) {
+        WATCHED.with(|v| {
+            *v.borrow_mut() = clouds
+                .into_iter()
+                .map(|(name, features)| (name, features, 0))
+                .collect()
+        });
+    }
+    pub fn record(features: &[FpfhDescriptor]) {
+        WATCHED.with(|v| {
+            for (_, expected, count) in v.borrow_mut().iter_mut() {
+                if expected == features {
+                    *count += 1;
+                }
+            }
+        });
+    }
+    pub fn counts() -> Vec<(String, usize)> {
+        WATCHED.with(|v| {
+            v.borrow()
+                .iter()
+                .map(|(name, _, count)| (name.clone(), *count))
+                .collect()
+        })
     }
 }

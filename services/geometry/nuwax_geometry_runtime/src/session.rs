@@ -234,6 +234,8 @@ impl SessionHandle {
             lio: lio_tx,
             nav,
             explorer: None,
+            relocalization_target: None,
+            saved_last_pose: None,
         };
         tokio::spawn(actor.run(command_rx, fault_rx, nav_rx));
         Ok(Self {
@@ -404,6 +406,8 @@ struct Session {
     lio: watch::Sender<Option<Arc<Lio>>>,
     nav: NavBridge,
     explorer: Option<ExplorerWorker>,
+    relocalization_target: Option<Arc<nuwax_mapping::relocalization::TargetCache>>,
+    saved_last_pose: Option<nalgebra::Isometry3<f64>>,
 }
 impl Session {
     async fn run(
@@ -559,6 +563,8 @@ impl Session {
         } else {
             Ok(())
         };
+        self.relocalization_target = None;
+        self.saved_last_pose = None;
         self.save_sources.clear();
         self.explorer = None;
         self.state.phase = SessionPhase::Idle as i32;
@@ -682,6 +688,7 @@ impl Session {
             self.recover().await?;
         }
         self.end_current().await?;
+        self.saved_last_pose = seed.as_ref().map(pose_isometry);
         self.next_session = id;
         self.state.map_name = request.map_name.clone();
         self.save_sources.insert(request.map_name.clone());
@@ -801,7 +808,10 @@ impl Session {
             result.finished_at_ns = now_ns();
             result
         } else {
-            corrector::Corrector::relocalize(&mapper, self.router.recent_frames()).await?
+            corrector::Corrector::relocalize(
+                &mapper, self.router.recent_frames(), &mut self.relocalization_target,
+                self.saved_last_pose, request.seed,
+            ).await?
         };
         self.state.reason = if result.succeeded {
             String::new()

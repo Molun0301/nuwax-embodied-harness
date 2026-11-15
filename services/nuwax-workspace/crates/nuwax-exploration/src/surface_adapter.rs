@@ -735,7 +735,7 @@ impl SurfaceGoalSourceAdapter {
                 |source, goals| {
                     // 每个区域代表一次单源搜索求得到其余代表的代价。
                     let targets: Vec<_> = goals.iter().map(|&target| admissible[target].1 .0).collect();
-                    frontier_rank_costs(&mut search, admissible[source].1 .0, &targets, &route_budget)
+                    frontier_rank_costs(&mut search, admissible[source].1 .0, &targets, &route_budget, true)
                         .into_iter()
                         .map(|cost| cost.map_or(f64::INFINITY, |(cost, _, _)| cost))
                         .collect()
@@ -1265,21 +1265,22 @@ fn frontier_rank_cost(
     search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
     start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget,
 ) -> Option<(f64, [f64; 3], f64)> {
-    frontier_rank_costs(search, start, &[goal], budget).pop().flatten()
+    // 候选目标逐个确定，从当前位置展开全图，选中目标的完整查询直接取用这棵父链核对可达。
+    frontier_rank_costs(search, start, &[goal], budget, false).pop().flatten()
 }
 
 /// 一个起点一次单源搜索求多个目标的排序代价；每个目标仍计一次逻辑查询，
-/// 超出本轮额度的目标与逐个查询时一样记为不可达。
+/// 超出本轮额度的目标与逐个查询时一样记为不可达。`bounded`见`MultiGoalSearch::rank_costs`。
 fn frontier_rank_costs(
     search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
-    start: [f64; 3], goals: &[[f64; 3]], budget: &FrontierRouteBudget,
+    start: [f64; 3], goals: &[[f64; 3]], budget: &FrontierRouteBudget, bounded: bool,
 ) -> Vec<Option<(f64, [f64; 3], f64)>> {
     let allowed = (MAX_FRONTIER_ROUTE_QUERIES - budget.reserved)
         .saturating_sub(budget.queries.get())
         .min(goals.len());
     budget.queries.set(budget.queries.get() + allowed);
     let started = std::time::Instant::now();
-    let results = search.rank_costs(start, &goals[..allowed]);
+    let results = search.rank_costs(start, &goals[..allowed], bounded);
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         query = budget.queries.get(), goals = allowed, ?start,
         reachable = results.iter().filter(|result| result.is_ok()).count(),

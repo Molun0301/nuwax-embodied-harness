@@ -653,7 +653,7 @@ fn legacy_frontier_query_cost(
     // 保留逻辑目标预留次数；转移复用不能让本轮跳过原预算或游标。
     budget.queries.set(budget.queries.get() + 1);
     let started = std::time::Instant::now();
-    let result = if rank { search.rank_costs(start, &[goal]).remove(0) } else { search.cost(start, goal) };
+    let result = if rank { search.rank_costs(start, &[goal], false).remove(0) } else { search.cost(start, goal) };
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         query = budget.queries.get(), ?start, ?goal,
         expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(),

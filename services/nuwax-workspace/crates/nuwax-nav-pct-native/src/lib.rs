@@ -182,7 +182,7 @@ unsafe extern "C" {
         err: *mut c_char, cap: usize,
     ) -> i32;
     fn pct_multi_goal_rank_costs(
-        search: *mut c_void, start: *const f64, goals: *const f64, count: usize,
+        search: *mut c_void, start: *const f64, goals: *const f64, count: usize, bounded: bool,
         out: *mut RouteCost, found: *mut u8,
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
@@ -221,7 +221,9 @@ impl MultiGoalSearch<'_> {
     /// 从一个起点做一次单源搜索，得到到多个目标的排序代价；起点不可搜索或已取消时全部失败。
     /// 代价为同一完整转移图单源父链的真实几何长度，目标只核验真实端点入边；
     /// 用于前沿排序，允许与目标专属启发式搜索选取不同的等权路线。
-    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]]) -> Vec<Result<RouteCost, String>> {
+    /// `bounded`为真时单源展开到这批目标全部定值即停，代价与展开全图相同；
+    /// 为假时展开全图，换起点后仍保留这棵父链，回到该起点（含完整查询的前置核对）直接取用。
+    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]], bounded: bool) -> Vec<Result<RouteCost, String>> {
         // 没有目标时不做单源搜索。
         if goals.is_empty() {
             return Vec::new();
@@ -230,7 +232,7 @@ impl MultiGoalSearch<'_> {
         let mut found = vec![0_u8; goals.len()];
         let mut error = [0; 512];
         let status = unsafe { pct_multi_goal_rank_costs(self.native.as_ptr(), start.as_ptr(),
-            goals.as_ptr().cast(), goals.len(), costs.as_mut_ptr(), found.as_mut_ptr(),
+            goals.as_ptr().cast(), goals.len(), bounded, costs.as_mut_ptr(), found.as_mut_ptr(),
             cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
         if status != 0 {
             let message = native_error(&error);

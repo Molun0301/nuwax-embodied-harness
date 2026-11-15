@@ -6,6 +6,23 @@ use nuwax_nav_runtime::native_map::PctTerrainSource;
 
 const SOURCES: [PctTerrainSource; 2] = [PctTerrainSource::Tomography, PctTerrainSource::Mls];
 
+/// 只记录搜索工作量的元数据；单源搜索提前停止和父链复用只改变这些计数，不参与选点结果比较。
+const EFFORT_KEYS: [&str; 2] = ["route_exact_queries", "route_source_searches"];
+
+fn without_effort(mut goal: FrontierGoal) -> FrontierGoal {
+    for key in EFFORT_KEYS {
+        goal.metadata.remove(key);
+    }
+    goal
+}
+
+fn selection(poll: Result<ExplorationPoll, String>) -> Result<ExplorationPoll, String> {
+    poll.map(|poll| match poll {
+        ExplorationPoll::Goal(goal) => ExplorationPoll::Goal(without_effort(goal)),
+        other => other,
+    })
+}
+
 /// 同一接收端、同一状态序列驱动的新旧两个选点器。
 struct Pair {
     current: SurfaceGoalSourceAdapter,
@@ -27,12 +44,12 @@ impl Pair {
         Self { current: build(), legacy: build(), terrain }
     }
 
-    /// 两侧逐项一致：选点结果（目标、增益、路线代价、区域元数据）、历史、区域调度与诊断。
+    /// 两侧逐项一致：选点结果（目标、增益、路线代价、区域元数据，工作量计数除外）、历史、区域调度与诊断。
     fn poll(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExplorationPoll {
         let current = self.current.poll_goal(state).map_err(|error| error.to_string());
         let legacy = legacy_poll_goal(&mut self.legacy, state, self.terrain)
             .map_err(|error| error.to_string());
-        assert_eq!(current, legacy, "地形来源{:?}", self.terrain);
+        assert_eq!(selection(current.clone()), selection(legacy), "地形来源{:?}", self.terrain);
         self.assert_same_state();
         current.unwrap_or_else(|error| ExplorationPoll::SourceUnavailable(error))
     }
@@ -47,7 +64,8 @@ impl Pair {
         let (current, legacy) = (&self.current, &self.legacy);
         assert_eq!(current.checkpoint().unwrap(), legacy.checkpoint().unwrap());
         assert_eq!(current.frontier_count, legacy.frontier_count);
-        assert_eq!(current.last_frontiers, legacy.last_frontiers);
+        let strip = |goals: &Vec<FrontierGoal>| goals.iter().cloned().map(without_effort).collect::<Vec<_>>();
+        assert_eq!(strip(&current.last_frontiers), strip(&legacy.last_frontiers));
         assert_eq!(current.last_error, legacy.last_error);
         assert_eq!(current.route_cursor, legacy.route_cursor);
         assert_eq!(current.retry_support, legacy.retry_support);
@@ -204,7 +222,7 @@ fn shared_planner_matches_with_long_body_turns_and_recent_obstacles() {
     }
 }
 
-/// 区域代价矩阵：每个代表一次单源搜索求到其余代表的代价，与逐对查询的区域顺序和代价相同；
+/// 区域代价矩阵：每个代表一次单源搜索、展开到其余代表全部定值即停，与逐对全图查询的区域顺序和代价相同；
 /// 查询额度在矩阵中途用尽时，未查询的项同样记为不可达。
 #[test]
 fn one_source_region_rows_match_pairwise_queries_including_budget_exhaustion() {
@@ -230,7 +248,7 @@ fn one_source_region_rows_match_pairwise_queries_including_budget_exhaustion() {
             budget.queries.set(spent);
             let (current, _) = schedule.prepare_select_observed(&candidates, None, |source, goals| {
                 let targets: Vec<_> = goals.iter().map(|&target| bodies[target]).collect();
-                frontier_rank_costs(&mut search, bodies[source], &targets, &budget)
+                frontier_rank_costs(&mut search, bodies[source], &targets, &budget, true)
                     .into_iter().map(|cost| cost.map_or(f64::INFINITY, |(cost, _, _)| cost)).collect()
             });
             let rebuilt = NativeFrontierCache::default().get(&surface, 0.3, &boundary, terrain).unwrap();
@@ -254,6 +272,8 @@ fn one_source_region_rows_match_pairwise_queries_including_budget_exhaustion() {
             if spent == 0 {
                 assert!(current.regional_order.len() > 2);
                 assert!(search.stats().source_searches < legacy_budget.queries.get());
+                assert!(search.stats().source_expanded < pairwise.stats().source_expanded,
+                    "目标全部定值即停：{} 对 {}", search.stats().source_expanded, pairwise.stats().source_expanded);
             } else {
                 assert!(budget.exhausted(), "中途用尽额度的分支必须被覆盖");
             }
@@ -337,7 +357,7 @@ fn selection_timing_shared_cached_planner_versus_rebuilt_planner() {
                 let legacy = legacy_poll_goal(&mut pair.legacy, &state, terrain).unwrap();
                 timings[1] += started.elapsed().as_secs_f64() * 1000.0;
                 details[1] = stages.describe();
-                assert_eq!(current, legacy);
+                assert_eq!(selection(Ok(current.clone())), selection(Ok(legacy)));
                 pair.assert_same_state();
                 outcome = current;
                 if outcome != ExplorationPoll::Pending { break; }
@@ -346,10 +366,40 @@ fn selection_timing_shared_cached_planner_versus_rebuilt_planner() {
             eprintln!("{name} {label}（{polls}次轮询）：总耗时 改后{:.1}ms 改前{:.1}ms\n  改后 {}\n  改前 {}",
                 timings[0], timings[1], details[0], details[1]);
             let ExplorationPoll::Goal(goal) = outcome else { panic!("{name}应选出目标：{outcome:?}") };
-            eprintln!("  单源搜索{}次，路线查询{}次，排序区域{}个",
+            eprintln!("  单源搜索 改后{}次，路线查询{}次，排序区域{}个",
                 goal.metadata["route_source_searches"], goal.metadata["route_query_count"],
                 goal.metadata["route_regions"]);
             pair.feedback(&goal.id, ExplorationGoalFeedback::Reached);
         }
+    }
+}
+
+/// 调查：排序代价（全图单源父链）与选中目标完整查询（目标窗口A*）是否同一模型。
+#[test]
+#[ignore = "调查，手动运行"]
+fn rank_cost_versus_exact_route_cost() {
+    let terrain = PctTerrainSource::from_runtime().unwrap();
+    for (name, surface, start) in [("夹具", far_connected_floors(), [0.85, 0.85, 0.35]),
+        ("50米", rooms(50.0, 10.0), [25.25, 25.25, 0.35])] {
+        let planner = PctPlanner::new(terrain);
+        let mut routes = planner.route_costs(&surface, 0.3, &[]).unwrap();
+        let mut search = routes.search().unwrap();
+        let goals: Vec<_> = surface.frontier_candidates(&[]).unwrap().into_iter()
+            .filter(|f| distance(f.support_xyz, start) < 30.0).step_by(97).take(30)
+            .map(|f| surface.body_position_from_support(f.support_xyz, [0.,0.,0.,1.], 0.3).unwrap()).collect();
+        let ranks = search.rank_costs(start, &goals, false);
+        let (mut same, mut differ, mut worst) = (0, 0, 0.0_f64);
+        for (goal, rank) in goals.iter().zip(ranks) {
+            let exact = search.cost(start, *goal);
+            match (rank, exact) {
+                (Ok(r), Ok(e)) => {
+                    let gap = (r.cost - e.cost).abs();
+                    if gap < 1e-9 && r.endpoint == e.endpoint { same += 1 } else { differ += 1; worst = worst.max(gap / e.cost.max(1e-9)); }
+                    if gap / e.cost.max(1e-9) > 0.003 { eprintln!("  {name} 目标{goal:?} 排序{:.4} 精确{:.4} 端点{:?}/{:?} 朝向{:.3}/{:.3}", r.cost, e.cost, r.endpoint, e.endpoint, r.yaw, e.yaw); }
+                }
+                (r, e) => eprintln!("  {name} 可达性不同 排序{:?} 精确{:?}", r.is_ok(), e.is_ok()),
+            }
+        }
+        eprintln!("{name}: 代价与端点完全相同{same}个，不同{differ}个，最大相对差{:.3}", worst);
     }
 }

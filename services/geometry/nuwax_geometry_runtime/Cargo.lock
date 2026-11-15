@@ -1503,7 +1503,7 @@ dependencies = [
  "nuwax-nav-base",
  "nuwax-nav-mls-planner",
  "nuwax-nav-pct-native",
- "nuwax-nav-runtime",
+ "nuwax-nav-stack",
  "nuwax-nav-types-messages",
  "serde",
  "serde_json",

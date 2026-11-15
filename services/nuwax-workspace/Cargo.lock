@@ -1629,12 +1629,14 @@ dependencies = [
  "nuwax-nav-patrolling",
  "nuwax-nav-pct-native",
  "nuwax-nav-runtime",
+ "nuwax-nav-stack",
  "nuwax-nav-types-messages",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -181,11 +181,13 @@ unsafe extern "C" {
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
-    fn pct_multi_goal_rank_cost(
-        search: *mut c_void, start: *const f64, goal: *const f64, cost: *mut RouteCost,
+    fn pct_multi_goal_rank_costs(
+        search: *mut c_void, start: *const f64, goals: *const f64, count: usize, bounded: bool,
+        out: *mut RouteCost, found: *mut u8,
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
+    fn pct_multi_goal_grounds(search: *const c_void, x: f64, y: f64, out: *mut f64, cap: usize) -> usize;
     fn pct_plan(
         planner: *mut c_void,
         start: *const f64,
@@ -216,14 +218,37 @@ impl Drop for MultiGoalSearch<'_> {
     fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
 }
 impl MultiGoalSearch<'_> {
-    /// 同一完整转移图单源父链的真实几何长度；目标只核验真实端点入边。
+    /// 从一个起点做一次单源搜索，得到到多个目标的排序代价；起点不可搜索或已取消时全部失败。
+    /// 代价为同一完整转移图单源父链的真实几何长度，目标只核验真实端点入边；
     /// 用于前沿排序，允许与目标专属启发式搜索选取不同的等权路线。
-    pub fn rank_cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
-        let mut result = RouteCost::default();
+    /// `bounded`为真时单源展开到这批目标全部定值即停，代价与展开全图相同；
+    /// 为假时展开全图，换起点后仍保留这棵父链，回到该起点（含完整查询的前置核对）直接取用。
+    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]], bounded: bool) -> Vec<Result<RouteCost, String>> {
+        // 没有目标时不做单源搜索。
+        if goals.is_empty() {
+            return Vec::new();
+        }
+        let mut costs = vec![RouteCost::default(); goals.len()];
+        let mut found = vec![0_u8; goals.len()];
         let mut error = [0; 512];
-        let status = unsafe { pct_multi_goal_rank_cost(self.native.as_ptr(), start.as_ptr(), goal.as_ptr(),
-            &mut result, cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
-        if status == 0 { Ok(result) } else { Err(native_error(&error)) }
+        let status = unsafe { pct_multi_goal_rank_costs(self.native.as_ptr(), start.as_ptr(),
+            goals.as_ptr().cast(), goals.len(), bounded, costs.as_mut_ptr(), found.as_mut_ptr(),
+            cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
+        if status != 0 {
+            let message = native_error(&error);
+            return goals.iter().map(|_| Err(message.clone())).collect();
+        }
+        costs.into_iter().zip(found).map(|(cost, found)| if found != 0 { Ok(cost) } else {
+            Err("PCT未找到满足已知占据与机体尺寸的路径".into())
+        }).collect()
+    }
+    /// 平面点所在原生格的实测地面高度（静态列与本次临时叠加）；缺测列为空，不补造地面。
+    pub fn measured_heights(&self, point: [f64; 2]) -> Vec<f64> {
+        let count = unsafe { pct_multi_goal_grounds(self.native.as_ptr(), point[0], point[1],
+            std::ptr::null_mut(), 0) };
+        let mut heights = vec![0.0; count];
+        unsafe { pct_multi_goal_grounds(self.native.as_ptr(), point[0], point[1], heights.as_mut_ptr(), count) };
+        heights
     }
     pub fn cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
         self.cost_inner(start, goal, std::ptr::null())

@@ -999,3 +999,55 @@ async fn planar_localized_session_still_rejects_save() {
     session.nav.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel() {
+    use crate::explorer::tests::{distant_hole, floor, vanishing_fixture, vanishing_pose};
+    use crate::nav_bridge::tests::Capture;
+    use nuwax_codec::lcm::schema;
+    let root = std::env::temp_dir().join(format!("e2-vanish-{}", uuid::Uuid::new_v4()));
+    let mapper = Mapper::start(9271, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper, root.clone()).await;
+    session.nav.shutdown().await;
+    let capture = Arc::new(Capture::new());
+    let (tx, _updates) = mpsc::unbounded_channel();
+    session.nav = NavBridge::with_transport(nuwax_transport::LcmTransport::new(capture.clone()), tx).await.unwrap();
+    // 连接时清空导航栈旧目标的取消不属于本测试。
+    capture.published.lock().unwrap().clear();
+    session.nav.set_input_ready(Ok(()));
+    capture.inject_status("", 17, schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    let cancels = || capture.published.lock().unwrap().iter()
+        .filter(|frame| frame.topic.channel() == "/nav/cancel").count();
+    let sent = |count: usize| {
+        let capture = capture.clone();
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            while capture.goals().len() < count { tokio::time::sleep(Duration::from_millis(10)).await; }
+        })
+    };
+    let (mut explorer, partial) = vanishing_fixture();
+    let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial), Ok(())).unwrap();
+    let (first_id, _) = first.goal.clone().unwrap();
+    session.exploration_update(first).await;
+    sent(1).await.unwrap();
+    // 前沿消失：新子目标直接替换当前导航目标，会话不发取消。
+    let replaced = explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole()), Ok(())).unwrap();
+    let (second_id, _) = replaced.goal.clone().unwrap();
+    session.exploration_update(replaced).await;
+    sent(2).await.unwrap();
+    assert_eq!(cancels(), 0);
+    let current = session.state.navigation.as_ref().unwrap();
+    assert_eq!(current.goal_id, second_id);
+    assert!(current.exploration_child);
+    let previous = session.state.previous_navigation.as_ref().unwrap();
+    assert_eq!((previous.goal_id.as_str(), previous.status), (first_id.as_str(), GoalStatus::Replaced as i32));
+    // 没有其它前沿：取消当前子目标。
+    let exhausted = explorer.tick(Some(vanishing_pose()), None, Ok(floor(|_, _| false)), Ok(())).unwrap();
+    assert_eq!(exhausted.cancel_goal.as_deref(), Some(second_id.as_str()));
+    session.exploration_update(exhausted).await;
+    assert_eq!(cancels(), 1);
+    assert_eq!(session.state.navigation.as_ref().unwrap().status, GoalStatus::Cancelled as i32);
+    assert_eq!(capture.goals().len(), 2);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
+}

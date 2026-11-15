@@ -184,9 +184,9 @@ fn compute_for_test(
 ) -> (Isometry3<f64>, f64, bool) {
     let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
     let target = TargetCache::new(target, RelocalizationConfig::default());
-    compute_relocalization(&source, &target, &[initial], Isometry3::identity())
-        .map(|(pose, fitness, succeeded, _)| (pose, fitness, succeeded))
-        .unwrap()
+    let (pose, fitness, succeeded, _) =
+        compute_relocalization(&source, &target, &[initial], Isometry3::identity());
+    (pose, fitness, succeeded)
 }
 
 #[test]
@@ -311,9 +311,34 @@ fn relocalization_local_consensus_uses_second_initial_after_first_fails() {
         odom,
     );
     let (actual, _, succeeded, _) =
-        compute_relocalization(&source, &target, &initials, odom).unwrap();
+        compute_relocalization(&source, &target, &initials, odom);
     assert!(succeeded);
     assert_transform(actual, truth);
+}
+
+#[test]
+fn relocalization_local_error_continues_to_second_initial_and_then_global() {
+    let points = local_consensus_source();
+    let mut target_points = points.clone();
+    // 远处目标在双精度中有限，超过原生点云单精度范围，用于触发现有内核错误通道。
+    target_points.extend(points.iter().map(|p| Point3::new(1e40, p.y, p.z)));
+    let target = TargetCache::new(&target_points, RelocalizationConfig::default());
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    let bad = Isometry3::translation(1e40, 0.0, 0.0);
+    let odom = Isometry3::identity();
+    assert!(local_registration(&source, &target, bad, odom).is_err());
+    let (pose, fitness, succeeded, ambiguous) =
+        compute_relocalization(&source, &target, &[bad, odom], odom);
+    assert!(succeeded && !ambiguous);
+    assert!(fitness >= 0.45);
+    assert_transform(pose, odom);
+    let global = relocation_pipeline_cached(&source, &target, RelocalizationConfig::default());
+    assert!(global.fitness >= 0.45);
+    let actual = compute_relocalization(&source, &target, &[bad, bad], odom);
+    assert_eq!(actual.0, global.registration.transformation);
+    assert_eq!(actual.1, global.fitness);
+    assert_eq!(actual.2, global.registration.converged);
+    assert_eq!(actual.3, global.ambiguous);
 }
 
 #[test]
@@ -330,8 +355,7 @@ fn relocalization_local_consensus_preserves_nonzero_anchor_and_reuses_registrati
         Isometry3::from_parts(Translation3::new(2.03, -3.02, 0.41), truth.rotation);
     for _ in 0..2 {
         let (actual, _, succeeded, _) =
-            compute_relocalization(&source, &target, &[registration], Isometry3::identity())
-                .unwrap();
+            compute_relocalization(&source, &target, &[registration], Isometry3::identity());
         assert!(succeeded);
         assert_transform(actual, truth);
         registration = actual;

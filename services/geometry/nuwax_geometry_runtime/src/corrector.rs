@@ -219,7 +219,7 @@ impl Corrector {
             let odom = pose_isometry(&frames.last().unwrap().odom_pose);
             let initials = relocalization_initials(initial, last_pose, seed, odom);
             let (transform, fitness, succeeded, ambiguous) =
-                compute_relocalization(&source, &target_cache, &initials, odom)?;
+                compute_relocalization(&source, &target_cache, &initials, odom);
             let last = frames.last().unwrap();
             let result = proto::RelocalizationResult {
                 succeeded,
@@ -286,23 +286,25 @@ fn compute_relocalization(
     target: &TargetCache,
     initials: &[Isometry3<f64>],
     odom: Isometry3<f64>,
-) -> Result<(Isometry3<f64>, f64, bool, bool), String> {
+) -> (Isometry3<f64>, f64, bool, bool) {
     let config = RelocalizationConfig::default();
     for initial in initials {
-        let local = local_registration(source, target, *initial, odom)?;
+        let Ok(local) = local_registration(source, target, *initial, odom) else {
+            continue;
+        };
         let transform = local.transformation;
         let score = score_relocalization(source, transform, target);
         if score.accepts(&transform) {
-            return Ok((transform, score.wall_fitness, true, false));
+            return (transform, score.wall_fitness, true, false);
         }
     }
     let global = relocation_pipeline_cached(source, target, config);
-    Ok((
+    (
         global.registration.transformation,
         global.fitness,
         global.registration.converged,
         global.ambiguous,
-    ))
+    )
 }
 
 #[cfg(test)]

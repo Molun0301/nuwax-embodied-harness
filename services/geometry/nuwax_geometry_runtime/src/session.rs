@@ -162,6 +162,8 @@ pub struct SessionHandle {
 }
 const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
 const PLANAR_VIEW_ONLY: &str = "缺少二维定位图，只能查看";
+/// 文本固定，适配度等数字只在 `localization_quality` 里，避免状态流每轮因原因文本变化而推送。
+const LOCALIZATION_DEGRADED: &str = "定位质量下降，建议重新定位";
 type Reply<T> = oneshot::Sender<Result<T, Status>>;
 enum Command {
     Start(StartMappingRequest, Reply<GeometryState>),
@@ -590,8 +592,8 @@ impl Session {
         // 只有最近一轮吻合才写入地图；吻合差的这一轮起回到只读，恢复吻合再写入。
         self.mapper().expect("跟踪器运行期间路由上有地图").set_writing(update.bad_rounds == 0);
         if update.bad_rounds >= 10 {
-            self.state.reason = format!("定位质量下降：最近扫描与地图吻合度为 {:.3}，建议重新定位", update.score.wall_fitness);
-        } else if update.bad_rounds == 0 && self.state.reason.starts_with("定位质量下降：") {
+            self.state.reason = LOCALIZATION_DEGRADED.into();
+        } else if update.bad_rounds == 0 && self.state.reason == LOCALIZATION_DEGRADED {
             self.state.reason.clear();
         }
         self.state.localization_quality = Some(LocalizationQuality {

@@ -277,6 +277,7 @@ fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map(
         assert_eq!(worker.cloud.final_poses(), before.final_poses);
         assert!((worker.poses.borrow().as_ref().unwrap().position.as_ref().unwrap().x - offset).abs() < 1e-12);
         assert_eq!(worker.map_from_odom, Isometry3::translation(offset, 0., 0.));
+        assert_eq!(worker.evidence_from_odom, Isometry3::identity(), "小校正不改去动态证据坐标");
     }
     let before_replay = worker.cloud.snapshot().revision;
     worker.apply_pgo(PgoUpdate::constant_for_test(first,
@@ -284,8 +285,11 @@ fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map(
     let rebuilt_revision = worker.cloud.snapshot().revision;
     assert_eq!(rebuilt_revision, before_replay + 1,
         "连续小校正相对建图位姿累计超过阈值时必须重放");
+    assert_eq!(worker.evidence_from_odom, Isometry3::translation(0.051, 0., 0.),
+        "采用重放地图后证据坐标取这次校正的最新值");
     worker.apply_pgo(PgoUpdate::constant_for_test(first,
         Isometry3::translation(0.075, 0., 0.))).unwrap();
+    assert_eq!(worker.evidence_from_odom, Isometry3::translation(0.051, 0., 0.));
     assert_eq!(worker.cloud.snapshot().revision, rebuilt_revision,
         "重放后应比较更新后的建图位姿");
 }

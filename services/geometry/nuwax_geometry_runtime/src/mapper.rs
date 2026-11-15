@@ -458,6 +458,8 @@ struct Worker {
     cloud: CloudMap,
     grid: Option<PersistentOccupancyGrid>,
     map_from_odom: Isometry3<f64>,
+    /// 在线去动态证据坐标 ← 里程计：会话开始为单位变换，每次采用重放地图后取这次校正的最新值。
+    evidence_from_odom: Isometry3<f64>,
     poses: watch::Sender<Option<proto::Pose>>,
     maps: watch::Sender<Option<proto::MapUpdate>>,
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
@@ -561,6 +563,7 @@ impl Worker {
             cloud,
             grid,
             map_from_odom,
+            evidence_from_odom: Isometry3::identity(),
             poses,
             maps,
             fine_root,
@@ -810,6 +813,7 @@ impl Worker {
             &points,
             [origin.x, origin.y, origin.z],
             self.map_from_odom,
+            self.evidence_from_odom,
         )?;
         if self.cloud.take_recording_limit() {
             self.stop_correction("扫描记录已达上限，回环校正已停止".into());
@@ -935,6 +939,8 @@ impl Worker {
         self.grid = rebuilt.grid;
         self.grid_stamp = rebuilt.stamp;
         self.map_from_odom = rebuilt.update.latest;
+        // 重放地图的去动态证据在校正后的坐标里，之后的在线帧按这次校正的最新值放入同一坐标。
+        self.evidence_from_odom = rebuilt.update.latest;
         self.built_until = rebuilt.stamp;
         self.built_corrections.clear();
         self.built_corrections.push((rebuilt.stamp, self.map_from_odom));

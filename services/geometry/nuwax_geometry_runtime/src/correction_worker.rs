@@ -160,8 +160,9 @@ impl Rebuilt {
             let body = correction * pose_isometry(&frame.odom_pose);
             let points: Vec<_> = frame.points_body.iter().map(|p| body * Point3::from(*p)).collect();
             let origin = body * Point3::from(frame.ray_origin_body);
+            // 证据坐标取该帧时刻的校正，即校正后的地图坐标。
             let (dynamic, _, _) = self.cloud.accumulate(self.sequence, &frame, &points,
-                [origin.x, origin.y, origin.z], correction)?;
+                [origin.x, origin.y, origin.z], correction, correction)?;
             let input = MappingBackendInput {
                 source_timestamp_ns: self.stamp, received_at_ns: self.stamp,
                 registered_frame_id: self.config.map_frame_id.clone(),
@@ -214,7 +215,8 @@ mod tests {
         for i in 1..=10 {
             let frame = tests_frame(i * 1_000_000_000);
             let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
-            cloud.accumulate(i, &frame, &points, frame.ray_origin_body, Isometry3::identity()).unwrap();
+            cloud.accumulate(i, &frame, &points, frame.ray_origin_body, Isometry3::identity(),
+                Isometry3::identity()).unwrap();
         }
         let (corrector, _) = Corrector::scripted_for_test(vec![Ok(Some(PgoUpdate::constant_for_test(
             1_000_000_000, Isometry3::translation(0.2, 0., 0.))))]);

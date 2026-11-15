@@ -1051,3 +1051,30 @@ async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel()
     session.nav.shutdown().await;
     if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
 }
+
+#[tokio::test]
+async fn relocalize_entry_waits_for_five_recent_frames_or_the_limit() {
+    let mapper = Mapper::start(717, MapperConfig::default()).unwrap();
+    let handle = test_block_session(mapper.clone());
+    // 一直没有帧：到等待上限返回。
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_millis(300)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(300) && waited < Duration::from_millis(600), "{waited:?}");
+    // 帧在 0.3 秒后陆续到达：凑满 5 帧就返回，不等到上限。
+    let recent = handle.recent.clone();
+    let feeder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for stamp in 1..=5 {
+            recent.lock().push_back((Instant::now(), crate::mapper::tests::room_frame(717, stamp)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_secs(10)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(handle.recent.lock().len(), 5);
+    feeder.await.unwrap();
+    mapper.shutdown().await.unwrap();
+}

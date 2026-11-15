@@ -158,6 +158,7 @@ pub struct SessionHandle {
     maps: watch::Receiver<Option<MapUpdate>>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
+    recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
 }
 const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
 const PLANAR_VIEW_ONLY: &str = "缺少二维定位图，只能查看";
@@ -193,6 +194,7 @@ impl SessionHandle {
             faults: faults.clone(),
             recent: Default::default(),
         };
+        let recent = router.recent.clone();
         let (maps_tx, maps) = watch::channel(None);
         tokio::spawn(forward_maps(
             route.clone(),
@@ -253,6 +255,7 @@ impl SessionHandle {
             maps,
             lio: lio_rx,
             faults,
+            recent,
         })
     }
     async fn request<T>(&self, build: impl FnOnce(Reply<T>) -> Command) -> Result<T, Status> {
@@ -283,6 +286,22 @@ impl SessionHandle {
         request: RelocalizeRequest,
     ) -> Result<RelocalizationResult, Status> {
         self.request(|tx| Command::Relocalize(request, tx)).await
+    }
+    /// 三维重定位前等近期主雷达帧不少于 5 帧：每 100 毫秒看一次，最多等 `limit`；
+    /// 到时仍不足也返回，由会话照常给出原因。只读输入缓冲，不经会话命令循环。
+    pub async fn wait_recent_frames(&self, limit: Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let count = {
+                let mut recent = self.recent.lock();
+                trim_recent(&mut recent);
+                recent.len()
+            };
+            if count >= 5 || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     pub async fn set_goal(&self, request: NavigationGoal) -> Result<SetGoalResponse, Status> {
         self.request(|tx| Command::Goal(request, tx)).await
@@ -1323,7 +1342,7 @@ pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
     let (_, maps) = watch::channel(None);
     let (_, lio) = watch::channel(None);
     let (faults, _) = mpsc::unbounded_channel();
-    SessionHandle { commands, state, route, pose, maps, lio, faults }
+    SessionHandle { commands, state, route, pose, maps, lio, faults, recent: Default::default() }
 }
 
 #[cfg(test)]

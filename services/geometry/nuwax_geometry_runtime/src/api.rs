@@ -90,6 +90,12 @@ impl GeometryRuntime for GeometryApi {
                 return Err(Status::invalid_argument("重定位初值必须为有限数值"));
             }
         }
+        // 输入刚接通时里程计要几秒才出帧：三维链在入口等近期帧，不占用会话命令循环。
+        if self.session.state().info.as_ref().unwrap().pipeline == "lio_3d" {
+            self.session
+                .wait_recent_frames(std::time::Duration::from_secs(30))
+                .await;
+        }
         Ok(Response::new(self.session.relocalize(request).await?))
     }
     async fn set_goal(

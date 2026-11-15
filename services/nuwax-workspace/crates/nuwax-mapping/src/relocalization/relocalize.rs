@@ -346,7 +346,8 @@ pub struct TargetCache {
     pub points: Vec<Point3<f64>>,
     /// 精细层最近邻索引。
     pub index: NearestPointIndex,
-    /// 地图坐标中的0.1米占据体素。
+    /// 穿透检查用的地图坐标0.1米占据体素：只收正上方和正下方一格也被占据的体素
+    /// （墙、柱、立面内部），地面、天花板、桌面这类水平面不收。
     pub occupied: std::collections::HashSet<[i64; 3]>,
     scales: std::sync::OnceLock<Vec<ProcessedCloud>>,
 }
@@ -355,7 +356,12 @@ impl TargetCache {
     pub fn new(target: &[Point3<f64>], config: RelocalizationConfig) -> Self {
         let points = voxel_downsample(target, config.fine_voxel_size);
         let index = NearestPointIndex::new(&points);
-        let occupied = points.iter().map(voxel_key).collect();
+        let all: std::collections::HashSet<_> = points.iter().map(voxel_key).collect();
+        let occupied = all
+            .iter()
+            .filter(|[x, y, z]| all.contains(&[*x, *y, z - 1]) && all.contains(&[*x, *y, z + 1]))
+            .copied()
+            .collect();
         Self {
             points,
             index,
@@ -418,7 +424,7 @@ impl SourceCloud {
 pub struct RelocalizationScore {
     /// 墙面源点中0.15米内有目标点的比例。
     pub wall_fitness: f64,
-    /// 射线中段穿过地图占据体素的比例。
+    /// 射线中段穿过地图竖向结构体素的比例。
     pub penetration: f64,
     /// 墙面内点均方根误差。
     pub rmse: f64,
@@ -1047,6 +1053,33 @@ mod tests {
         let endpoints = TargetCache::new(&endpoints, RelocalizationConfig::default());
         let score = score_relocalization(&through, Isometry3::identity(), &endpoints);
         assert_eq!(score.penetration, 0.0, "两端排除段不能计为穿透：{score:?}");
+    }
+
+    #[test]
+    fn rays_from_floor_height_do_not_penetrate_floor_or_ceiling() {
+        let center = |i: i32| (i as f64 + 0.5) * 0.1;
+        // 单层地面、单层天花板与一面墙，各点位于0.1米体素中心。
+        let mut target = Vec::new();
+        for i in 0..30 {
+            for j in -15..15 {
+                target.push(Point3::new(center(i), center(j), center(0)));
+                target.push(Point3::new(center(i), center(j), center(15)));
+            }
+        }
+        let wall: Vec<_> = (-15..15)
+            .flat_map(|j| (0..15).map(move |k| Point3::new(center(30), center(j), center(k))))
+            .collect();
+        target.extend(&wall);
+        let target = TargetCache::new(&target, RelocalizationConfig::default());
+        // 射线原点在地面高度，射向墙面从最低一层到最高一层的各点。
+        let origin = Point3::new(0.0, 0.0, center(0));
+        let source = SourceCloud::from_rays(wall.iter().map(|p| (*p, origin)));
+        let score = score_relocalization(&source, Isometry3::identity(), &target);
+        assert_eq!(score.penetration, 0.0, "贴地射线不能把地面算作穿透：{score:?}");
+        assert!(score.accepts(&Isometry3::identity()), "正确位姿应通过：{score:?}");
+        assert!(!target.occupied.contains(&voxel_key(&Point3::new(center(10), 0.05, center(0)))));
+        assert!(!target.occupied.contains(&voxel_key(&Point3::new(center(10), 0.05, center(15)))));
+        assert!(target.occupied.contains(&voxel_key(&Point3::new(center(30), 0.05, center(7)))));
     }
 
     #[test]

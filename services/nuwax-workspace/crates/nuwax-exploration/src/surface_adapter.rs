@@ -2,9 +2,10 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use nuwax_nav_mls_planner::SurfaceSnapshot;
+use nuwax_nav_stack::surface_oriented::PctPlanner;
 use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped};
 use nuwax_nav_types_messages::visual::FrontierGoal;
 
@@ -97,82 +98,6 @@ fn input_lock_error() -> ExploreError {
 struct FrozenSurfaceInput {
     snapshot: Option<Arc<SurfaceSnapshot>>,
     notification: u64,
-}
-
-#[derive(Clone)]
-struct CachedFrontierPlanner {
-    terrain_source: nuwax_nav_runtime::native_map::PctTerrainSource,
-    offset: f64,
-    boundary: Vec<[f64; 2]>,
-    resolution: f64,
-    measured: Arc<std::collections::BTreeMap<[i32; 2], Vec<f64>>>,
-    planner: Arc<Mutex<nuwax_nav_pct_native::Planner>>,
-    input: Arc<nuwax_nav_pct_native::Config>,
-}
-#[derive(Default)]
-struct NativeFrontierCache {
-    state: Mutex<Option<CachedFrontierPlanner>>,
-}
-impl std::fmt::Debug for NativeFrontierCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NativeFrontierCache")
-            .finish_non_exhaustive()
-    }
-}
-impl NativeFrontierCache {
-    fn get(
-        &self,
-        snapshot: &SurfaceSnapshot,
-        offset: f64,
-        boundary: &[[f64; 2]],
-    ) -> Result<CachedFrontierPlanner, String> {
-        if nuwax_nav_pct_native::planning_cancelled() {
-            return Err("PCT规划已取消".into());
-        }
-        let terrain_source = nuwax_nav_runtime::native_map::PctTerrainSource::from_runtime()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "前沿原生地图缓存锁已失效".to_string())?;
-        if let Some(cached) = state.as_ref().filter(|cached| {
-            cached.offset == offset
-                && cached.boundary == boundary
-                && cached.terrain_source == terrain_source
-        }) {
-            return Ok(cached.clone());
-        }
-        let (config, cells, bands) = nuwax_nav_runtime::native_map::pct_input_for_source(
-            snapshot,
-            offset,
-            boundary,
-            terrain_source,
-        )?;
-        let started = std::time::Instant::now();
-        tracing::debug!(target: "navigation.exploration.compute", cells = cells.len(), bands = bands.len(), "开始构建前沿原生规划器");
-        let mut measured = std::collections::BTreeMap::<[i32; 2], Vec<f64>>::new();
-        for cell in &cells {
-            measured
-                .entry([cell.x, cell.y])
-                .or_default()
-                .push(cell.ground);
-        }
-        let resolution = config.resolution;
-        let planner = nuwax_nav_pct_native::Planner::from_cells(config.clone(), &cells, &bands)?;
-        tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "前沿原生规划器构建完成");
-        tracing::debug!(target:"navigation.pct",event="navigation.pct.map",cells=cells.len(),
-                occupied_bands=bands.len(),"探索PCT原生输入构建完成");
-        let cached = CachedFrontierPlanner {
-            terrain_source,
-            offset,
-            boundary: boundary.to_vec(),
-            resolution,
-            measured: Arc::new(measured),
-            planner: Arc::new(Mutex::new(planner)),
-            input: Arc::new(config),
-        };
-        *state = Some(cached.clone());
-        Ok(cached)
-    }
 }
 
 // 同步计算只记录本次实际变化的字段，反馈历史不参与复制。
@@ -275,6 +200,8 @@ pub struct SurfaceGoalSourceAdapter {
     name: Cow<'static, str>,
     body_to_support_z_m: f64,
     receiver: SurfaceInputReceiver,
+    /// 与返航查询共用的带缓存全局规划器。
+    planner: Arc<PctPlanner>,
     boundary: Option<ExplorationBoundary>,
     max_navigation_retries: u32,
     blacklist_radius_m: f64,
@@ -298,10 +225,12 @@ pub struct SurfaceGoalSourceAdapter {
 
 impl SurfaceGoalSourceAdapter {
     /// 标定距离必须是正值；同一接收端可由根拥有方独立更新和撤销。
+    /// 前沿路线代价经拥有方传入的全局规划器查询，与返航路线共用同一份缓存原生地图。
     pub fn new(
         name: impl Into<Cow<'static, str>>,
         body_to_support_z_m: f64,
         receiver: SurfaceInputReceiver,
+        planner: Arc<PctPlanner>,
     ) -> ExploreResult<Self> {
         let name = name.into();
         if name.trim().is_empty() || !body_to_support_z_m.is_finite() || body_to_support_z_m <= 0.0
@@ -316,6 +245,7 @@ impl SurfaceGoalSourceAdapter {
             name,
             body_to_support_z_m,
             receiver,
+            planner,
             boundary: None,
             max_navigation_retries: 1,
             blacklist_radius_m: 0.5,
@@ -502,33 +432,29 @@ impl SurfaceGoalSourceAdapter {
         let observation_targets = geometry.targets;
         let frontier_ms = compute_started.elapsed().as_secs_f64() * 1000.0 - geometry_ms;
         let native_started = std::time::Instant::now();
-        // 前沿路线使用与导航相同的原生实测层与占据输入，缺测不补造可通行节点。
-        let uncached = NativeFrontierCache::default();
-        let native = uncached
-            .get(snapshot, self.body_to_support_z_m, &boundary)
+        if nuwax_nav_pct_native::planning_cancelled() {
+            return Err(ExploreError::SourceError("PCT规划已取消".into()));
+        }
+        // 前沿路线与返航共用导航同源的缓存原生地图，地图变化只替换变化列；缺测不补造可通行节点。
+        let mut routes = self
+            .planner
+            .route_costs(snapshot, self.body_to_support_z_m, &boundary)
             .map_err(ExploreError::SourceError)?;
+        let mut search = routes.search().map_err(ExploreError::SourceError)?;
         for candidate in &mut candidates {
-            let xy = [
-                (candidate.support_xyz[0] / native.resolution).floor() as i32,
-                (candidate.support_xyz[1] / native.resolution).floor() as i32,
-            ];
-            if let Some(heights) = native.measured.get(&xy) {
-                if let Some(height) = heights.iter().min_by(|a, b| {
-                    (*a - candidate.support_xyz[2])
+            if let Some(height) = search
+                .measured_heights([candidate.support_xyz[0], candidate.support_xyz[1]])
+                .into_iter()
+                .min_by(|a, b| {
+                    (a - candidate.support_xyz[2])
                         .abs()
-                        .total_cmp(&(*b - candidate.support_xyz[2]).abs())
-                }) {
-                    candidate.support_xyz[2] = *height;
-                }
+                        .total_cmp(&(b - candidate.support_xyz[2]).abs())
+                })
+            {
+                candidate.support_xyz[2] = height;
             }
         }
         let native_input_ms = native_started.elapsed().as_secs_f64() * 1000.0;
-        let planner = native.planner.clone();
-        let lock_started = std::time::Instant::now();
-        let mut planner_guard = planner.lock().map_err(|_| {
-            ExploreError::SourceError("native frontier planner lock is poisoned".into())
-        })?;
-        let planner_lock_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
         delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
         delta.last_notification = Some(Some(notification));
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
@@ -580,7 +506,6 @@ impl SurfaceGoalSourceAdapter {
         let rotation_offset = deferred.map(|route|route.rotation_offset).unwrap_or(0)
             % candidates.len().max(1);
         candidates.rotate_left(rotation_offset);
-        let mut search = planner_guard.multi_goal_search().map_err(ExploreError::SourceError)?;
         let mut route_budget_limited = false;
         let mut next_route_cursor = 0;
         let mut examined_route_cursor = 0;
@@ -804,17 +729,11 @@ impl SurfaceGoalSourceAdapter {
                 &routing_candidates,
                 self.observation_model.as_ref().map(|_| observed.as_slice()),
                 |source, goals| {
-                    goals
-                        .iter()
-                        .map(|&target| {
-                            frontier_rank_cost(
-                                &mut search,
-                                admissible[source].1 .0,
-                                admissible[target].1 .0,
-                                &route_budget,
-                            )
-                            .map_or(f64::INFINITY, |(cost, _, _)| cost)
-                        })
+                    // 每个区域代表一次单源搜索求得到其余代表的代价。
+                    let targets: Vec<_> = goals.iter().map(|&target| admissible[target].1 .0).collect();
+                    frontier_rank_costs(&mut search, admissible[source].1 .0, &targets, &route_budget)
+                        .into_iter()
+                        .map(|cost| cost.map_or(f64::INFINITY, |(cost, _, _)| cost))
                         .collect()
                 },
             );
@@ -899,7 +818,7 @@ impl SurfaceGoalSourceAdapter {
                 ("route_cost_m",selection.route_cost.to_string()),
             ] {goal.metadata.insert(key.into(),value);}
         }
-        tracing::info!(event="exploration.selection.stages", captured_now_ns=state.now.nanos, geometry_ms, frontier_ms, native_ms, native_input_ms, planner_lock_ms, ranking_ms,
+        tracing::info!(event="exploration.selection.stages", captured_now_ns=state.now.nanos, geometry_ms, frontier_ms, native_ms, native_input_ms, ranking_ms,
             exact_ms=exact_started.elapsed().as_secs_f64()*1000.0,
             candidates=geometric_candidate_count, targets=observation_targets.len(),
             route_queries=route_budget.queries.get(), expanded=route_budget.expanded.get(),
@@ -1286,25 +1205,12 @@ fn frontier_geometry(
     })
 }
 
+/// 选中目标的完整路线代价，使用目标专属搜索。
 fn frontier_route_cost(
     search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
     start: [f64; 3],
     goal: [f64; 3],
     budget: &FrontierRouteBudget,
-) -> Option<(f64, [f64; 3], f64)> {
-    frontier_query_cost(search, start, goal, budget, false)
-}
-
-fn frontier_rank_cost(
-    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
-    start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget,
-) -> Option<(f64, [f64; 3], f64)> {
-    frontier_query_cost(search, start, goal, budget, true)
-}
-
-fn frontier_query_cost(
-    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
-    start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget, rank: bool,
 ) -> Option<(f64, [f64; 3], f64)> {
     if budget.exhausted() {
         return None;
@@ -1312,7 +1218,7 @@ fn frontier_query_cost(
     // 保留逻辑目标预留次数；转移复用不能让本轮跳过原预算或游标。
     budget.queries.set(budget.queries.get() + 1);
     let started = std::time::Instant::now();
-    let result = if rank { search.rank_cost(start, goal) } else { search.cost(start, goal) };
+    let result = search.cost(start, goal);
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         query = budget.queries.get(), ?start, ?goal,
         expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(),
@@ -1322,6 +1228,42 @@ fn frontier_query_cost(
     let route = result.ok()?;
     budget.expanded.set(budget.expanded.get() + route.expanded);
     Some((route.cost, route.endpoint, route.yaw))
+}
+
+fn frontier_rank_cost(
+    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
+    start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget,
+) -> Option<(f64, [f64; 3], f64)> {
+    frontier_rank_costs(search, start, &[goal], budget).pop().flatten()
+}
+
+/// 一个起点一次单源搜索求多个目标的排序代价；每个目标仍计一次逻辑查询，
+/// 超出本轮额度的目标与逐个查询时一样记为不可达。
+fn frontier_rank_costs(
+    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
+    start: [f64; 3], goals: &[[f64; 3]], budget: &FrontierRouteBudget,
+) -> Vec<Option<(f64, [f64; 3], f64)>> {
+    let allowed = (MAX_FRONTIER_ROUTE_QUERIES - budget.reserved)
+        .saturating_sub(budget.queries.get())
+        .min(goals.len());
+    budget.queries.set(budget.queries.get() + allowed);
+    let started = std::time::Instant::now();
+    let results = search.rank_costs(start, &goals[..allowed]);
+    tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        query = budget.queries.get(), goals = allowed, ?start,
+        reachable = results.iter().filter(|result| result.is_ok()).count(),
+        checks = search.stats().checks, hits = search.stats().hits,
+        source_searches = search.stats().source_searches, rejected = search.stats().rejected, "前沿单源多目标查询完成");
+    let mut costs: Vec<_> = results
+        .into_iter()
+        .map(|result| {
+            let route = result.ok()?;
+            budget.expanded.set(budget.expanded.get() + route.expanded);
+            Some((route.cost, route.endpoint, route.yaw))
+        })
+        .collect();
+    costs.resize(goals.len(), None);
+    costs
 }
 
 fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
@@ -1361,7 +1303,7 @@ mod tests {
     use nuwax_nav_types_messages::geometry::{Point2, Quaternion, Timestamp};
     use nuwax_nav_types_messages::NavFrameId;
 
-    fn map() -> Arc<SurfaceSnapshot> {
+    pub(super) fn map() -> Arc<SurfaceSnapshot> {
         let config = Config {
             world_frame: "map".into(),
             voxel_size: 0.1,
@@ -1389,7 +1331,7 @@ mod tests {
         Arc::new(SurfaceSnapshot::from_points(&points, config, 0.1).unwrap())
     }
 
-    fn state(height: f64, sequence: i64) -> ExplorationStateSnapshot<'static> {
+    pub(super) fn state(height: f64, sequence: i64) -> ExplorationStateSnapshot<'static> {
         let now = Timestamp::from_unix(sequence, 0);
         ExplorationStateSnapshot::new(
             PoseStamped {
@@ -1404,8 +1346,15 @@ mod tests {
         )
     }
 
+    /// 与生产相同按合成配置选择地形来源的共享规划器。
+    pub(super) fn planner() -> Arc<PctPlanner> {
+        Arc::new(PctPlanner::new(
+            nuwax_nav_runtime::native_map::PctTerrainSource::from_runtime().unwrap(),
+        ))
+    }
+
     fn source(receiver: SurfaceInputReceiver, retries: u32) -> SurfaceGoalSourceAdapter {
-        let mut source = SurfaceGoalSourceAdapter::new("surface", 0.3, receiver).unwrap();
+        let mut source = SurfaceGoalSourceAdapter::new("surface", 0.3, receiver, planner()).unwrap();
         source.configure_constraints(None, retries, 0.3).unwrap();
         source.begin().unwrap();
         source
@@ -1419,7 +1368,7 @@ mod tests {
         goal
     }
 
-    fn volume_model() -> nuwax_nav_types_messages::ObservationModel {
+    pub(super) fn volume_model() -> nuwax_nav_types_messages::ObservationModel {
         nuwax_nav_types_messages::ObservationModel {
             kind: nuwax_nav_types_messages::ObservationKind::Volume,
             min_range_m: 0.05,
@@ -2066,7 +2015,7 @@ mod tests {
         );
     }
 
-    fn far_connected_floors() -> Arc<SurfaceSnapshot> {
+    pub(super) fn far_connected_floors() -> Arc<SurfaceSnapshot> {
         let config = map().config().clone();
         let mut points = Vec::new();
         let mut add = |x, y, z| {
@@ -2283,7 +2232,8 @@ mod tests {
     #[test]
     fn no_frontier_pending_and_missing_input_remain_distinct_in_the_controller() {
         let receiver = SurfaceInputReceiver::new();
-        let mut source = SurfaceGoalSourceAdapter::new("surface", 0.3, receiver.clone()).unwrap();
+        let mut source =
+            SurfaceGoalSourceAdapter::new("surface", 0.3, receiver.clone(), planner()).unwrap();
         source
             .configure_constraints(
                 Some(
@@ -2369,7 +2319,7 @@ mod tests {
             })
             .collect();
         let planner =
-            Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg.clone(), &[], &bands).unwrap());
+            std::sync::Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg.clone(), &[], &bands).unwrap());
         let mut guard = planner.lock().unwrap();
         let mut search = guard.multi_goal_search().unwrap();
         assert!(frontier_route_cost(
@@ -2379,7 +2329,7 @@ mod tests {
             nuwax_nav_pct_native::Cell {x,y,ground:0.0,ceiling:f64::INFINITY}
         )).collect();
         let planner =
-            Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg, &cells, &bands).unwrap());
+            std::sync::Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg, &cells, &bands).unwrap());
         let mut guard = planner.lock().unwrap();
         let mut search = guard.multi_goal_search().unwrap();
         let budget = FrontierRouteBudget::default();
@@ -2428,3 +2378,11 @@ mod tests {
         assert_eq!(selected.metadata["route_cost_basis"], "full_transition_source_tree_then_selected_astar");
     }
 }
+
+#[cfg(test)]
+#[path = "surface_adapter_legacy.rs"]
+mod legacy;
+
+#[cfg(test)]
+#[path = "surface_adapter_equivalence_tests.rs"]
+mod equivalence_tests;

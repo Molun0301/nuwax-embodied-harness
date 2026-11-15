@@ -244,10 +244,12 @@ impl Explorer {
         let mut controller =
             ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         if let Some(surface) = &self.surface_config {
+            // 前沿选点与返航查询共用同一份带缓存的全局规划器。
             let mut source = SurfaceGoalSourceAdapter::new(
                 "surface",
                 surface.follower.body_to_support_z_m,
                 self.surface_input.clone(),
+                surface.planner.clone(),
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
             if let Some(model) = observation {

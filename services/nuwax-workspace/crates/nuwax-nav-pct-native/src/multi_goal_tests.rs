@@ -16,6 +16,37 @@ fn summarize(route: &Route) -> (f64,[f64;3],f64) {
     let yaw=route.path.windows(2).last().map_or(0.,|e|(e[1][1]-e[0][1]).atan2(e[1][0]-e[0][0]));
     (cost,*route.path.last().unwrap(),yaw)
 }
+fn rank(search: &mut MultiGoalSearch<'_>,start: [f64;3],goal: [f64;3]) -> Result<RouteCost,String> {
+    search.rank_costs(start,&[goal]).remove(0)
+}
+#[test]
+fn one_source_search_ranks_many_goals_like_separate_queries_and_reads_measured_heights() {
+    let bands:Vec<_>=(0..23).map(|y|Band{x:20,y,low:0.,high:1.5}).collect();
+    let mut cells:Vec<_>=flat().into_iter().filter(|c|c.x<30 || c.x>33).collect();
+    cells.push(Cell{x:3,y:3,ground:0.9,ceiling:f64::INFINITY});
+    let start=[0.55,0.55,0.4];
+    let goals:Vec<_>=(0..40).map(|i|[0.35+(i%10) as f64*0.5,0.45+(i/10) as f64*0.7,0.4]).collect();
+    let mut planner=Planner::from_cells(config(),&cells,&bands).unwrap();
+    let mut search=planner.multi_goal_search().unwrap();
+    let batch=search.rank_costs(start,&goals);
+    assert_eq!(search.stats().source_searches,1,"同一起点只做一次单源搜索");
+    assert!(batch.iter().any(Result::is_ok) && batch.iter().any(Result::is_err));
+    assert_eq!(search.measured_heights([0.35,0.35]),vec![0.,0.9]);
+    assert!(search.measured_heights([3.15,0.35]).is_empty(),"缺测列不能补造地面");
+    drop(search);
+    for (goal,batched) in goals.iter().zip(batch) {
+        let mut separate=Planner::from_cells(config(),&cells,&bands).unwrap();
+        let single=rank(&mut separate.multi_goal_search().unwrap(),start,*goal);
+        assert_eq!(single.is_ok(),batched.is_ok(),"goal={goal:?}");
+        if let (Ok(single),Ok(batched))=(single,batched) {
+            assert_eq!((single.cost,single.endpoint,single.yaw),(batched.cost,batched.endpoint,batched.yaw));
+        }
+    }
+    with_planning_cancellation(Arc::new(AtomicBool::new(true)),|| {
+        assert!(planner.multi_goal_search().unwrap().rank_costs(start,&goals[..2]).iter()
+            .all(|cost|cost.as_ref().unwrap_err().contains("取消")));
+    });
+}
 fn compare(cfg: Config,cells: &[Cell],bands: &[Band],queries: &[([f64;3],[f64;3])]) -> MultiGoalStats {
     let mut independent=Planner::from_cells(cfg.clone(),cells,bands).unwrap();
     let mut shared=Planner::from_cells(cfg,cells,bands).unwrap();
@@ -123,12 +154,12 @@ fn source_tree_bounds_many_reachable_goals_and_preserves_exact_navigation() {
     let start=[0.55,0.55,0.4];
     {
         let mut search=planner.multi_goal_search().unwrap();
-        let first=search.rank_cost(start,[1.55,1.55,0.4]).unwrap();
+        let first=rank(&mut search,start,[1.55,1.55,0.4]).unwrap();
         assert!(first.cost>=2_f64.sqrt()-1e-10);
         let expanded=search.stats().source_expanded;
         for i in 0..128 {
             let goal=[1.05+(i%35) as f64*0.1,0.65+(i%20) as f64*0.1,0.4];
-            let route=search.rank_cost(start,goal).unwrap();
+            let route=rank(&mut search,start,goal).unwrap();
             assert_eq!(route.endpoint,goal);
             assert!(route.cost+1e-10>=((goal[0]-start[0]).powi(2)+(goal[1]-start[1]).powi(2)).sqrt());
             assert_eq!(search.stats().source_expanded,expanded);
@@ -147,19 +178,19 @@ fn source_tree_uses_real_detours_missing_ground_floors_and_endpoint_offsets() {
     let bands:Vec<_>=(0..23).map(|y|Band{x:20,y,low:0.,high:1.5}).collect();
     let mut planner=Planner::from_cells(cfg.clone(),&flat(),&bands).unwrap();
     let mut search=planner.multi_goal_search().unwrap();
-    let route=search.rank_cost([0.55,0.55,0.4],[4.37,0.53,0.4]).unwrap();
+    let route=rank(&mut search,[0.55,0.55,0.4],[4.37,0.53,0.4]).unwrap();
     // 墙的下端在y=0，上端在y=2.3；任意绕行都至少到达其中一个端点高度。
     let minimum_detour=1.45_f64.hypot(0.55)+2.37_f64.hypot(0.53);
     assert!(route.cost>=minimum_detour,"必须绕过真实墙体：{route:?}");
     assert_eq!(route.endpoint,[4.37,0.53,0.4]);
     let cells:Vec<_>=flat().into_iter().filter(|c|c.x<18||c.x>27).collect();
     let mut planner=Planner::from_cells(cfg.clone(),&cells,&[]).unwrap();
-    assert!(planner.multi_goal_search().unwrap().rank_cost([0.55,0.55,0.4],[4.45,0.55,0.4]).is_err());
+    assert!(rank(&mut planner.multi_goal_search().unwrap(),[0.55,0.55,0.4],[4.45,0.55,0.4]).is_err());
     let cells:Vec<_>=flat().into_iter().flat_map(|c|[Cell{ceiling:0.95,..c},Cell{ground:1.,..c}]).collect();
     let mut planner=Planner::from_cells(cfg,&cells,&[]).unwrap();
     let mut search=planner.multi_goal_search().unwrap();
-    assert!(search.rank_cost([0.55,0.55,0.4],[4.45,0.55,1.4]).is_err());
-    assert!(search.rank_cost([0.55,0.55,1.4],[4.45,0.55,1.4]).is_ok());
+    assert!(rank(&mut search,[0.55,0.55,0.4],[4.45,0.55,1.4]).is_err());
+    assert!(rank(&mut search,[0.55,0.55,1.4],[4.45,0.55,1.4]).is_ok());
 }
 
 #[test]
@@ -168,10 +199,10 @@ fn source_tree_keeps_directional_step_limits_and_owner_cancellation() {
     let mut cfg=config();cfg.max_slope=0.;cfg.max_step=0.15;cfg.max_step_down=0.;
     let mut planner=Planner::from_cells(cfg,&cells,&[]).unwrap();
     let mut search=planner.multi_goal_search().unwrap();
-    assert!(search.rank_cost([0.55,0.55,0.4],[4.45,0.55,0.52]).is_ok());
-    assert!(search.rank_cost([4.45,0.55,0.52],[0.55,0.55,0.4]).is_err());
+    assert!(rank(&mut search,[0.55,0.55,0.4],[4.45,0.55,0.52]).is_ok());
+    assert!(rank(&mut search,[4.45,0.55,0.52],[0.55,0.55,0.4]).is_err());
     with_planning_cancellation(Arc::new(AtomicBool::new(true)),|| {
-        assert!(search.rank_cost([4.45,0.55,0.52],[3.45,0.55,0.52]).unwrap_err().contains("取消"));
+        assert!(rank(&mut search,[4.45,0.55,0.52],[3.45,0.55,0.52]).unwrap_err().contains("取消"));
     });
-    assert!(search.rank_cost([4.45,0.55,0.52],[3.45,0.55,0.52]).is_ok());
+    assert!(rank(&mut search,[4.45,0.55,0.52],[3.45,0.55,0.52]).is_ok());
 }

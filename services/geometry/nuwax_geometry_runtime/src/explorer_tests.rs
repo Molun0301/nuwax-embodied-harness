@@ -642,6 +642,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
             "surface",
             config.follower.body_to_support_z_m,
             explorer.surface_input.clone(),
+            config.planner.clone(),
         )
         .unwrap();
         source.configure_constraints(None, 1, 0.5).unwrap();

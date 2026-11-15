@@ -348,7 +348,8 @@ pub struct TargetCache {
     pub index: NearestPointIndex,
     /// 地图坐标中的0.1米占据体素。
     pub occupied: std::collections::HashSet<[i64; 3]>,
-    scales: Vec<ProcessedCloud>,
+    global_source: Vec<Point3<f64>>,
+    scales: std::sync::OnceLock<Vec<ProcessedCloud>>,
 }
 impl TargetCache {
     /// 每次加载的第一次重定位构建一次。
@@ -356,24 +357,31 @@ impl TargetCache {
         let points = voxel_downsample(target, config.fine_voxel_size);
         let index = NearestPointIndex::new(&points);
         let occupied = points.iter().map(voxel_key).collect();
-        let scales = config
-            .voxel_sizes
-            .into_iter()
-            .map(|size| {
-                preprocess(
-                    target,
-                    FeatureConfig::for_voxel(size, config.max_feature_neighbors),
-                )
-            })
-            .collect();
         Self {
             points,
             index,
             occupied,
-            scales,
+            global_source: target.to_vec(),
+            scales: std::sync::OnceLock::new(),
         }
     }
+
+    fn global_scales(&self, config: RelocalizationConfig) -> &[ProcessedCloud] {
+        self.scales.get_or_init(|| {
+            config
+                .voxel_sizes
+                .into_iter()
+                .map(|size| {
+                    preprocess(
+                        &self.global_source,
+                        FeatureConfig::for_voxel(size, config.max_feature_neighbors),
+                    )
+                })
+                .collect()
+        })
+    }
 }
+
 fn voxel_key(point: &Point3<f64>) -> [i64; 3] {
     [point.x, point.y, point.z].map(|v| (v / 0.1).floor() as i64)
 }
@@ -595,7 +603,11 @@ pub fn relocation_pipeline_cached(
     let mut ransac_iterations = 0;
     let mut candidates = Vec::new();
 
-    for (voxel_size, target_features) in config.voxel_sizes.into_iter().zip(&target.scales) {
+    for (voxel_size, target_features) in config
+        .voxel_sizes
+        .into_iter()
+        .zip(target.global_scales(config))
+    {
         let feature_config = FeatureConfig::for_voxel(voxel_size, config.max_feature_neighbors);
         let source_features = preprocess(fine_source, feature_config);
         if source_features.descriptors.len() != source_features.points.len()
@@ -1075,6 +1087,37 @@ mod tests {
     }
 
     #[test]
+    fn local_registration_leaves_global_features_unbuilt() {
+        let points = synthetic_room();
+        let config = RelocalizationConfig::default();
+        let target = TargetCache::new(&points, config);
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+        assert!(target.scales.get().is_none());
+        for _ in 0..2 {
+            let local = local_registration(
+                &source,
+                &target,
+                Isometry3::identity(),
+                Isometry3::identity(),
+            )
+            .unwrap();
+            assert!(score_relocalization(&source, local.transformation, &target)
+                .accepts(&local.transformation));
+            assert!(target.scales.get().is_none());
+        }
+        let started = std::time::Instant::now();
+        let _ = relocation_pipeline_cached(&source, &target, config);
+        let first = target.scales.get().unwrap();
+        let _ = relocation_pipeline_cached(&source, &target, config);
+        assert!(std::ptr::eq(first, target.scales.get().unwrap()));
+        assert_eq!(first.len(), 3);
+        eprintln!(
+            "全局首次使用后缓存三个尺度，重复调用复用，验证耗时={:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn target_cache_builds_and_timing() {
         use super::super::{features::descriptor_builds, nearest::builds};
         let source = synthetic_room();
@@ -1100,6 +1143,17 @@ mod tests {
         descriptor_builds::watch(descriptors);
         let started = std::time::Instant::now();
         let target = TargetCache::new(&target, config);
+        let created = started.elapsed();
+        assert_eq!(
+            builds::counts(),
+            vec![
+                ("精细点".into(), 1),
+                ("尺度0.2".into(), 0),
+                ("尺度0.3".into(), 0),
+                ("尺度0.8".into(), 0)
+            ]
+        );
+        assert!(descriptor_builds::counts().iter().all(|(_, n)| *n == 0));
         let source_cloud = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
         let result = relocation_pipeline_cached(&source_cloud, &target, config);
         let cold = started.elapsed();
@@ -1109,9 +1163,10 @@ mod tests {
         let source_cloud = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
         let _ = relocation_pipeline_cached(&source_cloud, &target, config);
         eprintln!(
-            "源点={} 目标点={} 首次总耗时={:?} 复用总耗时={:?} 结果={} 点索引={:?} 特征索引={:?}",
+            "源点={} 目标点={} 精细缓存创建={:?} 首次总耗时={:?} 复用总耗时={:?} 结果={} 点索引={:?} 特征索引={:?}",
             source.len(),
             12968,
+            created,
             cold,
             started.elapsed(),
             result.registration.converged,

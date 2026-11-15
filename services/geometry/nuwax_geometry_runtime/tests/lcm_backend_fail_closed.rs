@@ -161,6 +161,13 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// 按真实时间连续送 `count` 帧，帧间隔大于建图候选节拍。
+    async fn frames(&mut self, count: usize) {
+        for _ in 0..count {
+            self.frame(now()).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
     /// 与 `frame` 相同，另多一块加载后才出现的竖直障碍板。
     async fn obstacle_frame(&mut self, stamp: u64) {
         self.odom(stamp, 0.).await;
@@ -680,6 +687,34 @@ async fn localized_map_writes_new_obstacle_and_overwritten_map_reloads_with_it()
     f.map_ready().await;
     assert!(f.obstacle_cells().await > 0, "重新加载的二维栅格应有新障碍");
     assert!(f.obstacle_points().await > 0, "重新加载的稠密点云应有新障碍");
+}
+
+#[tokio::test]
+async fn three_dimensional_relocalize_with_seed_passes_the_grpc_entry() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("初值图").await;
+    f.client.stop_session(Empty {}).await.unwrap();
+    f.client
+        .load_map(LoadMapRequest {
+            map_name: "初值图".into(),
+        })
+        .await
+        .unwrap();
+    f.frames(5).await;
+    let matched = f
+        .client
+        .relocalize(RelocalizeRequest {
+            seed: Some(PlanarSeed {
+                x: 0.0,
+                y: 0.0,
+                yaw: 0.0,
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
 }
 
 #[tokio::test]

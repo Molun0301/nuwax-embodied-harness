@@ -8,6 +8,7 @@
 //! 2026-10-26：从 PCT_planner 35cd73f 的 tomographyKernel 移植为 Rust/rayon。
 use nuwax_nav_pct_native::{Band, Cell};
 use rayon::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,105 @@ struct Sample {
     x: i32,
     y: i32,
     z: f32,
+}
+
+/// 每次只交付变化列，空几何表示删除该列。
+pub struct ColumnUpdate {
+    pub column: [i32; 2],
+    pub cells: Vec<Cell>,
+    pub bands: Vec<Band>,
+}
+
+/// 静态采样保持排序；近期地面只重算相交列，切片规则与整图构建相同。
+#[derive(Default)]
+pub struct ColumnCache {
+    static_points: Vec<[f32; 3]>,
+    sorted: BTreeMap<[i32; 2], Vec<Sample>>,
+    recent: BTreeMap<[i32; 2], Vec<f32>>,
+    dirty: BTreeSet<[i32; 2]>,
+    static_min: Option<f32>,
+    slice_h0: Option<f64>,
+}
+
+impl ColumnCache {
+    /// 来源变化后比较实际列内容；未变化列的排序结果继续保留。
+    pub fn replace_static(&mut self, points: &[[f32; 3]], resolution: f64) -> Result<(), String> {
+        let mut candidates = BTreeSet::new();
+        for index in 0..points.len().max(self.static_points.len()) {
+            let old = self.static_points.get(index);
+            let new = points.get(index);
+            if old == new { continue; }
+            for point in old.into_iter().chain(new).filter(|p| p.iter().all(|v| v.is_finite())) {
+                candidates.insert([coordinate(point[0], resolution)?, coordinate(point[1], resolution)?]);
+            }
+        }
+        let mut next: BTreeMap<_, Vec<f32>> = candidates.into_iter().map(|key| (key, Vec::new())).collect();
+        let mut minimum: Option<f32> = None;
+        for point in points.iter().filter(|p| p.iter().all(|v| v.is_finite())) {
+            minimum = Some(minimum.map_or(point[2], |z| z.min(point[2])));
+            let column = [coordinate(point[0], resolution)?, coordinate(point[1], resolution)?];
+            if let Some(zs) = next.get_mut(&column) { zs.push(point[2]); }
+        }
+        for (column, mut zs) in next {
+            zs.sort_unstable_by(f32::total_cmp);
+            let same = self.sorted.get(&column).map_or(zs.is_empty(), |old|
+                old.iter().map(|sample| sample.z).eq(zs.iter().copied()));
+            if same { continue; }
+            self.dirty.insert(column);
+            if zs.is_empty() { self.sorted.remove(&column); }
+            else {
+                self.sorted.insert(column, zs.into_iter().map(|z| Sample {
+                    x: column[0], y: column[1], z,
+                }).collect());
+            }
+        }
+        self.static_min = minimum;
+        self.static_points = points.to_vec();
+        Ok(())
+    }
+
+    /// 与整图相同地从最低点确定首层；返回原生结构需要替换的列。
+    pub fn update(&mut self, recent: &[[f32; 3]], cfg: &TomographyConfig) -> Result<Vec<ColumnUpdate>, String> {
+        validate(cfg)?;
+        let next = point_columns(recent, cfg.resolution)?;
+        for column in self.recent.keys().chain(next.keys()) {
+            if self.recent.get(column) != next.get(column) {
+                self.dirty.insert(*column);
+            }
+        }
+        let min_z = self.static_min.into_iter().chain(next.values().flatten().copied())
+            .min_by(f32::total_cmp);
+        let h0 = min_z.map_or(0., |z| f64::from(z) + cfg.slice_dh);
+        if self.slice_h0 != Some(h0) {
+            self.dirty.extend(self.sorted.keys().chain(self.recent.keys()).chain(next.keys()).copied());
+        }
+        let config = TomographyConfig { slice_h0: h0, ..cfg.clone() };
+        let updates = self.dirty.iter().map(|&column| {
+            let mut merged = self.sorted.get(&column).cloned().unwrap_or_default();
+            if let Some(zs) = next.get(&column) {
+                merged.extend(zs.iter().map(|&z| Sample { x: column[0], y: column[1], z }));
+                merged.sort_unstable_by(|a, b| a.z.total_cmp(&b.z));
+            }
+            let (cells, bands) = match merged.last() {
+                Some(last) => column_geometry(&merged, &Slices::new(last.z, &config)?, cfg.point_resolution),
+                None => (Vec::new(), Vec::new()),
+            };
+            Ok(ColumnUpdate { column, cells, bands })
+        }).collect::<Result<Vec<_>, String>>()?;
+        self.recent = next;
+        self.slice_h0 = Some(h0);
+        self.dirty.clear();
+        Ok(updates)
+    }
+}
+
+fn point_columns(points: &[[f32; 3]], resolution: f64) -> Result<BTreeMap<[i32; 2], Vec<f32>>, String> {
+    let mut columns = BTreeMap::<_, Vec<_>>::new();
+    for p in points.iter().filter(|p| p.iter().all(|v| v.is_finite())) {
+        columns.entry([coordinate(p[0], resolution)?, coordinate(p[1], resolution)?])
+            .or_default().push(p[2]);
+    }
+    Ok(columns)
 }
 
 /// 上游切片按浮点模板 U（输入为 f32）保存；保留最终转换位置。

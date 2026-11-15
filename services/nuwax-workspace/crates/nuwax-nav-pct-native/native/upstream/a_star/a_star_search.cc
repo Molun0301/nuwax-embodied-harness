@@ -37,14 +37,22 @@ step_cost_weight_  = step_cost_weight;
     row_offset = i * max_y_;
     grid_map_[i].resize(max_y_);
     for (int j = 0; j < max_y_; ++j) {
-      grid_map_[i][j].clear();
+      auto& nodes = grid_map_[i][j];
+      for (auto it = nodes.begin(); it != nodes.end();) {
+        if (it->first >= max_x_) it = nodes.erase(it);
+        else ++it;
+      }
       for (int k = 0; k < max_x_; ++k) {
         double height = height_map(j + row_offset, k);
         const double cost = cost_map(j + row_offset, k);
         const double ele = ele_map(j + row_offset, k);
-        if (height == -100.0 && cost == 100.0 && ele == 0.0) continue;
+        if (height == -100.0 && cost == 100.0 && ele == 0.0) {
+          nodes.erase(k);
+          continue;
+        }
         double z = static_cast<int>(height / resolution);
-        auto& node = grid_map_[i][j].emplace(k, Node(Eigen::Vector3i(z, j, k), nullptr)).first->second;
+        auto& node = nodes[k];
+        node = Node(Eigen::Vector3i(z, j, k), nullptr);
         node.cost = cost;
         node.height = height;
         node.ele = ele;

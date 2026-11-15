@@ -247,7 +247,6 @@ impl Planner {
             planning_velocity: self.travel,
             yaw: r.start_yaw,
             yaw_rate: r.start_yaw_rate.unwrap_or(0.),
-            route_progress: self.progress,
             timestamp_ns: r.odometry_timestamp_ns,
             measured_velocity: u32::from(r.start_velocity.is_some()),
             measured_yaw_rate: u32::from(r.start_yaw_rate.is_some()),

@@ -77,12 +77,20 @@ pub fn from_surface_window(
     map: &SurfaceSnapshot,
     window: Option<([f64; 2], f64)>,
 ) -> Result<NativeMap, String> {
+    from_surface_selected(map, window, None)
+}
+
+fn from_surface_selected(
+    map: &SurfaceSnapshot,
+    window: Option<([f64; 2], f64)>,
+    selected: Option<&BTreeSet<[i32; 2]>>,
+) -> Result<NativeMap, String> {
     let measured_surface =
         map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::MeasuredSurface;
     let occupied_volume =
         map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::OccupiedVolume;
     let (resolution, columns) = map.navigation_source_columns(window);
-    let columns: Vec<_> = columns.collect();
+    let columns: Vec<_> = columns.filter(|(key, _)| selected.is_none_or(|keys| keys.contains(key))).collect();
     let nearby = |point: &[f64; 3]| {
         window.is_none_or(|(center, radius)| {
             (point[0] - center[0]).abs() <= radius && (point[1] - center[1]).abs() <= radius
@@ -116,8 +124,11 @@ pub fn from_surface_window(
         .navigation_measured_points()
         .filter(|_| measured_surface)
     {
-        let selected = window.map(|_| points.iter().copied().filter(nearby).collect::<Vec<_>>());
-        let points = selected.as_deref().unwrap_or(points);
+        let filtered = (window.is_some() || selected.is_some()).then(|| points.iter().copied()
+            .filter(nearby).filter(|p| selected.is_none_or(|keys| keys.contains(&[
+                (p[0] / resolution).floor() as i32, (p[1] / resolution).floor() as i32,
+            ]))).collect::<Vec<_>>());
+        let points = filtered.as_deref().unwrap_or(points);
         let (cells, bands) = nuwax_nav_pct_native::classify_points(
             &Config {
                 resolution,
@@ -451,8 +462,41 @@ pub fn pct_input_from_tomogram(
     body_to_ground: f64,
     boundary: &[[f64; 2]],
 ) -> Result<(Config, Vec<Cell>, Vec<Band>), String> {
-    let (resolution, columns) = map.navigation_source_columns(None);
+    let (resolution, _) = map.navigation_source_columns(None);
     let config = pct_config(map, body_to_ground, boundary, resolution);
+    let mut cache = nuwax_pct_tomography::ColumnCache::default();
+    cache.replace_static(&tomography_points(map, &config), resolution)?;
+    let (ground, _) = map.navigation_recent_samples();
+    let ground: Vec<_> = ground.iter().map(|p| p.map(|v| v as f32)).collect();
+    let updates = cache.update(&ground, &nuwax_pct_tomography::TomographyConfig {
+        resolution, point_resolution: config.point_resolution, slice_h0: 0.,
+        slice_dh: config.robot_height.max(config.point_resolution),
+    })?;
+    let mut cells = Vec::new();
+    let mut bands = Vec::new();
+    for update in updates { cells.extend(update.cells); bands.extend(update.bands); }
+    bands.extend(pct_overlay_bands(map, &config));
+    Ok((config, cells, bands))
+}
+
+/// 叠加仅表示近期非地面和禁行占据，不生成动态物体顶面的地形。
+fn pct_overlay_bands(map: &SurfaceSnapshot, config: &Config) -> Vec<Band> {
+    let (_, recent_obstacles) = map.navigation_recent_samples();
+    let resolution = config.resolution;
+    let half = config.point_resolution * 0.5;
+    let mut bands: Vec<_> = recent_obstacles.iter().map(|p| Band {
+        x: (p[0] / resolution).floor() as i32, y: (p[1] / resolution).floor() as i32,
+        low: p[2] - half, high: p[2] + half,
+    }).collect();
+    bands.extend(map.navigation_forbidden_columns(resolution).into_iter().map(|[x, y]| Band {
+        x, y, low: f64::NEG_INFINITY, high: f64::INFINITY,
+    }));
+    bands
+}
+
+/// 原始静态采样的唯一转换入口；保持连续地面高度与原浮点转换位置。
+fn tomography_points(map: &SurfaceSnapshot, config: &Config) -> Vec<[f32; 3]> {
+    let (resolution, columns) = map.navigation_source_columns(None);
     let mut points = Vec::new();
     // 完整精细源带独立地面记录时，地面取记录的连续高度，成员体素不再作为占据采样。
     // 体素中心按源精度量化，缓坡或略倾斜的地图会被切成逐格台阶，两层体素厚的地面也会挡住机体。
@@ -486,32 +530,7 @@ pub fn pct_input_from_tomogram(
             }
         }
     }
-    let (recent_ground, recent_obstacles) = map.navigation_recent_samples();
-    points.extend(recent_ground.iter().map(|p| p.map(|v| v as f32)));
-    let slice_dh = config.robot_height.max(config.point_resolution);
-    let min_z = points.iter().map(|p| f64::from(p[2])).fold(f64::INFINITY, f64::min);
-    let slice_h0 = if min_z.is_finite() { min_z + slice_dh } else { 0.0 };
-    let mut tomogram = nuwax_pct_tomography::build(&points, &nuwax_pct_tomography::TomographyConfig {
-        resolution,
-        point_resolution: config.point_resolution,
-        slice_h0,
-        slice_dh,
-    })?;
-    // 近期非地面只补实体占据，不能把动态物体顶面变成全局地形。
-    let half = config.point_resolution * 0.5;
-    tomogram.bands.extend(recent_obstacles.iter().map(|p| Band {
-        x: (p[0] / resolution).floor() as i32,
-        y: (p[1] / resolution).floor() as i32,
-        low: p[2] - half,
-        high: p[2] + half,
-    }));
-    tomogram.bands.extend(map.navigation_forbidden_columns(resolution).into_iter().map(|column| Band {
-        x: column[0],
-        y: column[1],
-        low: f64::NEG_INFINITY,
-        high: f64::INFINITY,
-    }));
-    Ok((config, tomogram.cells, tomogram.bands))
+    points
 }
 
 /// 显式来源便于两个消费者使用同一配置，并把来源纳入缓存身份。
@@ -701,3 +720,13 @@ mod tests {
             .any(|band| band.low > 0.4 && band.high > 0.5));
     }
 }
+
+#[path = "native_map_cache.rs"]
+mod global_cache;
+pub use global_cache::CachedPctPlanner;
+#[cfg(test)]
+#[path = "native_map_full_reference.rs"]
+mod full_reference;
+#[cfg(test)]
+#[path = "native_map_cache_tests.rs"]
+mod cache_tests;

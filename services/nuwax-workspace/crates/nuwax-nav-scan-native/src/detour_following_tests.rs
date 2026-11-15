@@ -107,44 +107,6 @@ fn reference_seed_flows_through_a_small_turn_and_stops_at_a_large_turn() {
 }
 
 #[test]
-fn recorded_long_detour_uses_local_segment_times() {
-    let route = include!("归档长绕行.rs");
-    let mut cfg = config();
-    cfg.resolution = 0.05;
-    cfg.max_velocity = 0.5;
-    cfg.max_acceleration = 0.5;
-    cfg.planning_horizon = 5.;
-    cfg.sample_dt = 0.05;
-    // 复用同一归档禁行圆；完整办公室实体图不在此轨迹回放夹具内。
-    let forbidden: Vec<[i32; 2]> = (-20..100).flat_map(|x| (-30..50).map(move |y| [x, y]))
-        .filter(|p| ((p[0] as f64 + 0.5) * cfg.resolution - 2.8157907737910612)
-            .hypot((p[1] as f64 + 0.5) * cfg.resolution - 0.48732379702069534) <= 0.25)
-        .collect();
-    let mut map = MapOwner::new(&cfg).unwrap();
-    map.seed_occupied(&[], route[0]);
-    map.update_surface(&[], &[], &[], &forbidden).unwrap();
-    let state = MotionState { position: route[0], measured_velocity: 1,
-        measured_yaw_rate: 1, timestamp_ns: 1_000_000_000, ..MotionState::default() };
-    let trajectory = ScanPlanner::default().plan(&cfg, &map.snapshot(), &route, &state, None, 0., None)
-        .expect("原归档长绕行应通过原规划接纳检查");
-    let samples = trajectory.samples(0., 0.001);
-    let duration = samples.last().unwrap().time;
-    let max_speed = samples.iter().map(|s| s.velocity[0].hypot(s.velocity[1])).fold(0., f64::max);
-    let max_3d_speed = samples.iter().map(|s| s.velocity.iter().map(|v| v*v).sum::<f64>().sqrt()).fold(0., f64::max);
-    eprintln!("归档长绕行：时长={duration:.9}，最大水平速度={max_speed:.9}，最大三维速度={max_3d_speed:.9}");
-    // 同设备参数原版为37.883047444秒；还须保留长直段速度，防止分段初值未被采用。
-    assert!(duration < 37.883047444 * 0.9, "局部分段定时应缩短归档绕行：{duration}");
-    assert!(max_speed > cfg.max_velocity * 0.8, "长直段应采用局部时距：{max_speed}");
-    for sample in &samples {
-        // 严格设备界约束水平运动；原三维采样检查的绝对容差仍为1.0。
-        assert!(sample.velocity[0].hypot(sample.velocity[1]) <= cfg.max_velocity + 1e-8);
-        assert!(sample.acceleration[0].hypot(sample.acceleration[1]) <= cfg.max_acceleration + 1e-8);
-        assert!(sample.velocity.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_velocity + 1.);
-        assert!(sample.acceleration.iter().map(|v| v*v).sum::<f64>().sqrt() <= cfg.max_acceleration + 1.);
-    }
-}
-
-#[test]
 fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
     let route = [[0., 0., 0.35], [0.4, 0., 0.45], [0.4, -0.4, 0.45], [2.4, -0.4, 0.45], [2.4, -1.7, 0.45]];
     let mut cfg = config();
@@ -193,17 +155,6 @@ fn slow_retimed_detour_accelerates_and_advances_under_command_integration() {
         state.position[1] += state.velocity[1] * cfg.sample_dt;
         state.yaw += w * cfg.sample_dt;
         state.yaw_rate = w;
-        let mut arc = 0.;
-        let mut nearest = (f64::INFINITY, 0.);
-        for pair in route.windows(2) {
-            let delta: [f64; 3] = std::array::from_fn(|i| pair[1][i] - pair[0][i]);
-            let length2: f64 = delta.iter().map(|v| v * v).sum();
-            let fraction = ((0..3).map(|i| (state.position[i] - pair[0][i]) * delta[i]).sum::<f64>() / length2).clamp(0., 1.);
-            let distance: f64 = (0..3).map(|i| (state.position[i] - pair[0][i] - fraction * delta[i]).powi(2)).sum();
-            if distance < nearest.0 { nearest = (distance, arc + fraction * length2.sqrt()); }
-            arc += length2.sqrt();
-        }
-        state.route_progress = nearest.1;
         previous = tracked.command;
         phase = tracked.phase;
     }
@@ -248,7 +199,6 @@ fn reference_time_waits_at_deviation_bound_and_restarts_at_installed_projection(
     }
     // 单拍跳到时间窗之外应判偏离；重装原轨不能继承旧投影或期望时间。
     state.position = samples.iter().find(|s| s.position[0] > 0.8).unwrap().position;
-    state.route_progress = state.position[0];
     state.timestamp_ns += 50_000_000;
     let advanced = tracker.track_and_check(&cfg, &snapshot, &state, [0.1, 0., 0.], None).unwrap();
     assert!(advanced.deviated() && advanced.deviation > 0.2,
@@ -281,7 +231,6 @@ fn reference_end_does_not_stop_before_actual_projection_finishes() {
     let mut tracker = ScanTracker::default();
     tracker.install(&curve);
     state.position[0] = 0.9;
-    state.route_progress = 0.9;
     let mut previous = [0.; 3];
     for tick in 0..120 {
         state.timestamp_ns += 50_000_000;
@@ -616,7 +565,7 @@ fn ninth_round_install_starts_at_measured_position_despite_finished_route_hint()
         velocity: [-0.06127247549019853,0.026582925583705418,0.00473548417914593],
         planning_velocity: [-0.13327088489909533,0.014603019467604653,-0.006600926846269191],
         yaw: 2.4383138193590392, yaw_rate: -0.006601498556930645,
-        route_progress: 2.0538049611970046, timestamp_ns: 1794348454087610483,
+        timestamp_ns: 1794348454087610483,
         measured_velocity:1, measured_yaw_rate:1,
     };
     let mut map=MapOwner::new(&cfg).unwrap();

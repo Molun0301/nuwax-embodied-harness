@@ -123,7 +123,6 @@ pub struct SurfaceFollower {
     goal: Option<PoseStamped>,
     path: Option<Path3D>,
     reference: Arc<Vec<[f64; 3]>>,
-    reference_start: usize,
     boundary: Arc<Vec<[f64; 2]>>,
     options: GoalOptions,
     applied: Twist2,
@@ -132,7 +131,6 @@ pub struct SurfaceFollower {
     motion_boundary: Option<crate::motion_feedback::MotionBoundary>,
     planning_velocity: [f64; 3],
     motion_sample_time: Option<i64>,
-    progress: f64,
     local_path: Vec<[f64; 3]>,
     local_body_path: Option<Path3D>,
     wait_reason: Option<String>,
@@ -176,7 +174,6 @@ impl SurfaceFollower {
             goal: None,
             path: None,
             reference: Arc::new(Vec::new()),
-            reference_start: 0,
             boundary: Arc::new(Vec::new()),
             options: GoalOptions::default(),
             applied: Twist2::ZERO,
@@ -185,7 +182,6 @@ impl SurfaceFollower {
             motion_boundary: None,
             planning_velocity: [0.; 3],
             motion_sample_time: None,
-            progress: 0.,
             local_path: Vec::new(),
             local_body_path: None,
             wait_reason: None,
@@ -270,10 +266,7 @@ impl SurfaceFollower {
     pub fn terminal_points(&self) -> Option<nuwax_nav_scan_native::TerminalPoints> {
         self.terminal_approach.as_ref().map(|a| a.points)
     }
-    /// 沿全局路线的实际进度。
-    pub fn progress_m(&self) -> f64 {
-        self.progress
-    }
+
     /// 已完成并安装的局部规划数。
     pub fn local_plans(&self) -> u64 {
         self.plans
@@ -290,45 +283,10 @@ impl SurfaceFollower {
     pub fn local_body_path_for_display(&self) -> Option<Path3D> {
         self.local_body_path.clone()
     }
-    /// 实际进度观测。
-    pub fn progress(&self) -> f64 {
-        self.progress
-    }
+
     fn position(pose: &PoseStamped) -> [f64; 3] {
         let p = pose.pose.position;
         [p.x, p.y, p.z]
-    }
-    fn update_progress(&mut self) {
-        let Some(pose) = &self.odometry else {
-            return;
-        };
-        let point = Self::position(pose);
-        let mut along = 0.;
-        let mut nearest = (f64::INFINITY, self.progress, self.reference_start);
-        for (index, pair) in self.reference.windows(2).enumerate() {
-            let a = pair[0];
-            let b = pair[1];
-            let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let length = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if length == 0. {
-                continue;
-            }
-            if index < self.reference_start {
-                along += length;
-                continue;
-            }
-            let t = ((0..3).map(|i| (point[i] - a[i]) * v[i]).sum::<f64>() / (length * length))
-                .clamp(0., 1.);
-            let distance = (0..3)
-                .map(|i| (point[i] - a[i] - t * v[i]).powi(2))
-                .sum::<f64>();
-            if distance < nearest.0 {
-                nearest = (distance, along + t * length, index);
-            }
-            along += length;
-        }
-        self.progress = self.progress.max(nearest.1);
-        self.reference_start = nearest.2;
     }
     fn position_reached(&self) -> bool {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
@@ -555,7 +513,6 @@ impl SurfaceFollower {
             planning_velocity: self.planning_velocity,
             yaw: pose.pose.orientation.yaw(),
             yaw_rate: boundary.yaw_rate.unwrap_or(0.),
-            route_progress: self.progress,
             timestamp_ns: pose.stamp.nanos,
             measured_velocity: u32::from(boundary.velocity.is_some()),
             measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
@@ -564,7 +521,6 @@ impl SurfaceFollower {
         state
     }
     fn compute(&mut self) -> Result<Twist2, String> {
-        self.update_progress();
         let state = self.state();
         if let Some(result) = self.map_worker.take() {
             match result {
@@ -774,8 +730,6 @@ impl NavPlanner for SurfaceFollower {
         self.options = options;
         self.path = None;
         self.reference = Arc::new(Vec::new());
-        self.reference_start = 0;
-        self.progress = 0.;
         Ok(())
     }
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
@@ -806,17 +760,13 @@ impl NavPlanner for SurfaceFollower {
         }
         self.retire_route();
         self.reference = Arc::new(path.poses.iter().map(Self::position).collect());
-        self.reference_start = 0;
         self.path = Some(path);
         self.goal = Some(goal);
-        self.progress = 0.;
-        self.update_progress();
         self.submit_map();
         Ok(())
     }
     fn update_odometry(&mut self, pose: PoseStamped) {
         self.odometry = Some(pose);
-        self.update_progress();
         self.submit_map();
     }
     fn update_costmap(&mut self, _map: CostMap2D) {
@@ -921,8 +871,6 @@ impl NavPlanner for SurfaceFollower {
         self.retire_route();
         self.path = None;
         self.reference = Arc::new(Vec::new());
-        self.reference_start = 0;
-        self.progress = 0.;
     }
 }
 
@@ -1264,15 +1212,6 @@ mod native_execution_tests {
         assert!(moving>0,"不能用持续零速通过设备约束验收");
     }
     #[test]
-    fn spatial_progress_does_not_cut_or_replace_author_a_full_reference() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        let reference=follower.reference.clone();
-        follower.update_odometry(pose(2.5,1.,0.));
-        assert!(follower.progress()>0.);
-        assert_eq!(follower.reference,reference);
-        assert_eq!(SurfaceFollowerConfig::new(0.4, 0.15).scan.planning_horizon,3.5);
-    }
-    #[test]
     fn profile_reverse_permission_never_invents_unknown_hardware_channels() {
         let config = SurfaceFollowerConfig::new(0.5, 0.15);
         assert!(config.kinematics().is_none());
@@ -1309,7 +1248,6 @@ mod native_execution_tests {
                 plans,
                 "同一路线与采样的重复计算应沿用持续轨迹"
             );
-            assert_eq!(follower.progress_m(), 0., "控制时钟不能充当实际移动");
             assert_eq!(
                 follower
                     .refresh_execution_context(Twist2::ZERO)
@@ -1318,11 +1256,6 @@ mod native_execution_tests {
                 current
             );
         }
-        let mut moved = current;
-        moved.pose.position.x = 0.7;
-        moved.stamp.nanos += 400_000_000;
-        follower.update_odometry(moved);
-        assert!((follower.progress_m() - 0.2).abs() < 1e-9);
     }
     #[test]
     fn applied_command_never_becomes_measured_velocity_or_acceleration() {
@@ -1348,42 +1281,6 @@ mod native_execution_tests {
         measured.source_timestamp_ns+=1;measured.body_linear_xyz=[0.1,0.,0.];
         follower.observe_measured_motion(Some(measured));let _=follower.step();
         assert_eq!(follower.motion_boundary.as_ref().unwrap().velocity,Some([0.1,0.,0.]));
-    }
-    #[test]
-    fn measured_loop_progress_preserves_author_full_reference() {
-        let mut follower = follower(pose(0., 0., 0.), unknown());
-        follower.config.scan.planning_horizon = 0.6;
-        let goal = pose(1., -1., 0.);
-        let points = [[0., 0.], [1., 0.], [1., 1.], [0., 1.], [0., 0.], [1., -1.]];
-        follower
-            .replace_execution_path(
-                ExecutionPath::Surface(Path3D {
-                    poses: points.into_iter().map(|p| pose(p[0], p[1], 0.)).collect(),
-                }),
-                None,
-                goal,
-            )
-            .unwrap();
-        for (index, position) in [[1., 0.5], [0.5, 1.], [0., 0.5], [0., 0.]]
-            .into_iter()
-            .enumerate()
-        {
-            let mut actual = pose(position[0], position[1], 0.);
-            actual.stamp.nanos += (index as i64 + 1) * 4_000_000_000;
-            follower.update_odometry(actual);
-        }
-        let progress = follower.progress_m();
-        let reference = follower.reference.clone();
-        assert_eq!(progress, 4., "重叠路口的实测进度不能退回首段");
-        assert!(matches!(follower.step(), PlannerStep::Command(_)));
-        next_sample(&mut follower);
-        assert!(matches!(follower.step(), PlannerStep::Command(_)));
-        assert_eq!(follower.reference, reference, "实测进度不得切尾重建作者A的完整时间参考");
-        assert_eq!(
-            follower.progress_m(),
-            progress,
-            "计算局部目标不能推进真实进度"
-        );
     }
     #[test]
     fn recent_obstacle_inside_real_body_rejects_the_actual_command() {
@@ -1427,7 +1324,6 @@ mod native_execution_tests {
         assert!(command.angular_z < 0.);
         assert!(command.linear.x >= 0.);
         assert_eq!(command.linear.y, 0.);
-        assert_eq!(follower.progress_m(), 0.);
     }
 }
 

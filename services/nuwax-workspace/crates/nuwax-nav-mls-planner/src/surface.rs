@@ -288,6 +288,25 @@ impl std::fmt::Debug for SurfaceSnapshot {
 }
 
 impl SurfaceSnapshot {
+    /// 全局层析的静态来源；虚拟禁行层与近期帧由规划前叠加。
+    pub fn same_navigation_static_geometry(&self, other: &Self) -> bool {
+        let same_points = match (&self.navigation_measurements, &other.navigation_measurements) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_observations = match (&self.observations, &other.observations) {
+            (Some(a), Some(b)) => a.same_geometry(b),
+            (None, None) => true,
+            _ => false,
+        };
+        Arc::ptr_eq(&self.data.occupied_columns, &other.data.occupied_columns)
+            && Arc::ptr_eq(&self.data.height_bounds, &other.data.height_bounds)
+            && self.data.body_envelope == other.data.body_envelope
+            && self.ground_evidence == other.ground_evidence
+            && same_points && same_observations
+    }
+
     /// 原始点输入已有体素降采样，原生规划器直接消费这些实测坐标。
     pub fn navigation_measured_points(&self) -> Option<&[[f64; 3]]> {
         self.navigation_measurements

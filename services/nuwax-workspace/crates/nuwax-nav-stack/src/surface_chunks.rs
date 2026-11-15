@@ -423,7 +423,7 @@ mod tests {
                                         "schema":"dense-doorway-input-trace-v1", "heading":heading,
                                         "aligned":aligned,"tick":tick,"time_ns":time,
                                         "current":current,"applied":[applied.linear.x,applied.linear.y,applied.angular_z],
-                                        "goal":goal,"progress_m":follower.progress_m(),"outcome":format!("{other:?}"),
+                                        "goal":goal,"outcome":format!("{other:?}"),
                                         "simulation":true,"control_frequency":20.0,"speed":0.3,
                                         "allow_reverse":options.allow_reverse,
                                         "position_tolerance_m":options.position_tolerance_m,

@@ -10,7 +10,7 @@
 #include <vector>
 
 // Independent NEH business constraints, not an Author A occupancy-map algorithm.
-// Source semantics: existing native/include/plan_env/grid_map.h boundary polygon
+// 业务边界沿用原边界多边形语义；物理地图使用作者A自己的占据接口。
 // admission and Z-unbounded forbidden columns. No ground/bodyHeight/traversable,
 // rectangular swept envelope, implicit boundary, occupancy buffer, or sensing.
 class BusinessConstraintMask {

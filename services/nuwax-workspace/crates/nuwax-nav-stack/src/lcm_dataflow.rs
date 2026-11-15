@@ -1142,6 +1142,7 @@ where
                             &telemetry,
                             "goal",
                             &format!("NavigationGoal rejected: {error}"),
+                            &mut publications,
                         )
                         .await?;
                         continue;
@@ -1155,6 +1156,7 @@ where
                     &mut telemetry,
                     &mut latest_goal,
                     navigation_goal,
+                    &mut publications,
                 )
                 .await?;
             }
@@ -1168,6 +1170,7 @@ where
                         &telemetry,
                         "path",
                         "no active versioned goal lease",
+                        &mut publications,
                     )
                     .await?;
                     continue;
@@ -1183,6 +1186,7 @@ where
                             &telemetry,
                             "path",
                             &format!("PathEnvelope rejected: {error}"),
+                            &mut publications,
                         )
                         .await?;
                         continue;
@@ -1196,6 +1200,7 @@ where
                         &telemetry,
                         "path",
                         &reason,
+                        &mut publications,
                     )
                     .await?;
                     continue;
@@ -1213,6 +1218,7 @@ where
                             &telemetry,
                             "path",
                             &error.to_string(),
+                            &mut publications,
                         )
                         .await?;
                         continue;
@@ -1247,6 +1253,7 @@ where
                     Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.path", error) {
                         Ok(OwnerInput::Rejected(reason)) => publish_guarded_rejection(
                             transport, &node.outputs[1], scheduler.status(), &telemetry, "path", &reason,
+                            &mut publications,
                         ).await,
                         Ok(OwnerInput::Accepted(())) => unreachable!("error classifier accepted an error"),
                         Err(error) => Err(error),
@@ -1290,8 +1297,11 @@ async fn activate_guarded_goal(
     telemetry: &mut GuardedNavTelemetry,
     latest_goal: &mut Option<schema::NavigationGoal>,
     navigation_goal: schema::NavigationGoal,
+    publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
     let goal = pose_from_schema(&navigation_goal.goal)?;
+    // 容差等选项变化也代表替换目标，本次状态立即发布。
+    publications.state_published_at = None;
     telemetry.goal = [
         goal.pose.position.x,
         goal.pose.position.y,
@@ -1329,6 +1339,7 @@ async fn activate_guarded_goal(
                     telemetry,
                     "goal",
                     &reason,
+                    publications,
                 )
                 .await?
             }
@@ -1341,6 +1352,7 @@ async fn activate_guarded_goal(
             scheduler.status(),
             telemetry,
             None,
+            publications,
         )
         .await?;
     }
@@ -1429,6 +1441,10 @@ struct GuardedStatusPublications {
     applied_commands: u64,
     last_terminal: Option<nuwax_nav_runtime::TerminalOutcome>,
     reached_published: bool,
+    state_goal: Option<(String, i64, [f64; 3], f64)>,
+    state_phase: Option<nuwax_nav_runtime::SchedulerPhase>,
+    state_terminal: Option<nuwax_nav_runtime::TerminalOutcome>,
+    state_published_at: Option<Instant>,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1473,14 +1489,30 @@ impl GuardedStatusPublications {
                 self.reached_published = true;
             }
         }
-        frames.push(build_guarded_nav_state_frame(
-            &node.outputs[1],
-            status,
-            telemetry,
-            planner_observation,
-        )?);
+        if let Some(frame) = self.state_frame_at(&node.outputs[1], status, telemetry, planner_observation, Instant::now())? {
+            frames.push(frame);
+        }
         Ok(frames)
     }
+    fn state_frame_at(
+        &mut self, channel: &str, status: &nuwax_nav_runtime::SchedulerStatus,
+        telemetry: &GuardedNavTelemetry, planner_observation: Option<bool>, now: Instant,
+    ) -> NavStackResult<Option<RawLcmFrame>> {
+        let goal = (telemetry.public_session_id.clone(), telemetry.motion_generation, telemetry.goal, telemetry.goal_z);
+        let immediate = self.state_goal.as_ref() != Some(&goal)
+            || self.state_phase != Some(status.phase)
+            || self.state_terminal != status.last_terminal;
+        if !immediate && self.state_published_at.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
+            return Ok(None);
+        }
+        let frame = build_guarded_nav_state_frame(channel, status, telemetry, planner_observation)?;
+        self.state_goal = Some(goal);
+        self.state_phase = Some(status.phase);
+        self.state_terminal = status.last_terminal;
+        self.state_published_at = Some(now);
+        Ok(Some(frame))
+    }
+
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1530,16 +1562,13 @@ async fn publish_guarded_nav_state(
     status: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
+    publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
-    transport
-        .publish(build_guarded_nav_state_frame(
-            channel,
-            &status,
-            telemetry,
-            planner_observation,
-        )?)
-        .await
-        .map_err(|error| NavStackError::Internal(format!("publish {channel}: {error}")))
+    if let Some(frame) = publications.state_frame_at(channel, &status, telemetry, planner_observation, Instant::now())? {
+        transport.publish(frame).await
+            .map_err(|error| NavStackError::Internal(format!("publish {channel}: {error}")))?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1670,10 +1699,11 @@ async fn publish_guarded_rejection(
     telemetry: &GuardedNavTelemetry,
     input: &str,
     reason: &str,
+    publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
     tracing::warn!(input, reason, session_id = %telemetry.public_session_id, "导航输入被拒绝");
     let status = guarded_rejection_status(status, input, reason);
-    publish_guarded_nav_state(transport, channel, status, telemetry, None).await
+    publish_guarded_nav_state(transport, channel, status, telemetry, None, publications).await
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -6731,6 +6761,33 @@ path: schema::Path {
     }
 
     #[test]
+    fn nav_state_limits_ordinary_updates_and_immediately_publishes_transitions() {
+        let mut publications = GuardedStatusPublications::default();
+        let mut status = nuwax_nav_runtime::SchedulerStatus { phase: SchedulerPhase::Controlling, ..Default::default() };
+        let mut telemetry = GuardedNavTelemetry { public_session_id: "goal-a".into(), ..Default::default() };
+        let start = Instant::now();
+        let mut emitted = 0;
+        for ms in 0..1000 {
+            status.remaining_distance_m = f64::from(ms);
+            emitted += usize::from(publications.state_frame_at("/nav/state", &status, &telemetry, None,
+                start + Duration::from_millis(ms as u64)).unwrap().is_some());
+        }
+        assert_eq!(emitted, 10);
+        let now = start + Duration::from_millis(999);
+        status.phase = SchedulerPhase::AwaitingPath;
+        assert!(publications.state_frame_at("/nav/state", &status, &telemetry, None, now).unwrap().is_some());
+        status.last_terminal = Some(TerminalOutcome::Succeeded);
+        assert!(publications.state_frame_at("/nav/state", &status, &telemetry, None, now).unwrap().is_some());
+        telemetry.public_session_id = "goal-b".into();
+        assert!(publications.state_frame_at("/nav/state", &status, &telemetry, None, now).unwrap().is_some());
+        status.remaining_distance_m = 1234.;
+        let frame = publications.state_frame_at("/nav/state", &status, &telemetry, None,
+            now + Duration::from_millis(100)).unwrap().unwrap();
+        let decoded = schema::decode_navigation_status_body(&frame.payload).unwrap();
+        assert_eq!(decoded.remaining_distance_m, 1234.);
+    }
+
+    #[test]
     fn guarded_input_rejection_preserves_the_real_scheduler_phase() {
         let status = nuwax_nav_runtime::SchedulerStatus {
             phase: SchedulerPhase::AwaitingPath,
@@ -7014,7 +7071,7 @@ path: schema::Path {
                 .frames(&node, &status, &telemetry, None)
                 .unwrap()
                 .len(),
-            1
+            0
         );
         clear_guarded_session_telemetry(&mut telemetry);
         assert_eq!(

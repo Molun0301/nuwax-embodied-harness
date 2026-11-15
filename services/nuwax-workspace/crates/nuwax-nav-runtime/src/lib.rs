@@ -665,6 +665,7 @@ pub struct NavScheduler<M, P> {
     obstacle_source_available: bool,
     costmap_receipt: Option<PlannerInputReceipt>,
     status: SchedulerStatus,
+    in_control_tick: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -705,6 +706,7 @@ where
             obstacle_source_available: true,
             costmap_receipt: None,
             status,
+            in_control_tick: false,
         })
     }
 
@@ -818,7 +820,6 @@ where
                 }
                 self.obstacle_source_available=available;
                 self.refresh_input_status(Instant::now());
-                self.publish_status(status_tx);
                 Ok(())
             })(),
             InputKind::CapturePlanningActual(identity, reply) => {
@@ -858,7 +859,7 @@ where
 
     fn observe_odometry(
         &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
+        _status_tx: &watch::Sender<SchedulerStatus>,
         odometry: PoseStamped,
         source_max_age: Option<Duration>,
     ) -> Result<(), RuntimeError> {
@@ -877,13 +878,12 @@ where
         self.planner.update_odometry(odometry);
         self.pose_source_max_age = source_max_age;
         self.refresh_input_status(Instant::now());
-        self.publish_status(status_tx);
         Ok(())
     }
 
     fn observe_costmap(
         &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
+        _status_tx: &watch::Sender<SchedulerStatus>,
         observation: CostmapObservation,
         received_at: Instant,
     ) -> Result<(), RuntimeError> {
@@ -894,7 +894,6 @@ where
             received_at,
         });
         self.refresh_input_status(Instant::now());
-        self.publish_status(status_tx);
         Ok(())
     }
 
@@ -1243,6 +1242,17 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
+        self.in_control_tick = true;
+        let result = self.session_tick_inner(status_tx).await;
+        self.in_control_tick = false;
+        self.publish_tick_status(status_tx);
+        result
+    }
+
+    async fn session_tick_inner(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
         self.refresh_input_status(Instant::now());
         self.sample_input_status();
         if self.session.is_none() {
@@ -1448,6 +1458,20 @@ where
     }
 
     fn publish_status(&self, status_tx: &watch::Sender<SchedulerStatus>) {
+        let previous = status_tx.borrow();
+        let immediate = previous.phase != self.status.phase
+            || previous.last_terminal != self.status.last_terminal
+            || previous.session_id != self.status.session_id
+            || previous.motion_sink_ready != self.status.motion_sink_ready
+            || (!self.in_control_tick && (previous.message != self.status.message
+                || previous.path_revision != self.status.path_revision));
+        drop(previous);
+        if immediate {
+            self.publish_tick_status(status_tx);
+        }
+    }
+
+    fn publish_tick_status(&self, status_tx: &watch::Sender<SchedulerStatus>) {
         let mut status = self.status.clone();
         if self.current_route_kind == RouteKind::Approach && status.last_terminal.is_none()
             && matches!(status.phase,SchedulerPhase::Controlling | SchedulerPhase::AwaitingPath) {
@@ -2003,6 +2027,7 @@ mod tests {
         terminal_phase: TerminalPhase,
         step: PlannerStep,
         wait_reason: Option<String>,
+        display_reads: usize,
         costmap_updates: usize,
         odometry_updates: usize,
         stops: usize,
@@ -2018,6 +2043,7 @@ mod tests {
                         angular_z: 0.1,
                     }),
                     wait_reason: None,
+                    display_reads: 0,
                     costmap_updates: 0,
                     odometry_updates: 0,
                     stops: 0,
@@ -2027,6 +2053,10 @@ mod tests {
     }
 
     impl NavPlanner for FakePlanner {
+        fn local_path_for_display(&self) -> Vec<[f64; 3]> {
+            self.state.lock().unwrap().display_reads += 1;
+            Vec::new()
+        }
         fn terminal_phase(&self) -> TerminalPhase {
             self.state.lock().unwrap().terminal_phase
         }
@@ -2088,6 +2118,24 @@ mod tests {
         scheduler.submit_path(&status, path()).await.unwrap();
         scheduler.session_tick(&status).await.unwrap();
         (scheduler, status, motion)
+    }
+
+    #[tokio::test]
+    async fn control_tick_publishes_one_final_snapshot_for_repeated_zero_commands() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        {
+            let mut planner = scheduler.planner.state.lock().unwrap();
+            planner.step = PlannerStep::Pending(Vec::new());
+            planner.wait_reason = Some("当拍局部规划待定".into());
+            planner.display_reads = 0;
+        }
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.planner.state.lock().unwrap().display_reads, 1);
+        assert_eq!(status.borrow().message, "当拍局部规划待定");
+        assert_eq!(status.borrow().last_applied_twist, Some(Twist2::ZERO));
+        scheduler.planner.state.lock().unwrap().step = PlannerStep::Succeeded;
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(status.borrow().last_terminal, Some(TerminalOutcome::Succeeded));
     }
 
     #[tokio::test]

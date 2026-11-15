@@ -661,6 +661,8 @@ pub struct NavScheduler<M, P> {
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     path_wait_started_at: Option<Instant>,
+    progress_remaining_m: Option<f64>,
+    progress_terminal_phase: TerminalPhase,
     latest_pose: Option<PoseStamped>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_source_max_age: Option<Duration>,
@@ -702,6 +704,8 @@ where
             current_path: None,
             current_execution_identity: None,
             path_wait_started_at: None,
+            progress_remaining_m: None,
+            progress_terminal_phase: TerminalPhase::Travel,
             latest_pose: None,
             pose_receipt: None,
             pose_source_max_age: None,
@@ -958,6 +962,9 @@ where
         self.current_route_kind = RouteKind::Complete;
         self.current_path_revision = 0;
         self.path_wait_started_at = Some(Instant::now());
+        self.progress_remaining_m = None;
+        self.progress_terminal_phase = TerminalPhase::Travel;
+        self.status.remaining_distance_m = 0.;
         self.status.session_id = Some(session.session_id.clone());
         self.session = Some(session);
         self.status.path_revision = 0;
@@ -1078,6 +1085,9 @@ where
         self.current_route_kind = route_kind;
 
         self.current_path = Some((planner_path, path_yaws));
+        // 新路线只更换距离基准，不能用绕行长度变化给原目标续期。
+        self.progress_remaining_m = None;
+        self.progress_terminal_phase = self.planner.terminal_phase();
         self.current_execution_identity = Some(Arc::new(execution_identity));
         self.status.surface_replan_feedback = None;
         // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
@@ -1207,8 +1217,6 @@ where
         if let Err(error)=self.motion.velocity(twist).await{return Err(self.motion_failed(status_tx,error).await);}
         self.status.applied_commands+=1;self.status.last_applied_twist=Some(twist);
         self.planner.observe_measured_motion(self.motion.measured_motion());self.planner.observe_applied_command(twist);
-        if twist!=Twist2::ZERO{self.path_wait_started_at=None;}
-        else{self.path_wait_started_at.get_or_insert_with(Instant::now);}
         if let Some(feedback)=&mut self.status.surface_replan_feedback{
             if feedback.current_context.as_ref().is_some_and(|c|c.applied!=twist){feedback.current_context=None;}
         }
@@ -1302,6 +1310,7 @@ where
             }
         }
         if self.session.is_some() {
+            self.sample_route_progress();
             self.check_path_wait_timeout(status_tx).await?;
         }
         Ok(())
@@ -1319,6 +1328,42 @@ where
         self.status.message = format!("等待新鲜导航输入: {reason}");
         self.publish_status(status_tx);
         Ok(())
+    }
+
+    /// 剩余距离累计改善五厘米才刷新预算；命令回执不参与进展判断。
+    fn sample_route_progress(&mut self) {
+        let phase = self.planner.terminal_phase();
+        if self.progress_terminal_phase == TerminalPhase::Travel && phase != TerminalPhase::Travel {
+            self.path_wait_started_at = Some(Instant::now());
+            self.progress_remaining_m = None;
+        }
+        self.progress_terminal_phase = phase;
+        self.status.remaining_distance_m = self.route_remaining_distance();
+        if self.current_path.is_some() && self.latest_pose.is_some() {
+            let remaining = self.status.remaining_distance_m;
+            match self.progress_remaining_m {
+                Some(previous) if previous - remaining >= 0.05 => {
+                    self.progress_remaining_m = Some(remaining);
+                    self.path_wait_started_at = Some(Instant::now());
+                }
+                None => self.progress_remaining_m = Some(remaining),
+                _ => {}
+            }
+        }
+    }
+
+    fn route_remaining_distance(&self) -> f64 {
+        match (&self.current_path, &self.latest_pose) {
+            (Some((path, _)), Some(pose)) => {
+                let points: Vec<[f64; 3]> = match path {
+                    ExecutionPath::Planar(path) => path.points.iter().map(|p| [p.x, p.y, 0.0]).collect(),
+                    ExecutionPath::Surface(path) => path.poses.iter().map(|p| [p.pose.position.x, p.pose.position.y, p.pose.position.z]).collect(),
+                };
+                let z = if matches!(path, ExecutionPath::Surface(_)) { pose.pose.position.z } else { 0.0 };
+                remaining_route_distance(&points, [pose.pose.position.x, pose.pose.position.y, z])
+            }
+            _ => 0.0,
+        }
     }
 
     async fn check_path_wait_timeout(
@@ -1438,6 +1483,9 @@ where
         self.current_execution_identity = None;
 
         self.path_wait_started_at = None;
+        self.progress_remaining_m = None;
+        self.progress_terminal_phase = TerminalPhase::Travel;
+        self.status.remaining_distance_m = 0.;
         self.status.phase = if release_error.is_some() { SchedulerPhase::Failed } else { phase_after };
         self.status.session_id = None;
         self.status.path_revision = 0;
@@ -1486,17 +1534,6 @@ where
         } else {
             status.local_path.clear();
         }
-        status.remaining_distance_m = match (&self.current_path, &self.latest_pose) {
-            (Some((path, _)), Some(pose)) => {
-                let points: Vec<[f64; 3]> = match path {
-                    ExecutionPath::Planar(path) => path.points.iter().map(|p| [p.x, p.y, 0.0]).collect(),
-                    ExecutionPath::Surface(path) => path.poses.iter().map(|p| [p.pose.position.x, p.pose.position.y, p.pose.position.z]).collect(),
-                };
-                let z = if matches!(path, ExecutionPath::Surface(_)) { pose.pose.position.z } else { 0.0 };
-                remaining_route_distance(&points, [pose.pose.position.x, pose.pose.position.y, z])
-            }
-            _ => 0.0,
-        };
         status_tx.send_replace(status);
     }
 }
@@ -2296,7 +2333,7 @@ mod tests {
             .status
             .last_applied_twist
             .is_some_and(|twist| twist != Twist2::ZERO));
-        assert!(scheduler.path_wait_started_at.is_none());
+        assert!(scheduler.path_wait_started_at.is_some(), "非零命令不能清除等待预算");
         let motion = motion.lock().unwrap();
         assert_eq!(
             motion
@@ -2702,7 +2739,7 @@ mod tests {
         scheduler.start_session(&status, session()).await.unwrap();
         scheduler.submit_path(&status, path()).await.unwrap();
         scheduler.session_tick(&status).await.unwrap();
-        assert!(scheduler.path_wait_started_at.is_none());
+        assert!(scheduler.path_wait_started_at.is_some(), "非零回执不清除实测进展预算");
         scheduler.pose_source_max_age = Some(Duration::from_millis(500));
         scheduler.session_tick(&status).await.unwrap();
         let first_wait = scheduler.path_wait_started_at;
@@ -3417,6 +3454,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alternating_motion_and_failure_without_measured_progress_expires_at_thirty_seconds() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        assert_eq!(scheduler.config.path_wait_timeout, Duration::from_secs(30));
+        for elapsed in 0..=30 {
+            scheduler.planner.state.lock().unwrap().step = if elapsed % 2 == 0 {
+                PlannerStep::Command(Twist2 { linear: Point2::new(0.2, 0.), angular_z: 0. })
+            } else { PlannerStep::Pending(vec!["局部规划失败".into()]) };
+            let original = Instant::now() - Duration::from_secs(elapsed);
+            scheduler.path_wait_started_at = Some(original);
+            scheduler.session_tick(&status).await.unwrap();
+            if elapsed < 30 {
+                assert!(scheduler.status.last_terminal.is_none());
+                assert_eq!(scheduler.path_wait_started_at, Some(original));
+            } else {
+                assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulated_five_centimetres_and_continuous_actual_progress_refresh_budget() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        let old = Instant::now() - Duration::from_secs(29);
+        scheduler.path_wait_started_at = Some(old);
+        for x in [1.02, 1.04, 1.049] {
+            let mut pose = map_pose(); pose.pose.position.x = x;
+            scheduler.observe_odometry(&status, pose, None).unwrap();
+            scheduler.session_tick(&status).await.unwrap();
+            assert_eq!(scheduler.path_wait_started_at, Some(old));
+        }
+        for index in 0..8 {
+            let mut pose = map_pose(); pose.pose.position.x = 1.06 + index as f64 * 0.06;
+            scheduler.observe_odometry(&status, pose, None).unwrap();
+            scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+            scheduler.session_tick(&status).await.unwrap();
+            assert!(scheduler.status.last_terminal.is_none());
+            assert!(scheduler.path_wait_started_at.unwrap().elapsed() < Duration::from_secs(1));
+        }
+        let last = scheduler.path_wait_started_at;
+        for x in [1.1, 1.48] {
+            let mut pose = map_pose(); pose.pose.position.x = x;
+            scheduler.observe_odometry(&status, pose, None).unwrap();
+            scheduler.session_tick(&status).await.unwrap();
+            assert_eq!(scheduler.path_wait_started_at, last, "回退再回到原最小剩余距离不算新进展");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_replacement_changes_distance_reference_without_renewing_goal_budget() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        let mut replacement = path_for("goal-1", 2);
+        replacement.path = ExecutionPath::Planar(Path2D::stamped(NavFrameId::Map, Timestamp::default(),
+            vec![Point2::new(0., 0.), Point2::new(0.2, 0.)]));
+        let old = Instant::now() - Duration::from_secs(31);
+        scheduler.path_wait_started_at = Some(old);
+        scheduler.submit_path(&status, replacement).await.unwrap();
+        assert_eq!(scheduler.path_wait_started_at, Some(old));
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+    }
+
+    #[tokio::test]
+    async fn entering_terminal_stage_restarts_budget_once() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.planner.state.lock().unwrap().terminal_phase = TerminalPhase::Turning;
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(scheduler.status.last_terminal.is_none());
+        let restarted = scheduler.path_wait_started_at;
+        scheduler.planner.state.lock().unwrap().terminal_phase = TerminalPhase::Translating;
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.path_wait_started_at, restarted);
+        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+    }
+
+    #[tokio::test]
     async fn default_wait_budget_terminates_all_stationary_waits_and_allows_recovery() {
         for reason in [None, Some(""), Some("当前几何尚无可执行运动"),
             Some("机身与障碍重叠、脱困失败：BODY_OVERLAP_RECOVERY_FAILED: Current body pose is occupied; escape penetration exceeds half a voxel")] {
@@ -3446,9 +3561,13 @@ mod tests {
                     state.wait_reason = None;
                 }
                 scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
-                scheduler.session_tick(&sender).await.unwrap();
-                assert!(scheduler.path_wait_started_at.is_none());
                 if recover {
+                    let mut moved = map_pose(); moved.pose.position.x = 1.1;
+                    scheduler.observe_odometry(&sender, moved, None).unwrap();
+                }
+                scheduler.session_tick(&sender).await.unwrap();
+                if recover {
+                    assert!(scheduler.path_wait_started_at.is_some());
                     assert_eq!(scheduler.status.last_terminal, None);
                     assert_ne!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
                 } else {

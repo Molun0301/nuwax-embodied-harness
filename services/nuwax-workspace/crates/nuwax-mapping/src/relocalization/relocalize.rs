@@ -348,7 +348,6 @@ pub struct TargetCache {
     pub index: NearestPointIndex,
     /// 地图坐标中的0.1米占据体素。
     pub occupied: std::collections::HashSet<[i64; 3]>,
-    global_source: Vec<Point3<f64>>,
     scales: std::sync::OnceLock<Vec<ProcessedCloud>>,
 }
 impl TargetCache {
@@ -361,7 +360,6 @@ impl TargetCache {
             points,
             index,
             occupied,
-            global_source: target.to_vec(),
             scales: std::sync::OnceLock::new(),
         }
     }
@@ -373,7 +371,7 @@ impl TargetCache {
                 .into_iter()
                 .map(|size| {
                     preprocess(
-                        &self.global_source,
+                        &self.points,
                         FeatureConfig::for_voxel(size, config.max_feature_neighbors),
                     )
                 })
@@ -1129,11 +1127,12 @@ mod tests {
                 .map(|p| Point3::new(p.x * 0.7 + 42.0, p.y * 1.3 + 20.0, p.z)),
         );
         let config = RelocalizationConfig::default();
-        let mut watched = vec![("精细点".into(), voxel_downsample(&target, 0.1))];
+        let fine = voxel_downsample(&target, 0.1);
+        let mut watched = vec![("精细点".into(), fine.clone())];
         let mut descriptors = Vec::new();
         for scale in config.voxel_sizes {
             let cloud = preprocess(
-                &target,
+                &fine,
                 FeatureConfig::for_voxel(scale, config.max_feature_neighbors),
             );
             watched.push((format!("尺度{scale}"), cloud.points));

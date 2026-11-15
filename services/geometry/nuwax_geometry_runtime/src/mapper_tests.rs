@@ -18,6 +18,37 @@ pub(crate) fn room_frame(session: u64, stamp: u64) -> MappingFrame {
         registered_cloud: None,
     }
 }
+/// 加载后才出现的障碍：与 `room_frame` 同一走廊，多一根立在此处、半径 0.25 米的圆柱。
+pub(crate) const OBSTACLE: [f64; 2] = [3.0, 0.8];
+pub(crate) fn obstacle_frame(session: u64, stamp: u64) -> MappingFrame {
+    let (points, _) = crate::dynamic_scene::tests::corridor(Some(OBSTACLE[1]), 0.);
+    MappingFrame {
+        points_body: points.into_iter().step_by(4).map(|p| [p.x, p.y, p.z]).collect(),
+        ..room_frame(session, stamp)
+    }
+}
+/// 精细层里离障碍圆柱轴线 0.3 米内、高出地面的体素数。
+pub(crate) fn fine_voxels_at_obstacle(sealed: &nuwax_map_chunks::SealedMap) -> usize {
+    let mut receiver = nuwax_map_chunks::Receiver::new(sealed.repository.clone());
+    let size = f64::from(sealed.manifest().voxel_size_m);
+    sealed.manifest().blocks.iter().map(|reference| {
+        receiver.block(reference).unwrap().keys().filter(|&&local| {
+            let center = nuwax_map_chunks::global_key(reference.key, local).unwrap()
+                .map(|value| (f64::from(value) + 0.5) * size);
+            (center[0] - OBSTACLE[0]).hypot(center[1] - OBSTACLE[1]) <= 0.3 && (0.2..=1.8).contains(&center[2])
+        }).count()
+    }).sum()
+}
+/// 二维栅格里离障碍圆柱轴线 0.3 米内的障碍格数。
+pub(crate) fn grid_cells_at_obstacle(grid: &proto::OccupancyGrid) -> usize {
+    let meta = grid.meta.as_ref().unwrap();
+    let resolution = f64::from(meta.resolution);
+    grid.data.iter().enumerate().filter(|(index, value)| {
+        let x = meta.origin_x + ((*index as u32 % meta.width) as f64 + 0.5) * resolution;
+        let y = meta.origin_y + ((*index as u32 / meta.width) as f64 + 0.5) * resolution;
+        **value == 100 && (x - OBSTACLE[0]).hypot(y - OBSTACLE[1]) <= 0.3
+    }).count()
+}
 fn config() -> MapperConfig {
     MapperConfig {
         map_name: "实测地图".into(),
@@ -184,6 +215,40 @@ fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
     assert_eq!(after.final_poses.len(), 3);
     assert!(worker.failure.is_none());
     assert!(!stopped.has_changed().unwrap());
+}
+
+#[test]
+fn full_scan_budget_without_correction_only_reports_that_scans_stop() {
+    let mut source = Worker::new(
+        953, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    source.frame(room_frame(953, 1_000_000_000)).unwrap();
+    let mut loaded = Worker::new(
+        954, config(), Some(source.snapshot().unwrap()), true,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    assert!(loaded.corrector.is_none(), "加载的会话没有校正线程");
+    loaded.command(Command::Writing(true)).unwrap();
+    loaded.frame(room_frame(954, 2_000_000_000)).unwrap();
+    let own = loaded.snapshot().unwrap().scans.last().unwrap().0.parent().unwrap().to_path_buf();
+    let used: u64 = std::fs::read_dir(&own).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+    let filler_path = own.join("budget-used");
+    std::fs::File::create(&filler_path).unwrap()
+        .set_len(nuwax_cloud_cleanup::scan_log::storage_budget_bytes().unwrap() - used).unwrap();
+    let mut stopped = loaded.correction_stopped.subscribe();
+    loaded.frame(room_frame(954, 3_000_000_000)).unwrap();
+    assert_eq!(stopped.borrow_and_update().as_deref(), Some("扫描记录已达上限，后续扫描不再记录"));
+    std::fs::remove_file(filler_path).unwrap();
+    let revision = loaded.cloud.snapshot().revision;
+    loaded.frame(room_frame(954, 4_000_000_000)).unwrap();
+    assert!(loaded.cloud.snapshot().revision > revision, "扫描不再记录后地图照常更新");
+    assert!(loaded.failure.is_none());
+    assert!(!stopped.has_changed().unwrap(), "只通知一次");
 }
 
 #[test]
@@ -383,6 +448,62 @@ fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_be
     ).unwrap();
     assert_eq!(loaded.built_corrections, vec![(0, loaded.map_from_odom)]);
     assert!(loaded.corrector.is_none());
+}
+
+#[test]
+fn loaded_map_writes_frames_only_while_writing_and_releases_the_classifier() {
+    let mut source = Worker::new(
+        951, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    source.frame(room_frame(951, 1_000_000_000)).unwrap();
+    let saved = source.snapshot().unwrap();
+    let mut loaded = Worker::new(
+        952, config(), Some(saved), true,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut recent = loaded.recent_cloud.subscribe();
+    let revision = |worker: &Worker| worker.cloud.snapshot().revision;
+    let grid = |worker: &Worker| worker.maps.borrow().as_ref().map(|map| proto::OccupancyGrid {
+        map_name: map.map_name.clone(), meta: map.meta.clone(), data: map.raw_data.clone() }).unwrap();
+    let loaded_revision = revision(&loaded);
+    assert_eq!(fine_voxels_at_obstacle(&loaded.cloud.surface().unwrap()), 0);
+    assert_eq!(grid_cells_at_obstacle(&grid(&loaded)), 0);
+    // 加载后默认只读：只分类并发布近期点云，分类副本按需建立。
+    loaded.frame(obstacle_frame(952, 2_000_000_000)).unwrap();
+    assert!(recent.has_changed().unwrap());
+    recent.borrow_and_update();
+    assert_eq!(revision(&loaded), loaded_revision);
+    assert!(loaded.cloud.has_readonly_classifier());
+    loaded.command(Command::Writing(true)).unwrap();
+    assert!(!loaded.cloud.has_readonly_classifier(), "切到写入时释放只读分类副本");
+    for second in 3..=5 {
+        loaded.frame(obstacle_frame(952, second * 1_000_000_000)).unwrap();
+    }
+    assert!(recent.has_changed().unwrap());
+    recent.borrow_and_update();
+    let written = revision(&loaded);
+    assert!(written > loaded_revision);
+    assert!(fine_voxels_at_obstacle(&loaded.cloud.surface().unwrap()) > 0, "新障碍进入精细层");
+    assert!(grid_cells_at_obstacle(&grid(&loaded)) > 0, "新障碍进入二维栅格");
+    assert!(!loaded.cloud.has_readonly_classifier());
+    // 切回只读：地图不变，近期点云照发，分类副本从当前精细根重新建立。
+    loaded.command(Command::Writing(false)).unwrap();
+    let published = loaded.maps.borrow().clone();
+    loaded.frame(obstacle_frame(952, 6_000_000_000)).unwrap();
+    assert!(recent.has_changed().unwrap());
+    recent.borrow_and_update();
+    assert_eq!(revision(&loaded), written);
+    assert_eq!(*loaded.maps.borrow(), published);
+    assert!(loaded.cloud.has_readonly_classifier());
+    loaded.command(Command::Writing(true)).unwrap();
+    loaded.frame(obstacle_frame(952, 7_000_000_000)).unwrap();
+    assert!(revision(&loaded) > written, "恢复写入后继续更新地图");
+    assert!(loaded.corrector.is_none(), "加载的会话没有回环校正");
 }
 
 #[test]

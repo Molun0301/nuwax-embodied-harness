@@ -174,6 +174,7 @@ enum Command {
     ),
     Transform(Isometry3<f64>, oneshot::Sender<Result<(), String>>),
     Name(String),
+    Writing(bool),
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
     Forbidden(PathBuf, oneshot::Sender<Result<(), String>>),
@@ -399,6 +400,10 @@ impl Mapper {
     }
     pub fn set_map_name(&self, name: String) {
         let _ = self.sender.send(Command::Name(name));
+    }
+    /// 加载的三维地图在只读与写入之间切换；写入时帧按新建地图会话处理。
+    pub fn set_writing(&self, writing: bool) {
+        let _ = self.sender.send(Command::Writing(writing));
     }
     pub(crate) async fn display_cloud(&self) -> Result<crate::pointcloud::CloudSnapshot, String> {
         let (tx, rx) = oneshot::channel();
@@ -663,6 +668,13 @@ impl Worker {
                 Ok(())
             }
             Command::Shutdown => Ok(()),
+            Command::Writing(writing) => {
+                self.read_only = !writing;
+                if writing {
+                    self.cloud.release_readonly_classifier();
+                }
+                Ok(())
+            }
             Command::ActivateShared(reply) => {
                 let result = match self.config.cloudmap_shm_path.as_deref() {
                     Some(path) => self.cloud.attach_shared(path),
@@ -816,7 +828,12 @@ impl Worker {
             self.evidence_from_odom,
         )?;
         if self.cloud.take_recording_limit() {
-            self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            if self.corrector.is_some() {
+                self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            } else {
+                // 没有校正线程（加载的会话、不校正的配置）：只经同一通知通道写进会话原因。
+                self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
+            }
         }
         if !frame.mapping_only {
             self.publish_recent(encode_recent_cloud(

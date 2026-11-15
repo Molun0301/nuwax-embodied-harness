@@ -233,7 +233,12 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
         state: &ExplorationStateSnapshot<'_>,
     ) -> ExploreResult<ExplorationPoll> {
         self.prepare_poll(state)?;
-        self.commit_prepared_poll()
+        let outcome = self.commit_prepared_poll()?;
+        if outcome == ExplorationPoll::NoFrontier && self.session.reintroduce_failed_frontiers() {
+            self.prepare_poll(state)?;
+            return self.commit_prepared_poll();
+        }
+        Ok(outcome)
     }
 
     fn supports_prepared_poll(&self) -> bool {
@@ -490,6 +495,25 @@ mod tests {
             }
         }
         grid
+    }
+
+    #[test]
+    fn failed_planar_frontiers_are_reintroduced_once_before_no_frontier() {
+        let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(
+            r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"一次放回测试"}"#).unwrap();
+        let mut source = WavefrontGoalSourceAdapter::with_default_id("wavefront",
+            WavefrontConfig { max_consecutive_failures: 0, ..Default::default() }, geometry);
+        source.configure_constraints(None, 0, 10.0);
+        source.begin().unwrap();
+        let map = frontier_grid();
+        let mut state = sample_state(Some(&map), Timestamp::default());
+        state.robot_pose.pose.position = Point3::new(2.25, 2.25, 0.0);
+        for _ in 0..2 {
+            let ExplorationPoll::Goal(goal) = source.poll_goal(&state).unwrap() else { panic!("应选择放回的前沿") };
+            source.report_goal_feedback(&goal.id, ExplorationGoalFeedback::Failed("不可达".into())).unwrap();
+        }
+        assert_eq!(source.poll_goal(&state).unwrap(), ExplorationPoll::NoFrontier);
+        assert_eq!(source.session.blacklist_count(), 1);
     }
 
     #[test]

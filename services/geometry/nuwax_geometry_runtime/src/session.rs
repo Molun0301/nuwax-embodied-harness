@@ -1018,6 +1018,7 @@ impl Session {
                 .await
             {
                 self.navigation_failed(error.message().into());
+                self.state.navigation.as_mut().unwrap().input_unavailable = true;
                 if let (Some(explorer), Some(status)) = (&self.explorer, &self.state.navigation) {
                     explorer.feedback(status.clone());
                 }

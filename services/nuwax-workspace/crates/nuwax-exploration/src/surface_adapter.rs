@@ -393,6 +393,7 @@ struct GoalHistory {
     vertical_radius_m: f64,
     reached: bool,
     failures: u64,
+    reintroduced: bool,
 }
 
 struct SelectedGoal {
@@ -1388,6 +1389,24 @@ impl SurfaceGoalSourceAdapter {
         })
     }
 
+    fn reintroduce_failed_frontiers(&mut self) -> bool {
+        let mut restored = false;
+        for entry in &mut self.history {
+            if !entry.reached && !entry.reintroduced
+                && entry.failures > u64::from(self.max_navigation_retries)
+            {
+                entry.failures = 0;
+                entry.reintroduced = true;
+                restored = true;
+            }
+        }
+        if restored {
+            self.last_no_frontier = false;
+            self.last_snapshot = None;
+        }
+        restored
+    }
+
     fn record_feedback(&mut self, point: [f64; 3], vertical_radius: f64, reached: bool) -> u64 {
         let index = self
             .history
@@ -1401,6 +1420,7 @@ impl SurfaceGoalSourceAdapter {
                 vertical_radius_m: vertical_radius,
                 reached: false,
                 failures: 0,
+                reintroduced: false,
             });
             self.history.last_mut().expect("history was just inserted")
         };
@@ -1505,7 +1525,12 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         state: &ExplorationStateSnapshot<'_>,
     ) -> ExploreResult<ExplorationPoll> {
         self.prepare_poll(state)?;
-        self.commit_prepared_poll()
+        let outcome = self.commit_prepared_poll()?;
+        if outcome == ExplorationPoll::NoFrontier && self.reintroduce_failed_frontiers() {
+            self.prepare_poll(state)?;
+            return self.commit_prepared_poll();
+        }
+        Ok(outcome)
     }
 
     fn supports_prepared_poll(&self) -> bool {
@@ -1902,6 +1927,35 @@ mod tests {
             sensor_rotation_body_xyzw: [0.0, 0.0, 0.0, 1.0],
             max_rays: 16,
         }
+    }
+
+    #[test]
+    fn exhausted_surface_history_is_reintroduced_once_before_no_frontier() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut source = source(receiver.clone(), 0);
+        source.configure_constraints(None, 0, 10.0).unwrap();
+        for round in 0..2 {
+            receiver.observe(map()).unwrap();
+            let mut outcome = source.poll_goal(&state(0.4, round + 1)).unwrap();
+            for _ in 0..16 {
+                if outcome != ExplorationPoll::Pending { break; }
+                outcome = source.poll_goal(&state(0.4, round + 1)).unwrap();
+            }
+            let selected = goal(outcome);
+            source.report_goal_feedback(&selected.id, ExplorationGoalFeedback::Failed("无法到达".into())).unwrap();
+        }
+        receiver.observe(map()).unwrap();
+        let mut outcome = source.poll_goal(&state(0.4, 3)).unwrap();
+        for _ in 0..16 {
+            if outcome != ExplorationPoll::Pending { break; }
+            outcome = source.poll_goal(&state(0.4, 3)).unwrap();
+        }
+        assert_eq!(outcome, ExplorationPoll::NoFrontier);
+        assert!(source.history[0].reintroduced);
+        assert_eq!(source.history[0].failures, 1);
+        source.record_feedback([1.0, 1.0, 0.05], 0.3, true);
+        assert!(!source.reintroduce_failed_frontiers());
     }
 
     #[test]
@@ -3452,6 +3506,7 @@ mod tests {
                     vertical_radius_m: 0.3,
                     reached: true,
                     failures: 0,
+                    reintroduced: false,
                 });
             }
         }
@@ -3556,6 +3611,7 @@ mod tests {
                     vertical_radius_m: 0.3,
                     reached: true,
                     failures: 0,
+                    reintroduced: false,
                 });
             } else {
                 radial_collisions += 1;
@@ -3638,6 +3694,7 @@ mod tests {
                 vertical_radius_m: 0.3,
                 reached: true,
                 failures: 0,
+                reintroduced: false,
             });
         }
         let selected = goal(adapter.poll_goal(&state(0.4, 1)).unwrap());

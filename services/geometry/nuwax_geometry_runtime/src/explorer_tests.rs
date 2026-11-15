@@ -759,3 +759,22 @@ fn frontier_count_keeps_last_completed_computation_while_selection_is_pending() 
     assert_eq!(empty.status.frontier_count, 0);
     assert_eq!(empty.status.phase, proto::ExplorationPhase::Running as i32);
 }
+
+#[test]
+fn geometry_input_failure_does_not_count_frontier_or_return_failures() {
+    let mut explorer = started_with_max_goals(2);
+    let (id, _) = explorer.tick(Some(pose()), Some(grid()), Err("无曲面".into()), Ok(())).unwrap().goal.unwrap();
+    explorer.navigation_feedback(&proto::NavigationStatus {
+        goal_id: id, status: proto::GoalStatus::Failed as i32,
+        input_unavailable: true, message: "目标提交失败".into(), ..Default::default()
+    }).unwrap();
+    let progress: Progress = serde_json::from_str(&explorer.progress().unwrap().progress_json).unwrap();
+    let history: serde_json::Value = serde_json::from_str(&progress.sources[0].payload).unwrap();
+    assert!(history[1]["failed_goals"].as_array().unwrap().is_empty());
+    explorer.child = Some(Child { id: "home".into(), source_id: String::new(), returning: true });
+    explorer.navigation_feedback(&proto::NavigationStatus {
+        goal_id: "home".into(), status: proto::GoalStatus::Failed as i32,
+        input_unavailable: true, ..Default::default()
+    }).unwrap();
+    assert_eq!(explorer.return_failures, 0);
+}

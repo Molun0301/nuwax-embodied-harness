@@ -359,6 +359,8 @@ impl Explorer {
             proto::GoalStatus::try_from(status.status).unwrap_or(proto::GoalStatus::Unspecified);
         let feedback = match phase {
             proto::GoalStatus::Succeeded => ExplorationGoalFeedback::Reached,
+            proto::GoalStatus::Failed if status.input_unavailable =>
+                ExplorationGoalFeedback::InputUnavailable(status.message.clone()),
             proto::GoalStatus::Failed => ExplorationGoalFeedback::Failed(status.message.clone()),
             proto::GoalStatus::Cancelled
             | proto::GoalStatus::Replaced
@@ -387,6 +389,9 @@ impl Explorer {
             }
             self.finish(ExplorationStopReason::UserCancelled)?;
         } else if child.returning {
+            if matches!(feedback, ExplorationGoalFeedback::InputUnavailable(_)) {
+                return Ok(());
+            }
             self.return_failures += 1;
             if self.return_failures
                 > self

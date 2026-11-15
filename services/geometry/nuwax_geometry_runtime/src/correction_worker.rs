@@ -170,8 +170,7 @@ impl Rebuilt {
             };
             if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
                 &mut self.kernel, &input, self.config.compute, 0)? {
-                self.grid = Some(PersistentOccupancyGrid::stage_observation(
-                    self.grid.as_ref(), &candidate.latest_frame_occupancy)?);
+                PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
             }
             #[cfg(test)]
             if let Some(probe) = &self.probe {

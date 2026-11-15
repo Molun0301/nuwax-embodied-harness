@@ -55,3 +55,29 @@ async fn committed_cumulative_map_reaches_person_follow_decoder_once_per_revisio
     assert_eq!(capture.0.lock().unwrap().len(), 2);
     mapper.shutdown().await.unwrap();
 }
+
+#[test]
+fn three_dimensional_occupancy_is_sent_at_most_once_per_second_keeping_the_latest() {
+    let map = |stamp| proto::MapUpdate {
+        meta: Some(proto::OccupancyGridMeta { timestamp_ns: stamp, ..Default::default() }),
+        ..Default::default()
+    };
+    let start = tokio::time::Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
+    let mut rate = OccupancyRate { limited: true, sent_at: None, pending: None };
+    assert_eq!(rate.offer(map(1), at(0)), Some(map(1)));
+    assert_eq!(rate.offer(map(2), at(300)), None);
+    assert_eq!(rate.offer(map(3), at(600)), None);
+    assert_eq!(rate.due_at(), Some(at(1000)));
+    assert_eq!(rate.take_due(at(1000)), Some(map(3)), "到点补发间隔内最新的一张");
+    assert_eq!(rate.due_at(), None);
+    assert_eq!(rate.offer(map(4), at(1500)), None);
+    assert_eq!(rate.due_at(), Some(at(2000)));
+    assert_eq!(rate.offer(map(5), at(2000)), Some(map(5)), "间隔已满的新栅格直接发并替换待发");
+    assert_eq!(rate.due_at(), None);
+    let mut planar = OccupancyRate { limited: false, sent_at: None, pending: None };
+    for (stamp, ms) in [(1, 0), (2, 10), (3, 20)] {
+        assert_eq!(planar.offer(map(stamp), at(ms)), Some(map(stamp)), "二维链每次都发");
+    }
+    assert_eq!(planar.due_at(), None);
+}

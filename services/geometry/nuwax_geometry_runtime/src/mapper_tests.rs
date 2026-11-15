@@ -29,6 +29,48 @@ fn config() -> MapperConfig {
     }
 }
 
+/// 二千乘二千持久栅格上按建图线程的提交步骤计时：并入观测、记栅格时间、发布栅格与掩码。
+fn g3_commit_timing(observation_size: u32, observation_origin: f64) -> serde_json::Value {
+    let mut worker = Worker::new(
+        960, config(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut whole = nuwax_mapping::OccupancyGrid::with_frame(2000, 2000, 0.05, "map");
+    whole.data.fill(0);
+    worker.grid = Some(PersistentOccupancyGrid::from_grid(whole).unwrap());
+    let mut observation = nuwax_mapping::OccupancyGrid::with_frame(observation_size, observation_size, 0.05, "map");
+    observation.origin = [observation_origin, observation_origin, 0.];
+    observation.data.fill(0);
+    let mut durations = Vec::new();
+    for i in 1..=25 {
+        observation.ts = i as f64;
+        let started = Instant::now();
+        PersistentOccupancyGrid::merge_or_create(&mut worker.grid, &observation).unwrap();
+        worker.grid_stamp = i * 1_000_000_000;
+        worker.publish_grid().unwrap();
+        durations.push(started.elapsed().as_secs_f64() * 1000.);
+    }
+    serde_json::json!({ "栅格尺寸": [2000, 2000], "观测尺寸": [observation_size, observation_size],
+        "提交次数": durations.len(),
+        "平均毫秒": durations.iter().sum::<f64>() / durations.len() as f64,
+        "最小毫秒": durations.iter().copied().fold(f64::INFINITY, f64::min),
+        "最慢毫秒": durations.iter().copied().fold(0., f64::max) })
+}
+
+#[test]
+#[ignore = "G3二千乘二千栅格提交耗时，手动执行"]
+fn g3_grid_commit_benchmark() {
+    // 整图观测沿用基线口径；局部观测近似单帧水平扫描只覆盖雷达周围一块。
+    let result = serde_json::json!({ "整图观测": g3_commit_timing(2000, 0.),
+        "局部观测": g3_commit_timing(400, 40.) });
+    let root = PathBuf::from(std::env::var_os("NUWAX_G3_METRICS_DIR").unwrap());
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("栅格提交.json"), serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    eprintln!("G3栅格提交：{result}");
+}
+
 pub(crate) fn benchmark_frame(stamp: u64) -> MappingFrame {
     let x = (stamp / 1_000_000_000 - 1) as f64 * 0.001;
     let points_body = (0..12).flat_map(|a| (0..12).flat_map(move |b| {
@@ -51,7 +93,7 @@ fn g2_replay_latency_benchmark() {
         957, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     for i in 1..=1000 { worker.frame(benchmark_frame(i * 1_000_000_000)).unwrap(); }
     let prefix = worker.cloud.scan_prefix().unwrap();
@@ -99,7 +141,7 @@ fn rejected_native_correction_stops_once_and_mapping_continues() {
         937, MapperConfig { correction_backend: "native_pgo".into(), ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let mut stopped = worker.correction_stopped.subscribe();
     let mut rejected = room_frame(937, 1_000_000_000);
@@ -122,7 +164,7 @@ fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
         942, MapperConfig { correction_backend: "library_pgo".into(), ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.frame(room_frame(942, 1_000_000_000)).unwrap();
     let saved = worker.snapshot().unwrap();
@@ -150,7 +192,7 @@ fn failed_replay_preserves_the_current_map() {
         938, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.frame(room_frame(938, 1_000_000_000)).unwrap();
     let before = worker.snapshot().unwrap();
@@ -168,7 +210,7 @@ fn failed_replay_preserves_the_current_map() {
 }
 
 #[test]
-fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates() {
+fn forbidden_publication_failure_warns_after_replay_and_keeps_grid_updates() {
     use std::{io::Write, sync::{Arc, Mutex}};
     #[derive(Clone)]
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -183,12 +225,12 @@ fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates()
         948, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
     worker.frame(room_frame(948, first)).unwrap();
     let before = worker.cloud.snapshot().revision;
-    let mut physical = worker.raw_grid.subscribe();
+    let maps = worker.maps.subscribe();
     let _ = worker.forbidden_status.send_replace(Err("测试禁行区读取失败".into()));
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer = LogBuffer(buffer.clone());
@@ -200,10 +242,9 @@ fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates()
     }).expect("禁行区发布失败不能使已完成重建的校正失败");
     assert_eq!(worker.cloud.snapshot().revision, before + 1);
     assert_eq!(worker.map_from_odom, Isometry3::translation(0.2, 0., 0.));
-    assert!(physical.has_changed().unwrap());
-    let mut expected = kernel_grid_to_proto(&worker.grid.as_ref().unwrap().grid, &worker.config.map_name);
-    expected.meta.as_mut().unwrap().timestamp_ns = worker.grid_stamp;
-    assert_eq!(physical.borrow_and_update().as_ref(), Some(&expected));
+    // 物理栅格只随已发布的地图更新给出；禁行区读取失败期间地图不发布，持久栅格照常替换。
+    assert!(!maps.has_changed().unwrap());
+    assert_eq!(worker.grid_stamp, first);
     assert!(worker.correction_stopped.borrow().is_none());
     let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
     let warnings: Vec<serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str(line).ok())
@@ -211,9 +252,8 @@ fn forbidden_publication_failure_warns_after_replay_and_keeps_physical_updates()
     assert_eq!(warnings.len(), 1, "重放后只记录一次禁行区警告：{text}");
     assert_eq!(warnings[0]["level"], "WARN");
     worker.frame(room_frame(948, first + 1_000_000_000)).unwrap();
-    assert!(physical.has_changed().unwrap(), "后续在线帧也须先更新物理栅格");
-    assert_eq!(physical.borrow().as_ref().unwrap().meta.as_ref().unwrap().timestamp_ns,
-        first + 1_000_000_000);
+    assert!(!maps.has_changed().unwrap());
+    assert_eq!(worker.grid_stamp, first + 1_000_000_000, "后续在线帧仍并入持久栅格");
     assert!(worker.failure.is_none());
 }
 
@@ -223,7 +263,7 @@ fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map(
         945, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
     worker.frame(room_frame(945, first)).unwrap();
@@ -256,7 +296,7 @@ fn replayed_timeline_keeps_centimeter_updates_small_after_robot_motion() {
         947, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
     assert!(worker.built_timeline.is_none());
@@ -300,7 +340,7 @@ fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_be
         949, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     assert_eq!(worker.built_corrections, vec![(0, Isometry3::identity())]);
     worker.frame(room_frame(949, 1_000_000_000)).unwrap();
@@ -335,7 +375,7 @@ fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_be
         950, config(), Some(snapshot), true,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     assert_eq!(loaded.built_corrections, vec![(0, loaded.map_from_odom)]);
     assert!(loaded.corrector.is_none());
@@ -348,7 +388,7 @@ fn pgo_replay_threshold_combines_rotation_and_translation_and_checks_every_keyfr
             946, config(), None, false,
             watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
             watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+            watch::channel(None).0, watch::channel(Ok(())).0, false,
         ).unwrap();
         let first = 1_000_000_000;
         worker.frame(room_frame(946, first)).unwrap();
@@ -374,7 +414,7 @@ pub(crate) fn frames_without_candidate_keep_session_healthy(
         frame.session_id, MapperConfig { backend, ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
         watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.corrector = Some(CorrectionWorker::start(worker.session_id, worker.config.clone(), corrector).unwrap());
     // 辅助帧先真实提交地图，但不调用校正器；后继主帧必须跳过旧地图。
@@ -421,7 +461,7 @@ fn pgo_rebuild_keeps_root_and_block_versions_accepted_by_navigation() {
             session, MapperConfig { backend, ..config() }, None, false,
             watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
             watch::channel(Isometry3::identity()).0, watch::channel(None).0,
-            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+            watch::channel(None).0, watch::channel(Ok(())).0, false,
         ).unwrap();
         let mut receiver = Receiver::new(Repository::temporary().unwrap());
         let receive = |receiver: &mut Receiver, worker: &Worker| {
@@ -892,6 +932,52 @@ async fn failed_forbidden_read_is_checked_again_with_unchanged_metadata() {
     assert_eq!(mapper.occupancy(true).unwrap().data, raw.data);
     assert_eq!(mapper.snapshot().await.unwrap().occupancy.unwrap(), raw);
     mapper.shutdown().await.unwrap();
+}
+
+#[test]
+fn forbidden_mask_is_rasterized_again_only_when_zones_or_grid_layout_change() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join("forbidden_zones.json");
+    let zone = r#"[{"id":"区域","shape":"rectangle","mode":"inside","vertices":[{"x":1.2,"y":0.2},{"x":1.8,"y":0.8}]}]"#;
+    std::fs::write(&path, zone).unwrap();
+    let mut worker = Worker::new(
+        949, MapperConfig { backend: MappingBackendSpec::SlamToolbox, ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut mask = worker.forbidden.subscribe();
+    let effective = |worker: &Worker| worker.maps.borrow().as_ref().unwrap().data.clone();
+    let overlay = |raw: &[u8], mask: &[u8]| -> Vec<u8> {
+        raw.iter().zip(mask).map(|(raw, mask)| if *mask == 100 { 100 } else { *raw }).collect()
+    };
+    worker.grid(kernel_grid_to_proto(&test_grid([0., 0.], &[0, 0, 0, 0], 1.), "实测地图")).unwrap();
+    let (reply, _) = oneshot::channel();
+    worker.command(Command::Forbidden(path.clone(), reply)).unwrap();
+    assert!(mask.has_changed().unwrap());
+    let first = mask.borrow_and_update().as_ref().unwrap().data.clone();
+    assert!(first.contains(&100) && first.contains(&0));
+    assert_eq!(effective(&worker), first);
+    // 原点、尺寸不变的新栅格沿用上次掩码，掩码通道不重发。
+    worker.grid(kernel_grid_to_proto(&test_grid([0., 0.], &[0, 0, 0, 100], 2.), "实测地图")).unwrap();
+    assert!(!mask.has_changed().unwrap());
+    assert_eq!(worker.maps.borrow().as_ref().unwrap().raw_data, [0, 0, 0, 100]);
+    assert_eq!(effective(&worker), overlay(&[0, 0, 0, 100], &first));
+    // 原点左移一格、尺寸加一格：重新栅格化后禁行格仍落在同一处世界坐标。
+    worker.grid(kernel_grid_to_proto(&test_grid([-1., 0.], &[0; 5], 3.), "实测地图")).unwrap();
+    assert!(mask.has_changed().unwrap(), "栅格原点与尺寸变化须重新栅格化");
+    let shifted: Vec<u8> = std::iter::once(0).chain(first.iter().copied()).collect();
+    assert_eq!(mask.borrow_and_update().as_ref().unwrap().data, shifted);
+    assert_eq!(effective(&worker), shifted);
+    // 文件改写但禁行区内容相同，不重新栅格化。
+    std::fs::write(&path, format!("{zone} ")).unwrap();
+    worker.refresh_forbidden(false).unwrap();
+    assert!(!mask.has_changed().unwrap());
+    std::fs::write(&path, "[]").unwrap();
+    worker.refresh_forbidden(false).unwrap();
+    assert!(mask.has_changed().unwrap(), "禁行区内容变化须重新栅格化");
+    assert_eq!(mask.borrow_and_update().as_ref().unwrap().data, [0; 5]);
+    assert_eq!(effective(&worker), [0; 5]);
 }
 
 #[test]

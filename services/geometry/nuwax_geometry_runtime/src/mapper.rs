@@ -156,7 +156,6 @@ pub struct Mapper {
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
     forbidden_status: watch::Receiver<Result<(), String>>,
     recent_cloud: watch::Receiver<Option<RecentPublication>>,
-    raw_grid: watch::Receiver<Option<proto::OccupancyGrid>>,
     worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 enum Input {
@@ -228,7 +227,6 @@ impl Mapper {
         let (transform_tx, transform) = watch::channel(Isometry3::identity());
         let (forbidden_tx, forbidden) = watch::channel(None);
         let (recent_cloud_tx, recent_cloud) = watch::channel(None);
-        let (raw_grid_tx, raw_grid) = watch::channel(None);
         let mut worker = Worker::new(
             session_id,
             config.clone(),
@@ -240,7 +238,6 @@ impl Mapper {
             transform_tx,
             forbidden_tx,
             recent_cloud_tx,
-            raw_grid_tx,
             forbidden_status_tx,
             attach_shared,
         )?;
@@ -295,7 +292,6 @@ impl Mapper {
             forbidden,
             forbidden_status,
             recent_cloud,
-            raw_grid,
             worker: Arc::new(std::sync::Mutex::new(Some(worker_handle))),
         }))
     }
@@ -344,10 +340,8 @@ impl Mapper {
     pub fn has_occupancy(&self) -> bool {
         self.maps.borrow().is_some()
     }
+    /// 物理栅格与有效栅格都取自已发布的同一份地图更新。
     pub fn occupancy(&self, include_forbidden: bool) -> Option<proto::OccupancyGrid> {
-        if !include_forbidden {
-            return self.raw_grid.borrow().clone();
-        }
         self.maps.borrow().as_ref().map(|map| proto::OccupancyGrid {
             map_name: map.map_name.clone(),
             meta: map.meta.clone(),
@@ -487,7 +481,7 @@ struct Worker {
     forbidden_status: watch::Sender<Result<(), String>>,
     recent_cloud: watch::Sender<Option<RecentPublication>>,
     last_input: Option<MappingBackendInput>,
-    raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
+    forbidden_cells: Option<ForbiddenCells>,
     grid_stamp: u64,
     latest_odometry: Option<proto::Pose>,
     planar_resume_unavailable_reason: Option<String>,
@@ -504,7 +498,6 @@ impl Worker {
         transform: watch::Sender<Isometry3<f64>>,
         forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
         recent_cloud: watch::Sender<Option<RecentPublication>>,
-        raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
         forbidden_status: watch::Sender<Result<(), String>>,
         attach_shared: bool,
     ) -> Result<Self, Status> {
@@ -591,7 +584,7 @@ impl Worker {
             forbidden_status,
             recent_cloud,
             last_input: None,
-            raw_grid,
+            forbidden_cells: None,
             latest_odometry: snapshot
                 .as_ref()
                 .and_then(|s| s.last_pose.as_ref())
@@ -728,7 +721,11 @@ impl Worker {
         {
             return Ok(());
         }
-        self.forbidden_zones = crate::forbidden_zones::read(path)?;
+        let zones = crate::forbidden_zones::read(path)?;
+        if zones != self.forbidden_zones {
+            self.forbidden_cells = None;
+        }
+        self.forbidden_zones = zones;
         self.forbidden_metadata = metadata;
         let _ = self.forbidden_status.send_replace(Ok(()));
         self.publish_grid()
@@ -843,10 +840,7 @@ impl Worker {
         )?;
         let committed_this_frame = candidate.is_some();
         if let Some(candidate) = candidate {
-            self.grid = Some(PersistentOccupancyGrid::stage_observation(
-                self.grid.as_ref(),
-                &candidate.latest_frame_occupancy,
-            )?);
+            PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
             self.grid_stamp = stamp;
             self.cloud.commit(stamp)?;
             self.fine_root.send_replace(self.cloud.surface());
@@ -973,10 +967,7 @@ impl Worker {
             if let Some(candidate) =
                 mapping_backend::flush_candidate(kernel, input, self.config.compute)?
             {
-                self.grid = Some(PersistentOccupancyGrid::stage_observation(
-                    self.grid.as_ref(),
-                    &candidate.latest_frame_occupancy,
-                )?);
+                PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
                 self.grid_stamp = input.source_timestamp_ns;
                 flushed = true;
             }
@@ -1015,25 +1006,31 @@ impl Worker {
         let Some(grid) = self.grid.as_ref() else {
             return Ok(());
         };
-        let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
-        raw.meta.as_mut().unwrap().timestamp_ns = self.grid_stamp;
-        self.raw_grid.send_replace(Some(raw.clone()));
-        let mut data = raw.data.clone();
-        let mut mask = vec![0; data.len()];
         self.forbidden_status.borrow().clone()?;
-        if self.forbidden_path.is_some() {
-            crate::forbidden_zones::overlay_zones(&self.forbidden_zones, &grid.grid, &mut mask)?;
-            for (index, value) in mask.iter().enumerate() {
-                if *value == 100 {
-                    data[index] = 100
-                }
+        let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
+        let meta = raw.meta.as_mut().unwrap();
+        meta.timestamp_ns = self.grid_stamp;
+        let layout = (meta.origin_x, meta.origin_y, meta.width, meta.height);
+        // 禁行区内容与栅格原点、尺寸都没变时沿用上次的掩码，掩码通道也不重发。
+        if self.forbidden_cells.as_ref().is_none_or(|cells| cells.layout != layout) {
+            let mut mask = vec![0; raw.data.len()];
+            if self.forbidden_path.is_some() {
+                crate::forbidden_zones::overlay_zones(&self.forbidden_zones, &grid.grid, &mut mask)?;
             }
+            let blocked = mask.iter().enumerate().filter(|(_, value)| **value == 100)
+                .map(|(index, _)| index).collect();
+            self.forbidden.send_replace(Some(proto::OccupancyGrid {
+                map_name: raw.map_name.clone(),
+                meta: raw.meta.clone(),
+                data: mask,
+            }));
+            self.forbidden_cells = Some(ForbiddenCells { layout, blocked });
         }
-        self.forbidden.send_replace(Some(proto::OccupancyGrid {
-            map_name: raw.map_name.clone(),
-            meta: raw.meta.clone(),
-            data: mask,
-        }));
+        // 有效栅格 = 物理栅格的一份拷贝再叠加禁行格；没有禁行格时只有这一次拷贝。
+        let mut data = raw.data.clone();
+        for &index in &self.forbidden_cells.as_ref().unwrap().blocked {
+            data[index] = 100;
+        }
         self.maps.send_replace(Some(proto::MapUpdate {
             map_name: raw.map_name,
             meta: raw.meta,
@@ -1042,6 +1039,11 @@ impl Worker {
         }));
         Ok(())
     }
+}
+/// 上次栅格化禁行掩码时的栅格原点与尺寸，以及掩码里的禁行格下标。
+struct ForbiddenCells {
+    layout: (f64, f64, u32, u32),
+    blocked: Vec<usize>,
 }
 impl Drop for Worker {
     fn drop(&mut self) { self.corrector.take(); }

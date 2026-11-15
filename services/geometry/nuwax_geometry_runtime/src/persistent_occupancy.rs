@@ -23,21 +23,25 @@ pub(crate) struct PersistentOccupancyGrid {
 }
 
 impl PersistentOccupancyGrid {
-    /// 水平扫描只提供本帧真实射线，持久图在原拥有方内累积。
-    pub(crate) fn stage_observation(
-        current: Option<&Self>,
-        latest: &OccupancyGrid,
-    ) -> Result<Self, String> {
-        let mut staged = match current {
-            Some(current) => current.clone(),
+    /// 水平扫描只提供本帧真实射线，持久图在原拥有方内原地累积；还没有持久图时按本帧新建。
+    /// 合并出错时会话或本次重放随之失败，不保留合并前的副本。
+    pub(crate) fn merge_or_create(slot: &mut Option<Self>, latest: &OccupancyGrid) -> Result<(), String> {
+        match slot {
+            Some(grid) => grid.merge_observation(latest).map(drop),
             None => {
-                let mut unknown = latest.clone();
-                unknown.data.fill(-1);
-                Self::from_grid(unknown)?
+                *slot = Some(Self::from_observation(latest)?);
+                Ok(())
             }
-        };
-        staged.merge_observation(latest)?;
-        Ok(staged)
+        }
+    }
+
+    /// 以本帧范围的全未知图为起点并入本帧。
+    pub(crate) fn from_observation(latest: &OccupancyGrid) -> Result<Self, String> {
+        let mut unknown = latest.clone();
+        unknown.data.fill(-1);
+        let mut grid = Self::from_grid(unknown)?;
+        grid.merge_observation(latest)?;
+        Ok(grid)
     }
 
     /// 缺测不投票；同一源帧的再次物化也不能重复确认障碍或清除。

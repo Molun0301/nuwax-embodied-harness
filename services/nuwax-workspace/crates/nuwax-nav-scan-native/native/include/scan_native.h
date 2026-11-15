@@ -56,6 +56,7 @@ int nuwax_scan_map_ingest(void *map,const double *points,size_t count,const uint
 void nuwax_scan_map_seed_occupied(void *map,const double *points,size_t count,const double body[3]);
 void *nuwax_scan_map_snapshot(const void *map);
 int nuwax_scan_snapshot_affects(const void *current,const void *previous,const void *trajectory,double from);
+void* nuwax_scan_snapshot_ground(const void* snapshot,const ScanConfig* config,const double* ground,size_t count);
 void nuwax_scan_snapshot_destroy(void *snapshot);
 void nuwax_scan_terminal_points(const void *snapshot,const ScanConfig *config,const double goal[3],
     double yaw,double tolerance,ScanTerminalPoints *output);

@@ -46,7 +46,8 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
       if(x>=0&&x<width&&y>=0&&y<height)ground_points[y*width+x].push_back(points[i+2]);
     }
   }
-  const auto& body=md_.sliding_map_frame_pos_;
+  const auto& data=collisionData();
+  const auto& body=snapshot_?snapshot_->clearance_origin:md_.sliding_map_frame_pos_;
   const int start_x=int(std::floor(body.x()/r))-min_x,start_y=int(std::floor(body.y()/r))-min_y;
   const int start=start_y*width+start_x;
   std::vector<double> ground(size);
@@ -84,7 +85,7 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
     while(z0<=z1&&(z0+1.)*r<=low)++z0;
     while(z0<=z1&&z1*r>=high)--z1;
     const int column=getLocalIndex(gx,0)*height+getLocalIndex(gy,1);
-    const auto* bits=md_.occupancy_bits_.data()+column*md_.occupancy_words_per_column_;
+    const auto* bits=data.occupancy_bits_.data()+column*data.occupancy_words_per_column_;
     for(int z=z0;z<=z1&&!occupied;) {
       const int local=getLocalIndex(z,2),count=std::min({z1-z+1,nz-local,64-local%64});
       std::uint64_t mask=~std::uint64_t{0}<<(local%64);
@@ -92,8 +93,8 @@ BodyClearanceField GridMap::buildClearanceField(const ScanConfig& config,
       auto hits=bits[local/64]&mask;
       while(hits) {
         const int lz=(local/64)*64+__builtin_ctzll(hits);
-        const auto support=md_.support_member_max_z_.find(column*nz+lz);
-        if(support==md_.support_member_max_z_.end()||!(support->second<low)){occupied=true;break;}
+        const auto support=data.support_member_max_z_.find(column*nz+lz);
+        if(support==data.support_member_max_z_.end()||!(support->second<low)){occupied=true;break;}
         hits&=hits-1;
       }
       z+=count;

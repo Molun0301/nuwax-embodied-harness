@@ -18,7 +18,13 @@ using Eigen::Vector3d;
 namespace {
 constexpr double MINIMUM_DEVIATION_M = 0.20;
 constexpr double REPLAN_REMAINING_SECONDS = 2.5;
-using Snapshot = std::shared_ptr<const GridMap::CollisionSnapshot>;
+struct Snapshot : std::shared_ptr<const GridMap::CollisionSnapshot> {
+  std::shared_ptr<const SurfaceObstacleLayer> surface;
+  std::shared_ptr<const BusinessConstraintMask> business;
+  Snapshot(std::shared_ptr<const GridMap::CollisionSnapshot> value,
+      std::shared_ptr<const SurfaceObstacleLayer> s,std::shared_ptr<const BusinessConstraintMask> b)
+      :std::shared_ptr<const GridMap::CollisionSnapshot>(std::move(value)),surface(std::move(s)),business(std::move(b)){}
+};
 struct MapOwner {
   ScanConfig config;
   GridMap map;
@@ -150,7 +156,15 @@ extern "C" void nuwax_scan_map_seed_occupied(void* p,const double* points,size_t
 }
 extern "C" void* nuwax_scan_map_snapshot(const void* p){
   const auto& owner=*static_cast<const MapOwner*>(p);
-  return new Snapshot(owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get()));
+  return new Snapshot(owner.map.collisionSnapshot(owner.config,owner.surface.get(),owner.business.get()),owner.surface,owner.business);
+}
+extern "C" void* nuwax_scan_snapshot_ground(const void* p,const ScanConfig* config,const double* ground,size_t count) {
+  const auto& base=*static_cast<const Snapshot*>(p);
+  auto surface=std::make_shared<SurfaceObstacleLayer>(*base.surface,ground,count);
+  GridMap query;query.bindCollisionSnapshot(base);
+  auto view=query.groundSnapshot(*config,surface.get(),base.business.get(),
+      [surface](const Vector3d& x,double yaw,double pad,std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){return surface->contacts(x,yaw,pad,hits,initial,planar);});
+  return new Snapshot(std::move(view),std::move(surface),base.business);
 }
 extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previous,const void* trajectory,double from) {
   GridMap now,before;now.bindCollisionSnapshot(*static_cast<const Snapshot*>(current));before.bindCollisionSnapshot(*static_cast<const Snapshot*>(previous));

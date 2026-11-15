@@ -127,6 +127,7 @@ impl MapWorker {
         let mut owner: Option<MapOwner> = None;
         let mut previous: Option<MapInput> = None;
         let mut prepared: Option<PreparedMap> = None;
+        let mut filtered_ground: Option<Vec<[f64; 3]>> = None;
         let mut static_view: Option<([f64; 2], crate::native_map::NativeMap)> = None;
         Ok(Self(Worker::new(
             "nav-map-maintenance",
@@ -162,22 +163,19 @@ impl MapWorker {
                     owner = None;
                     prepared = None;
                     static_view = None;
+                    filtered_ground = None;
                 }
                 let rebuilt = owner.is_none();
                 if rebuilt {
                     owner = Some(MapOwner::new(&input.config)?);
                 }
-                let changed = !same_geometry || !same_frame || !same_pose || prepared.is_none();
-                if changed {
+                let window_moved = static_window_moved(&static_view, &input);
+                let changed = !same_geometry || !same_frame || window_moved || prepared.is_none();
+                if changed || !same_pose {
                     let c = input.config;
                     let native = static_surface_view(&mut static_view, &input, same_static_geometry)?;
                     let (recent_ground, recent_obstacles) =
                         input.source.navigation_recent_samples();
-                    let obstacles: Vec<_> = native
-                        .obstacles
-                        .iter().copied()
-                        .chain(recent_obstacles)
-                        .collect();
                     let ground = crate::native_map::collision_ground(
                         native.static_collision_ground.clone(),
                         recent_ground,
@@ -185,6 +183,17 @@ impl MapWorker {
                         input.pose,
                         input.yaw,
                     );
+                    if !changed {
+                        if filtered_ground.as_ref() != Some(&ground) {
+                            let current = prepared.as_mut().unwrap();
+                            current.snapshot = current.snapshot.with_ground(&c, &ground);
+                        }
+                    } else {
+                    let obstacles: Vec<_> = native
+                        .obstacles
+                        .iter().copied()
+                        .chain(recent_obstacles)
+                        .collect();
                     let map = owner.as_mut().unwrap();
                     if let Some(initialize) = initializer {
                         initialize(
@@ -226,6 +235,8 @@ impl MapWorker {
                         changed: false,
                         checked_curve: None,
                     });
+                    }
+                    filtered_ground = Some(ground);
                 }
                 let mut output = prepared.as_ref().unwrap().clone();
                 output.epoch = input.epoch;
@@ -255,7 +266,11 @@ impl MapWorker {
         self.0.take()
     }
 }
-/// 静态转换仅随来源几何或窗口锚点变化；机身相关处理仍留在原逐拍分支。
+fn static_window_moved(cached: &Option<([f64; 2], crate::native_map::NativeMap)>, input: &MapInput) -> bool {
+    cached.as_ref().is_none_or(|(anchor, _)|
+        (input.pose[0] - anchor[0]).hypot(input.pose[1] - anchor[1]) > input.config.planning_horizon * 0.25)
+}
+/// 静态窗口按原锚点阈值更新；普通位姿只更新地面派生视图。
 fn static_surface_view<'a>(
     cached: &'a mut Option<([f64; 2], crate::native_map::NativeMap)>,
     input: &MapInput,
@@ -263,8 +278,7 @@ fn static_surface_view<'a>(
 ) -> Result<&'a crate::native_map::NativeMap, String> {
     let c = input.config;
     let d = c.planning_horizon * 0.25;
-    let moved = cached.as_ref().is_none_or(|(anchor, _)|
-        (input.pose[0] - anchor[0]).hypot(input.pose[1] - anchor[1]) > d);
+    let moved = static_window_moved(cached, input);
     if !same_geometry || moved {
         let anchor = if moved { [input.pose[0], input.pose[1]] } else { cached.as_ref().unwrap().0 };
         let radius = c.planning_horizon
@@ -506,3 +520,10 @@ mod static_window_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "local_map_full_reference.rs"]
+mod full_reference;
+#[cfg(test)]
+#[path = "local_map_cache_tests.rs"]
+mod cache_tests;

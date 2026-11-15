@@ -212,6 +212,7 @@ extern "C" {
         trajectory: *const c_void,
         from: f64,
     ) -> i32;
+    fn nuwax_scan_snapshot_ground(map: *const c_void, config: *const Config, ground: *const f64, count: usize) -> *mut c_void;
     fn nuwax_scan_snapshot_destroy(map: *mut c_void);
     fn nuwax_scan_terminal_points(
         map: *const c_void, config: *const Config, goal: *const f64,
@@ -363,6 +364,12 @@ impl Drop for SnapshotHandle {
 #[derive(Clone)]
 pub struct CollisionSnapshot(Arc<SnapshotHandle>);
 impl CollisionSnapshot {
+    /// 单独替换机身下地面过滤视图，概率地图与实体索引继续共享。
+    pub fn with_ground(&self, config: &Config, ground: &[[f64; 3]]) -> Self {
+        Self(Arc::new(SnapshotHandle(NonNull::new(unsafe {
+            nuwax_scan_snapshot_ground(self.0.0.as_ptr(), config, ground.as_ptr().cast(), ground.len())
+        }).unwrap())))
+    }
     /// 为要求朝向的目标选择停点。
     pub fn terminal_points(
         &self, config: &Config, goal: [f64; 3], yaw: f64, tolerance: f64,

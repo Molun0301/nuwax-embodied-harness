@@ -1104,7 +1104,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    /// 子目标执行期间每张新表面快照核对一次：所选前沿格不在前沿索引里或已被排除时返回真。
+    /// 子目标执行期间每张新表面快照核对一次：所选前沿格周围水平黑名单半径、竖直该候选高度范围以内
+    /// 已没有任何前沿格时返回真；范围内还有前沿格就继续走原目标。
     fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
         let Some(snapshot) = self.receiver.snapshot()? else {
             return Ok(false);
@@ -1116,15 +1117,14 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             return Ok(false);
         }
         selected.checked = Arc::downgrade(&snapshot);
-        let (cell, support, vertical_radius) =
-            (selected.frontier_cell, selected.support_xyz, selected.vertical_radius_m);
+        let (cell, vertical_radius) = (selected.frontier_cell, selected.vertical_radius_m);
         let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
             boundary.vertices().iter().map(|point| [point.x, point.y]).collect()
         });
-        let frontier = snapshot
-            .is_frontier(cell, &boundary)
+        let near = snapshot
+            .frontier_near(cell, self.blacklist_radius_m, vertical_radius, &boundary)
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        Ok(!frontier || self.excluded(support, vertical_radius))
+        Ok(!near)
     }
 
     fn frontier_snapshot(&self) -> Vec<FrontierGoal> {

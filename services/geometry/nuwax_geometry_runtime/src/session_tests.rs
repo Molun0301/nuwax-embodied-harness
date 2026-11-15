@@ -853,7 +853,7 @@ async fn replacement_sends_new_goal_without_cancel_and_accepts_its_execution() {
 
 #[tokio::test]
 async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel() {
-    use crate::explorer::tests::{distant_hole, floor, goal_cell, vanishing_fixture, vanishing_pose};
+    use crate::explorer::tests::{distant_hole, floor, vanishing_fixture, vanishing_pose};
     use crate::nav_bridge::tests::Capture;
     use nuwax_codec::lcm::schema;
     let root = std::env::temp_dir().join(format!("e2-vanish-{}", uuid::Uuid::new_v4()));
@@ -877,11 +877,11 @@ async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel()
     };
     let (mut explorer, partial) = vanishing_fixture();
     let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial), Ok(())).unwrap();
-    let (first_id, goal) = first.goal.clone().unwrap();
+    let (first_id, _) = first.goal.clone().unwrap();
     session.exploration_update(first).await;
     sent(1).await.unwrap();
     // 前沿消失：新子目标直接替换当前导航目标，会话不发取消。
-    let replaced = explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole(goal_cell(&goal))), Ok(())).unwrap();
+    let replaced = explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole()), Ok(())).unwrap();
     let (second_id, _) = replaced.goal.clone().unwrap();
     session.exploration_update(replaced).await;
     sent(2).await.unwrap();

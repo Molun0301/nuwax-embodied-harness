@@ -119,10 +119,25 @@ impl SurfaceSnapshot {
         }).collect())
     }
 
-    /// 某个前沿格是否仍在本快照的前沿索引里；索引与选点共用，只局部重算变化范围。
-    pub fn is_frontier(&self, cell: [i32; 3], boundary: &[[f64; 2]]) -> Result<bool, SurfaceError> {
+    /// 某格中心水平`horizontal_m`、竖直`vertical_m`以内是否还有前沿格；索引与选点共用，只局部重算变化范围。
+    pub fn frontier_near(
+        &self,
+        cell: [i32; 3],
+        horizontal_m: f64,
+        vertical_m: f64,
+        boundary: &[[f64; 2]],
+    ) -> Result<bool, SurfaceError> {
         validate_boundary(boundary)?;
-        Ok(self.frontier_index(boundary).gains.contains_key(&(cell[0], cell[1], cell[2])))
+        let center = self.cell_position((cell[0], cell[1], cell[2]));
+        let reach = (horizontal_m / f64::from(self.config().voxel_size)).ceil() as i32 + 1;
+        let index = self.frontier_index(boundary);
+        let columns = (cell[0].saturating_sub(reach), i32::MIN, i32::MIN)
+            ..=(cell[0].saturating_add(reach), i32::MAX, i32::MAX);
+        Ok(index.gains.range(columns).any(|(&key, _)| {
+            let point = self.cell_position(key);
+            (point[0] - center[0]).hypot(point[1] - center[1]) <= horizontal_m + 1e-9
+                && (point[2] - center[2]).abs() <= vertical_m + 1e-9
+        }))
     }
 
     /// 只读取已完成计算的统计；等待下一次查询的局部更新返回空。

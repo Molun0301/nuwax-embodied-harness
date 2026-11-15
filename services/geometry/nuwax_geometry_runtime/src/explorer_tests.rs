@@ -857,9 +857,9 @@ fn vanishing_config() -> SurfaceNavigationConfig {
     )
     .unwrap()
 }
-/// 2米见方地面去掉`missing`选中的0.1米格，地面高0.05米。
+/// 3.2×2米地面去掉`missing`选中的0.1米格，地面高0.05米。
 pub(crate) fn floor(missing: impl Fn(i32, i32) -> bool) -> Arc<SurfaceSnapshot> {
-    let points: Vec<_> = (0..20)
+    let points: Vec<_> = (0..32)
         .flat_map(|x| (0..20).map(move |y| (x, y)))
         .filter(|&(x, y)| !missing(x, y))
         .map(|(x, y)| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05))
@@ -868,7 +868,7 @@ pub(crate) fn floor(missing: impl Fn(i32, i32) -> bool) -> Arc<SurfaceSnapshot> 
     geometry.robot_height = 0.45;
     Arc::new(SurfaceSnapshot::from_points(&points, geometry, 0.1).unwrap())
 }
-/// 三维探索：边界[0.5,1.5]²，初始地面只到x=1.2米，前沿在已知地面东缘。
+/// 三维探索：边界x∈[0.5,2.9]、y∈[0.5,1.5]，黑名单半径0.75米，初始地面只到x=1.2米，前沿在已知地面东缘。
 pub(crate) fn vanishing_fixture() -> (Explorer, Arc<SurfaceSnapshot>) {
     let config = vanishing_config();
     let mut explorer = started_with_max_goals(10);
@@ -882,12 +882,12 @@ pub(crate) fn vanishing_fixture() -> (Explorer, Arc<SurfaceSnapshot>) {
     .unwrap();
     let boundary = ExplorationBoundary::from_vertices(vec![
         Point2::new(0.5, 0.5),
-        Point2::new(1.5, 0.5),
-        Point2::new(1.5, 1.5),
+        Point2::new(2.9, 0.5),
+        Point2::new(2.9, 1.5),
         Point2::new(0.5, 1.5),
     ])
     .unwrap();
-    source.configure_constraints(Some(boundary), 1, 0.5).unwrap();
+    source.configure_constraints(Some(boundary), 1, 0.75).unwrap();
     explorer.controller = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
     explorer.controller.add_source(source);
     explorer.controller.begin_exploration().unwrap();
@@ -904,10 +904,9 @@ pub(crate) fn goal_cell(goal: &proto::NavigationGoal) -> [i32; 2] {
     let p = goal.pose.as_ref().unwrap().position.as_ref().unwrap();
     [(p.x / 0.1).floor() as i32, (p.y / 0.1).floor() as i32]
 }
-/// 与所选前沿格相距超过前沿视线前瞻的两格缺测，使原前沿消失而仍留有其它前沿。
-pub(crate) fn distant_hole(cell: [i32; 2]) -> Arc<SurfaceSnapshot> {
-    let hole_y = if cell[1] <= 9 { 14 } else { 5 };
-    floor(move |x, y| (13..=14).contains(&x) && y == hole_y)
+/// 地面补全到边界，只在x≈2.5米处留两格缺测：原前沿格周围0.75米内已无前沿，远处仍有前沿。
+pub(crate) fn distant_hole() -> Arc<SurfaceSnapshot> {
+    floor(|x, y| (25..=26).contains(&x) && y == 10)
 }
 
 #[test]
@@ -916,16 +915,25 @@ fn surface_child_switches_when_its_frontier_vanishes_and_cancels_only_without_ne
     let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial.clone()), Ok(())).unwrap();
     let (first_id, goal) = first.goal.expect("初始前沿应派发子目标");
     let cell = goal_cell(&goal);
-    // 同一张快照不重复核对；前沿仍在的新快照不换目标。
-    for surface in [partial, floor(|x, _| x >= 12)] {
+    // 同一张快照不重复核对；前沿仍在的新快照不换目标；前沿线前移、原前沿格已不是前沿，
+    // 但0.75米内仍有前沿格时也不换目标。
+    let advanced = floor(move |x, _| x >= cell[0] + 5);
+    let boundary = explorer.boundary();
+    let original = advanced.frontier_candidates(&boundary).unwrap().into_iter()
+        .find(|frontier| [frontier.cell.0, frontier.cell.1] == cell);
+    assert!(original.is_none(), "前移后原前沿格不再是前沿");
+    let z = advanced.frontier_candidates(&boundary).unwrap()[0].cell.2;
+    assert!(advanced.frontier_near([cell[0], cell[1], z], 0.75, 0.3, &boundary).unwrap());
+    assert!(!distant_hole().frontier_near([cell[0], cell[1], z], 0.75, 0.3, &boundary).unwrap());
+    for surface in [partial, floor(|x, _| x >= 12), advanced] {
         let update = explorer.tick(Some(vanishing_pose()), None, Ok(surface), Ok(())).unwrap();
         assert!(update.goal.is_none() && update.cancel_goal.is_none());
         assert_eq!(update.status.goals_completed, 0);
         assert_eq!(explorer.child.as_ref().unwrap().id, first_id);
     }
-    // 前沿消失且有其它前沿：计入已到达，当拍直接派发新目标替换，不发取消。
+    // 0.75米内已无前沿而别处还有：计入已到达，当拍直接派发新目标替换，不发取消。
     let replaced =
-        explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole(cell)), Ok(())).unwrap();
+        explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole()), Ok(())).unwrap();
     let (second_id, _) = replaced.goal.expect("前沿消失后应立即选出下一个目标");
     assert_ne!(second_id, first_id);
     assert!(replaced.cancel_goal.is_none());
@@ -953,7 +961,7 @@ fn surface_child_switches_when_its_frontier_vanishes_and_cancels_only_without_ne
 #[test]
 fn returning_child_is_not_switched_by_frontier_changes() {
     let (mut explorer, partial) = vanishing_fixture();
-    let (id, goal) = explorer
+    let (id, _) = explorer
         .tick(Some(vanishing_pose()), None, Ok(partial), Ok(()))
         .unwrap()
         .goal
@@ -961,7 +969,7 @@ fn returning_child_is_not_switched_by_frontier_changes() {
     // 保留前沿目标号只改成返航，证明返航子目标不做前沿核对。
     explorer.child.as_mut().unwrap().returning = true;
     let update = explorer
-        .tick(Some(vanishing_pose()), None, Ok(distant_hole(goal_cell(&goal))), Ok(()))
+        .tick(Some(vanishing_pose()), None, Ok(distant_hole()), Ok(()))
         .unwrap();
     assert!(update.goal.is_none() && update.cancel_goal.is_none());
     assert_eq!(update.status.goals_completed, 0);

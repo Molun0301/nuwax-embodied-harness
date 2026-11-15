@@ -443,7 +443,7 @@ pub trait ExplorationGoalSource: Send {
         Ok(())
     }
 
-    /// 在途子目标对应的前沿在新的输入里已不再是前沿时返回真；按目标号匹配，默认不核对。
+    /// 在途子目标的前沿格附近在新的输入里已没有前沿时返回真；按目标号匹配，默认不核对。
     fn frontier_vanished(&mut self, _goal_id: &str) -> ExploreResult<bool> {
         Ok(false)
     }

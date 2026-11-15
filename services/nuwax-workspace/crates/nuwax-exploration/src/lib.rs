@@ -443,6 +443,11 @@ pub trait ExplorationGoalSource: Send {
         Ok(())
     }
 
+    /// 在途子目标对应的前沿在新的输入里已不再是前沿时返回真；按目标号匹配，默认不核对。
+    fn frontier_vanished(&mut self, _goal_id: &str) -> ExploreResult<bool> {
+        Ok(false)
+    }
+
     /// source 当前可发布的 frontier 快照。默认 source 没有 frontier 视图。
     fn frontier_snapshot(&self) -> Vec<FrontierGoal> {
         Vec::new()
@@ -777,6 +782,16 @@ impl ExplorationController {
             source.report_goal_feedback(goal_id, feedback.clone())?;
         }
         Ok(())
+    }
+
+    /// 各 source 按目标号核对在途子目标的前沿是否已消失。
+    pub fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
+        for source in &mut self.sources {
+            if source.frontier_vanished(goal_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 合并所有 source 当前 frontier 快照。

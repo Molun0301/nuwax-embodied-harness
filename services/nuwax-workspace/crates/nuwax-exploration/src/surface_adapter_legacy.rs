@@ -623,7 +623,7 @@ impl SurfaceGoalSourceAdapter {
             candidates=geometric_candidate_count, targets=observation_targets.len(),
             route_queries=route_budget.queries.get(), expanded=route_budget.expanded.get(),
             "完整前沿评估阶段耗时");
-        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,delta))
+        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,source_snapshot,delta))
     }
 }
 

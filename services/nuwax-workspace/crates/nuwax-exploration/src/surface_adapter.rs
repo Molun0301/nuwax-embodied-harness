@@ -185,6 +185,10 @@ struct SelectedGoal {
     goal: FrontierGoal,
     support_xyz: [f64; 3],
     vertical_radius_m: f64,
+    /// 选出该目标的几何前沿格。
+    frontier_cell: [i32; 3],
+    /// 最近一次核对前沿所用的表面快照。
+    checked: Weak<SurfaceSnapshot>,
 }
 
 impl GoalHistory {
@@ -823,7 +827,7 @@ impl SurfaceGoalSourceAdapter {
             candidates=geometric_candidate_count, targets=observation_targets.len(),
             route_queries=route_budget.queries.get(), expanded=route_budget.expanded.get(),
             "完整前沿评估阶段耗时");
-        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,delta))
+        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,source_snapshot,delta))
     }
 
     fn make_candidate_goal(
@@ -896,6 +900,8 @@ impl SurfaceGoalSourceAdapter {
         goal: FrontierGoal,
         support_xyz: [f64; 3],
         vertical_radius_m: f64,
+        frontier_cell: [i32; 3],
+        snapshot: &Arc<SurfaceSnapshot>,
         delta: &mut SurfacePollDelta,
     ) -> ExplorationPoll {
         delta.last_frontiers = Some(vec![goal.clone()]);
@@ -903,6 +909,8 @@ impl SurfaceGoalSourceAdapter {
             goal: goal.clone(),
             support_xyz,
             vertical_radius_m,
+            frontier_cell,
+            checked: Arc::downgrade(snapshot),
         }));
         delta.last_no_frontier = Some(false);
         delta.last_error = Some(None);
@@ -1094,6 +1102,29 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.last_frontiers.clear();
         Ok(())
+    }
+
+    /// 子目标执行期间每张新表面快照核对一次：所选前沿格不在前沿索引里或已被排除时返回真。
+    fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
+        let Some(snapshot) = self.receiver.snapshot()? else {
+            return Ok(false);
+        };
+        let Some(selected) = self.selected.as_mut().filter(|selected| selected.goal.id == goal_id) else {
+            return Ok(false);
+        };
+        if Weak::ptr_eq(&selected.checked, &Arc::downgrade(&snapshot)) {
+            return Ok(false);
+        }
+        selected.checked = Arc::downgrade(&snapshot);
+        let (cell, support, vertical_radius) =
+            (selected.frontier_cell, selected.support_xyz, selected.vertical_radius_m);
+        let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
+            boundary.vertices().iter().map(|point| [point.x, point.y]).collect()
+        });
+        let frontier = snapshot
+            .is_frontier(cell, &boundary)
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        Ok(!frontier || self.excluded(support, vertical_radius))
     }
 
     fn frontier_snapshot(&self) -> Vec<FrontierGoal> {

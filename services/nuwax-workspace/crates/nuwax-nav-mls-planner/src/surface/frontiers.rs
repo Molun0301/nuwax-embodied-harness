@@ -119,6 +119,12 @@ impl SurfaceSnapshot {
         }).collect())
     }
 
+    /// 某个前沿格是否仍在本快照的前沿索引里；索引与选点共用，只局部重算变化范围。
+    pub fn is_frontier(&self, cell: [i32; 3], boundary: &[[f64; 2]]) -> Result<bool, SurfaceError> {
+        validate_boundary(boundary)?;
+        Ok(self.frontier_index(boundary).gains.contains_key(&(cell[0], cell[1], cell[2])))
+    }
+
     /// 只读取已完成计算的统计；等待下一次查询的局部更新返回空。
     pub fn frontier_cache_stats(&self) -> Option<SurfaceFrontierCacheStats> {
         self.data

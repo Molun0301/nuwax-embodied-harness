@@ -125,6 +125,7 @@ pub struct Mapper {
     maps: watch::Receiver<Option<proto::MapUpdate>>,
     fine_root: watch::Receiver<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     errors: watch::Receiver<Option<String>>,
+    correction_stopped: watch::Receiver<Option<String>>,
     transform: watch::Receiver<Isometry3<f64>>,
     config: MapperConfig,
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
@@ -218,6 +219,7 @@ impl Mapper {
             forbidden_status_tx,
             attach_shared,
         )?;
+        let correction_stopped = worker.correction_stopped.subscribe();
         let worker_handle = std::thread::Builder::new()
             .name(format!("geometry-map-{session_id}"))
             .spawn(move || loop {
@@ -258,6 +260,7 @@ impl Mapper {
             maps,
             fine_root,
             errors,
+            correction_stopped,
             transform,
             config,
             forbidden,
@@ -299,6 +302,9 @@ impl Mapper {
     }
     pub fn error_rx(&self) -> watch::Receiver<Option<String>> {
         self.errors.clone()
+    }
+    pub(crate) fn correction_stopped_rx(&self) -> watch::Receiver<Option<String>> {
+        self.correction_stopped.clone()
     }
     pub fn planar_view_only(&self) -> bool {
         self.planar_view_only
@@ -431,6 +437,7 @@ struct Worker {
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     transform: watch::Sender<Isometry3<f64>>,
     corrector: Corrector,
+    correction_stopped: watch::Sender<Option<String>>,
     sequence: u64,
     forbidden_path: Option<PathBuf>,
     forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
@@ -522,6 +529,7 @@ impl Worker {
             fine_root,
             transform,
             corrector,
+            correction_stopped: watch::channel(None).0,
             sequence: 0,
             forbidden_path: None,
             forbidden,
@@ -794,16 +802,25 @@ impl Worker {
         }
         self.last_input = Some(input);
         if committed_this_frame && !frame.mapping_only {
-            if let Some(update) = self.corrector.process_frame(
+            let result = self.corrector.process_frame(
                 &frame,
                 &pgo,
                 self.grid.as_ref().map(|g| (&g.grid, self.grid_stamp)),
                 self.base_anchor,
-            )? {
-                self.apply_pgo(update)?;
+            ).and_then(|update| {
+                if let Some(update) = update { self.apply_pgo(update)?; }
+                Ok(())
+            });
+            if let Err(error) = result {
+                self.stop_correction(format!("回环校正已停止：{error}"));
             }
         }
         Ok(())
+    }
+    fn stop_correction(&mut self, reason: String) {
+        tracing::error!(%reason, "回环校正已停止");
+        self.corrector.stop();
+        self.correction_stopped.send_replace(Some(reason));
     }
     fn apply_pgo(&mut self, update: PgoUpdate) -> Result<(), String> {
         // 原始扫描按优化后的关键帧轨迹逐帧重建，数值内核仍为同一组内核。
@@ -851,6 +868,7 @@ impl Worker {
                 )?);
             }
         }
+        let publication = self.prepare_grid(persistent.as_ref(), frames.last().map_or(0, |f| f.odom_pose.timestamp_ns))?;
         rebuilt.adopt_publication(&mut self.cloud)?;
         self.cloud = rebuilt;
         self.fine_root.send_replace(self.cloud.surface());
@@ -860,7 +878,8 @@ impl Worker {
         self.map_from_odom = update.latest;
         self.transform.send_replace(update.latest);
         self.publish_pose();
-        self.publish_grid()
+        self.send_grid(publication);
+        Ok(())
     }
     fn publish_pose(&self) {
         if let Some(odom) = &self.latest_odometry {
@@ -917,12 +936,18 @@ impl Worker {
         })
     }
     fn publish_grid(&mut self) -> Result<(), String> {
-        let Some(grid) = self.grid.as_ref() else {
-            return Ok(());
+        let publication = self.prepare_grid(self.grid.as_ref(), self.grid_stamp)?;
+        self.send_grid(publication);
+        Ok(())
+    }
+    fn prepare_grid(&self, grid: Option<&PersistentOccupancyGrid>, stamp: u64)
+        -> Result<Option<(proto::OccupancyGrid, proto::OccupancyGrid, proto::MapUpdate)>, String>
+    {
+        let Some(grid) = grid else {
+            return Ok(None);
         };
         let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
-        raw.meta.as_mut().unwrap().timestamp_ns = self.grid_stamp;
-        self.raw_grid.send_replace(Some(raw.clone()));
+        raw.meta.as_mut().unwrap().timestamp_ns = stamp;
         let mut data = raw.data.clone();
         let mut mask = vec![0; data.len()];
         self.forbidden_status.borrow().clone()?;
@@ -934,18 +959,25 @@ impl Worker {
                 }
             }
         }
-        self.forbidden.send_replace(Some(proto::OccupancyGrid {
+        let forbidden = proto::OccupancyGrid {
             map_name: raw.map_name.clone(),
             meta: raw.meta.clone(),
             data: mask,
-        }));
-        self.maps.send_replace(Some(proto::MapUpdate {
-            map_name: raw.map_name,
-            meta: raw.meta,
+        };
+        let map = proto::MapUpdate {
+            map_name: raw.map_name.clone(),
+            meta: raw.meta.clone(),
             data,
-            raw_data: raw.data,
-        }));
-        Ok(())
+            raw_data: raw.data.clone(),
+        };
+        Ok(Some((raw, forbidden, map)))
+    }
+    fn send_grid(&self, publication: Option<(proto::OccupancyGrid, proto::OccupancyGrid, proto::MapUpdate)>) {
+        if let Some((raw, forbidden, map)) = publication {
+            self.raw_grid.send_replace(Some(raw));
+            self.forbidden.send_replace(Some(forbidden));
+            self.maps.send_replace(Some(map));
+        }
     }
 }
 pub fn pose_isometry(pose: &proto::Pose) -> Isometry3<f64> {

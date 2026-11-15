@@ -1138,8 +1138,12 @@ async fn forward_maps(
         if let Some(route) = route {
             let mut updates = route.mapper.map_rx();
             let mut errors = route.mapper.error_rx();
+            let mut correction_stopped = route.mapper.correction_stopped_rx();
             let mut poses = route.mapper.pose_rx();
             maps.send_replace(updates.borrow_and_update().clone());
+            if let Some(reason) = correction_stopped.borrow_and_update().clone() {
+                let _ = faults.send((route.id, SessionIssue::Output(reason)));
+            }
             loop {
                 tokio::select! {
                     changed = routes.changed() => { if changed.is_err() { return; } break; },
@@ -1154,6 +1158,10 @@ async fn forward_maps(
                     changed = errors.changed() => {
                         if changed.is_err() { break; }
                         if let Some(reason) = errors.borrow_and_update().clone() { let _ = faults.send((route.id, SessionIssue::Fault(reason))); }
+                    },
+                    changed = correction_stopped.changed() => {
+                        if changed.is_err() { break; }
+                        if let Some(reason) = correction_stopped.borrow_and_update().clone() { let _ = faults.send((route.id, SessionIssue::Output(reason))); }
                     },
                 }
             }

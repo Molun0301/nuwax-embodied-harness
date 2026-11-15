@@ -1,6 +1,39 @@
 use super::*;
 
 #[tokio::test]
+async fn correction_stop_reason_is_forwarded_without_changing_mapping_phase() {
+    let mapper = Mapper::start(939, MapperConfig {
+        correction_backend: "native_pgo".into(), ..Default::default()
+    }).unwrap();
+    let mut session = actor(mapper.clone(), PathBuf::new()).await;
+    let (fault_tx, faults) = mpsc::unbounded_channel();
+    session.router.faults = fault_tx.clone();
+    let (maps, _) = watch::channel(None);
+    let forwarding = tokio::spawn(forward_maps(session.route.subscribe(), maps, fault_tx, session.router.clone()));
+    let mut state = session.publisher.subscribe();
+    let (commands, rx) = mpsc::unbounded_channel();
+    let (_, navigation) = mpsc::unbounded_channel();
+    let running = tokio::spawn(session.run(rx, faults, navigation));
+    let mut frame = crate::mapper::tests::room_frame(939, 1_000_000_000);
+    frame.points_body.truncate(3);
+    mapper.feed(frame);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !state.borrow_and_update().reason.starts_with("回环校正已停止：") {
+            state.changed().await.unwrap();
+        }
+    }).await.unwrap();
+    assert_eq!(state.borrow().phase, SessionPhase::Mapping as i32);
+    mapper.feed(crate::mapper::tests::room_frame(939, 2_000_000_000));
+    assert!(mapper.snapshot().await.unwrap().occupancy.is_some());
+    assert!(mapper.error_rx().borrow().is_none());
+    let (reply, result) = oneshot::channel();
+    commands.send(Command::Shutdown(reply)).ok().unwrap();
+    result.await.unwrap();
+    running.await.unwrap();
+    forwarding.abort();
+}
+
+#[tokio::test]
 async fn saved_pgo_map_load_uses_relocalization_and_new_mapping_keeps_pgo() {
     let root = std::env::temp_dir().join(format!("nuwax-loaded-pgo-{}", uuid::Uuid::new_v4()));
     let mapper = Mapper::start(713, MapperConfig::default()).unwrap();

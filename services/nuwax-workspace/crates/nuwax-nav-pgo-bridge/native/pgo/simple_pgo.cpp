@@ -316,8 +316,8 @@ bool SimplePGO::isKeyPoseSe3(const PoseWithTimeSe3& pose) const {
     constexpr double radians_to_degrees = 57.29577951308232;
     const double angular_delta = quaternionAngle(quaternionMultiply(
         quaternionConjugate(last.q), normalized_pose.q));
-    return distance(normalized_pose.t, last.t) > config_.key_pose_delta_trans ||
-           angular_delta * radians_to_degrees > config_.key_pose_delta_deg;
+    return distance(normalized_pose.t, last.t) >= config_.key_pose_delta_trans ||
+           angular_delta * radians_to_degrees >= config_.key_pose_delta_deg;
 }
 
 bool SimplePGO::addKeyPoseSe3(const PoseWithTimeSe3& pose) {

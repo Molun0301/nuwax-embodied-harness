@@ -29,6 +29,57 @@ fn config() -> MapperConfig {
     }
 }
 
+#[test]
+fn rejected_native_correction_stops_once_and_mapping_continues() {
+    let mut worker = Worker::new(
+        937, MapperConfig { correction_backend: "native_pgo".into(), ..config() }, None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut stopped = worker.correction_stopped.subscribe();
+    let mut rejected = room_frame(937, 1_000_000_000);
+    rejected.points_body.truncate(3);
+    worker.frame(rejected).expect("原生拒绝本帧时建图仍成功");
+    assert!(worker.failure.is_none());
+    assert!(stopped.has_changed().unwrap());
+    assert!(stopped.borrow_and_update().as_ref().unwrap().contains("回环校正已停止："));
+    let revision = worker.cloud.snapshot().revision;
+    worker.frame(room_frame(937, 2_000_000_000)).unwrap();
+    assert!(worker.cloud.snapshot().revision > revision);
+    assert!(!stopped.has_changed().unwrap(), "停止通知只发一次");
+    assert!(worker.snapshot().unwrap().occupancy.is_some());
+}
+
+#[test]
+fn failed_replay_or_publication_preserves_the_current_map() {
+    for publication_failure in [false, true] {
+        let mut worker = Worker::new(
+            938, config(), None, false,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel(None).0, watch::channel(None).0, watch::channel(Ok(())).0, false,
+        ).unwrap();
+        worker.frame(room_frame(938, 1_000_000_000)).unwrap();
+        let before = worker.snapshot().unwrap();
+        if publication_failure {
+            let _ = worker.forbidden_status.send_replace(Err("测试发布准备失败".into()));
+        } else {
+            let (path, _) = &before.scans[0];
+            let mut bytes = std::fs::read(path).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(worker.apply_pgo(PgoUpdate::constant_for_test(1_000_000_000,
+            Isometry3::translation(0.2, 0., 0.))).is_err());
+        assert_eq!(worker.cloud.snapshot().display, before.cloud.display);
+        assert_eq!(worker.cloud.snapshot().revision, before.cloud.revision);
+        assert_eq!(isometry_matrix(&worker.map_from_odom), before.map_from_odom);
+        assert_eq!(worker.maps.borrow().as_ref().unwrap().raw_data,
+            before.occupancy.as_ref().unwrap().data);
+    }
+}
+
 pub(crate) fn frames_without_candidate_keep_session_healthy(
     backend: MappingBackendSpec,
     corrector: Corrector,

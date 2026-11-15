@@ -89,6 +89,13 @@ impl PoseGraph {
         id
     }
 
+    /// 撤回刚新增的节点及其边，并恢复编号，保持历史子图的编号范围连续。
+    pub(super) fn remove_last_node(&mut self) {
+        self.next_id -= 1;
+        self.nodes.remove(&self.next_id);
+        self.edges.retain(|edge| edge.from != self.next_id && edge.to != self.next_id);
+    }
+
     /// 添加边
     pub fn add_edge(&mut self, edge: PoseEdge) {
         self.edges.push(edge);

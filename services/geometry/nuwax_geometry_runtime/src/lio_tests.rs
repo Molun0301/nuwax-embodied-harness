@@ -45,6 +45,36 @@ fn cloud(frame: &str, stamp: u64) -> schema::PointCloud2 {
     };
     decode_cloud(&encode_pointcloud_request_payload(&request).unwrap()).unwrap()
 }
+
+#[tokio::test]
+async fn device_delivery_records_the_configured_sensor_origin_in_body_coordinates() {
+    for configured in [false, true] {
+        let mapper = crate::mapper::Mapper::start(943, crate::mapper::MapperConfig::default()).unwrap();
+        let (router, _, _) = crate::session::test_router(mapper.clone());
+        let ingress = Ingress {
+            router, native: None,
+            body_from_sensor: configured.then(|| crate::native_lio_owner::BodyFromSensorTransform::from_json(
+                r#"{"translation_m":[0.28945,0.04,-0.046825],"rotation_row_major":[0,-1,0,1,0,0,0,0,1]}"#,
+            ).unwrap()),
+            self_filter: None,
+            transport: LcmTransport::new_real("memq://g1-device-origin").unwrap(),
+            auxiliary: Default::default(),
+        };
+        let stamp = 1_000_000_000;
+        let pose = pose(2., 0.7, stamp);
+        let expected_point = pose_isometry(&pose).unwrap().inverse() * Point3::new(1., 0., 0.);
+        ingress.deliver(943, pose, cloud("odom", stamp)).await.unwrap();
+        let saved = mapper.snapshot().await.unwrap();
+        let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open(&saved.scans[0].0).unwrap();
+        let scan = reader.next_scan().unwrap().unwrap();
+        assert_eq!(scan.metadata.sensor_origin_body,
+            Some(if configured { [0.28945_f32, 0.04, -0.046825] } else { [0.; 3] }));
+        for axis in 0..3 {
+            assert!((f64::from(scan.points[0][axis]) - expected_point[axis]).abs() < 1e-6);
+        }
+        mapper.shutdown().await.unwrap();
+    }
+}
 #[test]
 fn native_pairing_is_order_independent() {
     for cloud_first in [false, true] {
@@ -157,6 +187,7 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
     let ingress = Ingress {
         router,
         native: Some(native),
+        body_from_sensor: None,
         self_filter: None,
         transport: transport.clone(),
         auxiliary: Default::default(),
@@ -411,6 +442,7 @@ async fn odom_pointcloud_before_pose_is_rejected_without_mutation() {
         Ingress {
             router: router.clone(),
             native: None,
+            body_from_sensor: None,
             self_filter: None,
             transport,
             auxiliary: Default::default(),

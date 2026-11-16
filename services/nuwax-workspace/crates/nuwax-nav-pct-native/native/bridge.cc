@@ -685,31 +685,37 @@ struct SourceSearch {
   }
   double x_of(const Key& key) const {return key==start?start_x:(key.x+0.5)*q;}
   double y_of(const Key& key) const {return key==start?start_y:(key.y+0.5)*q;}
-  // 起点按原完整查询的十格、三维距离吸附到附近有效节点，吸附到别的格时用格心；
-  // 目标按平面位置所在格与地面高度所在层对应到节点，没有有效节点即不可达。
-  bool begin(const double* requested,const double* goals,size_t count,unsigned char* reachable) {
+  // 端点绑定与完整查询的snap_endpoint相同：所在格±10格内按三维距离取最近的有效节点，
+  // 等距保留先遍历到的（行、列、层号从小到大）。端点平面位置在所在格时保留，绑定到别的格时用格心。
+  // 只读取这些列的节点，不展开搜索。
+  bool snap(const double* requested,double ground,Key& key,std::array<double,2>& endpoint) {
     const XY origin{static_cast<int>(std::floor(requested[0]/q)),static_cast<int>(std::floor(requested[1]/q))};
     double best=INFINITY;bool found=false;
     for(int y=origin.second-10;y<=origin.second+10;++y)for(int x=origin.first-10;x<=origin.first+10;++x)
       for(const auto& layer:column({x,y})) {
         if(!layer.valid)continue;
-        const double score=std::hypot(std::hypot((x+0.5)*q-requested[0],(y+0.5)*q-requested[1]),layer.ground-sg);
-        if(score<best){best=score;start={x,y,layer.k};found=true;}
+        const double score=std::hypot(std::hypot((x+0.5)*q-requested[0],(y+0.5)*q-requested[1]),layer.ground-ground);
+        if(score<best){best=score;key={x,y,layer.k};found=true;}
       }
-    for(size_t i=0;i<count;++i)reachable[i]=0;
     if(!found)return false;
-    const bool same=start.x==origin.first&&start.y==origin.second;
-    start_x=same?requested[0]:(start.x+0.5)*q;start_y=same?requested[1]:(start.y+0.5)*q;
+    const bool same=key.x==origin.first&&key.y==origin.second;
+    endpoint={same?requested[0]:(key.x+0.5)*q,same?requested[1]:(key.y+0.5)*q};
+    return true;
+  }
+  // 起点与各目标按端点绑定规则绑定到节点；目标的绑定节点定值时该目标可达，没有绑定节点即不可达。
+  bool begin(const double* requested,const double* goals,size_t count,unsigned char* reachable) {
+    for(size_t i=0;i<count;++i)reachable[i]=0;
+    std::array<double,2> origin{};
+    if(!snap(requested,sg,start,origin))return false;
+    start_x=origin[0];start_y=origin[1];
     auto& source=states[start];
     source.g=0;source.ground=node(start.x,start.y,start.k)->ground;
     open.push({0,sequence++,start});
     for(size_t i=0;i<count;++i) {
       const double* goal=goals+3*i;
       targets.push_back({goal[0],goal[1]});
-      const Key key{static_cast<int>(std::floor(goal[0]/q)),static_cast<int>(std::floor(goal[1]/q)),
-          static_cast<int>(std::llround((goal[2]-p.cfg.body_to_ground-sg)/spacing))};
-      const Layer* layer=node(key.x,key.y,key.k);
-      if(!layer||!layer->valid)continue;
+      Key key{};
+      if(!snap(goal,goal[2]-p.cfg.body_to_ground,key,targets.back()))continue;
       reachable[i]=1;
       waiting[key].push_back(i);
     }
@@ -742,9 +748,10 @@ struct SourceSearch {
       for(auto& layer:layers)if(layer.k!=from.k)visit(layer);
     }
   }
-  // 展开到下一个已登记目标的节点定值。返回0为得到一个目标；1为可达范围已展开完，
+  // 展开到下一个已登记目标的绑定节点定值。返回0为得到一个目标；1为可达范围已展开完，
   // 或下一个出队代价超过limit（此时不出队，之后可用更大的limit继续）；2为取消。
-  // 目标长度与末段朝向按最后一条入边起点到目标平面位置计；起点格内的目标从起点直接计。
+  // 加权代价取绑定节点的代价；长度与末段朝向按最后一条入边起点到目标端点计（端点为格心时即绑定节点的
+  // 父链长度）；绑定到起点节点的目标从起点直接计。
   int next(size_t& index,double& weighted,PctCost& out,double limit,CancelFn cancel,const void* user) {
     while(ready.empty()) {
       if(open.empty()||open.top().g>limit)return 1;
@@ -814,7 +821,7 @@ extern "C" int pct_multi_goal_cost(void* search,const double* start,const double
   return status;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
-// 从起点开始一次按需展开的单源搜索并登记目标；reachable[i]为0表示该目标没有对应的有效节点。
+// 从起点开始一次按需展开的单源搜索并登记目标；reachable[i]为0表示该目标±10格内没有可绑定的有效节点。
 extern "C" int pct_source_begin(void* search,const double* start,const double* goals,size_t count,
                                 unsigned char* reachable,char* err,size_t cap) {
   try {
@@ -835,7 +842,7 @@ extern "C" int pct_source_begin(void* search,const double* start,const double* g
 extern "C" double pct_multi_goal_resolution(const void* search) {
   return static_cast<const MultiGoalSearch*>(search)->planner.cfg.resolution;
 }
-// 继续当前单源搜索到下一个已登记目标定值：0为得到目标，1为可达范围已展开完或超过出队代价上限，2为取消。
+// 继续当前单源搜索到下一个已登记目标的绑定节点定值：0为得到目标，1为可达范围已展开完或超过出队代价上限，2为取消。
 extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCost* out,double limit,
                                CancelFn cancel,const void* user,char* err,size_t cap) {
   try {

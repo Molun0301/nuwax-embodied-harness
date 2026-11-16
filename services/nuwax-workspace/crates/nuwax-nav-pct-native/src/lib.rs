@@ -220,7 +220,8 @@ pub struct MultiGoalSearch<'a> {
 impl Drop for MultiGoalSearch<'_> {
     fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
 }
-/// 单源搜索中定值的一个已登记目标：加权路径代价，以及到目标平面位置的路线长度、端点与末段朝向。
+/// 单源搜索中定值的一个已登记目标：绑定节点的加权路径代价，以及到端点的路线长度、端点与末段朝向。
+/// 端点在绑定节点的实测地面上，绑定节点在目标所在格时平面位置取目标，否则取绑定格中心。
 #[derive(Clone, Copy, Debug)]
 pub struct SettledGoal {
     pub index: usize,
@@ -228,8 +229,9 @@ pub struct SettledGoal {
     pub route: RouteCost,
 }
 impl MultiGoalSearch<'_> {
-    /// 从起点开始一次按需展开的单源搜索并登记目标，替换上一次单源搜索。目标按平面位置所在格与
-    /// 地面高度（`z`减机体到地面高度）所在层对应到节点；返回各目标是否有对应的有效节点，没有即不可达。
+    /// 从起点开始一次按需展开的单源搜索并登记目标，替换上一次单源搜索。起点与目标都按完整查询的
+    /// 端点绑定规则绑定到节点：所在格±10格内按三维距离（地面高度为`z`减机体到地面高度）最近的有效节点；
+    /// 返回各目标是否有绑定节点，没有即不可达。绑定只读取附近列，不展开搜索。
     pub fn begin_source(&mut self, start: [f64; 3], goals: &[[f64; 3]]) -> Result<Vec<bool>, String> {
         let mut reachable = vec![0_u8; goals.len()];
         let mut error = [0; 512];
@@ -240,8 +242,8 @@ impl MultiGoalSearch<'_> {
         }
         Ok(reachable.into_iter().map(|value| value != 0).collect())
     }
-    /// 继续当前单源搜索到下一个已登记目标的节点定值；节点按加权路径代价从小到大定值，
-    /// 同一节点上的目标按登记顺序返回。可达范围已展开完，或下一个出队的加权代价超过`limit`
+    /// 继续当前单源搜索到下一个已登记目标的绑定节点定值；节点按加权路径代价从小到大定值，
+    /// 绑定到同一节点的目标按登记顺序返回。可达范围已展开完，或下一个出队的加权代价超过`limit`
     /// （不出队，之后可用更大的上限继续）时返回`None`。
     pub fn next_settled(&mut self, limit: f64) -> Result<Option<SettledGoal>, String> {
         let mut index = 0;

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 fn config() -> Config {
     Config {
@@ -247,4 +248,43 @@ fn source_search_settles_goals_in_path_cost_order_and_expands_only_as_far_as_nee
     let exact=search.cost(start,goals[2]).unwrap();
     assert!((exact.cost-expected.0).abs()<1e-10);
     assert_eq!((exact.endpoint,exact.yaw),(expected.1,expected.2));
+}
+
+#[test]
+fn source_goals_bind_to_the_nearest_valid_node_within_ten_cells() {
+    // x方向第40—64格（4.0—6.5米）缺测；格(20,10)净空过低，节点无效。
+    let cells:Vec<_>=(-5..90).flat_map(|x|(-5..35).map(move |y|Cell{x,y,ground:0.,
+        ceiling:if (x,y)==(20,10){0.3}else{f64::INFINITY}})).filter(|c|c.x<40 || c.x>64).collect();
+    let center=|i:i32|(f64::from(i)+0.5)*0.1;
+    let start=[0.55,0.55,0.4];
+    let goals=[
+        [4.25,1.05,0.4],             // 缺测格(42,10)：10格内最近的有效节点是(39,10)
+        [5.25,1.05,0.4],             // 缺测格(52,10)：两侧实测都在13格外
+        [2.02,1.03,0.4],             // 无效节点格(20,10)：最近的有效节点是西邻(19,10)
+        [center(39),center(10),0.4], // 对照：直接放在绑定节点格心
+        [center(19),center(10),0.4],
+    ];
+    let mut planner=Planner::from_cells(config(),&cells,&[]).unwrap();
+    let mut search=planner.multi_goal_search().unwrap();
+    assert_eq!(search.begin_source(start,&goals).unwrap(),vec![true,false,true,true,true],
+        "10格内有有效节点的目标可绑定，没有的不可达");
+    let mut settled=BTreeMap::new();
+    while let Some(goal)=search.next_settled(f64::INFINITY).unwrap() {settled.insert(goal.index,goal);}
+    assert_eq!(settled.keys().copied().collect::<Vec<_>>(),vec![0,2,3,4]);
+    for (bound,reference,endpoint) in [(0,3,[center(39),center(10),0.4]),(2,4,[center(19),center(10),0.4])] {
+        let (bound,reference)=(settled[&bound],settled[&reference]);
+        assert_eq!(bound.route.endpoint,endpoint,"绑定到别的格时端点取绑定格中心");
+        assert_eq!((bound.weighted,bound.route.cost,bound.route.yaw),
+            (reference.weighted,reference.route.cost,reference.route.yaw),"路线代价取绑定节点的代价");
+    }
+    drop(search);
+    // 绑定只读取附近列：只登记绑定目标与只登记格心目标，定值时展开的节点数相同。
+    let mut expanded=Vec::new();
+    for goal in [goals[0],goals[3]] {
+        let mut search=planner.multi_goal_search().unwrap();
+        assert_eq!(search.begin_source(start,&[goal]).unwrap(),vec![true]);
+        search.next_settled(f64::INFINITY).unwrap().unwrap();
+        expanded.push(search.stats().source_expanded);
+    }
+    assert_eq!(expanded[0],expanded[1]);
 }

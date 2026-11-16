@@ -561,7 +561,8 @@ impl SurfaceGoalSourceAdapter {
         Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,source_snapshot,delta))
     }
 
-    /// 从当前位置一次按需展开的单源搜索，候选在其支撑格定值时按路径代价由近到远成为可达候选：
+    /// 从当前位置一次按需展开的单源搜索，候选按端点绑定规则（支撑点±10格内最近的有效地面层）绑定到节点，
+    /// 在绑定节点定值时按路径代价由近到远成为可达候选：
     /// 无视域时每个区域第一个定值的可达候选是代表；已有8个区域有代表或可达范围展开完即停；
     /// 有视域时再续到这8个区域内的候选全部定值，或出队代价超过8个代表里的最大代价加一个区域对角线路程。
     /// 重试候选仍最先被选。
@@ -597,7 +598,7 @@ impl SurfaceGoalSourceAdapter {
             .observation_model
             .as_ref()
             .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6);
-        // 从当前位置一次按需展开的单源搜索：候选在其支撑格定值时按路径代价由近到远成为可达候选。
+        // 从当前位置一次按需展开的单源搜索：候选在其绑定节点定值时按路径代价由近到远成为可达候选。
         let targets: Vec<_> = candidates
             .iter()
             .map(|candidate| {
@@ -609,7 +610,7 @@ impl SurfaceGoalSourceAdapter {
             .iter()
             .map(|candidate| nuwax_explore_routing::region_key(candidate.support_xyz))
             .collect();
-        // 起点没有可搜索的实测地面时所有候选都不可达。
+        // 起点没有可搜索的实测地面时所有候选都不可达；10格内没有绑定节点的候选不可达。
         let reachable = search.begin_source(current_body.0, &targets).ok();
         let mut unsettled = std::collections::BTreeMap::<[i64; 3], usize>::new();
         for (region, _) in regions
@@ -735,7 +736,7 @@ impl SurfaceGoalSourceAdapter {
             }) {
                 continue;
             }
-            // 路线代价取搜索代价；端点在支撑格的实测地面上，非定向视域的停留朝向取末段方向。
+            // 路线代价取绑定节点的搜索代价；端点在绑定节点的实测地面上，非定向视域的停留朝向取末段方向。
             let body = settled.route.endpoint;
             if !directional_view {
                 let yaw = settled.route.yaw;

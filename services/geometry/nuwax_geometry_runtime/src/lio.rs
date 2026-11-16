@@ -34,6 +34,8 @@ struct InputRuntime {
     planar: Option<Arc<crate::slam2d_owner::Owner>>,
     odometry_input: mpsc::UnboundedSender<proto::Pose>,
     cloud_input: mpsc::UnboundedSender<(u64, schema::PointCloud2)>,
+    /// 当前原生子进程已建立外部输入订阅。
+    native_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 struct Runtime {
     planar: Option<Arc<crate::slam2d_owner::Owner>>,
@@ -207,6 +209,7 @@ impl Lio {
         let (odometry_input, odometry_rx) = mpsc::unbounded_channel();
         let (cloud_input, cloud_rx) = mpsc::unbounded_channel();
         let mut tasks = Vec::new();
+        let mut native_ready = Arc::default();
         let planar = if let Some(settings) = &self.planar {
             Some(
                 crate::slam2d_owner::Owner::start(
@@ -256,6 +259,7 @@ impl Lio {
             )));
             if let Some(native) = &self.native {
                 let process = NativeProcessOwner::spawn(&native.runtime)?;
+                native_ready = process.input_ready();
                 let router = self.router.clone();
                 let stopped = shutdown.clone();
                 tasks.push(tokio::spawn(crate::lio_owner::supervise_native(
@@ -275,6 +279,7 @@ impl Lio {
             planar: planar.clone(),
             odometry_input,
             cloud_input,
+            native_ready,
         });
         *self.runtime.lock().await = Some(Runtime {
             planar,
@@ -328,6 +333,13 @@ impl Lio {
                 return Err(Status::invalid_argument(
                     "原生点云和惯性坐标必须与配置传感器一致",
                 ));
+            }
+            // 子进程订阅完成之前的输入直接丢弃，不计入输入序列。
+            if !runtime
+                .native_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(());
             }
             let request = match &self.native_self_filter {
                 Some(filter) => filter

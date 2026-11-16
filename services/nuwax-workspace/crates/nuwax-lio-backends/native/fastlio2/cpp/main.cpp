@@ -826,6 +826,7 @@ int main(int argc, char** argv) {
                 imu_subscription, nuwax_lio::kNativeInputImuQueueCapacity,
                 "fastlio2", g_input_imu_topic)) return 1;
         if (debug) { printf("[fastlio2] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
+        nuwax_lio::announce_native_input_ready();
     } else {
         // Direct Livox mode is retained for device deployments.
         if (!livox_common::init_livox_sdk(host_ip, lidar_ip, ports, debug)) return 1;

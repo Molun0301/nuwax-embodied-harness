@@ -1016,6 +1016,7 @@ static int run_pointlio(int argc, char** argv) {
         auto* subscription = lcm.subscribeFunction(input_frame_topic, on_input_frame, static_cast<void*>(nullptr));
         if (!nuwax_lio::configure_native_input_subscription(subscription,
                 nuwax_lio::kNativeInputCloudQueueCapacity, "pointlio", input_frame_topic)) return 1;
+        nuwax_lio::announce_native_input_ready();
     } else if (g_external_input) {
         auto* lidar_subscription = lcm.subscribeFunction(
             g_input_lidar_topic, on_typed_cloud, static_cast<void*>(nullptr));
@@ -1028,6 +1029,7 @@ static int run_pointlio(int argc, char** argv) {
                 imu_subscription, nuwax_lio::kNativeInputImuQueueCapacity,
                 "pointlio", g_input_imu_topic)) return 1;
         if (debug) { printf("[pointlio] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
+        nuwax_lio::announce_native_input_ready();
     } else {
         if (!livox_common::init_livox_sdk(host_ip, lidar_ip, ports, debug)) return 1;
         SetLivoxLidarPointCloudCallBack(on_point_cloud, nullptr);

@@ -435,3 +435,39 @@ async fn output_is_drained_concurrently_and_retained_with_a_bound() {
     assert!(String::from_utf8_lossy(&stdout).contains("stdout-00009999"));
     assert!(String::from_utf8_lossy(&stderr).contains("stderr-00009999"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn input_ready_follows_the_marker_even_when_split_across_writes() {
+    let runtime = shell_runtime(
+        "printf 'lidar_type: 1\\nnuwax-native-in'; sleep 0.3; printf 'put-ready\\n'; exec sleep 5",
+    );
+    let mut owner = NativeProcessOwner::spawn(&runtime).expect("spawn shell");
+    let ready = owner.input_ready();
+    wait_for_stdout(&owner, "nuwax-native-in").await;
+    assert!(!ready.load(Ordering::Acquire), "标记写完之前不能就绪");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !ready.load(Ordering::Acquire) {
+        assert!(tokio::time::Instant::now() < deadline, "跨两次写出的标记未被识别");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    owner
+        .shutdown(Duration::from_secs(1), Duration::from_secs(1))
+        .await
+        .expect("shutdown");
+}
+
+#[test]
+fn native_programs_report_the_same_input_ready_marker() {
+    let header = include_str!(
+        "../../../nuwax-workspace/crates/nuwax-lio-backends/native/common/native_input_subscription.hpp"
+    );
+    let marker = std::str::from_utf8(NATIVE_INPUT_READY).unwrap();
+    assert!(header.contains(&format!("kNativeInputReadyMarker = \"{marker}\"")));
+    for main in [
+        include_str!("../../../nuwax-workspace/crates/nuwax-lio-backends/native/fastlio2/cpp/main.cpp"),
+        include_str!("../../../nuwax-workspace/crates/nuwax-lio-backends/native/pointlio/cpp/main.cpp"),
+    ] {
+        assert!(main.contains("nuwax_lio::announce_native_input_ready();"));
+    }
+}

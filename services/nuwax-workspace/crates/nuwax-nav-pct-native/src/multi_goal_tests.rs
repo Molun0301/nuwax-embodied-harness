@@ -288,3 +288,92 @@ fn source_goals_bind_to_the_nearest_valid_node_within_ten_cells() {
     }
     assert_eq!(expanded[0],expanded[1]);
 }
+
+/// 与旧全图单源搜索对照用的地图（36×24格，0.1米格）：起点不在格心、起点地面不在层基准整数倍上；
+/// 边界多边形切去左上角；有墙、门洞、缺测块、低净空格、可走缓坡、过陡坡、只能上不能下的台阶，
+/// 以及两格一级的台阶通到上层平台（平台下方的低层地面被楼板挡住，节点有效但不可达）。
+fn reference_map() -> (Config, Vec<Cell>, Vec<Band>, [f64; 3]) {
+    let mut cfg = config();
+    cfg.boundary = vec![[0.0, 0.0], [3.6, 0.0], [3.6, 2.4], [0.5, 2.4], [0.0, 1.9]];
+    let (mut cells, mut bands) = (Vec::new(), Vec::new());
+    for x in 0..36 {
+        for y in 0..24 {
+            if (4..7).contains(&x) && (14..17).contains(&y) {
+                continue;
+            }
+            let platform = (18..22).contains(&x) && y >= 19;
+            let ground = if x >= 26 && y < 8 {
+                f64::from(x - 25) * 0.03
+            } else if x >= 30 && (9..14).contains(&y) {
+                f64::from(x - 29) * 0.08
+            } else if x >= 26 && y >= 17 {
+                0.12
+            } else if (10..18).contains(&x) && y >= 19 {
+                f64::from((x - 8) / 2) * 0.12
+            } else {
+                0.0
+            };
+            let ceiling = if platform { 0.55 } else if (x, y) == (8, 6) || (x, y) == (9, 6) { 0.3 } else { f64::INFINITY };
+            cells.push(Cell { x, y, ground, ceiling });
+            if platform {
+                cells.push(Cell { x, y, ground: 0.6, ceiling: f64::INFINITY });
+                bands.push(Band { x, y, low: 0.55, high: 0.6 });
+            }
+            if x == 12 && y < 14 {
+                bands.push(Band { x, y, low: 0.0, high: 1.5 });
+            }
+            if x == 22 && !(9..14).contains(&y) {
+                bands.push(Band { x, y, low: 0.0, high: 2.0 });
+            }
+        }
+    }
+    (cfg, cells, bands, [0.53, 0.47, 0.43])
+}
+
+/// 按需展开与旧全图做法逐位等价。夹具由`01dbc3d2`在`reference_map`同一地图与起点上导出：旧做法先建全图矩阵
+/// 与全图标签，再从起点展开到队列耗尽；每个实测有效节点一行，`x y 地面 加权代价 路线长度 末段朝向`，后四项为
+/// f64位模式（未到达为无穷；起点与未到达节点的朝向为NaN）。导出时只在旧提交上临时让访问回调记下末段朝向
+/// （由父节点平面位置到本节点格心，与长度同一组坐标），其余为原代码。每个节点的加权代价、沿父链的长度和
+/// 末段朝向都相同，即每个节点的父节点相同，整棵路线树相同。
+#[test]
+fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
+    let (cfg, cells, bands, start) = reference_map();
+    let to_ground = cfg.body_to_ground;
+    let bits = |text: &str| f64::from_bits(u64::from_str_radix(text, 16).unwrap());
+    let reference: Vec<_> = include_str!("multi_goal_reference_01dbc3d2.txt").lines().map(|line| {
+        let v: Vec<_> = line.split(' ').collect();
+        (v[0].parse::<i32>().unwrap(), v[1].parse::<i32>().unwrap(), bits(v[2]), bits(v[3]), bits(v[4]), bits(v[5]))
+    }).collect();
+    let center = |i: i32| (f64::from(i) + 0.5) * cfg.resolution;
+    // 目标放在每个旧有效节点的格心，按绑定规则绑定到该节点本身，读出该节点的代价、长度与末段朝向。
+    let goals: Vec<_> = reference.iter().map(|&(x, y, ground, ..)| [center(x), center(y), ground + to_ground]).collect();
+    let mut planner = Planner::from_cells(cfg.clone(), &cells, &bands).unwrap();
+    let mut search = planner.multi_goal_search().unwrap();
+    assert!(search.begin_source(start, &goals).unwrap().into_iter().all(|bound| bound));
+    let mut settled = vec![None; goals.len()];
+    while let Some(goal) = search.next_settled(f64::INFINITY).unwrap() {
+        settled[goal.index] = Some(goal);
+    }
+    let reached = reference.iter().filter(|node| node.3.is_finite()).count();
+    assert_eq!(search.stats().source_expanded, reached, "展开节点数等于旧做法到达的节点数");
+    let mut differences = Vec::new();
+    for (&(x, y, ground, weighted, length, yaw), goal) in reference.iter().zip(&settled) {
+        let expected = weighted.is_finite().then_some((weighted, length, yaw));
+        let actual = goal.map(|goal| {
+            assert_eq!(goal.route.endpoint, [center(x), center(y), ground + to_ground], "绑定到节点本身");
+            // 起点节点的旧长度为0、无末段；格心目标从起点直接计，只比较加权代价。
+            if weighted == 0.0 { (goal.weighted, length, yaw) } else { (goal.weighted, goal.route.cost, goal.route.yaw) }
+        });
+        let same = match (expected, actual) {
+            (Some(a), Some(b)) => [a.0, a.1, a.2].map(f64::to_bits) == [b.0, b.1, b.2].map(f64::to_bits),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !same {
+            differences.push(((x, y, ground), expected, actual));
+        }
+    }
+    assert!(differences.is_empty(), "{}个节点不同，前10个（节点、旧、新）：{:?}", differences.len(),
+        &differences[..differences.len().min(10)]);
+    assert!(reached > 400 && reference.iter().any(|node| node.2 == 0.6 && node.3.is_finite()),
+        "夹具覆盖大部分地图并经台阶到达上层平台");
+}

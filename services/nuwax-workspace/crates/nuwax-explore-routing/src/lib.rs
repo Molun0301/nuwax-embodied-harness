@@ -109,11 +109,14 @@ pub fn select(
     select_with_priority(candidates, None, None, costs)
 }
 
+/// 区域平面边长（米）；区域按平面边长与一米高度分组。
+pub const REGION_SIZE_M: f64 = 4.0;
+
 /// 前沿代表筛选和区域等待账本共用的空间分组，不代表已识别房间。
 pub fn region_key(p: [f64; 3]) -> [i64; 3] {
     [
-        (p[0] / 4.0).floor() as i64,
-        (p[1] / 4.0).floor() as i64,
+        (p[0] / REGION_SIZE_M).floor() as i64,
+        (p[1] / REGION_SIZE_M).floor() as i64,
         p[2].floor() as i64,
     ]
 }
@@ -263,6 +266,16 @@ impl RegionalSchedule {
                 .or_insert(delta.first_seen_round);
         }
     }
+}
+
+/// 不带等待优先的区域代表与访问顺序：每个区域取收益÷（1+路程）最大的候选作代表
+/// （有视域时只取视域非空的），至多8个区域，访问顺序由动态规划求出。
+pub fn select_regions(
+    candidates: &[Candidate],
+    observations: Option<&[BTreeSet<[i32; 3]>]>,
+    costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
+) -> Option<Selection> {
+    select_with_priority(candidates, None, observations, costs)
 }
 
 fn select_with_priority(

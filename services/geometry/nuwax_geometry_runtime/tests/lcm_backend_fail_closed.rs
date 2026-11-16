@@ -362,6 +362,17 @@ async fn session_transitions_save_collision_and_direct_load() {
         f.client.set_goal(goal(1.)).await.unwrap_err().code(),
         Code::FailedPrecondition
     );
+    // 空闲阶段重定位不会被受理：入口不等帧，直接拿到会话的拒绝。
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        f.client
+            .relocalize(RelocalizeRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(
         f.client
             .start_mapping(StartMappingRequest {

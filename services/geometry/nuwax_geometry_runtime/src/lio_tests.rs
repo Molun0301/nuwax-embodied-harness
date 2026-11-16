@@ -316,6 +316,7 @@ fn test_lio(
                 planar: None,
                 odometry_input,
                 cloud_input,
+                native_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             })),
             input: Mutex::new(Default::default()),
             native_self_filter: None,
@@ -373,6 +374,46 @@ async fn static_sensor_transform_is_omitted_only_for_shared_body_frame() {
     assert_eq!(transforms[0].child_frame, "laser");
     lio.sensor_frame = lio.info.base_frame_id.clone();
     assert!(lio.static_transforms().is_empty());
+    mapper.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn native_input_before_child_ready_is_dropped_without_using_a_sequence() {
+    let mapper = crate::mapper::Mapper::start(47, crate::mapper::MapperConfig::default()).unwrap();
+    let (lio, mut faults) = test_lio(mapper.clone(), Some(native_bound()));
+    let transport = LcmTransport::new_real("memq://f1-native-ready-gate").unwrap();
+    let ready = {
+        let mut runtime = lio.input_runtime.write();
+        let runtime = runtime.as_mut().unwrap();
+        runtime.transport = transport.clone();
+        runtime.native_ready.store(false, std::sync::atomic::Ordering::Release);
+        runtime.native_ready.clone()
+    };
+    let mut clouds = transport
+        .subscribe_owned(
+            LcmTopic::new("/b2/input/cloud").unwrap(),
+            Some(LcmMessageType::new("sensor_msgs.PointCloud2").unwrap()),
+        )
+        .await
+        .unwrap();
+    for stamp in [1, 2] {
+        lio.publish_point_cloud(raw_request(stamp)).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), clouds.recv())
+            .await
+            .is_err(),
+        "子进程就绪前不应送出输入"
+    );
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    lio.publish_point_cloud(raw_request(3)).await.unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), clouds.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let cloud = decode_cloud(&frame.payload).unwrap();
+    assert_eq!((cloud.header.seq, header_stamp(&cloud.header).unwrap()), (1, 3));
+    assert!(faults.try_recv().is_err());
+    let _ = clouds.unsubscribe().await;
     mapper.shutdown().await.unwrap();
 }
 #[tokio::test]

@@ -50,4 +50,13 @@ bool configure_native_input_subscription(
     return true;
 }
 
+// 外部输入订阅全部建立后在标准输出报告一次。拥有方见到这一行之前送来的输入直接丢弃，
+// 输入序号从之后送出的第一帧开始。
+inline constexpr const char* kNativeInputReadyMarker = "nuwax-native-input-ready";
+
+inline void announce_native_input_ready() {
+    std::puts(kNativeInputReadyMarker);
+    std::fflush(stdout);
+}
+
 }  // 命名空间 nuwax_lio

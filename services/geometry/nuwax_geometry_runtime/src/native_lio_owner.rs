@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ use tokio::task::JoinHandle;
 const LCM_MAX_CHANNEL_NAME_BYTES: usize = 63;
 const ROTATION_TOLERANCE: f64 = 1.0e-6;
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+/// 原生子进程建立全部外部输入订阅后在标准输出报告的一行（`native_input_subscription.hpp`）。
+pub(crate) const NATIVE_INPUT_READY: &[u8] = b"nuwax-native-input-ready";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -444,6 +447,7 @@ pub(crate) struct NativeProcessOwner {
     stderr_tail: SharedTail,
     stdout_drain: Option<DrainTask>,
     stderr_drain: Option<DrainTask>,
+    input_ready: Arc<AtomicBool>,
 }
 
 impl NativeProcessOwner {
@@ -474,8 +478,14 @@ impl NativeProcessOwner {
         })?;
         let stdout_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
         let stderr_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
-        let stdout_drain = Some(spawn_output_drain("stdout", stdout, stdout_tail.clone()));
-        let stderr_drain = spawn_output_drain("stderr", stderr, stderr_tail.clone());
+        let input_ready = Arc::new(AtomicBool::new(false));
+        let stdout_drain = Some(spawn_output_drain(
+            "stdout",
+            stdout,
+            stdout_tail.clone(),
+            Some(input_ready.clone()),
+        ));
+        let stderr_drain = spawn_output_drain("stderr", stderr, stderr_tail.clone(), None);
 
         Ok(Self {
             child: Some(child),
@@ -489,7 +499,13 @@ impl NativeProcessOwner {
             stderr_tail,
             stdout_drain,
             stderr_drain: Some(stderr_drain),
+            input_ready,
         })
+    }
+
+    /// 子进程报告外部输入订阅已建立后变为真。
+    pub(crate) fn input_ready(&self) -> Arc<AtomicBool> {
+        self.input_ready.clone()
     }
 
     #[cfg(test)]
@@ -812,12 +828,19 @@ async fn wait_for_process_group_exit(
     }
 }
 
-fn spawn_output_drain<R>(label: &'static str, mut reader: R, tail: SharedTail) -> DrainTask
+fn spawn_output_drain<R>(
+    label: &'static str,
+    mut reader: R,
+    tail: SharedTail,
+    mut ready: Option<Arc<AtomicBool>>,
+) -> DrainTask
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut buffer = [0_u8; 8 * 1024];
+        // 就绪标记可能被拆在两次读取之间，保留上次末尾不足一个标记长的字节。
+        let mut carry = Vec::new();
         loop {
             let read = reader
                 .read(&mut buffer)
@@ -829,6 +852,15 @@ where
             tracing::info!(component = "native_lio", stream = label,
                 output = %String::from_utf8_lossy(&buffer[..read]), "原生LIO子进程输出");
             tail.lock().extend(&buffer[..read]);
+            if let Some(flag) = &ready {
+                carry.extend_from_slice(&buffer[..read]);
+                if carry.windows(NATIVE_INPUT_READY.len()).any(|w| w == NATIVE_INPUT_READY) {
+                    flag.store(true, Ordering::Release);
+                    ready = None;
+                } else {
+                    carry.drain(..carry.len().saturating_sub(NATIVE_INPUT_READY.len() - 1));
+                }
+            }
         }
     })
 }

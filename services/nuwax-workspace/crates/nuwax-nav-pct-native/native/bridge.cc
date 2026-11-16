@@ -742,11 +742,12 @@ struct SourceSearch {
       for(auto& layer:layers)if(layer.k!=from.k)visit(layer);
     }
   }
-  // 展开到下一个已登记目标的节点定值。返回0为得到一个目标，1为可达范围已展开完，2为取消。
+  // 展开到下一个已登记目标的节点定值。返回0为得到一个目标；1为可达范围已展开完，
+  // 或下一个出队代价超过limit（此时不出队，之后可用更大的limit继续）；2为取消。
   // 目标长度与末段朝向按最后一条入边起点到目标平面位置计；起点格内的目标从起点直接计。
-  int next(size_t& index,double& weighted,PctCost& out,CancelFn cancel,const void* user) {
+  int next(size_t& index,double& weighted,PctCost& out,double limit,CancelFn cancel,const void* user) {
     while(ready.empty()) {
-      if(open.empty())return 1;
+      if(open.empty()||open.top().g>limit)return 1;
       if(cancel&&cancel(user))return 2;
       const Entry entry=open.top();open.pop();
       auto& state=states.at(entry.key);
@@ -830,8 +831,12 @@ extern "C" int pct_source_begin(void* search,const double* start,const double* g
     return 0;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
-// 继续当前单源搜索到下一个已登记目标定值：0为得到目标，1为可达范围已展开完，2为取消。
-extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCost* out,
+// 原生平面格边长（米）。
+extern "C" double pct_multi_goal_resolution(const void* search) {
+  return static_cast<const MultiGoalSearch*>(search)->planner.cfg.resolution;
+}
+// 继续当前单源搜索到下一个已登记目标定值：0为得到目标，1为可达范围已展开完或超过出队代价上限，2为取消。
+extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCost* out,double limit,
                                CancelFn cancel,const void* user,char* err,size_t cap) {
   try {
     auto& s=*static_cast<MultiGoalSearch*>(search);
@@ -839,7 +844,7 @@ extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCo
     struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};s.planner.shared=&s.transitions;
     const auto began=std::chrono::steady_clock::now();
     const size_t before=s.source->expanded;
-    const int status=s.source->next(*index,*weighted,*out,cancel,user);
+    const int status=s.source->next(*index,*weighted,*out,limit,cancel,user);
     s.transitions.stats.source_expanded+=s.source->expanded-before;
     s.transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
     if(status==2)error(err,cap,"PCT规划已取消");

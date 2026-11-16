@@ -81,6 +81,24 @@ struct Run {
     truth_expanded: usize,
 }
 
+/// 只做一次发现，返回发现结果、展开节点数与基础每米代价。
+fn discover_only(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, boundary: &[[f64; 2]], start: [f64; 3])
+    -> (Discovery, usize, f64) {
+    surface.prepare_frontier_geometry(boundary).unwrap();
+    let mut routes = source.planner.route_costs(surface, 0.3, boundary).unwrap();
+    let mut search = routes.search().unwrap();
+    let geometry = frontier_geometry(surface, boundary).unwrap();
+    let mut candidates = geometry.candidates;
+    snap_support_heights(&search, &mut candidates);
+    let robot_support = surface.support_position_from_body(start, IDENTITY, 0.3).unwrap();
+    let vertical_radius = f64::from(surface.config().step_threshold_m) + f64::from(surface.config().voxel_size);
+    let discovery = source
+        .discover(surface, &mut search, candidates, &geometry.targets, (start, IDENTITY),
+            robot_support, vertical_radius, true, Default::default())
+        .unwrap();
+    (discovery, search.stats().source_expanded, search.cost_per_meter())
+}
+
 fn run(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, boundary: &[[f64; 2]], start: [f64; 3]) -> Run {
     surface.prepare_frontier_geometry(boundary).unwrap();
     let mut routes = source.planner.route_costs(surface, 0.3, boundary).unwrap();
@@ -100,7 +118,7 @@ fn run(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, boundary: &
     let goals: Vec<_> = kept.iter().map(|c| [c.support_xyz[0], c.support_xyz[1], c.support_xyz[2] + 0.3]).collect();
     search.begin_source(start, &goals).unwrap();
     let mut truth = Vec::new();
-    while let Some(settled) = search.next_settled().unwrap() {
+    while let Some(settled) = search.next_settled(f64::INFINITY).unwrap() {
         let candidate = &kept[settled.index];
         truth.push((candidate.frontier_cell, region_key(candidate.support_xyz), settled.weighted));
     }
@@ -187,7 +205,7 @@ fn far_unreachable_candidates_neither_change_the_result_nor_expand_the_whole_map
 }
 
 #[test]
-fn with_view_model_every_candidate_of_the_selected_regions_is_settled_before_choosing() {
+fn with_view_model_selected_region_candidates_settle_up_to_the_representative_bound() {
     let center = 12.05;
     let holes = spiral(120, 14);
     let surface = floor(24.0, |x, y| in_hole(&holes, x, y));
@@ -195,17 +213,67 @@ fn with_view_model_every_candidate_of_the_selected_regions_is_settled_before_cho
     let receiver = SurfaceInputReceiver::new();
     let source = adapter(&receiver, Some(boundary.clone()), true);
     let run = run(&source, &surface, &vertices(&boundary), [center, center, 0.35]);
-    let regions: BTreeSet<_> = run.discovery.admissible.iter().map(|(c, _, _)| region_key(c.support_xyz)).collect();
-    assert_eq!(regions.len(), 8);
-    let mut members = 0;
-    for &(cell, region, _) in &run.truth {
-        if regions.contains(&region) {
-            members += 1;
-            assert!(run.discovery.examined.contains(&cell), "选中区域内的候选{cell:?}应已定值");
+    let weighted: BTreeMap<_, _> = run.truth.iter().map(|&(cell, _, w)| (cell, w)).collect();
+    // 每个区域第一个收下的候选是该区域的代表；上限 = 代表最大代价 + 区域对角线 × 每米代价（0.1米格，每米10）。
+    let mut representatives = BTreeMap::new();
+    for (candidate, _, _) in &run.discovery.admissible {
+        representatives.entry(region_key(candidate.support_xyz)).or_insert(weighted[&candidate.frontier_cell]);
+    }
+    assert_eq!(representatives.len(), 8);
+    let bound = representatives.values().copied().fold(f64::NEG_INFINITY, f64::max)
+        + nuwax_explore_routing::REGION_SIZE_M * std::f64::consts::SQRT_2 * 10.0;
+    let (mut within, mut beyond) = (0, 0);
+    for &(cell, region, w) in &run.truth {
+        if !representatives.contains_key(&region) { continue; }
+        if w <= bound {
+            within += 1;
+            assert!(run.discovery.examined.contains(&cell), "上限内的候选{cell:?}应已定值");
+        } else {
+            beyond += 1;
+            assert!(!run.discovery.examined.contains(&cell), "超出上限的候选{cell:?}按不可达处理");
         }
     }
-    assert!(run.discovery.admissible.len() > regions.len() && members >= run.discovery.admissible.len(),
-        "各区域内候选全部参与，按视域规则另选代表：{} 个候选，{} 个区域", run.discovery.admissible.len(), regions.len());
+    assert!(run.discovery.admissible.len() > representatives.len(), "区域内全部候选按视域规则另选代表");
+    eprintln!("选中区域内候选：上限内{within}，超出{beyond}");
+}
+
+#[test]
+fn view_model_with_unreachable_wall_tops_does_not_expand_with_map_area() {
+    let mut runs = Vec::new();
+    for (size, cell) in [(50.0, 250), (100.0, 490)] {
+        let center = (f64::from(cell) + 0.5) * 0.1;
+        let holes = spiral(cell, 14);
+        // 机器人东侧3米一道1米高、4米长的墙：墙顶格是前沿候选，但不可达。
+        let wall = move |x: i32, y: i32| x == cell + 30 && (cell - 20..cell + 20).contains(&y);
+        let cells = (size / 0.1_f64).round() as i32;
+        let points: Vec<_> = (0..cells)
+            .flat_map(|x| (0..cells).map(move |y| (x, y)))
+            .filter(|&(x, y)| !in_hole(&holes, x, y))
+            .flat_map(|(x, y)| {
+                let (px, py) = ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1);
+                let height = if wall(x, y) { 10 } else { 1 };
+                (0..height).map(move |z| (px, py, z as f32 * 0.1 + 0.05))
+            })
+            .collect();
+        let surface = Arc::new(SurfaceSnapshot::from_points(&points, map().config().clone(), 0.1).unwrap());
+        let boundary = inset(size);
+        let polygon = vertices(&boundary);
+        let receiver = SurfaceInputReceiver::new();
+        let source = adapter(&receiver, Some(boundary), true);
+        let (discovery, expanded, _) = discover_only(&source, &surface, &polygon, [center, center, 0.35]);
+        let regions: BTreeSet<_> = discovery.admissible.iter().map(|(c, _, _)| region_key(c.support_xyz)).collect();
+        let tops = surface.frontier_candidates(&polygon).unwrap().iter()
+            .filter(|f| f.support_xyz[2] > 0.5 && regions.contains(&region_key([f.support_xyz[0], f.support_xyz[1], 0.05]))).count();
+        eprintln!("{size}米：展开{expanded}，区域{}，选中区域内墙顶候选{tops}", regions.len());
+        assert!(tops > 0, "选中区域内应有不可达的墙顶候选");
+        assert_eq!(regions.len(), 8);
+        let relative: Vec<_> = discovery.admissible.iter()
+            .map(|(c, _, _)| [c.support_xyz[0] - center, c.support_xyz[1] - center].map(|v| (v * 10.0).round() as i64)).collect();
+        runs.push((expanded, relative, (size / 0.1 * size / 0.1) as usize));
+    }
+    assert_eq!(runs[0].1, runs[1].1, "同一场景选出相同的候选");
+    assert_eq!(runs[0].0, runs[1].0, "展开节点数不随地图面积增长");
+    assert!(runs[0].0 * 4 < runs[0].2, "不展开到全图：{} / {}", runs[0].0, runs[0].2);
 }
 
 #[test]

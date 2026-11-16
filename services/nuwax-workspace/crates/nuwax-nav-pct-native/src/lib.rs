@@ -184,8 +184,9 @@ unsafe extern "C" {
         search: *mut c_void, start: *const f64, goals: *const f64, count: usize, reachable: *mut u8,
         err: *mut c_char, cap: usize,
     ) -> i32;
+    fn pct_multi_goal_resolution(search: *const c_void) -> f64;
     fn pct_source_next(
-        search: *mut c_void, index: *mut usize, weighted: *mut f64, out: *mut RouteCost,
+        search: *mut c_void, index: *mut usize, weighted: *mut f64, out: *mut RouteCost, limit: f64,
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
@@ -240,13 +241,14 @@ impl MultiGoalSearch<'_> {
         Ok(reachable.into_iter().map(|value| value != 0).collect())
     }
     /// 继续当前单源搜索到下一个已登记目标的节点定值；节点按加权路径代价从小到大定值，
-    /// 同一节点上的目标按登记顺序返回。可达范围已展开完返回`None`。
-    pub fn next_settled(&mut self) -> Result<Option<SettledGoal>, String> {
+    /// 同一节点上的目标按登记顺序返回。可达范围已展开完，或下一个出队的加权代价超过`limit`
+    /// （不出队，之后可用更大的上限继续）时返回`None`。
+    pub fn next_settled(&mut self, limit: f64) -> Result<Option<SettledGoal>, String> {
         let mut index = 0;
         let mut weighted = 0.0;
         let mut route = RouteCost::default();
         let mut error = [0; 512];
-        let status = unsafe { pct_source_next(self.native.as_ptr(), &mut index, &mut weighted, &mut route,
+        let status = unsafe { pct_source_next(self.native.as_ptr(), &mut index, &mut weighted, &mut route, limit,
             cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
         match status {
             0 => Ok(Some(SettledGoal { index, weighted, route })),
@@ -263,7 +265,7 @@ impl MultiGoalSearch<'_> {
             Err(error) => return goals.iter().map(|_| Err(error.clone())).collect(),
         };
         while pending > 0 {
-            match self.next_settled() {
+            match self.next_settled(f64::INFINITY) {
                 Ok(Some(settled)) => {
                     costs[settled.index] = Ok(settled.route);
                     pending -= 1;
@@ -273,6 +275,11 @@ impl MultiGoalSearch<'_> {
             }
         }
         costs
+    }
+    /// 加权路径代价的基础每米代价（不含软代价）：相邻格的距离项按格数计，一格边长为原生分辨率米，
+    /// 所以每米代价为 1/分辨率。
+    pub fn cost_per_meter(&self) -> f64 {
+        1.0 / unsafe { pct_multi_goal_resolution(self.native.as_ptr()) }
     }
     /// 平面点所在原生格的实测地面高度（静态列与本次临时叠加）；缺测列为空，不补造地面。
     pub fn measured_heights(&self, point: [f64; 2]) -> Vec<f64> {

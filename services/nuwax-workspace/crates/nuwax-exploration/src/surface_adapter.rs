@@ -563,7 +563,8 @@ impl SurfaceGoalSourceAdapter {
 
     /// 从当前位置一次按需展开的单源搜索，候选在其支撑格定值时按路径代价由近到远成为可达候选：
     /// 无视域时每个区域第一个定值的可达候选是代表；已有8个区域有代表或可达范围展开完即停；
-    /// 有视域时再续到这8个区域内的候选全部定值。重试候选仍最先被选。
+    /// 有视域时再续到这8个区域内的候选全部定值，或出队代价超过8个代表里的最大代价加一个区域对角线路程。
+    /// 重试候选仍最先被选。
     #[allow(clippy::too_many_arguments)]
     fn discover(
         &self,
@@ -626,6 +627,11 @@ impl SurfaceGoalSourceAdapter {
         let mut represented = std::collections::BTreeSet::<[i64; 3]>::new();
         let mut retry_index = None;
         let mut retry_settled = false;
+        // 有视域时8个区域确定后的续搜上限：8个代表里的最大加权代价加一个区域对角线路程，超出的候选按不可达处理。
+        // 区域对角线 = 区域平面边长 × √2（米）；路程换算成代价用搜索的基础每米代价（不含软代价）。
+        let diagonal_cost = nuwax_explore_routing::REGION_SIZE_M * std::f64::consts::SQRT_2 * search.cost_per_meter();
+        let mut representative_cost = f64::NEG_INFINITY;
+        let mut limit = f64::INFINITY;
         while reachable.is_some() {
             // 已有8个区域的代表（有视域时这些区域的候选也全部定值），且重试候选已处理，即停止。
             let retry_pending = retry_target.is_some() && !retry_settled;
@@ -635,7 +641,7 @@ impl SurfaceGoalSourceAdapter {
             if !retry_pending && (regions_done || !selecting) {
                 break;
             }
-            let settled = match search.next_settled() {
+            let settled = match search.next_settled(if retry_pending { f64::INFINITY } else { limit }) {
                 Ok(Some(settled)) => settled,
                 Ok(None) => break,
                 Err(_) if nuwax_nav_pct_native::planning_cancelled() => {
@@ -763,7 +769,12 @@ impl SurfaceGoalSourceAdapter {
                 retry_index = Some(admissible.len() - 1);
                 break;
             }
-            represented.insert(region);
+            if represented.insert(region) {
+                representative_cost = representative_cost.max(settled.weighted);
+                if self.observation_model.is_some() && represented.len() == 8 {
+                    limit = representative_cost + diagonal_cost;
+                }
+            }
         }
         Ok(Discovery { admissible, retry_index, examined })
     }

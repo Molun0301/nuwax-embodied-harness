@@ -109,11 +109,14 @@ pub fn select(
     select_with_priority(candidates, None, None, costs)
 }
 
+/// 区域平面边长（米）；区域按平面边长与一米高度分组。
+pub const REGION_SIZE_M: f64 = 4.0;
+
 /// 前沿代表筛选和区域等待账本共用的空间分组，不代表已识别房间。
 pub fn region_key(p: [f64; 3]) -> [i64; 3] {
     [
-        (p[0] / 4.0).floor() as i64,
-        (p[1] / 4.0).floor() as i64,
+        (p[0] / REGION_SIZE_M).floor() as i64,
+        (p[1] / REGION_SIZE_M).floor() as i64,
         p[2].floor() as i64,
     ]
 }

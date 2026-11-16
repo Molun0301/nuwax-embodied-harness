@@ -218,7 +218,7 @@ fn source_search_settles_goals_in_path_cost_order_and_expands_only_as_far_as_nee
     assert_eq!(search.begin_source(start,&goals).unwrap(),vec![true,true,true,true,true,false,true],
         "缺测端点没有节点");
     let mut order=Vec::new();
-    while let Some(settled)=search.next_settled().unwrap() {
+    while let Some(settled)=search.next_settled(f64::INFINITY).unwrap() {
         order.push((settled,search.stats().source_expanded));
     }
     let mut indices:Vec<_>=order.iter().map(|(settled,_)|settled.index).collect();

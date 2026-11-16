@@ -59,6 +59,7 @@ async fn device_delivery_records_the_configured_sensor_origin_in_body_coordinate
             self_filter: None,
             transport: LcmTransport::new_real("memq://g1-device-origin").unwrap(),
             auxiliary: Default::default(),
+            odometry_quality: Default::default(),
         };
         let stamp = 1_000_000_000;
         let pose = pose(2., 0.7, stamp);
@@ -184,6 +185,7 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
     let (_cloud_tx, cloud_rx) = mpsc::unbounded_channel();
     let (stop, stopped) = watch::channel(false);
     let native = native_bound();
+    let quality = std::sync::Arc::new(parking_lot::Mutex::new(None));
     let ingress = Ingress {
         router,
         native: Some(native),
@@ -191,8 +193,20 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
         self_filter: None,
         transport: transport.clone(),
         auxiliary: Default::default(),
+        odometry_quality: quality.clone(),
     };
     let task = tokio::spawn(ingress.run(odom, clouds, odom_rx, cloud_rx, stopped));
+    // 位置块特征值为3、1、1，姿态块最大方差0.04；交叉块填大值，取错块会得到不同结果。
+    let mut pose_covariance = [7.0; 36];
+    for (row, values) in [[2., 1., 0.], [1., 2., 0.], [0., 0., 1.]].iter().enumerate() {
+        pose_covariance[row * 6..row * 6 + 3].copy_from_slice(values);
+    }
+    for (row, value) in [0.01, 0.04, 0.0001].into_iter().enumerate() {
+        pose_covariance[(row + 3) * 6 + 3..(row + 3) * 6 + 6].fill(0.);
+        pose_covariance[(row + 3) * 6 + 3 + row] = value;
+    }
+    let mut twist_covariance = [0.0; 36];
+    twist_covariance[..2].copy_from_slice(&[812., 0.031]);
     let message = schema::Odometry {
         header: schema::Header {
             stamp_sec: 2,
@@ -203,6 +217,8 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
             position: [3., 4., 0.],
             orientation_xyzw: [0., 0., 0., 1.],
         },
+        pose_covariance,
+        twist_covariance,
         ..Default::default()
     };
     transport
@@ -225,6 +241,22 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
     assert_eq!(
         (output.position.unwrap().x, output.frame_id),
         (3., "map".into())
+    );
+    let quality = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(quality) = *quality.lock() {
+                break quality;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!((quality.position_std_max_m - 3f64.sqrt()).abs() < 1e-9, "{quality:?}");
+    assert!((quality.orientation_std_max_rad - 0.2).abs() < 1e-9, "{quality:?}");
+    assert_eq!(
+        (quality.effective_points, quality.mean_residual_m, quality.timestamp_ns),
+        (812, 0.031, 2_000_000_000)
     );
     assert!(faults.try_recv().is_err());
     stop.send_replace(true);
@@ -290,6 +322,7 @@ fn test_lio(
             sensor_frame: "laser".into(),
             body_from_sensor: None,
             auxiliary: Default::default(),
+            odometry_quality: Default::default(),
         },
         faults,
     )
@@ -446,6 +479,7 @@ async fn odom_pointcloud_before_pose_is_rejected_without_mutation() {
             self_filter: None,
             transport,
             auxiliary: Default::default(),
+            odometry_quality: Default::default(),
         }
         .run(odom, clouds, odom_rx, cloud_rx, stopped),
     );

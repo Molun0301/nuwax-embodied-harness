@@ -125,6 +125,15 @@ class LocalizationQuality:
 
 
 @dataclass(frozen=True)
+class OdometryQuality:
+    position_std_max_m: float
+    orientation_std_max_rad: float
+    effective_points: int
+    mean_residual_m: float
+    timestamp_ns: int
+
+
+@dataclass(frozen=True)
 class GeometrySnapshot:
     phase: SessionPhase
     reason: str
@@ -137,6 +146,7 @@ class GeometrySnapshot:
     previous_navigation: Optional[NavigationStatus] = None
     view_only: bool = False
     localization_quality: Optional[LocalizationQuality] = None
+    odometry_quality: Optional[OdometryQuality] = None
 
     @property
     def can_navigate(self) -> bool:

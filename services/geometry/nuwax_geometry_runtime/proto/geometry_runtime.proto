@@ -214,6 +214,23 @@ message GeometryState {
   bool view_only = 10;
   // 三维跟踪最近一轮的质量；本次会话尚无跟踪采样时不设置。
   LocalizationQuality localization_quality = 11;
+  // 原生LIO最近一帧里程计的质量；设备里程计模式或尚无原生里程计输出时不设置。
+  // 与位姿一样随读取刷新，单独变化不唤醒状态订阅。
+  OdometryQuality odometry_quality = 12;
+}
+
+// 原生LIO随里程计输出的质量量，只用于显示，不改变阶段、帧准入或原因文本。
+message OdometryQuality {
+  // 位置协方差3×3块最大特征值的平方根，米。
+  double position_std_max_m = 1;
+  // 姿态协方差3×3块最大特征值的平方根，弧度。
+  double orientation_std_max_rad = 2;
+  // 本帧参与滤波更新的有效匹配点数。
+  uint32 effective_points = 3;
+  // 有效匹配点的平均点到平面残差，米；有效匹配点数为0时为0。
+  double mean_residual_m = 4;
+  // 对应里程计的源时间。
+  uint64 timestamp_ns = 5;
 }
 
 // 最近一轮三维跟踪的观测质量，不改变阶段或导航受理。

@@ -315,6 +315,7 @@ impl SessionHandle {
     pub fn state(&self) -> GeometryState {
         let mut state = self.state.borrow().clone();
         state.pose = self.pose.borrow().clone();
+        state.odometry_quality = self.lio.borrow().as_ref().and_then(|lio| lio.odometry_quality());
         state
     }
     pub fn state_rx(&self) -> watch::Receiver<GeometryState> {
@@ -504,17 +505,21 @@ impl Session {
     fn snapshot(&self) -> GeometryState {
         let mut state = self.state.clone();
         state.pose = self.router.pose.borrow().clone();
+        state.odometry_quality = self.lio.borrow().as_ref().and_then(|lio| lio.odometry_quality());
         state
     }
     fn publish(&self) {
         let state = self.snapshot();
         self.publisher.send_if_modified(|current| {
-            // 位姿独立发布；只有业务状态改变才唤醒状态订阅。
+            // 位姿与里程计质量随读取刷新；只有业务状态改变才唤醒状态订阅。
             let pose = current.pose.take();
+            let quality = current.odometry_quality.take();
             let mut next = state.clone();
             next.pose = None;
+            next.odometry_quality = None;
             let changed = *current != next;
             current.pose = pose;
+            current.odometry_quality = quality;
             if changed {
                 *current = state;
             }

@@ -14,6 +14,7 @@ from services.geometry.proto_gen import geometry_runtime_pb2_grpc as rpc
 from services.geometry.state import (
     ExplorationPhase, ExplorationStatus, GeometrySnapshot, GoalStatus, MapUpdate,
     NavigationStatus, OccupancyGrid, Pose, RelocalizationResult, RuntimeInfo, SessionPhase, LocalizationQuality,
+    OdometryQuality,
 )
 
 
@@ -143,6 +144,12 @@ def _snapshot(value) -> GeometrySnapshot:
                               value.localization_quality.timestamp_ns,
                               value.localization_quality.bad_rounds)
                               if value.HasField("localization_quality") else None),
+        odometry_quality=(OdometryQuality(value.odometry_quality.position_std_max_m,
+                          value.odometry_quality.orientation_std_max_rad,
+                          value.odometry_quality.effective_points,
+                          value.odometry_quality.mean_residual_m,
+                          value.odometry_quality.timestamp_ns)
+                          if value.HasField("odometry_quality") else None),
     )
 
 

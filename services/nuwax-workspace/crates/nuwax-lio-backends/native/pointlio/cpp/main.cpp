@@ -236,8 +236,19 @@ static nav_msgs::Odometry make_odometry_message(
     msg.pose.pose.orientation.z = odom.pose.pose.orientation.z;
     msg.pose.pose.orientation.w = odom.pose.pose.orientation.w;
 
-    // The pinned Point-LIO core does not populate pose covariance.
-    std::memset(msg.pose.covariance, 0, sizeof(msg.pose.covariance));
+    // 协方差取当前滤波器状态前6维：位置在前、姿态在后。
+    const auto fill_covariance = [&msg](const auto& covariance) {
+        for (int row = 0; row < 6; ++row) {
+            for (int col = 0; col < 6; ++col) {
+                msg.pose.covariance[row * 6 + col] = covariance(row, col);
+            }
+        }
+    };
+    if (use_imu_as_input) {
+        fill_covariance(kf_input.get_P());
+    } else {
+        fill_covariance(kf_output.get_P());
+    }
 
     // Velocity from Point-LIO's IESKF state (its key output over FAST-LIO).
     msg.twist.twist.linear.x = odom.twist.twist.linear.x;
@@ -247,6 +258,9 @@ static nav_msgs::Odometry make_odometry_message(
     msg.twist.twist.angular.y = odom.twist.twist.angular.y;
     msg.twist.twist.angular.z = odom.twist.twist.angular.z;
     std::memset(msg.twist.covariance, 0, sizeof(msg.twist.covariance));
+    // 速度协方差未使用：前两位放本帧到目前为止参与更新的有效匹配点数与平均点到平面残差（米）。
+    msg.twist.covariance[0] = effct_feat_num;
+    msg.twist.covariance[1] = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.0;
 
     // 内核参考惯性测量点，对外仍按配置声明的机体原点发布。
     g_imu_reference.shift_world_velocity_to_body(msg.pose.pose, msg.twist.twist);

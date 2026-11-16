@@ -1,0 +1,54 @@
+每帧累计有效匹配点的点到平面残差，供封装随里程计输出平均残差；不改变滤波预测或观测计算。
+
+--- a/src/Estimator.cpp
++++ b/src/Estimator.cpp
+@@ -12,6 +12,7 @@
+ bool   point_selected_surf[100000] = {0};
+ std::vector<M3D> crossmat_list;
+ int effct_feat_num = 0;
++double total_residual = 0.0; // 本帧有效匹配点的点到平面距离之和
+ int k = 0;
+ int idx = -1;
+ esekfom::esekf<state_input, 24, input_ikfom> kf_input;
+@@ -168,6 +169,7 @@
+ 						normvec->points[j].z = pabcd(2);
+ 						normvec->points[j].intensity = pabcd(3);
+ 						effect_num_k ++;
++						total_residual += pd2;
+ 					}
+ 				}  
+ 			}
+@@ -279,6 +281,7 @@
+ 						normvec->points[j].z = pabcd(2);
+ 						normvec->points[j].intensity = pabcd(3);
+ 						effect_num_k ++;
++						total_residual += pd2;
+ 					}
+ 				}  
+ 			}
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -17,6 +17,7 @@
+ 
+ #include "parameters.h"
+ #include "Estimator.h"
++extern double total_residual;
+ #include "native_lio_arguments.hpp"
+ #include "pointlio_scan_output.hpp"
+ 
+@@ -706,6 +707,7 @@
+             if (!use_imu_as_input) {
+                 bool imu_upda_cov = false;
+                 effct_feat_num = 0;
++                total_residual = 0.0;
+                 /**** point by point update ****/
+ 
+                 double pcl_beg_time = Measures.lidar_beg_time;
+@@ -850,6 +852,7 @@
+             } else {
+                 bool imu_prop_cov = false;
+                 effct_feat_num = 0;
++                total_residual = 0.0;
+ 
+                 double pcl_beg_time = Measures.lidar_beg_time;
+                 idx = -1;

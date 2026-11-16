@@ -428,6 +428,9 @@ pub struct RelocalizationScore {
     pub penetration: f64,
     /// 墙面内点均方根误差。
     pub rmse: f64,
+    /// 水平约束度：墙面内点法线在地图坐标的水平分量累加 `Σ n nᵀ`（2×2），较小特征值除以内点数。
+    /// 只有一个方向的墙面时接近 0，沿墙方向的位置没有约束。
+    pub horizontal_constraint: f64,
 }
 impl RelocalizationScore {
     /// 按任务规定的四个条件判断结果。
@@ -436,6 +439,10 @@ impl RelocalizationScore {
             && self.penetration <= 0.15
             && is_upright(transform, GRAVITY_TILT_MAX_DEG)
             && self.rmse.is_finite()
+    }
+    /// 自动得到的结果（非调用方初值）还要求水平约束度不低于 0.05。
+    pub fn constrained(&self) -> bool {
+        self.horizontal_constraint >= 0.05
     }
 }
 
@@ -450,7 +457,14 @@ pub fn score_relocalization(
     let mut squared_error = 0.0;
     let mut rays = 0_usize;
     let mut penetrated = 0_usize;
-    for ((point, origin), wall) in source.points.iter().zip(&source.origins).zip(&source.walls) {
+    let (mut xx, mut xy, mut yy) = (0.0, 0.0, 0.0);
+    for (((point, origin), wall), normal) in source
+        .points
+        .iter()
+        .zip(&source.origins)
+        .zip(&source.walls)
+        .zip(&source.normals)
+    {
         if !wall {
             continue;
         }
@@ -460,6 +474,10 @@ pub fn score_relocalization(
             if distance <= 0.15_f64.powi(2) {
                 inliers += 1;
                 squared_error += distance;
+                let normal = transform.rotation * normal;
+                xx += normal.x * normal.x;
+                xy += normal.x * normal.y;
+                yy += normal.y * normal.y;
             }
         }
         let origin = transform * origin;
@@ -482,6 +500,8 @@ pub fn score_relocalization(
             distance += 0.1;
         }
     }
+    // 2×2 对称矩阵的较小特征值。
+    let smaller = (xx + yy) / 2.0 - (((xx - yy) / 2.0).powi(2) + xy * xy).sqrt();
     RelocalizationScore {
         wall_fitness: inliers as f64 / walls.max(1) as f64,
         penetration: penetrated as f64 / rays.max(1) as f64,
@@ -490,6 +510,7 @@ pub fn score_relocalization(
         } else {
             (squared_error / inliers as f64).sqrt()
         },
+        horizontal_constraint: smaller / inliers.max(1) as f64,
     }
 }
 
@@ -583,6 +604,8 @@ pub struct RelocalizationResult {
     pub fitness: f64,
     /// 两个不同位置同样符合地图，调用方应报告歧义。
     pub ambiguous: bool,
+    /// 最好的结果其它条件都满足、只差水平约束度而未接受。
+    pub one_direction: bool,
 }
 
 /// Run the complete multi-scale FPFH, deterministic RANSAC, and seeded ICP pipeline.
@@ -724,6 +747,12 @@ fn finish_global_candidates(
         result.fitness = score.wall_fitness;
         return result;
     }
+    if !score.constrained() {
+        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+        result.fitness = score.wall_fitness;
+        result.one_direction = true;
+        return result;
+    }
     if refined.get(1).is_some_and(|(second, runner_up)| {
         different_positions(&transformation, second)
             && runner_up.accepts(second)
@@ -745,6 +774,7 @@ fn finish_global_candidates(
         ransac_inliers,
         fitness: score.wall_fitness,
         ambiguous: false,
+        one_direction: false,
     }
 }
 
@@ -814,6 +844,7 @@ fn rejected_relocalization(
         ransac_inliers,
         fitness: 0.0,
         ambiguous: false,
+        one_direction: false,
     }
 }
 

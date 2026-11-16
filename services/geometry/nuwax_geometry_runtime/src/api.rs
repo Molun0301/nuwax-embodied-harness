@@ -85,15 +85,23 @@ impl GeometryRuntime for GeometryApi {
         request: Request<RelocalizeRequest>,
     ) -> Result<Response<RelocalizationResult>, Status> {
         let request = request.into_inner();
-        if request.seed.is_some()
-            && self.session.state().info.as_ref().unwrap().pipeline != "slam_2d"
-        {
-            return Err(Status::invalid_argument("三维重定位不接受初值"));
-        }
         if let Some(seed) = &request.seed {
             if ![seed.x, seed.y, seed.yaw].iter().all(|v| v.is_finite()) {
                 return Err(Status::invalid_argument("重定位初值必须为有限数值"));
             }
+        }
+        // 输入刚接通时里程计要几秒才出帧：三维链在入口等近期帧，不占用会话命令循环。
+        // 只在重定位会被受理的阶段（已加载未定位、已定位）等；其它阶段直接交给会话拿拒绝原因。
+        let state = self.session.state();
+        if state.info.as_ref().unwrap().pipeline == "lio_3d"
+            && matches!(
+                SessionPhase::try_from(state.phase),
+                Ok(SessionPhase::Loaded | SessionPhase::Localized)
+            )
+        {
+            self.session
+                .wait_recent_frames(std::time::Duration::from_secs(30))
+                .await;
         }
         Ok(Response::new(self.session.relocalize(request).await?))
     }

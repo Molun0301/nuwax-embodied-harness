@@ -209,13 +209,10 @@ async fn quality_warns_after_ten_bad_rounds_and_recovers_without_changing_phase_
             GoalStatus::Executing as i32
         );
         if round < 10 {
-            assert!(!session.state.reason.starts_with("定位质量下降："));
+            assert_ne!(session.state.reason, super::super::LOCALIZATION_DEGRADED);
         }
     }
-    assert!(session
-        .state
-        .reason
-        .starts_with("定位质量下降：最近扫描与地图吻合度为 "));
+    assert_eq!(session.state.reason, "定位质量下降，建议重新定位");
     assert_eq!(
         session
             .state

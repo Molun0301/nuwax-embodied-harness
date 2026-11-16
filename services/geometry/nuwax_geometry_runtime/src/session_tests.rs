@@ -951,7 +951,7 @@ async fn localized_map_follows_tracking_quality_and_saves_in_place_or_as_new_map
     assert!(written > loaded_revision, "重定位成功后写入地图");
     assert!(fine_voxels_at_obstacle(&loaded.surface_map().await.unwrap().unwrap()) > 0);
     // 某一轮吻合差：回到只读，近期点云照发。
-    let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1. };
+    let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1., horizontal_constraint: 0. };
     session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 1, timestamp_ns: 0 });
     let mut recent = loaded.recent_cloud_rx();
     recent.borrow_and_update();
@@ -1050,4 +1050,31 @@ async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel()
     session.end_current().await.unwrap();
     session.nav.shutdown().await;
     if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
+}
+
+#[tokio::test]
+async fn relocalize_entry_waits_for_five_recent_frames_or_the_limit() {
+    let mapper = Mapper::start(717, MapperConfig::default()).unwrap();
+    let handle = test_block_session(mapper.clone());
+    // 一直没有帧：到等待上限返回。
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_millis(300)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(300) && waited < Duration::from_millis(600), "{waited:?}");
+    // 帧在 0.3 秒后陆续到达：凑满 5 帧就返回，不等到上限。
+    let recent = handle.recent.clone();
+    let feeder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for stamp in 1..=5 {
+            recent.lock().push_back((Instant::now(), crate::mapper::tests::room_frame(717, stamp)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_secs(10)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(handle.recent.lock().len(), 5);
+    feeder.await.unwrap();
+    mapper.shutdown().await.unwrap();
 }

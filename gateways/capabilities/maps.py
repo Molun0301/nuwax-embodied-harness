@@ -97,7 +97,8 @@ def relocalize(platform, ctx, args):
                                           timeout_sec=ctx.remaining())
     ctx.check()
     if not result.succeeded:
-        raise GatewayError(result.message, error_code="geometry_relocalization_failed", http_status=409)
+        raise GatewayError(result.message, error_code="geometry_relocalization_failed", http_status=409,
+                           details={"fitness": result.fitness, "frames_used": result.frames_used})
     return asdict(result)
 
 

@@ -8,7 +8,7 @@ use nuwax_nav_mls_planner::surface::{SurfaceObservation, SurfaceObservations};
 use nuwax_nav_scan_native::{ScanTracker, TrackFailure, TrackResult};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn source(ground: &[[f64; 3]], obstacles: &[[i32; 3]]) -> Arc<SurfaceSnapshot> {
+pub(super) fn source(ground: &[[f64; 3]], obstacles: &[[i32; 3]]) -> Arc<SurfaceSnapshot> {
     const Q: f32 = 0.05;
     let q = f64::from(Q);
     let mut writer = Writer::new(Repository::temporary().unwrap(), Q, 4 * 1024 * 1024).unwrap();
@@ -106,7 +106,7 @@ fn source(ground: &[[f64; 3]], obstacles: &[[i32; 3]]) -> Arc<SurfaceSnapshot> {
     )
 }
 
-fn input(source: Arc<SurfaceSnapshot>) -> MapInput {
+pub(super) fn input(source: Arc<SurfaceSnapshot>) -> MapInput {
     let (config, _) = crate::native_test_helpers::fixture();
     let mut config = config.scan;
     config.resolution = f64::from(0.05_f32);

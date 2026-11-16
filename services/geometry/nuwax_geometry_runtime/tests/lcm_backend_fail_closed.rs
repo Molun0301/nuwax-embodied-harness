@@ -161,6 +161,83 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// 按真实时间连续送 `count` 帧，帧间隔大于建图候选节拍。
+    async fn frames(&mut self, count: usize) {
+        for _ in 0..count {
+            self.frame(now()).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+    /// 与 `frame` 相同，另多一块加载后才出现的竖直障碍板。
+    async fn obstacle_frame(&mut self, stamp: u64) {
+        self.odom(stamp, 0.).await;
+        let mut request = points(stamp);
+        for y in 0..5 {
+            for z in 0..21 {
+                for value in [OBSTACLE_X, -0.4 + y as f32 * 0.05, z as f32 * 0.05] {
+                    request.points.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        request.point_count = (request.points.len() / 12) as u32;
+        self.client.publish_point_cloud(request).await.unwrap();
+    }
+    /// 二维物理栅格里障碍板所在处的障碍格数。
+    async fn obstacle_cells(&mut self) -> usize {
+        let grid = self
+            .client
+            .get_occupancy_grid(GetOccupancyGridRequest {
+                include_forbidden: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let meta = grid.meta.unwrap();
+        let resolution = f64::from(meta.resolution);
+        grid.data
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| {
+                let x = meta.origin_x + ((*index as u32 % meta.width) as f64 + 0.5) * resolution;
+                let y = meta.origin_y + ((*index as u32 / meta.width) as f64 + 0.5) * resolution;
+                **value == 100
+                    && (x - f64::from(OBSTACLE_X)).abs() <= 0.1
+                    && (-0.45..=-0.15).contains(&y)
+            })
+            .count()
+    }
+    /// 稠密点云里障碍板上、高出地面的点数。
+    async fn obstacle_points(&mut self) -> usize {
+        let (mut epoch, mut offset, mut count) = (String::new(), 0, 0);
+        loop {
+            let chunk = self
+                .client
+                .get_dense_cloud_chunk(DenseCloudChunkRequest {
+                    expected_epoch: epoch,
+                    offset_points: offset,
+                    max_points: 65_536,
+                    allow_delta: false,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            count += chunk
+                .xyz_f32_le
+                .chunks_exact(12)
+                .map(|bytes| {
+                    [0, 4, 8].map(|at| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+                })
+                .filter(|p| {
+                    (p[0] - OBSTACLE_X).abs() <= 0.05 && (-0.45..=-0.15).contains(&p[1]) && p[2] >= 0.2
+                })
+                .count();
+            offset += chunk.xyz_f32_le.len() as u64 / 12;
+            if offset >= chunk.total_points {
+                return count;
+            }
+            epoch = chunk.epoch;
+        }
+    }
     async fn map_ready(&mut self) {
         let start = tokio::time::Instant::now();
         loop {
@@ -213,6 +290,8 @@ impl Drop for Fixture {
         let _ = self.child.wait();
     }
 }
+/// 障碍板所在的 x：在建图时地面最近边（x=1）与原点之间，原图这里没有东西。
+const OBSTACLE_X: f32 = 0.6;
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -283,6 +362,17 @@ async fn session_transitions_save_collision_and_direct_load() {
         f.client.set_goal(goal(1.)).await.unwrap_err().code(),
         Code::FailedPrecondition
     );
+    // 空闲阶段重定位不会被受理：入口不等帧，直接拿到会话的拒绝。
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        f.client
+            .relocalize(RelocalizeRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(
         f.client
             .start_mapping(StartMappingRequest {
@@ -514,20 +604,20 @@ async fn relocalization_failure_then_success_and_continue() {
         })
         .await
         .unwrap();
+    // 一直没有帧：入口等满 30 秒后交给会话，返回原来的原因。
+    let started = tokio::time::Instant::now();
     let failed = f
         .client
         .relocalize(RelocalizeRequest::default())
         .await
         .unwrap()
         .into_inner();
+    assert!(started.elapsed() >= Duration::from_secs(30), "{:?}", started.elapsed());
     assert!(!failed.succeeded);
+    assert_eq!(failed.message, "最近两秒没有可用雷达帧");
     assert_eq!(f.state().await.phase, SessionPhase::Loaded as i32);
     assert!(!f.state().await.reason.is_empty());
-    let stamp = now();
-    f.frame(stamp).await;
-    f.frame(stamp + 100_000_000).await;
-    // 完成一次只读请求，确保刚才的真实输入已经到达当前地图对象。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.frames(5).await;
     let matched = f
         .client
         .relocalize(RelocalizeRequest::default())
@@ -556,6 +646,118 @@ async fn relocalization_failure_then_success_and_continue() {
             .into_inner()
             .replaced
     );
+}
+
+#[tokio::test]
+async fn localized_map_writes_new_obstacle_and_overwritten_map_reloads_with_it() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("更新图").await;
+    f.client.stop_session(Empty {}).await.unwrap();
+    let load = LoadMapRequest {
+        map_name: "更新图".into(),
+    };
+    f.client.load_map(load.clone()).await.unwrap();
+    f.map_ready().await;
+    assert_eq!(f.obstacle_cells().await, 0);
+    assert_eq!(f.obstacle_points().await, 0);
+    // 障碍在加载前已摆好：加载后的每一帧都带着它。
+    for _ in 0..5 {
+        f.obstacle_frame(now()).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let matched = f
+        .client
+        .relocalize(RelocalizeRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
+    let started = tokio::time::Instant::now();
+    while f.obstacle_cells().await == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "已定位后新障碍未写入地图，状态{:?}，日志{}",
+            f.state().await,
+            fs::read_to_string(f.root.join("进程.log")).unwrap()
+        );
+        f.obstacle_frame(now()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let saved = f
+        .client
+        .save_map(SaveMapRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(saved.replaced);
+    assert_eq!(saved.map_name, "更新图");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
+    f.client.stop_session(Empty {}).await.unwrap();
+    f.client.load_map(load).await.unwrap();
+    f.map_ready().await;
+    assert!(f.obstacle_cells().await > 0, "重新加载的二维栅格应有新障碍");
+    assert!(f.obstacle_points().await > 0, "重新加载的稠密点云应有新障碍");
+}
+
+#[tokio::test]
+async fn three_dimensional_relocalize_with_seed_passes_the_grpc_entry() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("初值图").await;
+    f.client.stop_session(Empty {}).await.unwrap();
+    f.client
+        .load_map(LoadMapRequest {
+            map_name: "初值图".into(),
+        })
+        .await
+        .unwrap();
+    f.frames(5).await;
+    let matched = f
+        .client
+        .relocalize(RelocalizeRequest {
+            seed: Some(PlanarSeed {
+                x: 0.0,
+                y: 0.0,
+                yaw: 0.0,
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
+}
+
+#[tokio::test]
+async fn relocalize_right_after_load_waits_for_frames_that_arrive_later() {
+    let mut source = Fixture::start(false, false).await;
+    source.saved_map("等帧图").await;
+    let saved_map = source.root.join("maps/等帧图");
+    drop(source);
+    // 新进程没有任何雷达输入。
+    let mut f = Fixture::start(false, false).await;
+    fs::create_dir_all(f.root.join("maps")).unwrap();
+    fs::rename(saved_map, f.root.join("maps/等帧图")).unwrap();
+    f.client
+        .load_map(LoadMapRequest {
+            map_name: "等帧图".into(),
+        })
+        .await
+        .unwrap();
+    let mut client = f.client.clone();
+    let started = tokio::time::Instant::now();
+    let relocalize =
+        tokio::spawn(async move { client.relocalize(RelocalizeRequest::default()).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    while !relocalize.is_finished() {
+        assert!(started.elapsed() < Duration::from_secs(10), "帧到达后重定位仍未返回");
+        f.frame(now()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let matched = relocalize.await.unwrap().unwrap().into_inner();
+    assert!(matched.succeeded, "{matched:?}");
+    assert!(matched.frames_used >= 5, "{matched:?}");
+    assert_eq!(f.state().await.phase, SessionPhase::Localized as i32);
 }
 
 #[tokio::test]
@@ -655,11 +857,7 @@ async fn pgo_saved_map_relocalizes_after_load() {
         .unwrap()
         .into_inner();
     assert_eq!(loaded.phase, SessionPhase::Loaded as i32);
-    let stamp = now();
-    f.frame(stamp).await;
-    f.frame(stamp + 100_000_000).await;
-    // 输入仍经生产队列进入帧路由，与已有重定位进程用例保持相同等待。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.frames(5).await;
     let matched = f
         .client
         .relocalize(RelocalizeRequest::default())

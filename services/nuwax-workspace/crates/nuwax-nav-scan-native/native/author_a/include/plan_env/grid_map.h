@@ -222,18 +222,27 @@ public:
   // 快照只保留碰撞查询输入，两个会话不拥有第二份可变概率图。
   struct CollisionSnapshot {
     CollisionParameters parameters;
-    CollisionData collision;
+    std::shared_ptr<const CollisionData> collision;
     BusinessConstraintQuery business;
     BusinessEnvelopeQuery envelope;
     SurfaceContactQuery surface;
-    BodyClearanceField clearance;
+    std::shared_ptr<const BodyClearanceField> clearance;
+    Eigen::Vector3d clearance_origin;
   };
   std::shared_ptr<const CollisionSnapshot> collisionSnapshot(const ScanConfig& config,
       const SurfaceObstacleLayer* surface, const BusinessConstraintMask* business) const {
     auto result = std::make_shared<CollisionSnapshot>(CollisionSnapshot{
-        static_cast<const CollisionParameters&>(mp_), static_cast<const CollisionData&>(md_), business_constraint_query_,
-        business_envelope_query_, surface_collision_query_, {}});
-    result->clearance = buildClearanceField(config, surface, business);
+        static_cast<const CollisionParameters&>(mp_), std::make_shared<CollisionData>(static_cast<const CollisionData&>(md_)), business_constraint_query_,
+        business_envelope_query_, surface_collision_query_, {}, md_.sliding_map_frame_pos_});
+    result->clearance = std::make_shared<BodyClearanceField>(buildClearanceField(config, surface, business));
+    return result;
+  }
+  // 地面派生视图共享概率占据大缓冲，净空场仍按原过滤结果计算。
+  std::shared_ptr<const CollisionSnapshot> groundSnapshot(const ScanConfig& config,
+      const SurfaceObstacleLayer* surface,const BusinessConstraintMask* business,SurfaceContactQuery query) const {
+    auto result=std::make_shared<CollisionSnapshot>(*snapshot_);
+    result->surface=std::move(query);
+    result->clearance=std::make_shared<BodyClearanceField>(buildClearanceField(config,surface,business));
     return result;
   }
   void bindCollisionSnapshot(std::shared_ptr<const CollisionSnapshot> snapshot) {
@@ -244,7 +253,7 @@ public:
     surface_collision_query_ = snapshot_->surface;
   }
   const CollisionData& collisionData() const {
-    return snapshot_ ? snapshot_->collision : static_cast<const CollisionData&>(md_);
+    return snapshot_ ? *snapshot_->collision : static_cast<const CollisionData&>(md_);
   }
 
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
@@ -585,7 +594,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
 
 inline double GridMap::fieldDistance(double x, double y) const {
   if(!std::isfinite(x)||!std::isfinite(y))return std::numeric_limits<double>::quiet_NaN();
-  const auto& field=snapshot_->clearance;
+  const auto& field=*snapshot_->clearance;
   const double u=std::clamp((x-field.origin_x)/field.resolution,0.,double(field.width-1));
   const double v=std::clamp((y-field.origin_y)/field.resolution,0.,double(field.height-1));
   const int x0=int(std::floor(u)),y0=int(std::floor(v));

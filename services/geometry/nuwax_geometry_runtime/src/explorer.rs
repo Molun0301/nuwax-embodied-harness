@@ -95,6 +95,8 @@ pub struct Explorer {
     id: String,
     motion_generation: u64,
     child: Option<Child>,
+    /// 本拍因前沿消失而结束的子导航；本拍没有派发新目标时随结果取消。
+    vanished_child: Option<String>,
     reached_goals: u32,
     frontier_count: u32,
     elapsed_before: Duration,
@@ -148,6 +150,7 @@ impl Explorer {
             id: String::new(),
             motion_generation: 0,
             child: None,
+            vanished_child: None,
             reached_goals: 0,
             frontier_count: 0,
             elapsed_before: Duration::ZERO,
@@ -244,10 +247,12 @@ impl Explorer {
         let mut controller =
             ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
         if let Some(surface) = &self.surface_config {
+            // 前沿选点与返航查询共用同一份带缓存的全局规划器。
             let mut source = SurfaceGoalSourceAdapter::new(
                 "surface",
                 surface.follower.body_to_support_z_m,
                 self.surface_input.clone(),
+                surface.planner.clone(),
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
             if let Some(model) = observation {
@@ -419,12 +424,14 @@ impl Explorer {
         surface: Result<Arc<SurfaceSnapshot>, String>,
         forbidden: Result<(), String>,
     ) -> Result<ExplorerTick, String> {
-        match self.tick_step(pose, grid, surface, forbidden) {
+        let update = match self.tick_step(pose, grid, surface, forbidden) {
             Ok(update) => Ok(update),
             Err(message) => {
                 self.fail_exploration(ExplorationStopReason::ConsecutiveFailuresExceeded, &message)
             }
-        }
+        };
+        self.vanished_child = None;
+        update
     }
 
     fn tick_step(
@@ -552,6 +559,31 @@ impl Explorer {
                 return Ok(self.output("达到探索停止条件", None, cancel_goal));
             }
         }
+        if let Ok(surface) = &surface {
+            self.surface_input
+                .observe(surface.clone())
+                .map_err(|e| e.to_string())?;
+        }
+        // 非返航子目标执行中，它的前沿在新表面快照里已不是前沿：按到达记账，立即选下一个。
+        if let Some(source_id) = self
+            .child
+            .as_ref()
+            .filter(|child| !child.returning)
+            .map(|child| child.source_id.clone())
+        {
+            if self
+                .controller
+                .frontier_vanished(&source_id)
+                .map_err(|e| e.to_string())?
+            {
+                let child = self.child.take().expect("已检查在途子目标");
+                self.controller
+                    .report_goal_feedback(&child.source_id, ExplorationGoalFeedback::Reached)
+                    .map_err(|e| e.to_string())?;
+                self.reached_goals += 1;
+                self.vanished_child = Some(child.id);
+            }
+        }
         if self.child.is_some() {
             return Ok(self.output("执行探索子目标", None, cancel_goal));
         }
@@ -579,11 +611,6 @@ impl Explorer {
             }
             self.finish(ExplorationStopReason::CoverageReached)?;
             return Ok(self.output("达到覆盖率", None, None));
-        }
-        if let Ok(surface) = surface {
-            self.surface_input
-                .observe(surface)
-                .map_err(|e| e.to_string())?;
         }
         let mut snapshot = ExplorationStateSnapshot::new(
             robot,
@@ -818,6 +845,9 @@ impl Explorer {
         goal: Option<(String, proto::NavigationGoal)>,
         cancel_goal: Option<String>,
     ) -> ExplorerTick {
+        // 前沿消失的子导航由新目标直接替换，不先取消；没有新目标时取消。
+        let cancel_goal = cancel_goal
+            .or_else(|| self.vanished_child.clone().filter(|_| goal.is_none()));
         ExplorerTick {
             status: self.status(message),
             goal,

@@ -137,6 +137,7 @@ impl NavBridge {
                                 if let Some(mut goal) = active.take() {
                                     goal.status = proto::GoalStatus::Failed as i32;
                                     goal.message = reason;
+                                    goal.input_unavailable = true;
                                     let _ = status_tx.send(goal);
                                 }
                                 states = None;
@@ -160,6 +161,7 @@ impl NavBridge {
                             if let Some(mut goal) = active.take() {
                                 goal.status = proto::GoalStatus::Failed as i32;
                                 goal.message = "导航栈已重启，目标中断".into();
+                                goal.input_unavailable = true;
                                 let _ = status_tx.send(goal);
                             }
                         }

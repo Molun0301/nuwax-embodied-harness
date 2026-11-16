@@ -24,12 +24,34 @@ pub struct PctPlanner {
     cached: Mutex<Option<native_map::CachedPctPlanner>>,
     terrain_source: native_map::PctTerrainSource,
 }
+
+/// 一轮多目标代价查询期间独占本规划器的原生地图，查询结束前地图不再更新。
+pub struct RouteCostSession<'a> {
+    cached: std::sync::MutexGuard<'a, Option<native_map::CachedPctPlanner>>,
+}
+impl RouteCostSession<'_> {
+    /// 本轮共享转移的多目标搜索：同一起点只做一次单源搜索，可一次求得到多个目标的代价。
+    pub fn search(&mut self) -> Result<nuwax_nav_pct_native::MultiGoalSearch<'_>, String> {
+        self.cached.as_mut().expect("原生地图已在本轮更新").planner().multi_goal_search()
+    }
+}
+
 impl PctPlanner {
     pub fn new(terrain_source: native_map::PctTerrainSource) -> Self {
         Self {
             cached: Default::default(),
             terrain_source,
         }
+    }
+    /// 前沿候选、区域代价与完整路线共用本规划器的缓存原生地图；地图变化只替换变化列。
+    pub fn route_costs(&self, map: &SurfaceSnapshot, offset: f64, boundary: &[[f64; 2]])
+        -> Result<RouteCostSession<'_>, String> {
+        let terrain_source = self.terrain_source;
+        let mut cached = self.cached.lock().map_err(|error| error.to_string())?;
+        cached
+            .get_or_insert_with(|| native_map::CachedPctPlanner::new(terrain_source))
+            .update(map, offset, boundary)?;
+        Ok(RouteCostSession { cached })
     }
     pub fn route(&self, map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose,
         options: GoalOptions, boundary: &[[f64; 2]], offset: f64,

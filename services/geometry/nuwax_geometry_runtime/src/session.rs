@@ -158,9 +158,12 @@ pub struct SessionHandle {
     maps: watch::Receiver<Option<MapUpdate>>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
+    recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
 }
 const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
 const PLANAR_VIEW_ONLY: &str = "缺少二维定位图，只能查看";
+/// 文本固定，适配度等数字只在 `localization_quality` 里，避免状态流每轮因原因文本变化而推送。
+const LOCALIZATION_DEGRADED: &str = "定位质量下降，建议重新定位";
 type Reply<T> = oneshot::Sender<Result<T, Status>>;
 enum Command {
     Start(StartMappingRequest, Reply<GeometryState>),
@@ -193,6 +196,7 @@ impl SessionHandle {
             faults: faults.clone(),
             recent: Default::default(),
         };
+        let recent = router.recent.clone();
         let (maps_tx, maps) = watch::channel(None);
         tokio::spawn(forward_maps(
             route.clone(),
@@ -253,6 +257,7 @@ impl SessionHandle {
             maps,
             lio: lio_rx,
             faults,
+            recent,
         })
     }
     async fn request<T>(&self, build: impl FnOnce(Reply<T>) -> Command) -> Result<T, Status> {
@@ -283,6 +288,22 @@ impl SessionHandle {
         request: RelocalizeRequest,
     ) -> Result<RelocalizationResult, Status> {
         self.request(|tx| Command::Relocalize(request, tx)).await
+    }
+    /// 三维重定位前等近期主雷达帧不少于 5 帧：每 100 毫秒看一次，最多等 `limit`；
+    /// 到时仍不足也返回，由会话照常给出原因。只读输入缓冲，不经会话命令循环。
+    pub async fn wait_recent_frames(&self, limit: Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let count = {
+                let mut recent = self.recent.lock();
+                trim_recent(&mut recent);
+                recent.len()
+            };
+            if count >= 5 || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     pub async fn set_goal(&self, request: NavigationGoal) -> Result<SetGoalResponse, Status> {
         self.request(|tx| Command::Goal(request, tx)).await
@@ -560,18 +581,24 @@ impl Session {
     fn start_localizer(&mut self, mapper: Arc<Mapper>) {
         if self.state.info.as_ref().unwrap().pipeline == "lio_3d" {
             let target = self.relocalization_target.as_ref().unwrap().clone();
+            // 重定位成功进入已定位：建图线程开始把帧写进地图。
+            mapper.set_writing(true);
             self.localizer = Some(localizer::Localizer::start(self.router.clone(), mapper, target));
         }
     }
     async fn stop_localizer(&mut self) {
         if let Some(localizer) = self.localizer.take() {
             localizer.stop().await;
+            // 离开已定位（重新定位、故障、结束会话）：建图线程回到只读。
+            self.mapper().expect("跟踪器运行期间路由上有地图").set_writing(false);
         }
     }
     fn localization_update(&mut self, update: localizer::TrackingUpdate) {
+        // 只有最近一轮吻合才写入地图；吻合差的这一轮起回到只读，恢复吻合再写入。
+        self.mapper().expect("跟踪器运行期间路由上有地图").set_writing(update.bad_rounds == 0);
         if update.bad_rounds >= 10 {
-            self.state.reason = format!("定位质量下降：最近扫描与地图吻合度为 {:.3}，建议重新定位", update.score.wall_fitness);
-        } else if update.bad_rounds == 0 && self.state.reason.starts_with("定位质量下降：") {
+            self.state.reason = LOCALIZATION_DEGRADED.into();
+        } else if update.bad_rounds == 0 && self.state.reason == LOCALIZATION_DEGRADED {
             self.state.reason.clear();
         }
         self.state.localization_quality = Some(LocalizationQuality {
@@ -772,10 +799,15 @@ impl Session {
         Ok(())
     }
     async fn save(&mut self, request: SaveMapRequest) -> Result<SaveMapResponse, Status> {
-        if !matches!(
-            self.phase(),
-            SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
-        ) {
+        // 三维链已定位时地图随环境更新，允许覆盖原图或另存。
+        let localized_3d = self.phase() == SessionPhase::Localized
+            && self.state.info.as_ref().unwrap().pipeline == "lio_3d";
+        if !localized_3d
+            && !matches!(
+                self.phase(),
+                SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
+            )
+        {
             return Err(Status::failed_precondition("当前没有正在建的地图"));
         }
         let name = if request.map_name.is_empty() {
@@ -1317,7 +1349,7 @@ pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
     let (_, maps) = watch::channel(None);
     let (_, lio) = watch::channel(None);
     let (faults, _) = mpsc::unbounded_channel();
-    SessionHandle { commands, state, route, pose, maps, lio, faults }
+    SessionHandle { commands, state, route, pose, maps, lio, faults, recent: Default::default() }
 }
 
 #[cfg(test)]

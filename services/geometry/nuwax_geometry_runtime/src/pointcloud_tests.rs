@@ -18,7 +18,7 @@ fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_conti
         let log_before = map.logs.values().next().map(|log| std::fs::metadata(&log.path).unwrap().len());
         frame.odom_pose.timestamp_ns += if stage == "progress" { 1 } else { 1_000_000_000 };
         let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
-        map.accumulate(2, &frame, &points, frame.ray_origin_body, Isometry3::identity())
+        map.accumulate(2, &frame, &points, frame.ray_origin_body, Isometry3::identity(), Isometry3::identity())
             .expect("预算耗尽不能使 accumulate 失败");
         assert!(!map.recording, "{stage}");
         assert!(map.take_recording_limit());
@@ -29,7 +29,7 @@ fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_conti
         std::fs::remove_file(source.join("budget-used")).unwrap();
         frame.odom_pose.timestamp_ns += 2_000_000_000;
         let before = map.scan_prefix().unwrap();
-        map.accumulate(3, &frame, &points, frame.ray_origin_body, Isometry3::identity()).unwrap();
+        map.accumulate(3, &frame, &points, frame.ray_origin_body, Isometry3::identity(), Isometry3::identity()).unwrap();
         assert_eq!(map.poses.len(), 2);
         assert_eq!(map.scan_prefix().unwrap(), before, "释放空间后本会话也不恢复记录");
     }
@@ -110,7 +110,7 @@ fn display_removals_match_full_scan_for_every_frame() {
             let origin = transform * Point3::from(frame.ray_origin_body);
             let before = map.voxels.clone();
             let (dynamic, _, _) = map.accumulate(index + 1, &frame, &points,
-                [origin.x, origin.y, origin.z], transform).unwrap();
+                [origin.x, origin.y, origin.z], transform, Isometry3::identity()).unwrap();
             let hits: VoxelIndex = points.iter()
                 .filter_map(|p| voxel_key([p.x, p.y, p.z], size)).collect();
             // 保留旧实现的逐键判定作为独立对照，比较生产 accumulate 实际删除结果。

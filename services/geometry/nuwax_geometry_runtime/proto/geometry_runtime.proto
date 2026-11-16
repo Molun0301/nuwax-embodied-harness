@@ -407,7 +407,8 @@ message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
 
 message RelocalizeRequest {
   // 可选初值。二维执行链按初值局部匹配，不给则用地图保存时的位姿；
-  // 三维执行链不接受初值（给了 → INVALID_ARGUMENT），做全局匹配。
+  // 三维执行链接受初值：初值只决定从哪里开始配准，是否成功由评分决定；
+  // 调用方给的初值不要求水平约束度。
   PlanarSeed seed = 1;
 }
 

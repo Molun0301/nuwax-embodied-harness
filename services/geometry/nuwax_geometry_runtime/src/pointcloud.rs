@@ -183,6 +183,8 @@ impl CloudMap {
         self.pages.invalidate();
         self.publish()
     }
+    /// `evidence_from_odom` 把本帧放进去动态证据所在的坐标：重放时取该帧时刻的校正，
+    /// 在线取建图线程最近一次采用重放地图时的校正。
     pub fn accumulate(
         &mut self,
         sequence: u64,
@@ -190,19 +192,21 @@ impl CloudMap {
         points: &[Point3<f64>],
         origin: [f64; 3],
         map_from_odom: Isometry3<f64>,
+        evidence_from_odom: Isometry3<f64>,
     ) -> Result<(MappedFrame, Vec<u32>, Vec<u32>), String> {
         let odom = pose_isometry(&frame.odom_pose);
-        let odom_points: Vec<_> = frame
+        let evidence_from_body = evidence_from_odom * odom;
+        let evidence_points: Vec<_> = frame
             .points_body
             .iter()
-            .map(|p| odom * Point3::from(*p))
+            .map(|p| evidence_from_body * Point3::from(*p))
             .collect();
-        let origin_odom = odom * Point3::from(frame.ray_origin_body);
+        let origin_evidence = evidence_from_body * Point3::from(frame.ray_origin_body);
         let (mut dynamic, indices) = self.dufo.observe(
-            &odom_points,
-            [origin_odom.x, origin_odom.y, origin_odom.z],
+            &evidence_points,
+            [origin_evidence.x, origin_evidence.y, origin_evidence.z],
             frame.odom_pose.timestamp_ns,
-            map_from_odom,
+            map_from_odom * evidence_from_odom.inverse(),
         )?;
         dynamic.bind_points(points, &indices);
         let ground = self.fine.accumulate(
@@ -416,6 +420,14 @@ impl CloudMap {
             frame.odom_pose.timestamp_ns,
             Some(dynamic),
         )
+    }
+    /// 切到写入时释放只读分类副本；切回只读后由 `classify_readonly` 按当前精细根重新建立。
+    pub fn release_readonly_classifier(&mut self) {
+        self.readonly_classifier = None;
+    }
+    #[cfg(test)]
+    pub(crate) fn has_readonly_classifier(&self) -> bool {
+        self.readonly_classifier.is_some()
     }
     pub fn disable_recording(&mut self) {
         self.recording = false;
@@ -742,3 +754,6 @@ impl Drop for CloudMapShmWriter {
 #[cfg(test)]
 #[path = "pointcloud_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "pointcloud_evidence_tests.rs"]
+mod evidence_tests;

@@ -182,7 +182,7 @@ fn native_pgo_request_preserves_committed_nanoseconds_and_skips_uncommitted_fram
             .unwrap()
             .unwrap();
         let grid =
-            PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy)
+            PersistentOccupancyGrid::from_observation(&candidate.latest_frame_occupancy)
                 .unwrap();
         let committed_stamp = candidate.source_timestamp_ns;
         assert_eq!(committed_stamp, stamp);
@@ -236,9 +236,9 @@ fn compute_for_test(
 ) -> (Isometry3<f64>, f64, bool) {
     let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
     let target = TargetCache::new(target, RelocalizationConfig::default());
-    let (pose, fitness, succeeded, _) =
-        compute_relocalization(&source, &target, &[initial], Isometry3::identity());
-    (pose, fitness, succeeded)
+    let (pose, fitness, outcome) =
+        compute_relocalization(&source, &target, &[(initial, true)], Isometry3::identity());
+    (pose, fitness, outcome == Outcome::Accepted)
 }
 
 #[test]
@@ -260,9 +260,11 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
         odom,
     );
     assert_eq!(initials.len(), 3);
-    assert_transform(initials[0], current);
-    assert_transform(initials[1] * odom, saved);
-    let body = initials[2] * odom;
+    assert_eq!(initials.iter().map(|(_, automatic)| *automatic).collect::<Vec<_>>(), [true, true, false],
+        "只有调用方给的初值不要求水平约束度");
+    assert_transform(initials[0].0, current);
+    assert_transform(initials[1].0 * odom, saved);
+    let body = initials[2].0 * odom;
     assert_transform(
         body,
         Isometry3::from_parts(
@@ -272,7 +274,7 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
     );
     assert_eq!(
         relocalization_initials(current, None, None, odom),
-        vec![current]
+        vec![(current, true)]
     );
     let without_saved = relocalization_initials(
         current,
@@ -284,7 +286,7 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
         }),
         odom,
     );
-    assert!(((without_saved[1] * odom).translation.z).abs() < 1e-9);
+    assert!(((without_saved[1].0 * odom).translation.z).abs() < 1e-9);
 }
 
 fn local_consensus_source() -> Vec<Point3<f64>> {
@@ -362,9 +364,9 @@ fn relocalization_local_consensus_uses_second_initial_after_first_fails() {
         }),
         odom,
     );
-    let (actual, _, succeeded, _) =
+    let (actual, _, outcome) =
         compute_relocalization(&source, &target, &initials, odom);
-    assert!(succeeded);
+    assert_eq!(outcome, Outcome::Accepted);
     assert_transform(actual, truth);
 }
 
@@ -379,18 +381,17 @@ fn relocalization_local_error_continues_to_second_initial_and_then_global() {
     let bad = Isometry3::translation(1e40, 0.0, 0.0);
     let odom = Isometry3::identity();
     assert!(local_registration(&source, &target, bad, odom).is_err());
-    let (pose, fitness, succeeded, ambiguous) =
-        compute_relocalization(&source, &target, &[bad, odom], odom);
-    assert!(succeeded && !ambiguous);
+    let (pose, fitness, outcome) =
+        compute_relocalization(&source, &target, &[(bad, true), (odom, true)], odom);
+    assert_eq!(outcome, Outcome::Accepted);
     assert!(fitness >= 0.45);
     assert_transform(pose, odom);
     let global = relocation_pipeline_cached(&source, &target, RelocalizationConfig::default());
     assert!(global.fitness >= 0.45);
-    let actual = compute_relocalization(&source, &target, &[bad, bad], odom);
+    let actual = compute_relocalization(&source, &target, &[(bad, true), (bad, true)], odom);
     assert_eq!(actual.0, global.registration.transformation);
     assert_eq!(actual.1, global.fitness);
-    assert_eq!(actual.2, global.registration.converged);
-    assert_eq!(actual.3, global.ambiguous);
+    assert_eq!(actual.2 == Outcome::Accepted, global.registration.converged);
 }
 
 #[test]
@@ -406,9 +407,9 @@ fn relocalization_local_consensus_preserves_nonzero_anchor_and_reuses_registrati
     let mut registration =
         Isometry3::from_parts(Translation3::new(2.03, -3.02, 0.41), truth.rotation);
     for _ in 0..2 {
-        let (actual, _, succeeded, _) =
-            compute_relocalization(&source, &target, &[registration], Isometry3::identity());
-        assert!(succeeded);
+        let (actual, _, outcome) =
+            compute_relocalization(&source, &target, &[(registration, true)], Isometry3::identity());
+        assert_eq!(outcome, Outcome::Accepted);
         assert_transform(actual, truth);
         registration = actual;
     }
@@ -460,6 +461,123 @@ async fn relocalization_global_ambiguity_keeps_mapper_transform_and_exact_messag
     assert!(result.pose.is_none());
     assert_eq!(loaded.map_from_odom(), before);
     loaded.shutdown().await.unwrap();
+}
+
+/// 一面沿 y 的长直墙（x=2.05）和地面，外加 y=-6.05 处 0.5 米长的一小段垂直墙。
+/// 坐标取 0.1 米体素的中心，降采样后仍是规则网格，法线不受网格混叠影响。
+fn one_wall_scene() -> Vec<Point3<f64>> {
+    let mut points = Vec::new();
+    for b in 0..=240 {
+        let y = -11.95 + b as f64 * 0.1;
+        points.extend((0..=25).map(|c| Point3::new(2.05, y, 0.05 + c as f64 * 0.1)));
+        points.extend((0..=30).map(|a| Point3::new(-0.95 + a as f64 * 0.1, y, 0.0)));
+    }
+    for a in 0..5 {
+        points.extend((0..=25).map(|c| Point3::new(1.55 + a as f64 * 0.1, -6.05, 0.05 + c as f64 * 0.1)));
+    }
+    points
+}
+
+#[tokio::test]
+async fn one_direction_walls_reject_automatic_results_but_accept_a_caller_seed() {
+    use crate::mapper::MapperConfig;
+    let scene = one_wall_scene();
+    let origin = [0.5, 0.0, 0.5];
+    let mut frame = crate::mapper::tests::room_frame(993, 1_000_000_000);
+    frame.points_body = scene.iter().map(|p| [p.x, p.y, p.z]).collect();
+    frame.ray_origin_body = origin;
+    let mapper = Mapper::start(993, MapperConfig::default()).unwrap();
+    mapper.feed(frame);
+    let snapshot = mapper.snapshot().await.unwrap();
+    mapper.shutdown().await.unwrap();
+    let loaded = Mapper::load(994, MapperConfig::default(), snapshot, true).unwrap();
+    // 真实 map→odom 为单位变换；当前 map→odom 与保存的最后位姿都沿墙偏 4 米。
+    let saved = Isometry3::translation(0.0, 4.0, 0.0);
+    loaded.set_map_from_odom(saved).await.unwrap();
+    let mut current = crate::mapper::tests::room_frame(994, 2_000_000_000);
+    current.ray_origin_body = origin;
+    // 视野 8 米内、墙角这一侧（墙角挡住其后的墙面）。
+    current.points_body = scene
+        .iter()
+        .filter(|p| (p.x - origin[0]).hypot(p.y) <= 8.0 && p.y > -6.1)
+        .map(|p| [p.x, p.y, p.z])
+        .collect();
+    let corner = current.points_body.iter().filter(|p| p[0] < 2.0 && p[2] > 0.0).count();
+    let walls = current.points_body.iter().filter(|p| p[0] > 2.0).count();
+    assert!(corner * 20 < walls, "墙角占墙面点不到 5%：{corner}/{walls}");
+    // 对照：从偏 4 米的初值配准，结果满足原有四个条件，只差水平约束度。
+    let source = SourceCloud::from_rays(
+        current.points_body.iter().map(|p| (Point3::from(*p), Point3::from(origin))),
+    );
+    let target = TargetCache::new(&scene, RelocalizationConfig::default());
+    let wrong = local_registration(&source, &target, saved, Isometry3::identity())
+        .unwrap()
+        .transformation;
+    let score = score_relocalization(&source, wrong, &target);
+    assert!(score.accepts(&wrong) && !score.constrained(), "{score:?}");
+    assert!((wrong.translation.y - 4.0).abs() < 0.2, "{wrong:?}");
+    // 全局阶段单独看：最好的候选满足原有条件，只差水平约束度，不接受。
+    let global = relocation_pipeline_cached(&source, &target, RelocalizationConfig::default());
+    assert!(!global.registration.converged && global.one_direction, "{global:?}");
+    let result = Corrector::relocalize(&loaded, vec![current.clone()], &mut None, Some(saved), None)
+        .await
+        .unwrap();
+    assert!(!result.succeeded);
+    assert_eq!(
+        result.message,
+        "重定位无法确定位置：周围只有一个方向的墙面，沿墙方向的位置不确定。请移动到能看到拐角或其它方向结构的位置后重试，或给出大致位置"
+    );
+    assert!(result.pose.is_none());
+    assert_eq!(loaded.map_from_odom(), saved);
+    // 调用方给出正确初值：不要求水平约束度，配准对齐后成功。
+    let seeded = Corrector::relocalize(
+        &loaded,
+        vec![current],
+        &mut None,
+        Some(saved),
+        Some(proto::PlanarSeed { x: 0.0, y: 0.0, yaw: 0.0 }),
+    )
+    .await
+    .unwrap();
+    assert!(seeded.succeeded, "{}", seeded.message);
+    let error = loaded.map_from_odom().translation.vector.norm();
+    assert!(error < 0.05, "初值成功后的误差 {error}");
+    loaded.shutdown().await.unwrap();
+}
+
+#[test]
+fn horizontal_constraint_needs_walls_in_two_directions() {
+    // 地面与 x=±2.95 两面墙；有没有 y=±1.95 两面墙两种情形。
+    let room = |with_cross_walls: bool| {
+        let mut points = Vec::new();
+        for a in 0..60 {
+            for b in 0..40 {
+                points.push(Point3::new(-2.95 + a as f64 * 0.1, -1.95 + b as f64 * 0.1, 0.0));
+            }
+        }
+        for c in 0..20 {
+            let z = 0.05 + c as f64 * 0.1;
+            for b in 0..40 {
+                let y = -1.95 + b as f64 * 0.1;
+                points.extend([Point3::new(-2.95, y, z), Point3::new(2.95, y, z)]);
+            }
+            if with_cross_walls {
+                for a in 0..60 {
+                    let x = -2.95 + a as f64 * 0.1;
+                    points.extend([Point3::new(x, -1.95, z), Point3::new(x, 1.95, z)]);
+                }
+            }
+        }
+        points
+    };
+    for (with_cross_walls, constrained) in [(true, true), (false, false)] {
+        let points = room(with_cross_walls);
+        let target = TargetCache::new(&points, RelocalizationConfig::default());
+        let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::new(0.0, 0.0, 1.0))));
+        let score = score_relocalization(&source, Isometry3::identity(), &target);
+        assert!(score.accepts(&Isometry3::identity()), "{score:?}");
+        assert_eq!(score.constrained(), constrained, "{score:?}");
+    }
 }
 
 #[test]

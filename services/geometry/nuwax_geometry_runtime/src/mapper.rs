@@ -156,7 +156,6 @@ pub struct Mapper {
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
     forbidden_status: watch::Receiver<Result<(), String>>,
     recent_cloud: watch::Receiver<Option<RecentPublication>>,
-    raw_grid: watch::Receiver<Option<proto::OccupancyGrid>>,
     worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 enum Input {
@@ -175,6 +174,7 @@ enum Command {
     ),
     Transform(Isometry3<f64>, oneshot::Sender<Result<(), String>>),
     Name(String),
+    Writing(bool),
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
     Forbidden(PathBuf, oneshot::Sender<Result<(), String>>),
@@ -228,7 +228,6 @@ impl Mapper {
         let (transform_tx, transform) = watch::channel(Isometry3::identity());
         let (forbidden_tx, forbidden) = watch::channel(None);
         let (recent_cloud_tx, recent_cloud) = watch::channel(None);
-        let (raw_grid_tx, raw_grid) = watch::channel(None);
         let mut worker = Worker::new(
             session_id,
             config.clone(),
@@ -240,7 +239,6 @@ impl Mapper {
             transform_tx,
             forbidden_tx,
             recent_cloud_tx,
-            raw_grid_tx,
             forbidden_status_tx,
             attach_shared,
         )?;
@@ -295,7 +293,6 @@ impl Mapper {
             forbidden,
             forbidden_status,
             recent_cloud,
-            raw_grid,
             worker: Arc::new(std::sync::Mutex::new(Some(worker_handle))),
         }))
     }
@@ -344,10 +341,8 @@ impl Mapper {
     pub fn has_occupancy(&self) -> bool {
         self.maps.borrow().is_some()
     }
+    /// 物理栅格与有效栅格都取自已发布的同一份地图更新。
     pub fn occupancy(&self, include_forbidden: bool) -> Option<proto::OccupancyGrid> {
-        if !include_forbidden {
-            return self.raw_grid.borrow().clone();
-        }
         self.maps.borrow().as_ref().map(|map| proto::OccupancyGrid {
             map_name: map.map_name.clone(),
             meta: map.meta.clone(),
@@ -405,6 +400,10 @@ impl Mapper {
     }
     pub fn set_map_name(&self, name: String) {
         let _ = self.sender.send(Command::Name(name));
+    }
+    /// 加载的三维地图在只读与写入之间切换；写入时帧按新建地图会话处理。
+    pub fn set_writing(&self, writing: bool) {
+        let _ = self.sender.send(Command::Writing(writing));
     }
     pub(crate) async fn display_cloud(&self) -> Result<crate::pointcloud::CloudSnapshot, String> {
         let (tx, rx) = oneshot::channel();
@@ -464,6 +463,8 @@ struct Worker {
     cloud: CloudMap,
     grid: Option<PersistentOccupancyGrid>,
     map_from_odom: Isometry3<f64>,
+    /// 在线去动态证据坐标 ← 里程计：会话开始为单位变换，每次采用重放地图后取这次校正的最新值。
+    evidence_from_odom: Isometry3<f64>,
     poses: watch::Sender<Option<proto::Pose>>,
     maps: watch::Sender<Option<proto::MapUpdate>>,
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
@@ -487,7 +488,7 @@ struct Worker {
     forbidden_status: watch::Sender<Result<(), String>>,
     recent_cloud: watch::Sender<Option<RecentPublication>>,
     last_input: Option<MappingBackendInput>,
-    raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
+    forbidden_cells: Option<ForbiddenCells>,
     grid_stamp: u64,
     latest_odometry: Option<proto::Pose>,
     planar_resume_unavailable_reason: Option<String>,
@@ -504,7 +505,6 @@ impl Worker {
         transform: watch::Sender<Isometry3<f64>>,
         forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
         recent_cloud: watch::Sender<Option<RecentPublication>>,
-        raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
         forbidden_status: watch::Sender<Result<(), String>>,
         attach_shared: bool,
     ) -> Result<Self, Status> {
@@ -568,6 +568,7 @@ impl Worker {
             cloud,
             grid,
             map_from_odom,
+            evidence_from_odom: Isometry3::identity(),
             poses,
             maps,
             fine_root,
@@ -591,7 +592,7 @@ impl Worker {
             forbidden_status,
             recent_cloud,
             last_input: None,
-            raw_grid,
+            forbidden_cells: None,
             latest_odometry: snapshot
                 .as_ref()
                 .and_then(|s| s.last_pose.as_ref())
@@ -667,6 +668,13 @@ impl Worker {
                 Ok(())
             }
             Command::Shutdown => Ok(()),
+            Command::Writing(writing) => {
+                self.read_only = !writing;
+                if writing {
+                    self.cloud.release_readonly_classifier();
+                }
+                Ok(())
+            }
             Command::ActivateShared(reply) => {
                 let result = match self.config.cloudmap_shm_path.as_deref() {
                     Some(path) => self.cloud.attach_shared(path),
@@ -728,7 +736,11 @@ impl Worker {
         {
             return Ok(());
         }
-        self.forbidden_zones = crate::forbidden_zones::read(path)?;
+        let zones = crate::forbidden_zones::read(path)?;
+        if zones != self.forbidden_zones {
+            self.forbidden_cells = None;
+        }
+        self.forbidden_zones = zones;
         self.forbidden_metadata = metadata;
         let _ = self.forbidden_status.send_replace(Ok(()));
         self.publish_grid()
@@ -813,9 +825,15 @@ impl Worker {
             &points,
             [origin.x, origin.y, origin.z],
             self.map_from_odom,
+            self.evidence_from_odom,
         )?;
         if self.cloud.take_recording_limit() {
-            self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            if self.corrector.is_some() {
+                self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+            } else {
+                // 没有校正线程（加载的会话、不校正的配置）：只经同一通知通道写进会话原因。
+                self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
+            }
         }
         if !frame.mapping_only {
             self.publish_recent(encode_recent_cloud(
@@ -843,10 +861,7 @@ impl Worker {
         )?;
         let committed_this_frame = candidate.is_some();
         if let Some(candidate) = candidate {
-            self.grid = Some(PersistentOccupancyGrid::stage_observation(
-                self.grid.as_ref(),
-                &candidate.latest_frame_occupancy,
-            )?);
+            PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
             self.grid_stamp = stamp;
             self.cloud.commit(stamp)?;
             self.fine_root.send_replace(self.cloud.surface());
@@ -941,6 +956,8 @@ impl Worker {
         self.grid = rebuilt.grid;
         self.grid_stamp = rebuilt.stamp;
         self.map_from_odom = rebuilt.update.latest;
+        // 重放地图的去动态证据在校正后的坐标里，之后的在线帧按这次校正的最新值放入同一坐标。
+        self.evidence_from_odom = rebuilt.update.latest;
         self.built_until = rebuilt.stamp;
         self.built_corrections.clear();
         self.built_corrections.push((rebuilt.stamp, self.map_from_odom));
@@ -973,10 +990,7 @@ impl Worker {
             if let Some(candidate) =
                 mapping_backend::flush_candidate(kernel, input, self.config.compute)?
             {
-                self.grid = Some(PersistentOccupancyGrid::stage_observation(
-                    self.grid.as_ref(),
-                    &candidate.latest_frame_occupancy,
-                )?);
+                PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
                 self.grid_stamp = input.source_timestamp_ns;
                 flushed = true;
             }
@@ -1015,25 +1029,31 @@ impl Worker {
         let Some(grid) = self.grid.as_ref() else {
             return Ok(());
         };
-        let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
-        raw.meta.as_mut().unwrap().timestamp_ns = self.grid_stamp;
-        self.raw_grid.send_replace(Some(raw.clone()));
-        let mut data = raw.data.clone();
-        let mut mask = vec![0; data.len()];
         self.forbidden_status.borrow().clone()?;
-        if self.forbidden_path.is_some() {
-            crate::forbidden_zones::overlay_zones(&self.forbidden_zones, &grid.grid, &mut mask)?;
-            for (index, value) in mask.iter().enumerate() {
-                if *value == 100 {
-                    data[index] = 100
-                }
+        let mut raw = kernel_grid_to_proto(&grid.grid, &self.config.map_name);
+        let meta = raw.meta.as_mut().unwrap();
+        meta.timestamp_ns = self.grid_stamp;
+        let layout = (meta.origin_x, meta.origin_y, meta.width, meta.height);
+        // 禁行区内容与栅格原点、尺寸都没变时沿用上次的掩码，掩码通道也不重发。
+        if self.forbidden_cells.as_ref().is_none_or(|cells| cells.layout != layout) {
+            let mut mask = vec![0; raw.data.len()];
+            if self.forbidden_path.is_some() {
+                crate::forbidden_zones::overlay_zones(&self.forbidden_zones, &grid.grid, &mut mask)?;
             }
+            let blocked = mask.iter().enumerate().filter(|(_, value)| **value == 100)
+                .map(|(index, _)| index).collect();
+            self.forbidden.send_replace(Some(proto::OccupancyGrid {
+                map_name: raw.map_name.clone(),
+                meta: raw.meta.clone(),
+                data: mask,
+            }));
+            self.forbidden_cells = Some(ForbiddenCells { layout, blocked });
         }
-        self.forbidden.send_replace(Some(proto::OccupancyGrid {
-            map_name: raw.map_name.clone(),
-            meta: raw.meta.clone(),
-            data: mask,
-        }));
+        // 有效栅格 = 物理栅格的一份拷贝再叠加禁行格；没有禁行格时只有这一次拷贝。
+        let mut data = raw.data.clone();
+        for &index in &self.forbidden_cells.as_ref().unwrap().blocked {
+            data[index] = 100;
+        }
         self.maps.send_replace(Some(proto::MapUpdate {
             map_name: raw.map_name,
             meta: raw.meta,
@@ -1042,6 +1062,11 @@ impl Worker {
         }));
         Ok(())
     }
+}
+/// 上次栅格化禁行掩码时的栅格原点与尺寸，以及掩码里的禁行格下标。
+struct ForbiddenCells {
+    layout: (f64, f64, u32, u32),
+    blocked: Vec<usize>,
 }
 impl Drop for Worker {
     fn drop(&mut self) { self.corrector.take(); }

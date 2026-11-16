@@ -902,3 +902,179 @@ async fn replacement_sends_new_goal_without_cancel_and_accepts_its_execution() {
     session.nav.shutdown().await;
     if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
 }
+
+/// 地图目录下全部文件的相对路径与内容。
+fn directory_files(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn localized_map_follows_tracking_quality_and_saves_in_place_or_as_new_map() {
+    use crate::mapper::tests::{fine_voxels_at_obstacle, grid_cells_at_obstacle, obstacle_frame, room_frame};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/L3会话测试")
+        .join(uuid::Uuid::new_v4().to_string());
+    let mapper = Mapper::start(716, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper.clone(), root.clone()).await;
+    let base = now_ns();
+    session.router.publish_frame(room_frame(716, base));
+    mapper.snapshot().await.unwrap();
+    session.save(SaveMapRequest { map_name: "原图".into() }).await.unwrap();
+    session.load(LoadMapRequest { map_name: "原图".into() }).await.unwrap();
+    let loaded = session.mapper().unwrap();
+    let id = loaded.session_id();
+    let revision = |sealed: Option<Arc<nuwax_map_chunks::SealedMap>>| sealed.unwrap().manifest().revision;
+    let loaded_revision = revision(loaded.surface_map().await.unwrap());
+    assert_eq!(fine_voxels_at_obstacle(&loaded.surface_map().await.unwrap().unwrap()), 0);
+    // 障碍在加载前就已摆好：加载后的帧都带着它，重定位成功前只读，地图不变。
+    session.router.publish_frame(obstacle_frame(id, base + 1_000_000_000));
+    assert_eq!(revision(loaded.surface_map().await.unwrap()), loaded_revision);
+    let result = session.relocalize(RelocalizeRequest::default()).await.unwrap();
+    assert!(result.succeeded, "{}", result.message);
+    assert_eq!(session.phase(), SessionPhase::Localized);
+    let target = session.relocalization_target.clone().unwrap();
+    let target_points = target.points.clone();
+    session.router.publish_frame(obstacle_frame(id, base + 2_000_000_000));
+    let written = revision(loaded.surface_map().await.unwrap());
+    assert!(written > loaded_revision, "重定位成功后写入地图");
+    assert!(fine_voxels_at_obstacle(&loaded.surface_map().await.unwrap().unwrap()) > 0);
+    // 某一轮吻合差：回到只读，近期点云照发。
+    let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1., horizontal_constraint: 0. };
+    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 1, timestamp_ns: 0 });
+    let mut recent = loaded.recent_cloud_rx();
+    recent.borrow_and_update();
+    session.router.publish_frame(obstacle_frame(id, base + 3_000_000_000));
+    assert_eq!(revision(loaded.surface_map().await.unwrap()), written, "吻合差期间地图不变");
+    assert!(recent.has_changed().unwrap());
+    // 下一轮吻合：继续写入。
+    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 0, timestamp_ns: 0 });
+    session.router.publish_frame(obstacle_frame(id, base + 4_000_000_000));
+    assert!(revision(loaded.surface_map().await.unwrap()) > written);
+    assert!(Arc::ptr_eq(session.relocalization_target.as_ref().unwrap(), &target));
+    assert_eq!(target.points, target_points, "跟踪定位的目标仍是加载时的地图");
+    // 已定位时不带名字保存即覆盖原图，阶段与跟踪器不变。
+    let saved = session.save(SaveMapRequest::default()).await.unwrap();
+    assert!(saved.replaced);
+    assert_eq!(saved.map_name, "原图");
+    assert_eq!(session.phase(), SessionPhase::Localized);
+    assert!(session.localizer.is_some());
+    let original = directory_files(&root.join("原图"));
+    session.router.publish_frame(obstacle_frame(id, base + 5_000_000_000));
+    loaded.surface_map().await.unwrap();
+    let renamed = session.save(SaveMapRequest { map_name: "新图".into() }).await.unwrap();
+    assert!(!renamed.replaced);
+    assert_eq!(session.state.map_name, "新图");
+    assert_eq!(directory_files(&root.join("原图")), original, "另存为新名不改原图目录");
+    // 重新加载覆盖后的原图能看到新障碍。
+    session.load(LoadMapRequest { map_name: "原图".into() }).await.unwrap();
+    let reloaded = session.mapper().unwrap();
+    assert!(fine_voxels_at_obstacle(&reloaded.surface_map().await.unwrap().unwrap()) > 0);
+    assert!(grid_cells_at_obstacle(&reloaded.occupancy(false).unwrap()) > 0);
+    session.end_current().await.unwrap();
+    session.lio().unwrap().shutdown().await;
+    session.nav.shutdown().await;
+    mapper.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn planar_localized_session_still_rejects_save() {
+    let (mut session, root, _) = load_fault_saved_planar_map().await;
+    session.state.phase = SessionPhase::Localized as i32;
+    let error = session.save(SaveMapRequest::default()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn vanished_exploration_frontier_replaces_navigation_goal_without_cancel() {
+    use crate::explorer::tests::{distant_hole, floor, vanishing_fixture, vanishing_pose};
+    use crate::nav_bridge::tests::Capture;
+    use nuwax_codec::lcm::schema;
+    let root = std::env::temp_dir().join(format!("e2-vanish-{}", uuid::Uuid::new_v4()));
+    let mapper = Mapper::start(9271, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper, root.clone()).await;
+    session.nav.shutdown().await;
+    let capture = Arc::new(Capture::new());
+    let (tx, _updates) = mpsc::unbounded_channel();
+    session.nav = NavBridge::with_transport(nuwax_transport::LcmTransport::new(capture.clone()), tx).await.unwrap();
+    // 连接时清空导航栈旧目标的取消不属于本测试。
+    capture.published.lock().unwrap().clear();
+    session.nav.set_input_ready(Ok(()));
+    capture.inject_status("", 17, schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    let cancels = || capture.published.lock().unwrap().iter()
+        .filter(|frame| frame.topic.channel() == "/nav/cancel").count();
+    let sent = |count: usize| {
+        let capture = capture.clone();
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            while capture.goals().len() < count { tokio::time::sleep(Duration::from_millis(10)).await; }
+        })
+    };
+    let (mut explorer, partial) = vanishing_fixture();
+    let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial), Ok(())).unwrap();
+    let (first_id, _) = first.goal.clone().unwrap();
+    session.exploration_update(first).await;
+    sent(1).await.unwrap();
+    // 前沿消失：新子目标直接替换当前导航目标，会话不发取消。
+    let replaced = explorer.tick(Some(vanishing_pose()), None, Ok(distant_hole()), Ok(())).unwrap();
+    let (second_id, _) = replaced.goal.clone().unwrap();
+    session.exploration_update(replaced).await;
+    sent(2).await.unwrap();
+    assert_eq!(cancels(), 0);
+    let current = session.state.navigation.as_ref().unwrap();
+    assert_eq!(current.goal_id, second_id);
+    assert!(current.exploration_child);
+    let previous = session.state.previous_navigation.as_ref().unwrap();
+    assert_eq!((previous.goal_id.as_str(), previous.status), (first_id.as_str(), GoalStatus::Replaced as i32));
+    // 没有其它前沿：取消当前子目标。
+    let exhausted = explorer.tick(Some(vanishing_pose()), None, Ok(floor(|_, _| false)), Ok(())).unwrap();
+    assert_eq!(exhausted.cancel_goal.as_deref(), Some(second_id.as_str()));
+    session.exploration_update(exhausted).await;
+    assert_eq!(cancels(), 1);
+    assert_eq!(session.state.navigation.as_ref().unwrap().status, GoalStatus::Cancelled as i32);
+    assert_eq!(capture.goals().len(), 2);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
+}
+
+#[tokio::test]
+async fn relocalize_entry_waits_for_five_recent_frames_or_the_limit() {
+    let mapper = Mapper::start(717, MapperConfig::default()).unwrap();
+    let handle = test_block_session(mapper.clone());
+    // 一直没有帧：到等待上限返回。
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_millis(300)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(300) && waited < Duration::from_millis(600), "{waited:?}");
+    // 帧在 0.3 秒后陆续到达：凑满 5 帧就返回，不等到上限。
+    let recent = handle.recent.clone();
+    let feeder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for stamp in 1..=5 {
+            recent.lock().push_back((Instant::now(), crate::mapper::tests::room_frame(717, stamp)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    handle.wait_recent_frames(Duration::from_secs(10)).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(handle.recent.lock().len(), 5);
+    feeder.await.unwrap();
+    mapper.shutdown().await.unwrap();
+}

@@ -20,6 +20,36 @@ struct MapOutput {
     prior: Option<Arc<nuwax_map_chunks::Manifest>>,
 }
 
+/// 三维链下 `/map/occupancy` 两次发布至少相隔的时间。
+const OCCUPANCY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 三维链下 `/map/occupancy` 每秒至多发一次，间隔内只留最新一张，到点补发；二维链每次都发。
+struct OccupancyRate {
+    limited: bool,
+    sent_at: Option<tokio::time::Instant>,
+    pending: Option<proto::MapUpdate>,
+}
+
+impl OccupancyRate {
+    /// 返回现在要发的一张；间隔未到时替换待发的一张。
+    fn offer(&mut self, map: proto::MapUpdate, now: tokio::time::Instant) -> Option<proto::MapUpdate> {
+        if self.limited && self.sent_at.is_some_and(|sent| now < sent + OCCUPANCY_INTERVAL) {
+            self.pending = Some(map);
+            return None;
+        }
+        self.pending = None;
+        self.sent_at = Some(now);
+        Some(map)
+    }
+    fn due_at(&self) -> Option<tokio::time::Instant> {
+        self.pending.as_ref().map(|_| self.sent_at.unwrap() + OCCUPANCY_INTERVAL)
+    }
+    fn take_due(&mut self, now: tokio::time::Instant) -> Option<proto::MapUpdate> {
+        self.sent_at = Some(now);
+        self.pending.take()
+    }
+}
+
 impl MapOutput {
     async fn clear(&mut self, transport: &LcmTransport) -> Result<(), String> {
         if self.prior.take().is_none() {
@@ -113,15 +143,26 @@ impl Outputs {
             let mut maps = session.map_rx();
             let mut output = MapOutput::default();
             let mut follow_sent: Option<(u64, u64)> = None;
+            let mut occupancy = OccupancyRate {
+                limited: session.state().info.is_some_and(|info| info.pipeline == "lio_3d"),
+                sent_at: None,
+                pending: None,
+            };
             loop {
+                let due = occupancy.due_at();
                 let (id, result) = tokio::select! {
                     _=&mut stopped=>break,
+                    _=tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some()=>{
+                        let id = routes.borrow().as_ref().map_or(0, |route| route.id);
+                        let map = occupancy.take_due(tokio::time::Instant::now()).unwrap();
+                        (id, publish_occupancy(&transport, &map).await)
+                    },
                     changed=maps.changed()=>{
                         if changed.is_err(){break;}
                         let id = routes.borrow().as_ref().map_or(0, |route| route.id);
                         let map=maps.borrow_and_update().clone();
                         let result = if let Some(map)=map {
-                            match publish_map(&transport, &session, &map, &mut output).await {
+                            match publish_map(&transport, &session, &map, &mut output, &mut occupancy).await {
                                 Ok(Some((sealed, changed))) if follow && changed => {
                                     publish_follow(&transport, &session, &sealed, &mut follow_sent).await
                                 }
@@ -130,6 +171,8 @@ impl Outputs {
                             }
                         } else {
                             follow_sent = None;
+                            // 地图撤下后不再补发撤下前的栅格。
+                            occupancy.pending = None;
                             output.clear(&transport).await
                         };
                         (id, result)
@@ -156,6 +199,7 @@ async fn publish_map(
     session: &SessionHandle,
     _map: &proto::MapUpdate,
     output: &mut MapOutput,
+    occupancy: &mut OccupancyRate,
 ) -> Result<Option<(Arc<nuwax_map_chunks::SealedMap>, bool)>, String> {
     let mapper = match session.mapper() {
         Ok(mapper) => mapper,
@@ -174,14 +218,10 @@ async fn publish_map(
     let Some(map) = publication.map else {
         return Ok(None);
     };
-    let effective = grid(&map, true)?;
-    publish(
-        transport,
-        "/map/occupancy",
-        "nav_msgs.OccupancyGrid",
-        schema::encode_occupancy_grid_body(&effective).map_err(|e| e.to_string())?,
-    )
-    .await?;
+    let frame_id = map.meta.as_ref().ok_or("栅格缺少元数据")?.frame_id.clone();
+    if let Some(map) = occupancy.offer(map, tokio::time::Instant::now()) {
+        publish_occupancy(transport, &map).await?;
+    }
     let Some(sealed) = publication.fine else {
         return Ok(None);
     };
@@ -207,17 +247,17 @@ async fn publish_map(
         })
         .transpose()?;
     if let Some(mask) = &mut virtual_obstacles {
-        mask.header = header(stamp, &effective.header.frame_id, root.revision);
+        mask.header = header(stamp, &frame_id, root.revision);
     }
     let message = schema::NavigationMap3D {
         session_id: root.domain.session.clone(),
         revision,
-        frame_id: effective.header.frame_id.clone(),
+        frame_id: frame_id.clone(),
         source_timestamp_ns: stamp as i64,
         source_voxel_size: root.voxel_size_m,
         virtual_obstacles,
         fine: Some(navigation_map_transfer::prepare(&sealed)?),
-        cloud: cloud(Vec::new(), &effective.header.frame_id, stamp, 0),
+        cloud: cloud(Vec::new(), &frame_id, stamp, 0),
         ..Default::default()
     };
     send_navigation_map(transport, &message).await?;
@@ -230,6 +270,16 @@ async fn publish_map(
     output.revision = revision;
     output.prior = Some(root.clone());
     Ok(Some((sealed, changed)))
+}
+
+async fn publish_occupancy(transport: &LcmTransport, map: &proto::MapUpdate) -> Result<(), String> {
+    publish(
+        transport,
+        "/map/occupancy",
+        "nav_msgs.OccupancyGrid",
+        schema::encode_occupancy_grid_body(&grid(map, true)?).map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
 async fn send_navigation_map(

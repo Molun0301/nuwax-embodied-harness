@@ -14,7 +14,7 @@ fn slanted_free_observations_remove_the_same_residue_as_three_dimensional_rays()
         .unwrap()
     };
     let first = observe(1.0, vec![point![1.025, 0.025, 0.0]]);
-    let mut persistent = PersistentOccupancyGrid::stage_observation(None, &first).unwrap();
+    let mut persistent = PersistentOccupancyGrid::from_observation(&first).unwrap();
     persistent
         .merge_observation(&observe(2.0, vec![point![1.025, 0.025, 0.0]]))
         .unwrap();
@@ -43,7 +43,7 @@ fn planar_observations_confirm_hits_and_clears_without_reusing_timestamps() {
     let mut scan = OccupancyGrid::with_frame(3, 1, 0.05, "map");
     scan.data = vec![0, 100, -1];
     scan.ts = 1.0;
-    let mut map = PersistentOccupancyGrid::stage_observation(None, &scan).unwrap();
+    let mut map = PersistentOccupancyGrid::from_observation(&scan).unwrap();
     assert_eq!(map.grid.data, [0, -1, -1]);
     map.merge_observation(&scan).unwrap();
     assert_eq!(map.grid.data[1], -1);
@@ -139,4 +139,58 @@ fn cached_axes_match_original_cell_projection_including_boundaries() {
             }
         }
     }
+}
+
+#[test]
+fn in_place_merge_matches_cloned_staging_over_one_observation_sequence() {
+    // 旧做法：先克隆整个持久图再合并，只留在测试里作对照。
+    fn staged(current: Option<&PersistentOccupancyGrid>, latest: &OccupancyGrid) -> PersistentOccupancyGrid {
+        let mut staged = match current {
+            Some(current) => current.clone(),
+            None => {
+                let mut unknown = latest.clone();
+                unknown.data.fill(-1);
+                PersistentOccupancyGrid::from_grid(unknown).unwrap()
+            }
+        };
+        staged.merge_observation(latest).unwrap();
+        staged
+    }
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let mut reference: Option<PersistentOccupancyGrid> = None;
+    let mut in_place: Option<PersistentOccupancyGrid> = None;
+    let mut ts = 0.0;
+    for step in 0..400 {
+        let mut latest = OccupancyGrid::with_frame(
+            5 + next(20) as u32, 5 + next(20) as u32, 0.05, "map");
+        // 原点在格线上左右移动，覆盖持久图扩张。
+        latest.origin = [(next(60) as f64 - 30.) * 0.05, (next(60) as f64 - 30.) * 0.05, 0.];
+        for value in &mut latest.data {
+            *value = [-1, 0, 30, 65, 100][next(5) as usize];
+        }
+        if step % 37 == 5 {
+            latest.data.fill(-1);
+        }
+        // 偶尔重复或倒退源时间，覆盖同帧不重复投票。
+        ts += [1.0, 1.0, 1.0, 0.0, -0.5][next(5) as usize];
+        latest.ts = ts;
+        reference = Some(staged(reference.as_ref(), &latest));
+        PersistentOccupancyGrid::merge_or_create(&mut in_place, &latest).unwrap();
+        let (a, b) = (reference.as_ref().unwrap(), in_place.as_ref().unwrap());
+        assert_eq!((a.grid.width, a.grid.height, a.grid.origin, a.grid.ts),
+            (b.grid.width, b.grid.height, b.grid.origin, b.grid.ts), "第{step}步栅格范围");
+        assert_eq!(a.grid.data, b.grid.data, "第{step}步占据值");
+        assert_eq!(a.pending_values, b.pending_values, "第{step}步待确认值");
+        assert_eq!(a.pending_counts, b.pending_counts, "第{step}步待确认计数");
+        assert_eq!(a.last_observation_timestamp, b.last_observation_timestamp, "第{step}步时间水位");
+    }
+    let last = in_place.unwrap();
+    assert!(last.pending_counts.iter().any(|count| *count > 0), "序列须留下未确认的票");
+    assert!(last.grid.width > 25 && last.grid.height > 25, "序列须让持久图扩张");
 }

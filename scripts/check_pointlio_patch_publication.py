@@ -55,8 +55,8 @@ def main():
     end = production.index('\nif(NOT LIVOX_COMMON_DIR)', start)
     fragment = production[start:end]
     patch_names = re.findall(r'\$\{CMAKE_CURRENT_SOURCE_DIR\}/([^"\n]+\.patch)', fragment)
-    if len(patch_names) != 8:
-        raise RuntimeError('Expected the production eight-patch sequence')
+    if len(patch_names) != 9:
+        raise RuntimeError('Expected the production nine-patch sequence')
     original_patches = {name: (repo / CPP / name).read_bytes() for name in patch_names}
     work.mkdir(parents=True, exist_ok=False)
     fixture, build, logs = work / 'fixture', work / 'build', work / 'logs'
@@ -147,7 +147,7 @@ def main():
             idle('07-input-%d-idle' % index)
         # Change a real added output line in the final production patch copy.
         final_patch = fixture / patch_names[-1]
-        old_line = b'+    p_pre->det_range      = params.det_range;'
+        old_line = b'+extern double total_residual;'
         new_line = old_line + b' // publication patch change'
         assert original_patches[patch_names[-1]].count(old_line) == 1
         valid_patch = original_patches[patch_names[-1]].replace(old_line, new_line)
@@ -156,9 +156,9 @@ def main():
         after_patch = snapshot(published)
         assert changed['after']['consumer'] == changed['before']['consumer'] + 1
         assert changed['after']['configure'] == changed['before']['configure'] + 1
-        assert b'// publication patch change' in after_patch['parameters.cpp'][0]
-        assert after_patch['parameters.cpp'][0] != after_input['parameters.cpp'][0]
-        assert all(after_patch[n] == after_input[n] for n in FILES if n != 'parameters.cpp')
+        assert b'// publication patch change' in after_patch['laserMapping.hpp'][0]
+        assert after_patch['laserMapping.hpp'][0] != after_input['laserMapping.hpp'][0]
+        assert all(after_patch[n] == after_input[n] for n in FILES if n != 'laserMapping.hpp')
         idle('09-patch-change-idle')
         failure_patch = ('--- a/src/parameters.cpp\n+++ b/src/parameters.cpp\n@@ -1 +1 @@\n'
                          '-NUWAX_IMPOSSIBLE_CONTEXT_BEFORE\n+NUWAX_IMPOSSIBLE_CONTEXT_AFTER\n')

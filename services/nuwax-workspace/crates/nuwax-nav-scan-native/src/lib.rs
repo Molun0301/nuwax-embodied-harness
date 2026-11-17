@@ -30,7 +30,20 @@ pub struct Config {
     pub obstacle_clearance_m: f64,
     pub min_executable_linear_mps: f64,
     pub min_executable_angular_rps: f64,
+    /// 末段平移结束距离，取 [`TERMINAL_TRANSLATION_DONE_M`]。
+    pub terminal_translation_done_m: f64,
+    /// 实测停稳平移速度门槛，取 [`STOPPED_LINEAR_MPS`]。
+    pub stopped_linear_mps: f64,
+    /// 实测停稳偏航速度门槛，取 [`STOPPED_YAW_RPS`]。
+    pub stopped_yaw_rps: f64,
 }
+
+/// 末段平移结束距离：到停点平面距离不超过它时末段平移结束，原生平移速度归零。
+pub const TERMINAL_TRANSLATION_DONE_M: f64 = 0.02;
+/// 实测停稳平移速度门槛（米/秒）：低于它且偏航速度低于 [`STOPPED_YAW_RPS`] 才算停稳。
+pub const STOPPED_LINEAR_MPS: f64 = 0.02;
+/// 实测停稳偏航速度门槛（弧度/秒）。
+pub const STOPPED_YAW_RPS: f64 = 0.02;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -67,9 +80,26 @@ pub struct MotionState {
     pub measured_yaw_rate: u32,
 }
 impl MotionState {
-    /// 与原生曲线末端共用实测停稳条件；缺少测速不充当静止。
+    /// 实测世界线速度与偏航速度分别外推；缺失的量保留来源值，不把命令当测量。
+    fn extrapolated(&self, age: std::time::Duration) -> Self {
+        if age.is_zero() { return *self; }
+        let mut current = *self;
+        let seconds = age.as_secs_f64();
+        if self.measured_velocity != 0 {
+            for axis in 0..3 { current.position[axis] += self.velocity[axis] * seconds; }
+        }
+        if self.measured_yaw_rate != 0 { current.yaw += self.yaw_rate * seconds; }
+        if self.measured_velocity != 0 || self.measured_yaw_rate != 0 {
+            current.timestamp_ns += age.as_nanos() as i64;
+        }
+        current
+    }
+
+    /// 实测停稳：平移与偏航速度都有实测且低于停稳门槛；缺少测速不充当静止。
     pub fn stopped(&self) -> bool {
-        unsafe { nuwax_scan_motion_stopped(self) != 0 }
+        self.measured_velocity != 0 && self.measured_yaw_rate != 0
+            && self.velocity[0].hypot(self.velocity[1]) < STOPPED_LINEAR_MPS
+            && self.yaw_rate.abs() < STOPPED_YAW_RPS
     }
 }
 #[repr(C)]
@@ -176,7 +206,6 @@ impl TrackResult {
     }
 }
 extern "C" {
-    fn nuwax_scan_motion_stopped(state: *const MotionState) -> i32;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
     fn nuwax_scan_map_destroy(map: *mut c_void);
     fn nuwax_scan_map_surface(
@@ -255,6 +284,7 @@ extern "C" {
         config: *const Config,
         map: *const c_void,
         state: *const MotionState,
+        tracking: *const MotionState,
         previous: *const f64,
         terminal_yaw: f64,
         terminal_position: *const f64,
@@ -505,14 +535,16 @@ impl Drop for ScanPlanner {
     }
 }
 /// 快控制会话；这里只做相位、控制与原命令检查。
-pub struct ScanTracker(NonNull<c_void>);
+pub struct ScanTracker(NonNull<c_void>, std::time::Duration);
 unsafe impl Send for ScanTracker {}
 impl Default for ScanTracker {
     fn default() -> Self {
-        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap())
+        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap(), std::time::Duration::ZERO)
     }
 }
 impl ScanTracker {
+    /// 调度器传入已按位姿新鲜时限限制的来源年龄。
+    pub fn set_pose_age(&mut self, age: std::time::Duration) { self.1 = age; }
     /// 读取原生脱困事件状态，不改变事件预算或退出判定。
     pub fn recovery_active(&self) -> bool {
         unsafe { nuwax_scan_tracker_recovery_active(self.0.as_ptr()) != 0 }
@@ -549,6 +581,7 @@ impl ScanTracker {
         terminal_yaw: Option<f64>,
         terminal_position: Option<[f64; 3]>,
     ) -> Result<TrackResult, TrackFailure> {
+        let tracking = state.extrapolated(self.1);
         let mut result = TrackRaw::default();
         let mut recovery = SamplesRaw::default();
         let mut error = [0 as c_char; 1024];
@@ -558,6 +591,7 @@ impl ScanTracker {
                 config,
                 map.0 .0.as_ptr(),
                 state,
+                &tracking,
                 previous.as_ptr(),
                 terminal_yaw.unwrap_or(f64::NAN),
                 terminal_position.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
@@ -613,6 +647,7 @@ mod tests {
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
     include!("terminal_tests.rs");
+    include!("pose_extrapolation_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {
@@ -648,6 +683,7 @@ mod tests {
             max_reverse_velocity: 0.6,
             max_lateral_velocity: 0.6,
             obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
+            terminal_translation_done_m: crate::TERMINAL_TRANSLATION_DONE_M, stopped_linear_mps: crate::STOPPED_LINEAR_MPS, stopped_yaw_rps: crate::STOPPED_YAW_RPS,
         }
     }
     fn request<'a>(reference: &'a [[f64; 3]], obstacles: &'a [[f64; 3]]) -> PlanRequest<'a> {

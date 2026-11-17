@@ -13,6 +13,8 @@ typedef struct {
     double max_reverse_velocity, max_lateral_velocity;
     double obstacle_clearance_m;
     double min_executable_linear_mps, min_executable_angular_rps;
+    /* 末段平移结束距离与实测停稳门槛，由 Rust 常量填入（nuwax-nav-scan-native lib.rs）。 */
+    double terminal_translation_done_m, stopped_linear_mps, stopped_yaw_rps;
 } ScanConfig;
 typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
 typedef struct { double stop[3]; } ScanTerminalPoints;
@@ -29,8 +31,8 @@ typedef struct {
     int64_t timestamp_ns;
     uint32_t measured_velocity, measured_yaw_rate;
 } ScanState;
-/* 实测停稳口径由原生末端和运行时共同使用。 */
-int nuwax_scan_motion_stopped(const ScanState *state);
+/* 原生一侧的实测停稳判定；门槛取 config 中由 Rust 传入的停稳速度。 */
+int nuwax_scan_motion_stopped(const ScanState *state, const ScanConfig *config);
 /* 跟踪原因位；与 Rust track_reason 一一对应。 */
 typedef enum {
     SCAN_TRACK_NO_TRAJECTORY = 1u << 0,
@@ -75,7 +77,7 @@ int nuwax_scan_tracker_recovery_active(const void* tracker);
 void nuwax_scan_tracker_clear_trajectory(void *tracker);
 void nuwax_scan_tracker_install(void *tracker,const void *trajectory);
 void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void *snapshot,
-    const ScanState *state,const double previous_command[3],double terminal_yaw,const double *terminal_position,ScanTrackOutput *output,ScanOutput *recovery,
+    const ScanState *state,const ScanState *tracking,const double previous_command[3],double terminal_yaw,const double *terminal_position,ScanTrackOutput *output,ScanOutput *recovery,
     char *error,size_t error_capacity);
 void nuwax_scan_free(ScanOutput *output);
 #ifdef __cplusplus

@@ -257,7 +257,7 @@ class AuthorOverlapEscape {
     const bool starting=!latched_;
     ScanState measured{};std::copy(velocity,velocity+3,measured.velocity);measured.yaw_rate=angular;
     measured.measured_velocity=measured.measured_yaw_rate=1;
-    const bool stopped=nuwax_scan_motion_stopped(&measured);
+    const bool stopped=nuwax_scan_motion_stopped(&measured,&c);
     const State actual{p,yaw,body(Eigen::Map<const Eigen::Vector3d>(velocity).head<2>(),yaw),angular};
     const bool rebuilding=waiting_for_stop_&&stopped;
     if(starting) {
@@ -302,7 +302,7 @@ class AuthorOverlapEscape {
         throw std::runtime_error("Current body pose is occupied; escape penetration exceeds localization and mapping allowance");
       }
       const Eigen::Vector2d voxel((contact.cell[0]+.5)*c.resolution,(contact.cell[1]+.5)*c.resolution);
-      const double stopped_rate=.02+.02*(voxel-p.head<2>()).norm();
+      const double stopped_rate=c.stopped_linear_mps+c.stopped_yaw_rps*(voxel-p.head<2>()).norm();
       if(latched_&&!rebuilding&&!startsOutward(contact,c,actual,stopped_rate)) {
         waiting_for_stop_=true;
         if(stamp>last_stamp_){traveled_=(p-last_).norm();++ticks_;last_stamp_=stamp;}

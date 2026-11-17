@@ -38,7 +38,8 @@ class NavigationMap3D(object):
 
         self.has_virtual_obstacles = 0
         """
-        仅表示同次提交的虚拟禁区，不包含二维物理投影。
+        虚拟禁区，不包含二维物理投影；内容、原点尺寸或会话变化时携带，至少每秒补带一次。
+        未携带时沿用本进程本会话最近一份；进程启动、换会话或清空后未收到过则等待。
         LCM Type: int8_t
         """
 

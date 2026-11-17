@@ -434,12 +434,7 @@ fn pct_config(
     };
     if let Some(body) = map.body_envelope() {
         // 全局与SCAN执行端共用同一长宽矩形，凸包的窄前角不能成为不可执行的通路。
-        let bounds = body.footprint_xy_m.iter().fold(
-            [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
-                for i in 0..2 { bounds[0][i] = bounds[0][i].min(point[i]);
-                    bounds[1][i] = bounds[1][i].max(point[i]); }
-                bounds
-            });
+        let bounds = body_rectangle(body);
         config.footprint = vec![bounds[0], [bounds[1][0], bounds[0][1]],
             bounds[1], [bounds[0][0], bounds[1][1]]];
         config.footprint_radius = config.footprint
@@ -454,6 +449,17 @@ fn pct_config(
         config.max_slope = body.max_cross_slope_deg.to_radians();
     }
     config
+}
+
+/// 全局 PCT 与局部 SCAN 共用的外形长宽矩形：外包足迹的轴对齐包围盒 `[[x最小, y最小], [x最大, y最大]]`。
+pub fn body_rectangle(body: &nuwax_nav_mls_planner::SurfaceBodyEnvelope) -> [[f64; 2]; 2] {
+    body.footprint_xy_m.iter().fold([[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
+        for i in 0..2 {
+            bounds[0][i] = bounds[0][i].min(point[i]);
+            bounds[1][i] = bounds[1][i].max(point[i]);
+        }
+        bounds
+    })
 }
 
 /// 从当前快照的源点生成层析；占据带和禁区交现有原生桥判定。
@@ -498,39 +504,75 @@ fn pct_overlay_bands(map: &SurfaceSnapshot, config: &Config) -> Vec<Band> {
 fn tomography_points(map: &SurfaceSnapshot, config: &Config) -> Vec<[f32; 3]> {
     let (resolution, columns) = map.navigation_source_columns(None);
     let mut points = Vec::new();
-    // 完整精细源带独立地面记录时，地面取记录的连续高度，成员体素不再作为占据采样。
-    // 体素中心按源精度量化，缓坡或略倾斜的地图会被切成逐格台阶，两层体素厚的地面也会挡住机体。
-    let ground = map.observations().filter(|source| {
-        map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::MeasuredSurface
-            && source.is_complete_geometry_source()
-            && source.voxel_size_m().to_bits() == map.source_voxel_size_m().to_bits()
-    });
+    let ground = tomography_ground(map);
     if let Some(measured) = map.navigation_measured_points().filter(|_| ground.is_none()) {
         points.extend(measured.iter().map(|p| p.map(|v| v as f32)));
     } else {
-        // 没有地面记录的列（旧存档或已分类为空）仅恢复已有源体素中心。
         for (column, bands) in columns {
-            let xy = column.map(|v| (f64::from(v) + 0.5) * resolution);
-            let mut members = BTreeSet::new();
-            for record in ground.into_iter().flat_map(|source| source.ground_records(column)) {
-                members.extend(record.members());
-                if let Some(height) = record.height_at(xy) {
-                    points.push([xy[0] as f32, xy[1] as f32, height as f32]);
-                }
-            }
-            for [low, high] in bands {
-                let count = ((high - low) / config.point_resolution).round().max(1.0) as usize;
-                for index in 0..count {
-                    let z = low + (index as f64 + 0.5) * (high - low) / count as f64;
-                    if members.contains(&((z / resolution).floor() as i32)) {
-                        continue;
-                    }
-                    points.push([xy[0] as f32, xy[1] as f32, z as f32]);
-                }
-            }
+            column_tomography_points(ground, column, &bands, resolution, config, &mut points);
         }
     }
     points
+}
+
+/// 完整精细源带独立地面记录时，地面取记录的连续高度，成员体素不再作为占据采样。
+/// 体素中心按源精度量化，缓坡或略倾斜的地图会被切成逐格台阶，两层体素厚的地面也会挡住机体。
+fn tomography_ground(map: &SurfaceSnapshot) -> Option<&nuwax_nav_mls_planner::SurfaceObservations> {
+    map.observations().map(|source| source.as_ref()).filter(|source| {
+        map.ground_evidence() == nuwax_nav_mls_planner::surface::GroundEvidence::MeasuredSurface
+            && source.is_complete_geometry_source()
+            && source.voxel_size_m().to_bits() == map.source_voxel_size_m().to_bits()
+    })
+}
+
+/// 一列的层析采样：地面记录高度与占据带内的体素中心。
+/// 没有地面记录的列（旧存档或已分类为空）仅恢复已有源体素中心。
+fn column_tomography_points(
+    ground: Option<&nuwax_nav_mls_planner::SurfaceObservations>,
+    column: [i32; 2],
+    bands: &[[f64; 2]],
+    resolution: f64,
+    config: &Config,
+    points: &mut Vec<[f32; 3]>,
+) {
+    let xy = column.map(|v| (f64::from(v) + 0.5) * resolution);
+    let mut members = BTreeSet::new();
+    for record in ground.into_iter().flat_map(|source| source.ground_records(column)) {
+        members.extend(record.members());
+        if let Some(height) = record.height_at(xy) {
+            points.push([xy[0] as f32, xy[1] as f32, height as f32]);
+        }
+    }
+    for &[low, high] in bands {
+        let count = ((high - low) / config.point_resolution).round().max(1.0) as usize;
+        for index in 0..count {
+            let z = low + (index as f64 + 0.5) * (high - low) / count as f64;
+            if members.contains(&((z / resolution).floor() as i32)) {
+                continue;
+            }
+            points.push([xy[0] as f32, xy[1] as f32, z as f32]);
+        }
+    }
+}
+
+/// 只取给定列的层析采样；采样逐列与整图转换相同。整图转换使用原始量测点时不能按列取，返回 `None`。
+fn tomography_column_points(
+    map: &SurfaceSnapshot,
+    config: &Config,
+    columns: &BTreeSet<[i32; 2]>,
+) -> Option<Vec<[f32; 3]>> {
+    let ground = tomography_ground(map);
+    if ground.is_none() && map.navigation_measured_points().is_some() {
+        return None;
+    }
+    let (resolution, _) = map.navigation_source_columns(None);
+    let mut points = Vec::new();
+    for &column in columns {
+        if let Some(bands) = map.navigation_source_column(column) {
+            column_tomography_points(ground, column, &bands, resolution, config, &mut points);
+        }
+    }
+    Some(points)
 }
 
 /// 显式来源便于两个消费者使用同一配置，并把来源纳入缓存身份。
@@ -601,7 +643,7 @@ mod tests {
             }
         }}
         let mut planner=nuwax_nav_pct_native::Planner::from_cells(config,&cells,&bands).unwrap();
-        assert!(planner.plan([0.025,0.025,0.4],[1.025,0.025,0.4]).is_err(),
+        assert!(planner.plan([0.025,0.025,0.4], None,[1.025,0.025,0.4]).is_err(),
             "前端凸包虽能伸入窄口，执行端的完整矩形放不下，不能交付完整路线");
     }
 

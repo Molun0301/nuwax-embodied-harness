@@ -224,6 +224,10 @@ impl SurfaceMapCache {
         });
         let reusable = same_mask && self.latest.as_ref()
             .is_some_and(|old| Arc::ptr_eq(&old.physical, &physical));
+        // 全局层析缓存只处理这里登记的变化列：承接上一份快照的记录并追加本次精细源与规划变化列。
+        let static_basis = change_basis.clone().filter(|_| intact_basis);
+        let static_changes = fine_changes.clone().zip(coarse_changes.clone()).filter(|_| intact_basis);
+        let record = |snapshot: SurfaceSnapshot| snapshot.with_static_columns(static_basis.as_deref(), static_changes);
         let changes = |snapshot: &Arc<SurfaceSnapshot>| {
             if !intact_basis { return SurfaceGeometryChanges::Unknown; }
             if change_basis.as_ref().is_some_and(|old| nuwax_nav_runtime::native_map::same_source_geometry(old, snapshot)) {
@@ -252,7 +256,7 @@ impl SurfaceMapCache {
                 _ => false,
             };
             let snapshot = if same_observations { Arc::clone(snapshot) }
-                else { Arc::new(snapshot.with_observations(observations.clone())) };
+                else { Arc::new(record(snapshot.with_observations(observations.clone()))) };
             self.observations = observations;
             self.fine_observed_root = Some(fine_root);
             self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
@@ -283,7 +287,7 @@ impl SurfaceMapCache {
         } else {
             Arc::clone(&physical)
         };
-        let snapshot = Arc::new(snapshot.with_observations(observations.clone()));
+        let snapshot = Arc::new(record(snapshot.with_observations(observations.clone())));
         self.observations = observations;
         self.fine_observed_root = Some(fine_root);
         self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });

@@ -546,6 +546,7 @@ fn snapshot_columns(columns: ColumnIz, heights: HeightBounds, config: Config,
         recent_obstacles:None,
         observations: None,
         body_query_cache: Default::default(),
+        static_columns: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),
@@ -744,6 +745,7 @@ fn update_columns(
         recent_obstacles:previous.recent_obstacles.clone(),
         observations: None,
         body_query_cache: Default::default(),
+        static_columns: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),

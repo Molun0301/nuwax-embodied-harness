@@ -36,6 +36,8 @@ mod frontiers;
 pub use frontiers::{SurfaceFrontierCacheStats, SurfaceFrontierIndex, SurfaceFrontierQuery, SurfaceFrontierCluster};
 mod wall;
 use frontiers::frontier_point_distance;
+mod static_columns;
+pub use static_columns::StaticColumnLog;
 mod update;
 pub use update::{SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceMapBuild, SurfaceMapBuilder};
 
@@ -273,6 +275,8 @@ pub struct SurfaceSnapshot {
     /// 同一不可变快照与精确位姿的检查缓存；任何几何或观察替换均清空。
     body_query_cache: Arc<std::sync::Mutex<body::BodyQueryCache>>,
     ground_evidence:GroundEvidence,
+    /// 表面图登记的静态变化列；静态几何被替换时清空。
+    static_columns: Option<Arc<StaticColumnLog>>,
 }
 
 impl std::fmt::Debug for SurfaceSnapshot {
@@ -316,7 +320,7 @@ impl SurfaceSnapshot {
 
     fn with_navigation_measurements(mut self, points: &[(f32, f32, f32)]) -> Self {
         if points.is_empty() {
-            self.navigation_measurements = None;
+            if self.navigation_measurements.take().is_some() { self.static_columns = None; }
             return self;
         }
         let size = f64::from(self.source_voxel_size_m());
@@ -336,6 +340,7 @@ impl SurfaceSnapshot {
             .collect();
         if self.navigation_measurements.as_deref() != Some(&measured) {
             self.navigation_measurements = Some(Arc::new(measured));
+            self.static_columns = None;
         }
         self
     }
@@ -370,6 +375,7 @@ impl SurfaceSnapshot {
             body_query_cache: Default::default(),
             ground_evidence: self.ground_evidence,
             recent_obstacles:self.recent_obstacles.clone(),
+            static_columns: self.static_columns.clone(),
         }
     }
 
@@ -379,28 +385,50 @@ impl SurfaceSnapshot {
 
         self.ground_evidence=evidence;
         self.body_query_cache=Default::default();
+        self.static_columns=None;
         self
     }
     /// 原始占据是否表示实体体积，而非带厚度的表面测量。
     pub fn ground_evidence(&self)->GroundEvidence {self.ground_evidence}
     /// 向层析规划提供实际占据高度带；不读取旧MLS路由或填补未知列。
     pub fn navigation_height_columns(&self) -> impl Iterator<Item = ([i32; 2], Vec<[f64; 2]>)> + '_ {
-        self.data.occupied_columns.iter().map(|(&(x, y), levels)| {
-            let size = f64::from(self.config().voxel_size);
-            let bands = levels.iter().map(|&z| {
-                self.data.height_bounds.get(&(x, y, z)).map_or(
-                    [f64::from(z) * size, f64::from(z + 1) * size],
-                    |bounds| bounds.map(f64::from),
-                )
-            }).collect();
-            ([x, y], bands)
-        })
+        self.data.occupied_columns.iter().map(|(&(x, y), levels)| ([x, y], self.height_column_bands(x, y, levels)))
+    }
+
+    fn height_column_bands(&self, x: i32, y: i32, levels: &[i32]) -> Vec<[f64; 2]> {
+        let size = f64::from(self.config().voxel_size);
+        levels.iter().map(|&z| {
+            self.data.height_bounds.get(&(x, y, z)).map_or(
+                [f64::from(z) * size, f64::from(z + 1) * size],
+                |bounds| bounds.map(f64::from),
+            )
+        }).collect()
+    }
+
+    fn navigation_fine_source(&self) -> Option<&Arc<SurfaceObservations>> {
+        self.observations.as_ref().filter(|o|o.is_complete_geometry_source()
+            && o.size_m.to_bits()==self.source_voxel_size_m().to_bits())
+    }
+
+    /// 层析列是否取自完整精细源（否则取规划列）。
+    pub fn navigation_uses_fine_source(&self) -> bool {
+        self.navigation_fine_source().is_some()
+    }
+
+    /// 与 `navigation_source_columns` 同一来源与高度带规则，只取一列；该列没有占据时为 `None`。
+    pub fn navigation_source_column(&self, column: [i32; 2]) -> Option<Vec<[f64; 2]>> {
+        if let Some(source) = self.navigation_fine_source() {
+            let size = f64::from(source.size_m);
+            return source.column_levels(column[0], column[1])
+                .map(|levels| levels.iter().map(|&z| [f64::from(z) * size, f64::from(z + 1) * size]).collect());
+        }
+        self.data.occupied_columns.get(&(column[0], column[1]))
+            .map(|levels| self.height_column_bands(column[0], column[1], levels))
     }
 
     /// 完整精细占据优先；粗规划格不能把局部侧面回波扩展成整格障碍。
     pub fn navigation_source_columns(&self,window:Option<([f64;2],f64)>)->(f64,Box<dyn Iterator<Item=([i32;2],Vec<[f64;2]>)>+'_>) {
-        if let Some(source)=self.observations.as_ref().filter(|o|o.is_complete_geometry_source()
-            && o.size_m.to_bits()==self.source_voxel_size_m().to_bits()) {
+        if let Some(source)=self.navigation_fine_source() {
             let size=f64::from(source.size_m);
             return (size,Box::new(source.navigation_window_columns(window).map(move|(column,levels)| {
                 (column,levels.iter().map(|&z|[f64::from(z)*size,f64::from(z+1)*size]).collect())
@@ -570,6 +598,7 @@ impl SurfaceSnapshot {
             recent_obstacles:self.recent_obstacles.clone(),
             observations: self.observations.clone(),
             body_query_cache: Default::default(),
+            static_columns: self.static_columns.clone(),
             data: Arc::new(SurfaceData {
                 frontier_cache: Default::default(),
                 body_cache: Default::default(),

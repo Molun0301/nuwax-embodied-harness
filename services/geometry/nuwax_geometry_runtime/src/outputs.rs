@@ -18,6 +18,8 @@ struct MapOutput {
     frame_id: String,
     revision: i64,
     prior: Option<Arc<nuwax_map_chunks::Manifest>>,
+    mask: Option<proto::OccupancyGrid>,
+    mask_sent_at: Option<tokio::time::Instant>,
 }
 
 /// 三维链下 `/map/occupancy` 两次发布至少相隔的时间。
@@ -51,7 +53,21 @@ impl OccupancyRate {
 }
 
 impl MapOutput {
+    /// 内容、栅格布局或会话变化立即携带；否则距上次携带满一秒的下一包携带。
+    fn mask_due(&self, session_id: u64, mask: Option<&proto::OccupancyGrid>, now: tokio::time::Instant) -> bool {
+        let layout = |mask: &proto::OccupancyGrid| mask.meta.as_ref().map(|m|
+            (m.origin_x, m.origin_y, m.resolution, m.width, m.height));
+        let same = match (self.mask.as_ref(), mask) {
+            (Some(old), Some(next)) => layout(old) == layout(next) && old.data == next.data,
+            (None, None) => true,
+            _ => false,
+        };
+        self.session_id != session_id || !same
+            || self.mask_sent_at.is_none_or(|sent| now >= sent + std::time::Duration::from_secs(1))
+    }
     async fn clear(&mut self, transport: &LcmTransport) -> Result<(), String> {
+        self.mask = None;
+        self.mask_sent_at = None;
         if self.prior.take().is_none() {
             return Ok(());
         }
@@ -232,15 +248,16 @@ async fn publish_map(
     } else {
         1
     };
+    let send_mask = output.mask_due(id, publication.forbidden.as_ref(), tokio::time::Instant::now());
     let mut virtual_obstacles = publication
-        .forbidden
+        .forbidden.as_ref().filter(|_| send_mask)
         .map(|mask| {
             grid(
                 &proto::MapUpdate {
-                    map_name: mask.map_name,
-                    meta: mask.meta,
+                    map_name: mask.map_name.clone(),
+                    meta: mask.meta.clone(),
                     data: mask.data.clone(),
-                    raw_data: mask.data,
+                    raw_data: Vec::new(),
                 },
                 true,
             )
@@ -261,6 +278,10 @@ async fn publish_map(
         ..Default::default()
     };
     send_navigation_map(transport, &message).await?;
+    if send_mask && publication.forbidden.is_some() {
+        output.mask = publication.forbidden;
+        output.mask_sent_at = Some(tokio::time::Instant::now());
+    }
     let changed = output
         .prior
         .as_ref()
@@ -462,5 +483,44 @@ mod pose_output_tests {
         backend.release.notify_one();
         output.shutdown().await;
         mapper.shutdown().await.unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod mask_delivery_tests {
+    use super::*;
+    #[test]
+    fn changed_layout_content_session_and_one_second_refresh_carry_mask() {
+        let now = tokio::time::Instant::now();
+        let mask = proto::OccupancyGrid { meta: Some(proto::OccupancyGridMeta {
+            resolution: 0.05, width: 2, height: 2, ..Default::default()
+        }), data: vec![0;4], ..Default::default() };
+        let mut output = MapOutput::default();
+        assert!(output.mask_due(1,Some(&mask),now));
+        output.session_id=1;output.mask=Some(mask.clone());output.mask_sent_at=Some(now);
+        let mut clock_only=mask.clone();clock_only.meta.as_mut().unwrap().timestamp_ns=20;
+        assert!(!output.mask_due(1,Some(&clock_only),now+std::time::Duration::from_millis(999)));
+        assert!(output.mask_due(1,Some(&mask),now+std::time::Duration::from_secs(1)));
+        assert!(output.mask_due(2,Some(&mask),now));
+        for changed in 0..6 {
+            let mut next=mask.clone(); let meta=next.meta.as_mut().unwrap();
+            match changed { 0=>next.data[0]=100,1=>meta.origin_x=1.,2=>meta.origin_y=1.,
+                3=>meta.width=1,4=>meta.height=1,_=>meta.resolution=0.1 }
+            assert!(output.mask_due(1,Some(&next),now),"变化项{changed}必须携带");
+        }
+    }
+    #[test]
+    fn lost_change_packet_is_carried_again_within_one_second() {
+        let now=tokio::time::Instant::now();
+        let mask=proto::OccupancyGrid {data:vec![100],..Default::default()};
+        let mut output=MapOutput::default();output.session_id=1;
+        // 变化包在0毫秒发布但丢失；发送端不感知丢包，下一秒主动补带。
+        assert!(output.mask_due(1,Some(&mask),now));
+        output.mask=Some(mask.clone());output.mask_sent_at=Some(now);
+        for ms in (100..1000).step_by(100) {
+            assert!(!output.mask_due(1,Some(&mask),now+std::time::Duration::from_millis(ms)));
+        }
+        assert!(output.mask_due(1,Some(&mask),now+std::time::Duration::from_secs(1)));
     }
 }

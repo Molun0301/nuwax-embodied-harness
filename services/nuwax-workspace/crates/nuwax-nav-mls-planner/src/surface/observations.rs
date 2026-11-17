@@ -1017,6 +1017,7 @@ impl SurfaceSnapshot {
             data: Arc::clone(&self.data),
             observations,
             body_query_cache: Default::default(),
+            static_columns: None,
         }
     }
 

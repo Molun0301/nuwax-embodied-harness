@@ -34,7 +34,7 @@ fn g1_door_clearance_uses_body_envelope_and_keeps_narrow_connectivity() {
                 })
                 .collect();
             let mut planner = Planner::from_cells(cfg, &cells, &bands).unwrap();
-            let result = planner.plan([0., 0.1, 0.4], [3., 0.1, 0.4]);
+            let result = planner.plan([0., 0.1, 0.4], None, [3., 0.1, 0.4]);
             if gap == 0.6 && width == 0.557 {
                 // 可用中心为[0.2785,0.3215]，5厘米格中心仅有0.275/0.325，均硬碰撞。
                 assert!(result
@@ -103,7 +103,7 @@ fn thin_door_clearance_keeps_the_straight_center_route_without_heading_loops() {
         .collect();
     let mut planner = Planner::from_cells(cfg, &cells, &bands).unwrap();
     let route = planner
-        .plan([-0.5, middle, 0.4], [0.5, middle, 0.4])
+        .plan([-0.5, middle, 0.4], None, [0.5, middle, 0.4])
         .unwrap();
     assert!(
         route

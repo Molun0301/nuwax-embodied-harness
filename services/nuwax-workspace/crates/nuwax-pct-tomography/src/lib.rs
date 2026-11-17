@@ -50,10 +50,13 @@ pub struct ColumnUpdate {
 #[derive(Default)]
 pub struct ColumnCache {
     static_points: Vec<[f32; 3]>,
+    /// 按列替换过静态采样后，`static_points` 不再是整图输入，下一次整图替换核对全部已有列。
+    static_points_stale: bool,
     sorted: BTreeMap<[i32; 2], Vec<Sample>>,
+    /// 各列最低静态采样（按 `f32::total_cmp` 排序）的列数，整图最低点取第一项。
+    column_minima: BTreeMap<i32, (f32, usize)>,
     recent: BTreeMap<[i32; 2], Vec<f32>>,
     dirty: BTreeSet<[i32; 2]>,
-    static_min: Option<f32>,
     slice_h0: Option<f64>,
 }
 
@@ -61,6 +64,9 @@ impl ColumnCache {
     /// 来源变化后比较实际列内容；未变化列的排序结果继续保留。
     pub fn replace_static(&mut self, points: &[[f32; 3]], resolution: f64) -> Result<(), String> {
         let mut candidates = BTreeSet::new();
+        if self.static_points_stale {
+            candidates.extend(self.sorted.keys().copied());
+        }
         for index in 0..points.len().max(self.static_points.len()) {
             let old = self.static_points.get(index);
             let new = points.get(index);
@@ -70,28 +76,54 @@ impl ColumnCache {
             }
         }
         let mut next: BTreeMap<_, Vec<f32>> = candidates.into_iter().map(|key| (key, Vec::new())).collect();
-        let mut minimum: Option<f32> = None;
         for point in points.iter().filter(|p| p.iter().all(|v| v.is_finite())) {
-            minimum = Some(minimum.map_or(point[2], |z| z.min(point[2])));
             let column = [coordinate(point[0], resolution)?, coordinate(point[1], resolution)?];
             if let Some(zs) = next.get_mut(&column) { zs.push(point[2]); }
         }
+        self.replace_sorted(next);
+        self.static_points = points.to_vec();
+        self.static_points_stale = false;
+        Ok(())
+    }
+
+    /// 只替换 `columns` 这些列的静态采样，`points` 是这些列的全部静态采样；其余列保持不变。
+    pub fn replace_static_columns(
+        &mut self,
+        columns: &BTreeSet<[i32; 2]>,
+        points: &[[f32; 3]],
+        resolution: f64,
+    ) -> Result<(), String> {
+        let mut next: BTreeMap<_, Vec<f32>> = columns.iter().map(|&key| (key, Vec::new())).collect();
+        for point in points.iter().filter(|p| p.iter().all(|v| v.is_finite())) {
+            let column = [coordinate(point[0], resolution)?, coordinate(point[1], resolution)?];
+            if let Some(zs) = next.get_mut(&column) { zs.push(point[2]); }
+        }
+        self.replace_sorted(next);
+        self.static_points = Vec::new();
+        self.static_points_stale = true;
+        Ok(())
+    }
+
+    fn replace_sorted(&mut self, next: BTreeMap<[i32; 2], Vec<f32>>) {
         for (column, mut zs) in next {
             zs.sort_unstable_by(f32::total_cmp);
             let same = self.sorted.get(&column).map_or(zs.is_empty(), |old|
                 old.iter().map(|sample| sample.z).eq(zs.iter().copied()));
             if same { continue; }
             self.dirty.insert(column);
-            if zs.is_empty() { self.sorted.remove(&column); }
-            else {
+            if let Some(old) = self.sorted.remove(&column) {
+                let key = order_key(old[0].z);
+                let entry = self.column_minima.get_mut(&key).expect("已登记的列最低点");
+                entry.1 -= 1;
+                if entry.1 == 0 { self.column_minima.remove(&key); }
+            }
+            if let Some(&lowest) = zs.first() {
+                self.column_minima.entry(order_key(lowest)).or_insert((lowest, 0)).1 += 1;
                 self.sorted.insert(column, zs.into_iter().map(|z| Sample {
                     x: column[0], y: column[1], z,
                 }).collect());
             }
         }
-        self.static_min = minimum;
-        self.static_points = points.to_vec();
-        Ok(())
     }
 
     /// 与整图相同地从最低点确定首层；返回原生结构需要替换的列。
@@ -103,7 +135,8 @@ impl ColumnCache {
                 self.dirty.insert(*column);
             }
         }
-        let min_z = self.static_min.into_iter().chain(next.values().flatten().copied())
+        let static_min = self.column_minima.values().next().map(|(z, _)| *z);
+        let min_z = static_min.into_iter().chain(next.values().flatten().copied())
             .min_by(f32::total_cmp);
         let h0 = min_z.map_or(0., |z| f64::from(z) + cfg.slice_dh);
         if self.slice_h0 != Some(h0) {
@@ -127,6 +160,12 @@ impl ColumnCache {
         self.dirty.clear();
         Ok(updates)
     }
+}
+
+/// 与 `f32::total_cmp` 同序的整数键。
+fn order_key(z: f32) -> i32 {
+    let bits = z.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
 }
 
 fn point_columns(points: &[[f32; 3]], resolution: f64) -> Result<BTreeMap<[i32; 2], Vec<f32>>, String> {

@@ -438,3 +438,169 @@ fn n6_20_healthy_event_ends_after_half_second_of_source_clear() {
     assert!(safe.command[0] < 0.);
     check_escape_sweep(&req.config, &[opposite], &safe.recovery_samples);
 }
+
+// 同一几何夹具经过公开地图/跟踪入口，限制为轴向运动以独立核算每拍预算。
+fn n4_hold_fixture(position: f64) -> (Config, MapOwner, MotionState, [f64; 3]) {
+    let mut c = config();
+    c.resolution = 0.05;
+    c.body_length = 0.6;
+    c.body_width = 0.32;
+    c.sample_dt = 0.05;
+    c.max_acceleration = 0.5;
+    c.min_executable_linear_mps = 0.1;
+    c.max_lateral_velocity = 0.;
+    c.max_yaw_rate = 0.;
+    let state = MotionState { position: [position, 0.025, 0.35], timestamp_ns: 1_000_000_000,
+        measured_velocity: 1, measured_yaw_rate: 1, ..Default::default() };
+    let cell = [-0.025, 0.025, 0.35];
+    let mut map = MapOwner::new(&c).unwrap();
+    map.seed_occupied(&[], state.position);
+    map.update_surface(&[cell], &[], &[], &[]).unwrap();
+    (c, map, state, cell)
+}
+
+#[test]
+fn n4_same_source_replays_only_the_proved_hold_ticks() {
+    for (interval, holds) in [(100_000_000, 2), (125_000_000, 3)] {
+        let (c, map, mut state, cell) = n4_hold_fixture(0.295);
+        let snapshot = map.snapshot();
+        let mut tracker = ScanTracker::default();
+        let first = tracker.track_and_check(&c, &snapshot, &state, [0.; 3], None).unwrap();
+        assert!(first.command[0] > 0.);
+        assert_eq!(tracker.track_and_check(&c, &snapshot, &state, first.command, None).unwrap().command,
+            [0.; 3], "首次没有来源间隔，k=1，第二拍必须零");
+        state.timestamp_ns += interval;
+        let first = tracker.track_and_check(&c, &snapshot, &state, [0.; 3], None).unwrap();
+        check_escape_sweep(&c, &[cell], &first.recovery_samples);
+        assert!(first.recovery_samples.len() >= holds + 2, "证明必须包含全部保持拍及制动");
+        for _ in 1..holds {
+            let repeated = tracker.track_and_check(&c, &snapshot, &state, first.command, None).unwrap();
+            assert_eq!(repeated.command, first.command, "证明内同源拍重发同一命令");
+        }
+        assert_eq!(tracker.track_and_check(&c, &snapshot, &state, first.command, None).unwrap().command,
+            [0.; 3], "恰好发满k拍后归零");
+        assert_eq!(tracker.track_and_check(&c, &snapshot, &state, [0.; 3], None).unwrap().command, [0.; 3]);
+        state.timestamp_ns += interval;
+        let restarted = tracker.track_and_check(&c, &snapshot, &state, [0.; 3], None).unwrap();
+        assert!((restarted.command[0] - c.max_acceleration * c.sample_dt).abs() < 1e-12,
+            "新来源以上一拍实际零命令起步，不能采用历史非零值");
+    }
+}
+
+#[test]
+fn n4_hold_proof_covers_later_ticks_and_braking_without_new_occupancy() {
+    for (interval, accepted) in [(50_000_000, true), (100_000_000, false)] {
+        let (mut c, mut map, mut state, cell) = n4_hold_fixture(0.2985);
+        c.max_velocity = 0.025;
+        let mut tracker = ScanTracker::default();
+        tracker.track_and_check(&c, &map.snapshot(), &state, [0.; 3], None).unwrap();
+        let ahead = [0.625, 0.025, 0.35];
+        map.update_surface(&[cell, ahead], &[], &[], &[]).unwrap();
+        state.timestamp_ns += interval;
+        let output = tracker.track_and_check(&c, &map.snapshot(), &state, [0.; 3], None);
+        if accepted {
+            let output = output.unwrap();
+            assert!(output.command[0] > 0.);
+            check_escape_sweep(&c, &[cell], &output.recovery_samples);
+            for sample in output.recovery_samples {
+                assert!(escape_cell_depth(&c, ahead, sample.position, sample.yaw) < 0.);
+            }
+        } else {
+            assert!(output.unwrap_err().message.contains("no monotone"),
+                "第一拍加制动可放，但第二保持拍加制动碰新格时必须拒绝");
+        }
+    }
+}
+
+#[test]
+fn n4_replayed_ticks_consume_the_unconfirmed_motion_budget() {
+    let mut results = Vec::new();
+    for replay in [false, true] {
+        let (mut c, map, mut state, _) = n4_hold_fixture(0.295);
+        c.max_velocity = 0.025;
+        let snapshot = map.snapshot();
+        let mut tracker = ScanTracker::default();
+        let mut previous = [0.; 3];
+        let mut issued = 0;
+        for source in 0..30 {
+            state.timestamp_ns = 1_000_000_000 + source * 100_000_000;
+            match tracker.track_and_check(&c, &snapshot, &state, previous, None) {
+                Ok(out) => {
+                    assert!(out.command[0] > 0.);
+                    previous = out.command;
+                    issued += 1;
+                    if replay && source > 0 {
+                        let out = tracker.track_and_check(&c, &snapshot, &state, previous, None).unwrap();
+                        assert_eq!(out.command, previous);
+                        issued += 1;
+                    }
+                }
+                Err(error) => {
+                    assert!(error.message.contains("budget exhausted"), "{error:?}");
+                    results.push((source, issued));
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(results.len(), 2);
+    assert!(results[1].0 < results[0].0, "每次重发计账，必须更早耗尽原预算：{results:?}");
+    assert!(results[1].1 > results[0].1, "更多实际发出拍消耗同一距离预算：{results:?}");
+    assert!(results[1].1 as f64 * 0.025 * 0.05 <= 0.05 + 1e-10);
+}
+
+#[test]
+fn n4_ten_hz_source_twenty_hz_control_reaches_escape_speed_in_closed_loop() {
+    let (c, map, mut source, cell) = n4_hold_fixture(0.255);
+    let snapshot = map.snapshot();
+    let mut tracker = ScanTracker::default();
+    let mut position = source.position;
+    let mut velocity = 0.;
+    let mut previous = [0.; 3];
+    let mut reached_speed = false;
+    let mut repeated_nonzero = 0;
+    for tick in 0..100 {
+        if tick % 2 == 0 {
+            source.position = position;
+            source.velocity = [velocity, 0., 0.];
+            source.timestamp_ns = 1_000_000_000 + tick * 50_000_000;
+        }
+        let out = tracker.track_and_check(&c, &snapshot, &source, previous, None).unwrap();
+        assert_eq!(&out.command[1..], &[0., 0.]);
+        assert!((out.command[0] - previous[0]).abs() <= c.max_acceleration * c.sample_dt + 1e-10);
+        if tick % 2 == 0 { check_escape_sweep(&c, &[cell], &out.recovery_samples); }
+        if tick % 2 == 1 && out.command[0] > 0. { repeated_nonzero += 1; assert_eq!(out.command, previous); }
+        reached_speed |= (out.command[0] - c.min_executable_linear_mps).abs() < 1e-12;
+        let next = velocity + (out.command[0] - velocity).clamp(-c.max_acceleration * c.sample_dt, c.max_acceleration * c.sample_dt);
+        let old_depth = escape_cell_depth(&c, cell, position, 0.).max(0.);
+        position[0] += (velocity + next) * 0.5 * c.sample_dt;
+        assert!(escape_cell_depth(&c, cell, position, 0.).max(0.) <= old_depth + 1e-12);
+        velocity = next;
+        previous = out.command;
+        if escape_cell_depth(&c, cell, position, 0.) < 0. {
+            assert!(reached_speed && repeated_nonzero > 0, "退出前应达到既定脱困速度并实际连续执行");
+            return;
+        }
+    }
+    panic!("10Hz来源/20Hz控制未退出初始浅重叠");
+}
+
+#[test]
+fn n4_hold_interval_uses_the_latest_clear_source_in_the_same_event() {
+    let (c, mut map, mut state, cell) = n4_hold_fixture(0.295);
+    let mut tracker = ScanTracker::default();
+    tracker.track_and_check(&c, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    map.update_surface(&[], &[], &[], &[]).unwrap();
+    // 暂时清除还没结束事件，但这两份来源也属于最近来源时间序列。
+    for tick in [1, 2] {
+        state.timestamp_ns = 1_000_000_000 + tick * 100_000_000;
+        tracker.track_and_check(&c, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    }
+    map.update_surface(&[cell], &[], &[], &[]).unwrap();
+    state.timestamp_ns = 1_300_000_000;
+    let first = tracker.track_and_check(&c, &map.snapshot(), &state, [0.; 3], None).unwrap();
+    assert!(first.command[0] > 0.);
+    assert_eq!(tracker.track_and_check(&c, &map.snapshot(), &state, first.command, None).unwrap().command, first.command);
+    assert_eq!(tracker.track_and_check(&c, &map.snapshot(), &state, first.command, None).unwrap().command,
+        [0.; 3], "最新来源间隔0.1秒只证明k=2，不能用上次重叠的0.3秒间隔给出k=6");
+}

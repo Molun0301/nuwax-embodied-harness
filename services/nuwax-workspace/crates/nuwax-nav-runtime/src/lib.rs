@@ -3559,6 +3559,7 @@ mod tests {
     #[tokio::test]
     async fn default_wait_budget_terminates_all_stationary_waits_and_allows_recovery() {
         for reason in [None, Some(""), Some("当前几何尚无可执行运动"),
+            Some("等待局部轨迹；原参考路线未被接纳：Original final target is occupied"),
             Some("机身与障碍重叠、脱困失败：BODY_OVERLAP_RECOVERY_FAILED: Current body pose is occupied; escape penetration exceeds half a voxel")] {
         for pending in [false, true] {
             for recover in [false, true] {

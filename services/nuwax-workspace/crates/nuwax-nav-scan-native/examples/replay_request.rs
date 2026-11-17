@@ -34,6 +34,9 @@ fn main() {
         obstacle_clearance_m: config["obstacle_clearance_m"].as_f64().unwrap(),
         min_executable_linear_mps: config["min_executable_linear_mps"].as_f64().unwrap(),
         min_executable_angular_rps: config["min_executable_angular_rps"].as_f64().unwrap(),
+        terminal_translation_done_m: nuwax_nav_scan_native::TERMINAL_TRANSLATION_DONE_M,
+        stopped_linear_mps: nuwax_nav_scan_native::STOPPED_LINEAR_MPS,
+        stopped_yaw_rps: nuwax_nav_scan_native::STOPPED_YAW_RPS,
     };
     let points = |key: &str| serde_json::from_value::<Vec<[f64; 3]>>(value[key].clone()).unwrap();
     let obstacles = points("obstacles");

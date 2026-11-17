@@ -30,7 +30,20 @@ pub struct Config {
     pub obstacle_clearance_m: f64,
     pub min_executable_linear_mps: f64,
     pub min_executable_angular_rps: f64,
+    /// 末段平移结束距离，取 [`TERMINAL_TRANSLATION_DONE_M`]。
+    pub terminal_translation_done_m: f64,
+    /// 实测停稳平移速度门槛，取 [`STOPPED_LINEAR_MPS`]。
+    pub stopped_linear_mps: f64,
+    /// 实测停稳偏航速度门槛，取 [`STOPPED_YAW_RPS`]。
+    pub stopped_yaw_rps: f64,
 }
+
+/// 末段平移结束距离：到停点平面距离不超过它时末段平移结束，原生平移速度归零。
+pub const TERMINAL_TRANSLATION_DONE_M: f64 = 0.02;
+/// 实测停稳平移速度门槛（米/秒）：低于它且偏航速度低于 [`STOPPED_YAW_RPS`] 才算停稳。
+pub const STOPPED_LINEAR_MPS: f64 = 0.02;
+/// 实测停稳偏航速度门槛（弧度/秒）。
+pub const STOPPED_YAW_RPS: f64 = 0.02;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -67,9 +80,11 @@ pub struct MotionState {
     pub measured_yaw_rate: u32,
 }
 impl MotionState {
-    /// 与原生曲线末端共用实测停稳条件；缺少测速不充当静止。
+    /// 实测停稳：平移与偏航速度都有实测且低于停稳门槛；缺少测速不充当静止。
     pub fn stopped(&self) -> bool {
-        unsafe { nuwax_scan_motion_stopped(self) != 0 }
+        self.measured_velocity != 0 && self.measured_yaw_rate != 0
+            && self.velocity[0].hypot(self.velocity[1]) < STOPPED_LINEAR_MPS
+            && self.yaw_rate.abs() < STOPPED_YAW_RPS
     }
 }
 #[repr(C)]
@@ -176,7 +191,6 @@ impl TrackResult {
     }
 }
 extern "C" {
-    fn nuwax_scan_motion_stopped(state: *const MotionState) -> i32;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
     fn nuwax_scan_map_destroy(map: *mut c_void);
     fn nuwax_scan_map_surface(
@@ -648,6 +662,7 @@ mod tests {
             max_reverse_velocity: 0.6,
             max_lateral_velocity: 0.6,
             obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
+            terminal_translation_done_m: crate::TERMINAL_TRANSLATION_DONE_M, stopped_linear_mps: crate::STOPPED_LINEAR_MPS, stopped_yaw_rps: crate::STOPPED_YAW_RPS,
         }
     }
     fn request<'a>(reference: &'a [[f64; 3]], obstacles: &'a [[f64; 3]]) -> PlanRequest<'a> {

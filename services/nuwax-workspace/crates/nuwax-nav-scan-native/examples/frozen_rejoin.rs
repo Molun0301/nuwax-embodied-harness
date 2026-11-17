@@ -109,6 +109,7 @@ fn config() -> Config {
         max_reverse_velocity: 0.0,
         max_lateral_velocity: 0.0,
         obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
+            terminal_translation_done_m: nuwax_nav_scan_native::TERMINAL_TRANSLATION_DONE_M, stopped_linear_mps: nuwax_nav_scan_native::STOPPED_LINEAR_MPS, stopped_yaw_rps: nuwax_nav_scan_native::STOPPED_YAW_RPS,
     }
 }
 fn run_case(

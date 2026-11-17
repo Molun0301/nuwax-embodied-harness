@@ -7,7 +7,10 @@ use nuwax_nav_types_messages::{
 use std::sync::Arc;
 
 /// 跟随器与全局路线消费共用的位置容差口径。
-pub fn position_within_tolerance(position: [f64; 3], goal: [f64; 3], tolerance: f64, step_height: f64) -> bool {
+/// 到达位置判定：非零容差时平面距离严格小于容差，高度差不超过台阶阈值与容差的较大者；
+/// 台阶阈值取配置合成给出的 `step_threshold_m`。
+pub fn position_within_tolerance(position: [f64; 3], goal: [f64; 3], tolerance: f64, map: &SurfaceSnapshot) -> bool {
+    let step_height = f64::from(map.config().step_threshold_m);
     if tolerance == 0. {
         nuwax_nav_types_messages::same_finite_position(position, goal)
     } else {
@@ -76,6 +79,9 @@ impl SurfaceFollowerConfig {
                 obstacle_clearance_m,
                 min_executable_linear_mps: 0.,
                 min_executable_angular_rps: 0.,
+                terminal_translation_done_m: nuwax_nav_scan_native::TERMINAL_TRANSLATION_DONE_M,
+                stopped_linear_mps: nuwax_nav_scan_native::STOPPED_LINEAR_MPS,
+                stopped_yaw_rps: nuwax_nav_scan_native::STOPPED_YAW_RPS,
             },
             body_to_support_z_m,
             motion_limits: None,
@@ -295,12 +301,11 @@ impl SurfaceFollower {
         [p.x, p.y, p.z]
     }
     fn position_reached(&self) -> bool {
-        let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
+        let (Some(pose), Some(goal), Some(map)) = (&self.odometry, &self.goal, &self.map) else {
             return false;
         };
-        let config = self.map.as_ref().map_or(self.config.scan, |map| self.native_config(map));
         position_within_tolerance(Self::position(pose), Self::position(goal),
-            self.options.position_tolerance_m, config.max_step_up.max(config.max_step_down))
+            self.options.position_tolerance_m, map)
     }
     fn reached(&self) -> bool {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
@@ -376,16 +381,7 @@ impl SurfaceFollower {
             config.max_yaw_rate = yaw;
         }
         if let Some(body) = map.body_envelope() {
-            let bounds = body.footprint_xy_m.iter().fold(
-                [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]],
-                |mut b, p| {
-                    for i in 0..2 {
-                        b[0][i] = b[0][i].min(p[i]);
-                        b[1][i] = b[1][i].max(p[i]);
-                    }
-                    b
-                },
-            );
+            let bounds = crate::native_map::body_rectangle(body);
             config.body_length = bounds[1][0] - bounds[0][0];
             config.body_width = bounds[1][1] - bounds[0][1];
             config.body_height = body.z_bounds_m[1] - body.z_bounds_m[0];
@@ -605,7 +601,8 @@ impl SurfaceFollower {
             let distance = (state.position[0] - stop[0]).hypot(state.position[1] - stop[1]);
             let progress = self.terminal_translation_progress.get_or_insert((distance, state.timestamp_ns));
             if distance < progress.0 { *progress = (distance, state.timestamp_ns); }
-            self.terminal_translation_finished = distance <= 0.02 || state.timestamp_ns - progress.1 >= 1_000_000_000;
+            self.terminal_translation_finished = distance <= nuwax_nav_scan_native::TERMINAL_TRANSLATION_DONE_M
+                || state.timestamp_ns - progress.1 >= 1_000_000_000;
         }
         let terminal_position = (self.terminal_phase == TerminalPhase::Translating
             && !self.terminal_translation_finished).then_some(stop);

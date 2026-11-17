@@ -111,6 +111,8 @@ impl std::fmt::Debug for ExecutionMap {
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// 默认连续等待路径或可执行运动的期限；成功执行运动后重新计时。
 pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 逼近路线近端：到逼近路线末点三维距离不超过它时，运行时请求重规划、全局一侧按无改善计数。
+pub const APPROACH_NEAR_END_M: f64 = 0.15;
 const INPUT_CAPACITY: usize = 32;
 const URGENT_CAPACITY: usize = 8;
 
@@ -1134,7 +1136,7 @@ where
         if self.current_route_kind == RouteKind::Approach && self.planner.terminal_phase() == TerminalPhase::Travel {
             let near_endpoint = match (&self.current_path,&self.latest_pose) {
                 (Some((ExecutionPath::Surface(path),_)),Some(pose)) => path.poses.last()
-                    .is_some_and(|end|pose.pose.position.distance(end.pose.position)<=0.15),
+                    .is_some_and(|end|pose.pose.position.distance(end.pose.position)<=APPROACH_NEAR_END_M),
                 _ => false,
             };
             if matches!(&step,PlannerStep::Succeeded) || near_endpoint

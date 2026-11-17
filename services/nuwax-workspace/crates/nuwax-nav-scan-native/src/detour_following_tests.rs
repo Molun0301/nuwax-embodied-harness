@@ -520,6 +520,7 @@ fn ninth_round_install_starts_at_measured_position_despite_finished_route_hint()
         max_reverse_velocity: 0.,
         max_lateral_velocity: 0.17442999999999878,
         obstacle_clearance_m: 0.15, min_executable_linear_mps: 0., min_executable_angular_rps: 0.,
+            terminal_translation_done_m: crate::TERMINAL_TRANSLATION_DONE_M, stopped_linear_mps: crate::STOPPED_LINEAR_MPS, stopped_yaw_rps: crate::STOPPED_YAW_RPS,
     };
     let reference=[
         [0.9028784610209901,-2.1714499553001647,0.04518715826388903],

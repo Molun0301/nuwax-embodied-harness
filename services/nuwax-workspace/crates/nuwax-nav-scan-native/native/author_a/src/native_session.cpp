@@ -237,9 +237,10 @@ extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double d
   double yaw=0.;for(size_t i=0;i<out->sample_count;++i){auto& x=out->samples[i];x.time=std::min(out->duration,i*dt);const double t=std::min(curve->duration(),from+x.time);const auto pos=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t),a=curve->acceleration.evaluateDeBoorT(t);yaw=curve->headingAt(t);for(int j=0;j<3;++j){x.position[j]=pos[j];x.velocity[j]=v[j];x.acceleration[j]=a[j];}x.yaw=yaw;}
 }
 extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
-extern "C" int nuwax_scan_motion_stopped(const ScanState* state) {
+extern "C" int nuwax_scan_motion_stopped(const ScanState* state,const ScanConfig* config) {
   return state->measured_velocity&&state->measured_yaw_rate
-      &&std::hypot(state->velocity[0],state->velocity[1])<.02&&std::abs(state->yaw_rate)<.02;
+      &&std::hypot(state->velocity[0],state->velocity[1])<config->stopped_linear_mps
+      &&std::abs(state->yaw_rate)<config->stopped_yaw_rps;
 }
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
 extern "C" int nuwax_scan_tracker_recovery_active(const void* p){return static_cast<const TrackerSession*>(p)->recovery_context;}
@@ -296,7 +297,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
         Eigen::Vector2d velocity=(target-position).head<2>();
         const double distance=velocity.norm();
         const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));
-        if(distance>.02)velocity*=std::min(cap,std::clamp(s.controller.kp_pos*distance,.03,.10))/distance;
+        if(distance>c->terminal_translation_done_m)velocity*=std::min(cap,std::clamp(s.controller.kp_pos*distance,.03,.10))/distance;
         else velocity.setZero();
         s.raw.linear.x=cs*velocity.x()+sn*velocity.y();s.raw.linear.y=-sn*velocity.x()+cs*velocity.y();
       }
@@ -309,7 +310,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       if(out->remaining<=0.) {
         out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();
         // FINISHED只表示几何曲线走完；仍在运动时按实测边界制动，由运行时统一确认停稳。
-        if(!nuwax_scan_motion_stopped(state)) {
+        if(!nuwax_scan_motion_stopped(state,c)) {
           const auto brake=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,
               command_world,Eigen::Vector2d::Zero(),0.,position,yaw,false);
           if(!brake.found){out->reason|=SCAN_TRACK_NO_CANDIDATE;return;}

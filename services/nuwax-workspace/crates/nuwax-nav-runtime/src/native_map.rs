@@ -434,12 +434,7 @@ fn pct_config(
     };
     if let Some(body) = map.body_envelope() {
         // 全局与SCAN执行端共用同一长宽矩形，凸包的窄前角不能成为不可执行的通路。
-        let bounds = body.footprint_xy_m.iter().fold(
-            [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
-                for i in 0..2 { bounds[0][i] = bounds[0][i].min(point[i]);
-                    bounds[1][i] = bounds[1][i].max(point[i]); }
-                bounds
-            });
+        let bounds = body_rectangle(body);
         config.footprint = vec![bounds[0], [bounds[1][0], bounds[0][1]],
             bounds[1], [bounds[0][0], bounds[1][1]]];
         config.footprint_radius = config.footprint
@@ -454,6 +449,17 @@ fn pct_config(
         config.max_slope = body.max_cross_slope_deg.to_radians();
     }
     config
+}
+
+/// 全局 PCT 与局部 SCAN 共用的外形长宽矩形：外包足迹的轴对齐包围盒 `[[x最小, y最小], [x最大, y最大]]`。
+pub fn body_rectangle(body: &nuwax_nav_mls_planner::SurfaceBodyEnvelope) -> [[f64; 2]; 2] {
+    body.footprint_xy_m.iter().fold([[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
+        for i in 0..2 {
+            bounds[0][i] = bounds[0][i].min(point[i]);
+            bounds[1][i] = bounds[1][i].max(point[i]);
+        }
+        bounds
+    })
 }
 
 /// 从当前快照的源点生成层析；占据带和禁区交现有原生桥判定。

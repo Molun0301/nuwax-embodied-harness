@@ -567,7 +567,8 @@ impl SurfaceGoalSourceAdapter {
     /// 从当前位置一次按需展开的单源搜索，候选按端点绑定规则（支撑点±10格内最近的有效地面层）绑定到节点，
     /// 在绑定节点定值时按路径代价由近到远成为可达候选：
     /// 无视域时每个前沿簇第一个定值并通过检查的可达候选是代表；已有8个簇有代表或可达范围展开完即停；
-    /// 有视域时再续到这8个簇的全部格定值，或出队代价超过8个代表里的最大代价加8个簇里最大的平面跨度路程。
+    /// 有视域时候选按簇和机体宽度的方格抽稀（每格只留第一个定值并通过检查的），续到这8个簇的每个方格都已有候选
+    /// 或可达候选都已定值，或出队代价超过8个代表里的最大代价加8个簇里最大的平面跨度路程。
     /// 重试候选仍最先被选。`spans`是簇号到簇平面跨度（米）。
     #[allow(clippy::too_many_arguments)]
     fn discover(
@@ -583,7 +584,6 @@ impl SurfaceGoalSourceAdapter {
         selecting: bool,
         mut examined: std::collections::BTreeSet<[i32; 3]>,
     ) -> ExploreResult<Discovery> {
-        let quaternion = current_body.1;
         let voxel = f64::from(snapshot.config().voxel_size);
         let minimum_distance = f64::from(snapshot.config().goal_tolerance.max(snapshot.config().voxel_size));
         let retry_matches = |point: [f64; 3]| {
@@ -611,16 +611,31 @@ impl SurfaceGoalSourceAdapter {
             })
             .collect();
         let clusters: Vec<_> = candidates.iter().map(|candidate| candidate.cluster).collect();
+        // 有视域时按簇和地图对齐、边长取机体宽度的方格抽稀：每格只留第一个定值并通过检查的候选。
+        let width = snapshot.frontier_body_width();
+        let squares: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                let p = candidate.support_xyz;
+                (candidate.cluster, [(p[0] / width).floor() as i64, (p[1] / width).floor() as i64])
+            })
+            .collect();
         // 起点没有可搜索的实测地面时所有候选都不可达；10格内没有绑定节点的候选不可达。
         let reachable = search.begin_source(current_body.0, &targets).ok();
-        let mut unsettled = std::collections::BTreeMap::<u32, usize>::new();
-        for (cluster, _) in clusters
+        // 各方格尚未定值的可达候选数；方格已有候选或可达候选都已定值即算完成，`open`是各簇未完成的方格数。
+        let mut unsettled = std::collections::BTreeMap::<(u32, [i64; 2]), usize>::new();
+        for (square, _) in squares
             .iter()
             .zip(reachable.iter().flatten())
             .filter(|(_, reachable)| **reachable)
         {
-            *unsettled.entry(*cluster).or_default() += 1;
+            *unsettled.entry(*square).or_default() += 1;
         }
+        let mut open = std::collections::BTreeMap::<u32, usize>::new();
+        for (cluster, _) in unsettled.keys() {
+            *open.entry(*cluster).or_default() += 1;
+        }
+        let mut filled = std::collections::BTreeSet::<(u32, [i64; 2])>::new();
         let retry_target = candidates
             .iter()
             .zip(reachable.iter().flatten())
@@ -631,15 +646,16 @@ impl SurfaceGoalSourceAdapter {
         let mut retry_index = None;
         let mut retry_settled = false;
         // 有视域时8个簇确定后的续搜上限：8个代表里的最大加权代价加8个簇里最大的平面跨度路程，超出的候选按不可达处理。
+        // 簇间代价取这次搜索树上的距离，所以发现阶段之后不再另做单源搜索。
         // 路程换算成代价用搜索的基础每米代价（不含软代价）。
         let mut representative_cost = f64::NEG_INFINITY;
         let mut limit = f64::INFINITY;
         while reachable.is_some() {
-            // 已有8个簇的代表（有视域时这些簇的格也全部定值），且重试候选已处理，即停止。
+            // 已有8个簇的代表（有视域时这些簇的每个方格都已有候选或可达候选都已定值），且重试候选已处理，即停止。
             let retry_pending = retry_target.is_some() && !retry_settled;
             let clusters_done = represented.len() >= 8
                 && (self.observation_model.is_none()
-                    || represented.iter().all(|cluster| unsettled.get(cluster).is_none_or(|count| *count == 0)));
+                    || represented.iter().all(|cluster| open.get(cluster).is_none_or(|count| *count == 0)));
             if !retry_pending && (clusters_done || !selecting) {
                 break;
             }
@@ -653,83 +669,28 @@ impl SurfaceGoalSourceAdapter {
             };
             let index = settled.index;
             let cluster = clusters[index];
-            if let Some(count) = unsettled.get_mut(&cluster) {
-                *count -= 1;
+            let square = squares[index];
+            let count = unsettled.get_mut(&square).expect("定值的候选都可达");
+            *count -= 1;
+            if *count == 0 && !filled.contains(&square) {
+                *open.get_mut(&cluster).expect("方格所在簇已计数") -= 1;
             }
             let mut candidate = candidates[index].clone();
             examined.insert(candidate.frontier_cell);
             let is_retry = retry_target == Some(index);
             retry_settled |= is_retry;
-            // 无视域时每个簇第一个定值的可达候选是代表；有视域时只收已选簇内的候选。
+            // 无视域时每个簇第一个定值的可达候选是代表；有视域时只收已选簇内、所在方格还没有候选的候选。
             if !is_retry
                 && (if self.observation_model.is_none() {
                     represented.contains(&cluster) || represented.len() >= 8
                 } else {
-                    !represented.contains(&cluster) && represented.len() >= 8
+                    (!represented.contains(&cluster) && represented.len() >= 8) || filled.contains(&square)
                 })
             {
                 continue;
             }
-            let base_yaw = (candidate.support_xyz[1] - robot_support[1])
-                .atan2(candidate.support_xyz[0] - robot_support[0]);
-            // 机体能否停留与传感器视场独立；直指前沿不适合时仍尝试沿边缘停留。
-            let turns = if snapshot.body_envelope().is_some() || directional_view {
-                4
-            } else {
-                1
-            };
-            let mut best = None;
-            for i in 0..turns {
-                let yaw = base_yaw + i as f64 * std::f64::consts::FRAC_PI_2;
-                let candidate_quaternion =
-                    if self.observation_model.is_some() || snapshot.body_envelope().is_some() {
-                        [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()]
-                    } else {
-                        quaternion
-                    };
-                let body = snapshot
-                    .body_position_from_support(
-                        candidate.support_xyz,
-                        candidate_quaternion,
-                        self.body_to_support_z_m,
-                    )
-                    .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-                let view = self
-                    .observation_model
-                    .as_ref()
-                    .map(|model| {
-                        snapshot.estimate_observation_view(
-                            model,
-                            body,
-                            candidate_quaternion,
-                            &observation_targets,
-                        )
-                    })
-                    .transpose()
-                    .map_err(ExploreError::SourceError)?;
-                if view.as_ref().is_some_and(|view| view.cells.is_empty()) {
-                    continue;
-                }
-                let count = view.as_ref().map_or(1, |view| view.cells.len());
-                if best.as_ref().is_none_or(
-                    |(_, _, _, old): &(
-                        [f64; 3],
-                        [f64; 4],
-                        Option<nuwax_explore_routing::observation::ViewEstimate>,
-                        usize,
-                    )| count > *old,
-                ) {
-                    best = Some((body, candidate_quaternion, view, count));
-                }
-                // 无方向性视场只需首个可行视点，避免普通候选多做三次几何与射线查询。
-                if !directional_view {
-                    break;
-                }
-            }
-            let Some((body, mut candidate_quaternion, mut view, _)) = best else {
-                continue;
-            };
-            // 支撑点和完整姿态转换后的机体目标都在候选阶段约束，不能选中后才丢掉。
+            // 端点在绑定节点的实测地面上；支撑点和完整姿态转换后的机体目标都在候选阶段约束，不能选中后才丢掉。
+            let body = settled.route.endpoint;
             if self.boundary.as_ref().is_some_and(|boundary| {
                 !boundary.contains(nuwax_nav_types_messages::geometry::Point2::new(
                     body[0], body[1],
@@ -737,33 +698,48 @@ impl SurfaceGoalSourceAdapter {
             }) {
                 continue;
             }
-            // 路线代价取绑定节点的搜索代价；端点在绑定节点的实测地面上，非定向视域的停留朝向取末段方向。
-            let body = settled.route.endpoint;
-            if !directional_view {
-                let yaw = settled.route.yaw;
-                candidate_quaternion = [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()];
-            }
+            // 视域只在绑定后的端点估计：定向视域试四个相差90度的朝向取看到最多的，否则停留朝向取末段方向。
+            let estimate = |quaternion: [f64; 4]| {
+                self.observation_model
+                    .as_ref()
+                    .map(|model| snapshot.estimate_observation_view(model, body, quaternion, observation_targets))
+                    .transpose()
+                    .map_err(ExploreError::SourceError)
+            };
+            let yaw_quaternion = |yaw: f64| [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()];
+            let (candidate_quaternion, view) = if directional_view {
+                let base_yaw = (candidate.support_xyz[1] - robot_support[1])
+                    .atan2(candidate.support_xyz[0] - robot_support[0]);
+                let mut best: Option<([f64; 4], nuwax_explore_routing::observation::ViewEstimate)> = None;
+                for i in 0..4 {
+                    let quaternion = yaw_quaternion(base_yaw + f64::from(i) * std::f64::consts::FRAC_PI_2);
+                    let view = estimate(quaternion)?.expect("定向视域必有视域模型");
+                    if !view.cells.is_empty() && best.as_ref().is_none_or(|(_, old)| view.cells.len() > old.cells.len()) {
+                        best = Some((quaternion, view));
+                    }
+                }
+                let Some((quaternion, view)) = best else { continue };
+                (quaternion, Some(view))
+            } else {
+                let quaternion = yaw_quaternion(settled.route.yaw);
+                let view = estimate(quaternion)?;
+                if view.as_ref().is_some_and(|view| view.cells.is_empty()) {
+                    continue;
+                }
+                (quaternion, view)
+            };
             candidate.support_xyz = snapshot
                 .support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
             if self.excluded(candidate.support_xyz, vertical_radius) {
                 continue;
             }
-            if let Some(model) = self.observation_model.as_ref() {
-                view = Some(
-                    snapshot
-                        .estimate_observation_view(
-                            model,
-                            body,
-                            candidate_quaternion,
-                            &observation_targets,
-                        )
-                        .map_err(ExploreError::SourceError)?,
-                );
-            }
             candidate.travel_cost = settled.route.cost;
             admissible.push((candidate, (body, candidate_quaternion), view));
             goals.push(index);
+            if filled.insert(square) && unsettled[&square] > 0 {
+                *open.get_mut(&cluster).expect("方格所在簇已计数") -= 1;
+            }
             // 重试候选仍最先被选。
             if is_retry {
                 retry_index = Some(admissible.len() - 1);

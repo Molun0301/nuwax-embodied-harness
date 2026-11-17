@@ -206,36 +206,61 @@ fn far_unreachable_candidates_neither_change_the_result_nor_expand_the_whole_map
 
 #[test]
 fn with_view_model_selected_cluster_candidates_settle_up_to_the_representative_bound() {
-    let center = 12.05;
-    let holes = spiral(120, 14);
-    let surface = floor(24.0, |x, y| in_hole(&holes, x, y));
-    let boundary = inset(24.0);
-    let receiver = SurfaceInputReceiver::new();
-    let source = adapter(&receiver, Some(boundary.clone()), true);
-    let run = run(&source, &surface, &vertices(&boundary), [center, center, 0.35]);
-    let weighted: BTreeMap<_, _> = run.truth.iter().map(|&(cell, _, w)| (cell, w)).collect();
-    // 每个簇第一个收下的候选是该簇的代表；上限 = 代表最大代价 + 8个簇里最大的平面跨度 × 每米代价（0.1米格，每米10）。
-    let mut representatives = BTreeMap::new();
-    for (candidate, _, _) in &run.discovery.admissible {
-        representatives.entry(candidate.cluster).or_insert(weighted[&candidate.frontier_cell]);
-    }
-    assert_eq!(representatives.len(), 8);
-    let span = representatives.keys().map(|cluster| run.spans[cluster]).fold(0.0, f64::max);
-    assert!(span > 0.0);
-    let bound = representatives.values().copied().fold(f64::NEG_INFINITY, f64::max) + span * 10.0;
-    let (mut within, mut beyond) = (0, 0);
-    for &(cell, cluster, w) in &run.truth {
-        if !representatives.contains_key(&cluster) { continue; }
-        if w <= bound {
-            within += 1;
-            assert!(run.discovery.examined.contains(&cell), "上限内的候选{cell:?}应已定值");
-        } else {
-            beyond += 1;
-            assert!(!run.discovery.examined.contains(&cell), "超出上限的候选{cell:?}按不可达处理");
+    let mut sampled_total = 0;
+    let mut within_total = 0;
+    let mut beyond_total = 0;
+    for (name, surface, boundary, center) in [
+        ("螺线缺测", floor(24.0, |x, y| in_hole(&spiral(120, 14), x, y)), Some(inset(24.0)), 12.05),
+        ("多房间", rooms(50.0, 10.0), None, 25.25),
+    ] {
+        let polygon = boundary.as_ref().map_or_else(Vec::new, vertices);
+        let receiver = SurfaceInputReceiver::new();
+        let source = adapter(&receiver, boundary, true);
+        let run = run(&source, &surface, &polygon, [center, center, 0.35]);
+        let weighted: BTreeMap<_, _> = run.truth.iter().map(|&(cell, _, w)| (cell, w)).collect();
+        // 每个簇第一个收下的候选是该簇的代表；上限 = 代表最大代价 + 8个簇里最大的平面跨度 × 每米代价（0.1米格，每米10）。
+        let mut representatives = BTreeMap::new();
+        for (candidate, _, _) in &run.discovery.admissible {
+            representatives.entry(candidate.cluster).or_insert(weighted[&candidate.frontier_cell]);
         }
+        assert_eq!(representatives.len(), 8);
+        let span = representatives.keys().map(|cluster| run.spans[cluster]).fold(0.0, f64::max);
+        assert!(span > 0.0);
+        let bound = representatives.values().copied().fold(f64::NEG_INFINITY, f64::max) + span * 10.0;
+        let width = surface.frontier_body_width();
+        let square = |p: [f64; 3]| [(p[0] / width).floor() as i64, (p[1] / width).floor() as i64];
+        let squares: BTreeMap<_, _> = frontier_geometry(&surface, &polygon).unwrap().candidates.into_iter()
+            .map(|c| (c.frontier_cell, (c.cluster, square(c.support_xyz)))).collect();
+        let filled: BTreeSet<_> = run.discovery.admissible.iter().map(|(c, _, _)| squares[&c.frontier_cell]).collect();
+        assert_eq!(filled.len(), run.discovery.admissible.len(), "每簇每方格至多收下一个候选");
+        let mut reachable_squares = BTreeMap::<_, Vec<_>>::new();
+        let (mut within, mut beyond, mut skipped) = (0, 0, 0);
+        for &(cell, cluster, w) in &run.truth {
+            if !representatives.contains_key(&cluster) { continue; }
+            reachable_squares.entry(squares[&cell]).or_default().push((cell, w));
+            if w <= bound {
+                within += 1;
+                if !run.discovery.examined.contains(&cell) { skipped += 1; }
+            } else {
+                beyond += 1;
+                assert!(!run.discovery.examined.contains(&cell), "超出上限的候选{cell:?}按不可达处理");
+            }
+        }
+        for (square, candidates) in &reachable_squares {
+            assert!(filled.contains(square) || candidates.iter().all(|(cell, w)| {
+                run.discovery.examined.contains(cell) || *w > bound
+            }), "方格{square:?}应已有候选，或可达候选都已定值，或剩余候选超出上限");
+        }
+        // 不含可达格的方格自然完成；有可达格的方格按上述三条路径结束。
+        assert!(run.discovery.admissible.len() > representatives.len(), "每簇可从多个方格的候选选择代表");
+        eprintln!("{name}选中簇内候选：上限内{within}，超出{beyond}，上限内未定值{skipped}，方格{}，已有候选{}",
+            reachable_squares.len(), filled.len());
+        sampled_total += run.discovery.admissible.len();
+        within_total += within;
+        beyond_total += beyond;
     }
-    assert!(run.discovery.admissible.len() > representatives.len(), "簇内全部候选按视域规则另选代表");
-    eprintln!("选中簇内候选：上限内{within}，超出{beyond}");
+    assert!(sampled_total < within_total, "抽稀后只收下每方格首个通过检查的候选");
+    assert!(beyond_total > 0, "必须覆盖代价上限截断，超出上限的候选不得定值");
 }
 
 #[test]
@@ -570,6 +595,103 @@ fn one_way_step_rooms() -> Arc<SurfaceSnapshot> {
             support_uncertainty_m: 0.0,
         })
         .unwrap())
+}
+
+/// 测试对照独立保留每簇视域非空、路程最短的代表，平局按支撑点坐标，与 select_clusters 一致。
+fn keep_view_representative(best: &mut BTreeMap<u32, (FrontierCandidate, usize)>, candidate: FrontierCandidate, cells: usize) {
+    if cells == 0 { return; }
+    let replace = best.get(&candidate.cluster).is_none_or(|(old, _)| {
+        candidate.travel_cost.total_cmp(&old.travel_cost)
+            .then_with(|| candidate.support_xyz[0].total_cmp(&old.support_xyz[0]))
+            .then_with(|| candidate.support_xyz[1].total_cmp(&old.support_xyz[1]))
+            .then_with(|| candidate.support_xyz[2].total_cmp(&old.support_xyz[2])).is_lt()
+    });
+    if replace { best.insert(candidate.cluster, (candidate, cells)); }
+}
+
+/// 不调用生产 discover、不抽稀、不提前停止：逐一在所有可达候选的绑定端点估视域，独立生成每簇代表。
+fn unthinned_view_representatives(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, polygon: &[[f64; 2]], start: [f64; 3])
+    -> BTreeMap<u32, (FrontierCandidate, usize)> {
+    let mut routes = source.planner.route_costs(surface, 0.3, polygon).unwrap();
+    let mut search = routes.search().unwrap();
+    let geometry = frontier_geometry(surface, polygon).unwrap();
+    let mut candidates = geometry.candidates;
+    snap_support_heights(&search, &mut candidates);
+    let robot_support = surface.support_position_from_body(start, IDENTITY, 0.3).unwrap();
+    let minimum = f64::from(surface.config().goal_tolerance.max(surface.config().voxel_size));
+    let vertical_radius = f64::from(surface.config().step_threshold_m) + f64::from(surface.config().voxel_size);
+    candidates.retain(|c| distance(robot_support, c.support_xyz) > minimum && !source.excluded(c.support_xyz, vertical_radius));
+    let goals: Vec<_> = candidates.iter().map(|c| [c.support_xyz[0], c.support_xyz[1], c.support_xyz[2] + 0.3]).collect();
+    search.begin_source(start, &goals).unwrap();
+    let model = source.observation_model.as_ref().unwrap();
+    let directional = model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6;
+    let mut representatives = BTreeMap::new();
+    while let Some(settled) = search.next_settled(f64::INFINITY).unwrap() {
+        let mut candidate = candidates[settled.index].clone();
+        let body = settled.route.endpoint;
+        if !inside_boundary([body[0], body[1]], polygon) { continue; }
+        let initial_yaw = if directional {
+            (candidate.support_xyz[1] - robot_support[1]).atan2(candidate.support_xyz[0] - robot_support[0])
+        } else { settled.route.yaw };
+        let mut best = (0, IDENTITY);
+        for turn in 0..if directional { 4 } else { 1 } {
+            let yaw = initial_yaw + f64::from(turn) * std::f64::consts::FRAC_PI_2;
+            let quaternion = [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()];
+            let cells = surface.estimate_observation_view(model, body, quaternion, &geometry.targets).unwrap().cells.len();
+            if cells > best.0 { best = (cells, quaternion); }
+        }
+        candidate.support_xyz = surface.support_position_from_body(body, best.1, 0.3).unwrap();
+        if source.excluded(candidate.support_xyz, vertical_radius) { continue; }
+        candidate.travel_cost = settled.route.cost;
+        keep_view_representative(&mut representatives, candidate, best.0);
+    }
+    representatives
+}
+
+/// 六个既有合成场景和定向视域：对照每个可达候选均在端点估视域，报告逐簇、总体的抽稀收益比值。
+/// `cargo test --release -p nuwax-exploration --all-features thinned_cluster_view -- --ignored --nocapture`
+#[test]
+#[ignore = "完整不抽稀对照，手动运行"]
+fn thinned_cluster_view_gain_against_unthinned_discovery() {
+    let scenes = vec![
+        ("50米多房间", rooms(50.0, 10.0), None, [25.25, 25.25], false),
+        ("50米远处前沿", open_floor(50.0, false), None, [25.05, 25.05], false),
+        ("50米近处前沿", open_floor(50.0, true), Some(inset(50.0)), [25.05, 25.05], false),
+        ("100米近处前沿", open_floor(100.0, true), Some(inset(100.0)), [50.05, 50.05], false),
+        ("24米螺线缺测", floor(24.0, |x, y| in_hole(&spiral(120, 14), x, y)), Some(inset(24.0)), [12.05, 12.05], false),
+        ("单向台阶门洞", one_way_step_rooms(), Some(inset(24.0)), [3.05, 3.05], false),
+        ("24米螺线定向视域", floor(24.0, |x, y| in_hole(&spiral(120, 14), x, y)), Some(inset(24.0)), [12.05, 12.05], true),
+    ];
+    let mut ratios = Vec::new();
+    for (name, surface, boundary, start, directional) in scenes {
+        let polygon = boundary.as_ref().map_or_else(Vec::new, vertices);
+        let receiver = SurfaceInputReceiver::new();
+        let mut source = adapter(&receiver, boundary, true);
+        if directional {
+            let mut model = volume_model();
+            model.horizontal_fov_rad = std::f64::consts::FRAC_PI_2;
+            source.set_observation_model(model).unwrap();
+        }
+        let body = [start[0], start[1], 0.35];
+        let (discovery, _, _) = discover_only(&source, &surface, &polygon, body);
+        let mut thinned = BTreeMap::new();
+        for (candidate, _, view) in discovery.admissible {
+            keep_view_representative(&mut thinned, candidate, view.unwrap().cells.len());
+        }
+        assert_eq!(thinned.len(), if name == "50米远处前沿" { 1 } else { 8 }, "{name}的可达簇数");
+        let full = unthinned_view_representatives(&source, &surface, &polygon, body);
+        for (cluster, (candidate, cells)) in thinned {
+            let (original, original_cells) = &full[&cluster];
+            let ratio = cells as f64 / *original_cells as f64;
+            eprintln!("{name} 簇{cluster}：抽稀{cells}格/不抽稀{original_cells}格={ratio:.6}，代表{:?}/{:?}",
+                candidate.frontier_cell, original.frontier_cell);
+            ratios.push(ratio);
+        }
+    }
+    ratios.sort_by(f64::total_cmp);
+    let median = (ratios[(ratios.len() - 1) / 2] + ratios[ratios.len() / 2]) * 0.5;
+    eprintln!("代表视域收益比值：{}簇，中位数{median:.6}，最小值{:.6}", ratios.len(), ratios[0]);
+    assert!(ratios[0] >= 0.8, "视域收益最小比值低于0.8，停止提交B");
 }
 
 /// 簇间代价两种求法派发的第一个目标逐拍对比：树上距离（生产）与从各代表另做单源搜索的精确矩阵。

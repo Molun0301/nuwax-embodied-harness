@@ -445,7 +445,8 @@ impl SurfaceSnapshot {
     }
 
     /// 机体宽度：有外形时取外形包络矩形的横向宽度，没有外形时取规划器所用圆的直径（2×`wall_clearance_m`）。
-    fn frontier_body_width(&self) -> f64 {
+    /// 前沿簇的最小尺寸与探索选点的候选抽稀共用。
+    pub fn frontier_body_width(&self) -> f64 {
         self.data.body_envelope.as_ref().map_or(2.0 * f64::from(self.config().wall_clearance_m), |body| {
             let (low, high) = body.footprint_xy_m.iter()
                 .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| (low.min(point[1]), high.max(point[1])));

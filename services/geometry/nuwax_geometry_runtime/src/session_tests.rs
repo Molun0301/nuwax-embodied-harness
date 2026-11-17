@@ -952,14 +952,14 @@ async fn localized_map_follows_tracking_quality_and_saves_in_place_or_as_new_map
     assert!(fine_voxels_at_obstacle(&loaded.surface_map().await.unwrap().unwrap()) > 0);
     // 某一轮吻合差：回到只读，近期点云照发。
     let score = nuwax_mapping::relocalization::RelocalizationScore { wall_fitness: 0.1, penetration: 0.5, rmse: 1., horizontal_constraint: 0. };
-    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 1, timestamp_ns: 0 });
+    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 1, limited: false, timestamp_ns: 0 });
     let mut recent = loaded.recent_cloud_rx();
     recent.borrow_and_update();
     session.router.publish_frame(obstacle_frame(id, base + 3_000_000_000));
     assert_eq!(revision(loaded.surface_map().await.unwrap()), written, "吻合差期间地图不变");
     assert!(recent.has_changed().unwrap());
     // 下一轮吻合：继续写入。
-    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 0, timestamp_ns: 0 });
+    session.localization_update(localizer::TrackingUpdate { score, bad_rounds: 0, limited: false, timestamp_ns: 0 });
     session.router.publish_frame(obstacle_frame(id, base + 4_000_000_000));
     assert!(revision(loaded.surface_map().await.unwrap()) > written);
     assert!(Arc::ptr_eq(session.relocalization_target.as_ref().unwrap(), &target));

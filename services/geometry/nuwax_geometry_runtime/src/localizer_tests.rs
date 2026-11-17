@@ -341,7 +341,8 @@ fn empty_input_skips_quality_and_step_limits_robot_pose_at_nonzero_odometry() {
     );
     let target_points: Vec<_> = points.iter().map(|p| candidate * p).collect();
     let target = TargetCache::new(&target_points, Default::default());
-    let result = constrained_step(&source, &target, Isometry3::identity(), candidate, odom);
+    let (result, limited) = constrained_step(&source, &target, Isometry3::identity(), candidate, odom);
+    assert!(limited, "本轮修正量超过现有平移和转角限幅");
     let before = odom;
     let after = result * odom;
     assert!((after.translation.vector - before.translation.vector).norm() <= 0.02 + 1e-9);
@@ -409,4 +410,215 @@ fn pending_relocalization_command_has_no_tracking_writes() {
         session.end_current().await.unwrap();
         session.nav.shutdown().await;
     });
+}
+
+/// 沿用G6调查的两墙、地面与3,200个固定采样点。
+fn g6_surfaces(board: bool) -> Vec<Point3<f64>> {
+    let mut points = Vec::new();
+    for i in 0..40 {
+        for j in 0..20 {
+            for y in [-2.025, 2.025] {
+                points.push(Point3::new(-1.975 + i as f64 * 0.1, y, 0.125 + j as f64 * 0.1));
+            }
+        }
+    }
+    for i in 0..40 {
+        for j in 0..40 {
+            points.push(Point3::new(-1.975 + i as f64 * 0.1, -1.975 + j as f64 * 0.1, 0.025));
+        }
+    }
+    if board {
+        for i in 0..12 {
+            for j in 0..16 {
+                points.push(Point3::new(0.525, -0.575 + i as f64 * 0.1, 0.325 + j as f64 * 0.1));
+            }
+        }
+    }
+    points
+}
+
+fn g6_frame(session: u64, stamp: u64, x: f64, bias: f64, yaw: f64, board: bool) -> MappingFrame {
+    MappingFrame {
+        session_id: session,
+        odom_pose: pose_from_isometry(
+            Isometry3::from_parts(Translation3::new(x, bias, 0.), UnitQuaternion::from_euler_angles(0., 0., yaw)),
+            "odom", stamp,
+        ),
+        points_body: g6_surfaces(board).iter().map(|p| [p.x - x, p.y, p.z]).collect(),
+        ray_origin_body: [0.025, 0.025, 0.65],
+        mapping_only: false,
+        sensor_id: "G6合成雷达".into(),
+        registered_cloud: None,
+    }
+}
+
+fn g6_keys(root: &nuwax_map_chunks::SealedMap) -> std::collections::BTreeSet<[i32; 3]> {
+    let mut reader = root.reader();
+    root.manifest().blocks.iter().flat_map(|reference| {
+        reader.block(reference).unwrap().keys().map(|&local| {
+            nuwax_map_chunks::global_key(reference.key, local).unwrap()
+        }).collect::<Vec<_>>()
+    }).collect()
+}
+
+fn g6_wall_p95(root: &nuwax_map_chunks::SealedMap) -> f64 {
+    let size = f64::from(root.manifest().voxel_size_m);
+    let mut distances: Vec<_> = g6_keys(root).into_iter().map(|key| key.map(|v| (v as f64 + 0.5) * size))
+        .filter(|p| p[2] > 0.1 && (p[1].abs() - 2.025).abs() < 0.3)
+        .map(|p| (p[1].abs() - 2.025).abs()).collect();
+    distances.sort_by(f64::total_cmp);
+    distances[(distances.len() - 1) * 95 / 100]
+}
+
+async fn g6_loaded_session(id: u64, root: std::path::PathBuf) -> super::super::Session {
+    let mapper = Mapper::start(id, crate::mapper::MapperConfig::default()).unwrap();
+    mapper.feed(g6_frame(id, super::super::now_ns(), 0., 0., 0., false));
+    let snapshot = mapper.snapshot().await.unwrap();
+    // 先保存再加载，加载会话的历史扫描引用必须指向持久归档。
+    let store = crate::map_store::MapStore::new(root.clone());
+    store.save("G6原图", None, snapshot).unwrap();
+    let snapshot = store.load("G6原图").unwrap();
+    mapper.shutdown().await.unwrap();
+    let loaded = Mapper::load(id + 1, crate::mapper::MapperConfig::default(), snapshot, true).unwrap();
+    let mut session = super::super::tests::actor(loaded.clone(), root).await;
+    session.install(loaded, crate::proto::SessionPhase::Localized);
+    session.relocalization_target = Some(Arc::new(TargetCache::new(&g6_surfaces(false), Default::default())));
+    session
+}
+
+/// 加速源时间，逐轮调用生产配准、变换发布、会话写入切换；不改跟踪器的真实秒钟。
+async fn g6_tracking_round(session: &mut super::super::Session, input: &MappingFrame) -> bool {
+    let mapper = session.mapper().unwrap();
+    let target = session.relocalization_target.as_ref().unwrap();
+    let round = compute_round(&[input.clone()], mapper.map_from_odom(), target).unwrap();
+    let correction = round.correction.expect("固定场景的跟踪候选应吻合");
+    session.router.publish_map_from_odom(mapper.session_id(), pose_from_isometry(correction, "map", input.odom_pose.timestamp_ns)).await;
+    session.localization_update(TrackingUpdate {
+        score: round.score, bad_rounds: 0, limited: round.limited, timestamp_ns: input.odom_pose.timestamp_ns,
+    });
+    round.limited
+}
+
+fn g6_metrics(name: &str, value: serde_json::Value) {
+    eprintln!("G6实施 {name}: {value}");
+    if let Some(path) = std::env::var_os("NUWAX_G6_IMPLEMENTATION_METRICS") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(format!("{name}.json")), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn g6_limited_flag_uses_the_existing_translation_and_rotation_scales() {
+    let points = room();
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    for (translation, angle, expected) in [
+        (0., 0., false), (0.019, 0., false), (0.021, 0., true),
+        (0., 0.19_f64, false), (0., 0.21, true), (0.021, 0.21, true),
+    ] {
+        let candidate = Isometry3::from_parts(Translation3::new(translation, 0., 0.),
+            UnitQuaternion::from_euler_angles(0., 0., angle.to_radians()));
+        let target_points: Vec<_> = points.iter().map(|p| candidate * p).collect();
+        let target = TargetCache::new(&target_points, Default::default());
+        let (_, limited) = constrained_step(&source, &target, Isometry3::identity(), candidate, Isometry3::identity());
+        assert_eq!(limited, expected, "平移={translation}米，转角={angle}度");
+    }
+}
+
+#[tokio::test]
+async fn g6_ten_minute_revisit_rejects_clipped_writes_without_growing_or_thickening_walls() {
+    let root = std::env::temp_dir().join(format!("nuwax-g6-revisit-{}", uuid::Uuid::new_v4()));
+    let mut session = g6_loaded_session(1601, root.clone()).await;
+    let mapper = session.mapper().unwrap();
+    let target = session.relocalization_target.clone().unwrap();
+    let initial = mapper.surface_map().await.unwrap().unwrap();
+    let initial_count = initial.manifest().points();
+    let initial_p95 = g6_wall_p95(&initial);
+    let base = super::super::now_ns();
+    let mut limited_rounds = 0;
+    let mut writing_rounds = 0;
+    for second in 0..600_u64 {
+        let index = second * 5;
+        let x = ((index % 400) as f64 / 200. - 1.).abs();
+        // 5.5厘米初始偏差经2厘米限幅后留下调查里的3.5厘米残差；之后叠加原正弦扰动。
+        let bias = 0.055 + 0.035 * (index as f64 * 0.071).sin();
+        let yaw = 0.2_f64.to_radians() * (index as f64 * 0.053).sin();
+        let input = g6_frame(mapper.session_id(), base + index * 200_000_000, x, bias, yaw, false);
+        let limited = g6_tracking_round(&mut session, &input).await;
+        let before = mapper.surface_map().await.unwrap().unwrap().manifest().revision;
+        if limited { limited_rounds += 1; } else { writing_rounds += 1; }
+        let mut recent = mapper.recent_cloud_rx();
+        recent.borrow_and_update();
+        for step in 0..5 {
+            let i = index + step;
+            let x = ((i % 400) as f64 / 200. - 1.).abs();
+            session.router.publish_frame(g6_frame(mapper.session_id(), base + i * 200_000_000, x,
+                0.055 + 0.035 * (i as f64 * 0.071).sin(),
+                0.2_f64.to_radians() * (i as f64 * 0.053).sin(), false));
+            mapper.surface_map().await.unwrap();
+        }
+        let after = mapper.surface_map().await.unwrap().unwrap().manifest().revision;
+        if limited { assert_eq!(after, before, "第{second}轮限幅时必须只读"); }
+        else { assert!(after > before, "第{second}轮追上后必须写入"); }
+        assert!(recent.has_changed().unwrap(), "只读与写入期间近期点云都要继续发布");
+    }
+    let final_map = mapper.surface_map().await.unwrap().unwrap();
+    let final_count = final_map.manifest().points();
+    let final_p95 = g6_wall_p95(&final_map);
+    assert!(limited_rounds > 0 && writing_rounds > 0, "必须实际覆盖限幅与恢复");
+    assert!(final_count <= initial_count + initial_count / 100, "精细体素净增长超过1%：{initial_count}→{final_count}");
+    assert!(final_p95 <= initial_p95 + 0.01, "墙面法向95分位增加超过1厘米：{initial_p95}→{final_p95}");
+    assert!(Arc::ptr_eq(session.relocalization_target.as_ref().unwrap(), &target));
+    g6_metrics("十分钟复走", serde_json::json!({"源时间秒":600,"帧数":3000,"限幅轮数":limited_rounds,
+        "写入轮数":writing_rounds,"起始精细体素":initial_count,"最终精细体素":final_count,
+        "初始墙面法向P95米":initial_p95,"最终墙面法向P95米":final_p95}));
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn g6_tracking_clips_then_resumes_writing_new_board_and_preserves_it_after_reload() {
+    let root = std::env::temp_dir().join(format!("nuwax-g6-board-{}", uuid::Uuid::new_v4()));
+    let mut session = g6_loaded_session(1603, root.clone()).await;
+    let mapper = session.mapper().unwrap();
+    let target = session.relocalization_target.clone().unwrap();
+    let base = super::super::now_ns();
+    let revision = mapper.surface_map().await.unwrap().unwrap().manifest().revision;
+    let mut limited = Vec::new();
+    session.localizer = Some(Localizer::start(session.router.clone(), mapper.clone(), target.clone()));
+    session.router.publish_frame(g6_frame(mapper.session_id(), base, 0., 0.055, 0., true));
+    mapper.surface_map().await.unwrap();
+    for round in 0..3 {
+        // 此用例使用真实逐秒工作线程，核对限幅标志经结果通道到会话后控制实际写入。
+        let update = session.localizer.as_mut().unwrap().next().await.unwrap();
+        assert_eq!(update.bad_rounds, 0, "限幅不改变本轮吻合质量");
+        limited.push(update.limited);
+        session.localization_update(update);
+        let input = g6_frame(mapper.session_id(), base + (round + 1) * 1_000_000_000, 0., 0.055, 0., true);
+        session.router.publish_frame(input);
+        let written = mapper.surface_map().await.unwrap().unwrap().manifest().revision;
+        if round < 2 { assert_eq!(written, revision, "吻合但被限幅的轮次只读"); }
+        else { assert!(written > revision, "第三轮追上后恢复写入"); }
+    }
+    assert_eq!(limited, vec![true, true, false]);
+    let board_count = |root: &nuwax_map_chunks::SealedMap| {
+        let size = f64::from(root.manifest().voxel_size_m);
+        g6_keys(root).iter().filter(|key| {
+            let p = key.map(|v| (v as f64 + 0.5) * size);
+            (p[0] - 0.525).abs() < 0.03 && p[1].abs() < 0.7 && p[2] > 0.3
+        }).count()
+    };
+    let board = board_count(&mapper.surface_map().await.unwrap().unwrap());
+    assert!(board > 0, "追上后真实新增板必须写入");
+    assert!(Arc::ptr_eq(session.relocalization_target.as_ref().unwrap(), &target));
+    session.save(crate::proto::SaveMapRequest { map_name: "G6新增板".into() }).await.unwrap();
+    session.load(crate::proto::LoadMapRequest { map_name: "G6新增板".into() }).await.unwrap();
+    let reloaded = session.mapper().unwrap().surface_map().await.unwrap().unwrap();
+    assert_eq!(board_count(&reloaded), board, "保存重载后新增板必须完整可见");
+    g6_metrics("新增板保存重载", serde_json::json!({"限幅标志":limited,"写入板体素":board,"重载板体素":board_count(&reloaded)}));
+    session.end_current().await.unwrap();
+    session.lio().unwrap().shutdown().await;
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
 }

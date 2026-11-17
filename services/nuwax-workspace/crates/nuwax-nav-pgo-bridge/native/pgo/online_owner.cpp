@@ -61,7 +61,9 @@ constexpr std::size_t kMaxSubmapPoints = 100'000;
 constexpr std::size_t kMaxGraphNodes =
     static_cast<std::size_t>(Result::MAX_GRAPH_NODES);
 constexpr int kIcpIterationLimit = 50;
-constexpr double kIcpMaxCorrespondenceDistanceM = 10.0;
+// 关键帧按 0.1 米体素采样，对应距离取约三倍体素，避免非重叠几何拉偏配准。
+constexpr double kIcpMaxCorrespondenceDistanceM = 0.3;
+constexpr double kIcpStatisticsRangeM = 10.0;
 constexpr std::size_t kMinIcpInliers = 20;
 constexpr std::size_t kStatusFixedWireBytes = 337;
 constexpr std::size_t kStatusStringCount = 7;
@@ -1256,7 +1258,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
         result.disposition = IcpDisposition::Cancelled;
         return result;
     }
-    const double fitness = icp.getFitnessScore(kIcpMaxCorrespondenceDistanceM);
+    const double fitness = icp.getFitnessScore(kIcpStatisticsRangeM);
     if ((!converged && !icp.hasConverged()) || !std::isfinite(fitness) ||
         fitness > score_threshold) {
         return {};
@@ -1270,7 +1272,7 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
     std::vector<int> indices(1);
     std::vector<float> distances(1);
     const double max_squared =
-        kIcpMaxCorrespondenceDistanceM * kIcpMaxCorrespondenceDistanceM;
+        kIcpStatisticsRangeM * kIcpStatisticsRangeM;
     for (const Point& point : *transformed) {
         if (cancelled->load(std::memory_order_acquire)) {
             IcpResult result;

@@ -34,6 +34,7 @@ fn cold_reference(input: &SurfaceSnapshot, mask: Arc<VirtualObstacleMask>) -> Su
         observations: input.observations.clone(),
         body_query_cache: Default::default(),
         navigation_measurements: None,
+        static_columns: None,
         data: Arc::new(SurfaceData {
             frontier_cache: Default::default(),
             body_cache: Default::default(),

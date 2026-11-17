@@ -104,3 +104,39 @@ fn selective_refresh_failed_physical_advance_is_unknown_once_then_recovers_known
     assert_eq!(fine,&vec![[RELATED[0],RELATED[1]]]);
     eprintln!("SELECTIVE_BASIS fail_after_physical=true recovered_unknown=true next_metadata_empty=true next_geometry_known=true");
 }
+
+#[test]
+fn registered_static_columns_keep_global_tomography_equal_to_full_rebuild() {
+    use nuwax_nav_runtime::native_map::{CachedPctPlanner, PctTerrainSource};
+    let configured=configured();
+    let offset=configured.follower.body_to_support_z_m;
+    let mut cache=SurfaceGeometryCache::configured(&configured);
+    let mut fixture=FineFixture::new();
+    let mut planner=CachedPctPlanner::new(PctTerrainSource::Tomography);
+    let mut previous:Option<Arc<SurfaceSnapshot>>=None;
+    let ground=2.025+offset;
+    let (start,goal)=([0.525,1.525,ground],[3.525,1.525,ground]);
+    for step in 0..6 {
+        match step {
+            1 => fixture.cells.extend((41..46).flat_map(|z|(28..33).map(move|y|[40,y,z]))),
+            2 => { fixture.cells.remove(&[10,10,40]); }
+            3 => { fixture.cells.remove(&[50,20,40]); fixture.cells.insert([50,20,41]); }
+            4 => fixture.cells.retain(|cell|!(cell[0]==40 && cell[2]>40 && cell[1]<31)),
+            _ => {}
+        }
+        let map=cache.build_with_changes(&fixture.next()).unwrap().snapshot;
+        if let Some(old)=&previous {
+            let columns=map.static_columns().unwrap().columns_since(old.static_columns().unwrap().id());
+            assert!(columns.is_some(),"第{step}步表面图须登记相对上一份的变化列");
+            assert_eq!(columns.unwrap().is_empty(),step==5);
+        }
+        planner.update(&map,offset,&[]).unwrap();
+        let mut full=CachedPctPlanner::new(PctTerrainSource::Tomography);
+        full.update(&map,offset,&[]).unwrap();
+        assert_eq!(planner.planner().geometry(),full.planner().geometry(),"第{step}步原生几何与全量重建不同");
+        let (route,expected)=(planner.planner().plan(start,goal),full.planner().plan(start,goal));
+        assert!(expected.is_ok(),"第{step}步应有完整路线：{expected:?}");
+        assert_eq!(route.unwrap().path,expected.unwrap().path);
+        previous=Some(map);
+    }
+}

@@ -66,8 +66,13 @@ impl CachedPctPlanner {
         let updates = match self.terrain {
             PctTerrainSource::Tomography => {
                 if static_changed {
-                    self.tomography
-                        .replace_static(&tomography_points(map, &config), resolution)?;
+                    let changed = self.source.as_ref().and_then(|old| static_columns_since(old, map))
+                        .and_then(|columns| tomography_column_points(map, &config, &columns)
+                            .map(|points| (columns, points)));
+                    match changed {
+                        Some((columns, points)) => self.tomography.replace_static_columns(&columns, &points, resolution)?,
+                        None => self.tomography.replace_static(&tomography_points(map, &config), resolution)?,
+                    }
                 }
                 let ground: Vec<_> = recent_ground.iter().map(|p| p.map(|v| v as f32)).collect();
                 self.tomography.update(
@@ -179,4 +184,9 @@ impl CachedPctPlanner {
         self.config = Some(config);
         Ok(())
     }
+}
+
+/// 表面图登记的、从上次静态几何到本次之间变化的层析列；登记记录不覆盖上次身份时为 `None`。
+fn static_columns_since(old: &SurfaceSnapshot, map: &SurfaceSnapshot) -> Option<BTreeSet<[i32; 2]>> {
+    map.static_columns()?.columns_since(old.static_columns()?.id())
 }

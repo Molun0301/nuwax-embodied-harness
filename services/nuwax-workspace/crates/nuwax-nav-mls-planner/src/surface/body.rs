@@ -532,6 +532,7 @@ impl SurfaceSnapshot {
             ground_evidence:self.ground_evidence,recent_obstacles:self.recent_obstacles.clone(),
             observations: self.observations.clone(),
             body_query_cache: Default::default(),
+            static_columns: None,
             data: Arc::new(SurfaceData {
                 graph: Arc::new(graph),
                 physical_graph: physical,

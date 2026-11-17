@@ -820,6 +820,17 @@ async fn localized_map_writes_new_obstacle_and_overwritten_map_reloads_with_it()
 async fn three_dimensional_relocalize_with_seed_passes_the_grpc_entry() {
     let mut f = Fixture::start(false, false).await;
     f.saved_map("初值图").await;
+    // 从建图状态取真实地图位姿，初值不再单独写死。
+    let truth = f.state().await.pose.unwrap();
+    let position = truth.position.as_ref().unwrap();
+    let rotation = truth.orientation.as_ref().unwrap();
+    let seed = PlanarSeed {
+        x: position.x,
+        y: position.y,
+        yaw: (2.0 * (rotation.w * rotation.z + rotation.x * rotation.y))
+            .atan2(1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)),
+    };
+    eprintln!("夹具真实位姿：{truth:?}，请求初值：{seed:?}");
     f.client.stop_session(Empty {}).await.unwrap();
     f.client
         .load_map(LoadMapRequest {
@@ -831,11 +842,7 @@ async fn three_dimensional_relocalize_with_seed_passes_the_grpc_entry() {
     let matched = f
         .client
         .relocalize(RelocalizeRequest {
-            seed: Some(PlanarSeed {
-                x: 0.0,
-                y: 0.0,
-                yaw: 0.0,
-            }),
+            seed: Some(seed),
         })
         .await
         .unwrap()

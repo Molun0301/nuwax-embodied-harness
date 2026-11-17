@@ -881,6 +881,13 @@ async fn native_child_kill_faults_session_without_exiting_process() {
     let mut f = Fixture::start(true, false).await;
     f.mapping("故障前").await;
     let parent = f.child.id();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !f.root.join("native.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let pid = fs::read_to_string(f.root.join("native.pid"))
         .unwrap()
         .trim()

@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut planner = Planner::new(config,&points)?;
     let prepared_ms = begin.elapsed().as_secs_f64()*1000.0;
     let search_begin = std::time::Instant::now();
-    let route = planner.plan([-1.0,0.2,0.4],None,[1.0,0.2,0.4]);
+    let route = planner.plan([-1.0,0.2,0.4],[1.0,0.2,0.4]);
     let search_ms = search_begin.elapsed().as_secs_f64()*1000.0;
     let result = match route {
         Ok(route) => serde_json::json!({"status":"planned","search_ms":route.elapsed_ms,

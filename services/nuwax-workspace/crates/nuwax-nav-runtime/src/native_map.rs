@@ -643,7 +643,7 @@ mod tests {
             }
         }}
         let mut planner=nuwax_nav_pct_native::Planner::from_cells(config,&cells,&bands).unwrap();
-        assert!(planner.plan([0.025,0.025,0.4], None,[1.025,0.025,0.4]).is_err(),
+        assert!(planner.plan([0.025,0.025,0.4],[1.025,0.025,0.4]).is_err(),
             "前端凸包虽能伸入窄口，执行端的完整矩形放不下，不能交付完整路线");
     }
 

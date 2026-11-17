@@ -71,7 +71,7 @@ fn compare(cfg: Config,cells: &[Cell],bands: &[Band],queries: &[([f64;3],[f64;3]
     let mut search=shared.multi_goal_search().unwrap();
     // 重复与改变来源交错，覆盖区域候选之间的查询，避免仅验证同一目标缓存。
     for &(start,goal) in queries.iter().chain(queries.iter().rev()) {
-        let expected=independent.plan(start, None,goal);
+        let expected=independent.plan(start,goal);
         let actual=search.cost(start,goal);
         assert_eq!(actual.is_ok(),expected.is_ok(),"start={start:?} goal={goal:?}, actual={actual:?}, expected={expected:?}");
         if let (Ok(actual),Ok(route))=(actual,expected) {
@@ -147,8 +147,8 @@ fn multi_goal_cancellation_reaches_cold_and_warm_search_then_recovers() {
             assert!(search.cost(start,goal).unwrap_err().contains("取消"));
         });
     }
-    assert!(planner.plan(start, None,goal).is_ok());
-    assert_eq!(planner.plan_progressive(start, None,[8.,0.55,0.4],None).unwrap().kind,RouteKind::Approach);
+    assert!(planner.plan(start,goal).is_ok());
+    assert_eq!(planner.plan_progressive(start,[8.,0.55,0.4],None).unwrap().kind,RouteKind::Approach);
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn source_tree_bounds_many_reachable_goals_and_preserves_exact_navigation() {
         search.cost(start,[3.55,1.55,0.4]).unwrap();
         assert_eq!(search.stats().exact_queries,1);
     }
-    assert!(planner.plan(start, None,[3.55,1.55,0.4]).is_ok());
+    assert!(planner.plan(start,[3.55,1.55,0.4]).is_ok());
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn source_search_settles_goals_in_path_cost_order_and_expands_only_as_far_as_nee
     assert!(behind>=1.45_f64.hypot(2.25)+1.05_f64.hypot(2.3-0.45));
     // 完整查询不受单源搜索影响。
     let mut independent=Planner::from_cells(config(),&cells,&bands).unwrap();
-    let expected=summarize(&independent.plan(start, None,goals[2]).unwrap());
+    let expected=summarize(&independent.plan(start,goals[2]).unwrap());
     let exact=search.cost(start,goals[2]).unwrap();
     assert!((exact.cost-expected.0).abs()<1e-10);
     assert_eq!((exact.endpoint,exact.yaw),(expected.1,expected.2));
@@ -347,7 +347,7 @@ fn reference_map() -> (Config, Vec<Cell>, Vec<Band>, [f64; 3]) {
     (cfg, cells, bands, [0.53, 0.47, 0.43])
 }
 
-/// 按需展开与旧全图参考逐位核对；第4项转向扫掠改变的节点在测试内逐条列明。夹具由`01dbc3d2`在`reference_map`同一地图与起点上导出：旧做法先建全图矩阵
+/// 按需展开与旧全图做法逐位等价。夹具由`01dbc3d2`在`reference_map`同一地图与起点上导出：旧做法先建全图矩阵
 /// 与全图标签，再从起点展开到队列耗尽；每个实测有效节点一行，`x y 地面 加权代价 路线长度 末段朝向`，后四项为
 /// f64位模式（未到达为无穷；起点与未到达节点的朝向为NaN）。导出时只在旧提交上临时让访问回调记下末段朝向
 /// （由父节点平面位置到本节点格心，与长度同一组坐标），其余为原代码。每个节点的加权代价、沿父链的长度和
@@ -372,71 +372,10 @@ fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
         settled[goal.index] = Some(goal);
     }
     let reached = reference.iter().filter(|node| node.3.is_finite()).count();
-    // 第4项π/8扫掠改变下列节点的父链与可达性；原01dbc3d2参考文件与地图保持原样。
-    // 所有其它节点仍逐位比较旧值；这些具名断言的旧/新位模式逐条记录在N3反馈附件。
-    let turn_expected = |x: i32, y: i32, ground: f64, old: Option<(f64,f64,f64)>| {
-        match (x, y, ground.to_bits()) {
-            (2, 2, 0) => None,
-            (2, 12, 0) => Some((4632048036126194403, 4606773117625704388, 4614256656552045848)),
-            (2, 13, 0) => Some((4634361714940341078, 4607428128175597948, 4614256656552045848)),
-            (2, 14, 0) => Some((4635614463012639600, 4607878488138334998, 4614256656552045848)),
-            (2, 15, 0) => Some((4636797683634650674, 4608328848101072047, 4614256656552045848)),
-            (2, 16, 0) => Some((4637980904256661748, 4608779208063809097, 4614256656552045848)),
-            (2, 17, 0) => Some((4638840109098298097, 4609229568026546146, 4614256656552045848)),
-            (7, 2, 0) => Some((4628603083175807674, 4600331644422614687, 13833125093779451160)),
-            (8, 2, 0) => Some((4633546787184089289, 4602133084273562887, 13833125093779451160)),
-            (9, 2, 0) => None,
-            (10, 2, 0) => None,
-            (10, 3, 0) => None,
-            (10, 4, 0) => None,
-            (10, 5, 0) => None,
-            (10, 6, 0) => None,
-            (10, 7, 0) => None,
-            (10, 8, 0) => None,
-            (10, 9, 0) => None,
-            (10, 10, 0) => None,
-            (10, 11, 0) => None,
-            (10, 12, 0) => None,
-            (10, 13, 0) => None,
-            (12, 21, 4597814931575086776) => Some((4640316492815383407, 4612116536894748942, 4609753056924675352)),
-            (13, 21, 4597814931575086776) => Some((4641251333698999517, 4612341716876117467, 4609753056924675352)),
-            (14, 21, 4600156803381319434) => Some((4642664391360708937, 4612693459251418305, 4609753056924675352)),
-            (15, 2, 0) => None,
-            (15, 21, 4600156803381319434) => None,
-            (16, 2, 0) => Some((4644920169633920786, 4615800846274657396, 13833125093779451160)),
-            (16, 18, 0) => None,
-            (16, 21, 4602318531202457272) => Some((4643821536430926925, 4613270381608087668, 4609753056924675352)),
-            (17, 21, 4602318531202457272) => Some((4644141695369875045, 4613495561589456192, 4609753056924675352)),
-            (18, 2, 0) => Some((4644920169633920787, 4615800846274657397, 13833125093779451160)),
-            (18, 21, 4603579539098121011) => Some((4644774593449299787, 4613847303964757030, 4609753056924675352)),
-            (19, 2, 0) => None,
-            (19, 16, 0) => None,
-            (19, 21, 4603579539098121011) => None,
-            (20, 2, 0) => None,
-            (20, 3, 0) => None,
-            (20, 4, 0) => None,
-            (20, 5, 0) => None,
-            (20, 6, 0) => None,
-            (20, 7, 0) => None,
-            (20, 8, 0) => None,
-            (20, 9, 0) => None,
-            (20, 13, 0) => None,
-            (20, 14, 0) => None,
-            (20, 15, 0) => None,
-            (20, 16, 0) => None,
-            (25, 2, 0) => None,
-            (26, 2, 4584304132692975288) => Some((4648085605784755261, 4617011479235186114, 13833125093779451160)),
-            (26, 21, 4593311331947716280) => Some((4648120847852544990, 4617324322171903322, 4609753056924675352)),
-            (31, 2, 4595653203753948938) => Some((4647891988618115535, 4617246015384936956, 13833125093779451160)),
-            (32, 2, 4596734067664517857) => Some((4648034793044090610, 4617228826924989640, 13833125093779451160)),
-            (33, 2, 4597814931575086776) => None,
-            (33, 21, 4593311331947716280) => None,
-            _ => old.map(|v| (v.0.to_bits(),v.1.to_bits(),v.2.to_bits())),
-        }.map(|v| (f64::from_bits(v.0),f64::from_bits(v.1),f64::from_bits(v.2)))
-    };
+    assert_eq!(search.stats().source_expanded, reached, "展开节点数等于旧做法到达的节点数");
     let mut differences = Vec::new();
     for (&(x, y, ground, weighted, length, yaw), goal) in reference.iter().zip(&settled) {
-        let expected = turn_expected(x,y,ground,weighted.is_finite().then_some((weighted, length, yaw)));
+        let expected = weighted.is_finite().then_some((weighted, length, yaw));
         let actual = goal.map(|goal| {
             assert_eq!(goal.route.endpoint, [center(x), center(y), ground + to_ground], "绑定到节点本身");
             // 起点节点的旧长度为0、无末段；格心目标从起点直接计，只比较加权代价。
@@ -450,7 +389,6 @@ fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
             differences.push(((x, y, ground), expected, actual));
         }
     }
-    assert_eq!(search.stats().source_expanded, 466, "π/8扫掠后展开466节点（旧501，35个转向受阻）");
     assert!(differences.is_empty(), "{}个节点不同，前10个（节点、旧、新）：{:?}", differences.len(),
         &differences[..differences.len().min(10)]);
     assert!(reached > 400 && reference.iter().any(|node| node.2 == 0.6 && node.3.is_finite()),

@@ -47,10 +47,10 @@ fn tomography_keeps_two_floors_and_native_bridge_prevents_teleporting() {
     assert!((levels[1].ground - 2.01).abs() < 1e-6);
     assert!(levels[1].ceiling.is_infinite());
     let mut planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands).unwrap();
-    assert!(planner.plan([0.55, 0.05, 0.41], None, [3.45, 0.05, 0.41]).is_ok());
-    assert!(planner.plan([0.55, 0.05, 2.41], None, [3.45, 0.05, 2.41]).is_ok());
+    assert!(planner.plan([0.55, 0.05, 0.41], [3.45, 0.05, 0.41]).is_ok());
+    assert!(planner.plan([0.55, 0.05, 2.41], [3.45, 0.05, 2.41]).is_ok());
     assert!(planner
-        .plan([0.55, 0.05, 0.41], None, [3.45, 0.05, 2.41])
+        .plan([0.55, 0.05, 0.41], [3.45, 0.05, 2.41])
         .is_err());
 }
 
@@ -74,10 +74,10 @@ fn tomography_keeps_recent_obstacle_in_collision_bands_without_adding_a_floor() 
         let (cfg, c, b) = pct_input_from_tomogram(&base, 0.4, &[]).unwrap();
         nuwax_nav_pct_native::Planner::from_cells(cfg, &c, &b).unwrap()
     };
-    assert!(clear.plan([0.55, 0.05, 0.41], None, [3.45, 0.05, 0.41]).is_ok());
+    assert!(clear.plan([0.55, 0.05, 0.41], [3.45, 0.05, 0.41]).is_ok());
     let mut blocked = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands).unwrap();
     assert!(blocked
-        .plan([0.55, 0.05, 0.41], None, [3.45, 0.05, 0.41])
+        .plan([0.55, 0.05, 0.41], [3.45, 0.05, 0.41])
         .is_err());
 }
 
@@ -133,7 +133,7 @@ fn route_on_tomography(map: &SurfaceSnapshot, start_z: f64, goal_z: f64) -> bool
     let (config, cells, bands) = pct_input_from_tomogram(map, 0.4, &boundary).unwrap();
     nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)
         .unwrap()
-        .plan([0.55, 0.05, start_z + 0.4], None, [3.45, 0.05, goal_z + 0.4])
+        .plan([0.55, 0.05, start_z + 0.4], [3.45, 0.05, goal_z + 0.4])
         .is_ok()
 }
 
@@ -234,7 +234,7 @@ pub(super) fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]],
 fn heightfield_route(map: &SurfaceSnapshot, height: impl Fn(f64) -> f64) -> Result<Vec<[f64; 3]>, String> {
     let (config, cells, bands) = pct_input_from_tomogram(map, 0.4, &[]).unwrap();
     let mut planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)?;
-    planner.plan([0.125, 0.025, height(0.125) + 0.4], None, [3.875, 0.025, height(3.875) + 0.4]).map(|route| route.path)
+    planner.plan([0.125, 0.025, height(0.125) + 0.4], [3.875, 0.025, height(3.875) + 0.4]).map(|route| route.path)
 }
 
 #[test]

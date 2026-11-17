@@ -304,14 +304,6 @@ struct Planner {
     }
     return grade_sq;
   }
-  // 最短转向按π/8（22.5度）等间隔取样，只检查两端之间的朝向；45度转向也有一个中间取样。
-  // 边检查覆盖转出端及中间节点的转入端；起点也不在这里额外检查当前朝向，搜索状态维度不变。
-  bool turn_clear(double x,double y,double ground,double from,double to) const {
-    const double turn=std::remainder(to-from,2*M_PI);
-    const int steps=static_cast<int>(std::ceil(std::abs(turn)/(M_PI/8)-1e-9));
-    for(int k=1;k<steps;++k)if(collision(x,y,ground,from+turn*k/steps))return false;
-    return true;
-  }
   bool transition(const Edge& edge,XY from,XY to) {
     const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
     if(shared) {
@@ -369,7 +361,7 @@ struct Planner {
       for(size_t i=0;i+1<column.surfaces.size();++i) column.surfaces[i].ceiling=column.occupied[i+1].low;
     }
   }
-  bool plan_region(const double* start,double start_yaw,const double* goal,double margin,PctResult& result,
+  bool plan_region(const double* start,const double* goal,double margin,PctResult& result,
                    CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false) {
     astar.Reset();
     const double q=cfg.resolution,sg=start[2]-cfg.body_to_ground,gg=goal[2]-cfg.body_to_ground;
@@ -488,15 +480,8 @@ struct Planner {
       const bool last=b->layer==gl&&b->idx[2]==gx&&b->idx[1]==gy;
       const double ax=first?start_x:(a->idx[2]+minx+0.5)*q,ay=first?start_y:(a->idx[1]+miny+0.5)*q;
       const double bx=last?goal_x:(b->idx[2]+minx+0.5)*q,by=last?goal_y:(b->idx[1]+miny+0.5)*q;
-      if(!transition({ax,ay,a->height,bx,by,b->height},
-                     {a->idx[2]+minx,a->idx[1]+miny},{b->idx[2]+minx,b->idx[1]+miny}))return false;
-      // 起点从当前朝向转到第一条边方向；拿不到当前朝向时不查起点。
-      const double out=std::atan2(by-ay,bx-ax);
-      const Node* p=a->parent;
-      if(!p)return !std::isfinite(start_yaw)||turn_clear(ax,ay,a->height,start_yaw,out);
-      const bool from_start=p->layer==sl&&p->idx[2]==sx&&p->idx[1]==sy;
-      const double px=from_start?start_x:(p->idx[2]+minx+0.5)*q,py=from_start?start_y:(p->idx[1]+miny+0.5)*q;
-      return turn_clear(ax,ay,a->height,std::atan2(ay-py,ax-px),out);
+      return transition({ax,ay,a->height,bx,by,b->height},
+                        {a->idx[2]+minx,a->idx[1]+miny},{b->idx[2]+minx,b->idx[1]+miny});
     });
     astar.SetTraversalCost([&](const Node* a,const Node* b){
       const bool first=a->layer==sl&&a->idx[2]==sx&&a->idx[1]==sy;
@@ -575,7 +560,7 @@ extern "C" void pct_replace_overlay(void* planner,const PctCell* cells,size_t nc
 }
 extern "C" void pct_destroy(void* planner){delete static_cast<Planner*>(planner);}
 extern "C" void pct_result_free(PctResult* result){delete[] result->points;result->points=nullptr;}
-extern "C" int pct_plan(void* planner,const double* start,double start_yaw,const double* goal,PctResult* result,
+extern "C" int pct_plan(void* planner,const double* start,const double* goal,PctResult* result,
                          CancelFn cancel,const void* user,bool progressive,char* err,size_t cap){
   const auto begin=std::chrono::steady_clock::now();
   try {
@@ -593,7 +578,7 @@ extern "C" int pct_plan(void* planner,const double* start,double start_yaw,const
     }
     for(;;){
       if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
-      if(p.plan_region(start,start_yaw,goal,margin,*result,cancel,user,progressive,progressive && margin>=full)){
+      if(p.plan_region(start,goal,margin,*result,cancel,user,progressive,progressive && margin>=full)){
         result->elapsed_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();return 0;
       }
       if(p.astar.Cancelled()||(cancel&&cancel(user))){error(err,cap,"PCT规划已取消");return 2;}
@@ -767,9 +752,6 @@ struct SourceSearch {
         if(!layer.valid||std::abs(layer.ground-state.ground)>height_limit)return;
         const double bx=(x+0.5)*q,by=(y+0.5)*q;
         if(!p.transition({ax,ay,state.ground,bx,by,layer.ground},{from.x,from.y},{x,y}))return;
-        // 单源搜索拿不到起点朝向，起点不查；其余节点查由入边方向转到本边方向。
-        if(!state.from_source&&!p.turn_clear(ax,ay,state.ground,std::atan2(ay-state.from_y,ax-state.from_x),
-            std::atan2(by-ay,bx-ax)))return;
         const double dz=(layer.ground-state.ground)/q;
         const double step=soft(x,y,layer)+p.clearance_cost({ax,ay,state.ground,bx,by,layer.ground});
         const double g=state.g+std::sqrt(dz*dz+offset[0]*offset[0]+offset[1]*offset[1])+step;
@@ -844,7 +826,7 @@ extern "C" int pct_multi_goal_cost(void* search,const double* start,const double
   if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
   ++s.transitions.stats.exact_queries;
   const auto began=std::chrono::steady_clock::now();
-  const int status=pct_plan(&s.planner,start,NAN,goal,&route,cancel,user,false,err,cap);
+  const int status=pct_plan(&s.planner,start,goal,&route,cancel,user,false,err,cap);
   s.transitions.stats.exact_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
   if(status==0) {
     cost->cost=0;cost->yaw=0;cost->elapsed_ms=route.elapsed_ms;cost->expanded=route.expanded;

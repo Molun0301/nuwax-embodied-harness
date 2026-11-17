@@ -90,7 +90,7 @@ fn g1_doorway_clearance_case(length: f64, width: f64, gap: f64, oblique: bool) {
         ..Default::default()
     };
     let mut global = nuwax_nav_pct_native::Planner::from_cells(pct_cfg, &cells, &bands).unwrap();
-    let result = global.plan(start, None, goal);
+    let result = global.plan(start, goal);
     if gap == 0.6 {
         assert!(result
             .unwrap_err()

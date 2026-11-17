@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
-use nuwax_nav_mls_planner::{SurfaceSnapshot, SurfaceFrontierClusterRef};
+use nuwax_nav_mls_planner::{SurfaceSnapshot, SurfaceFrontierIndex, SurfaceFrontierQuery, SurfaceFrontierCluster};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use nuwax_nav_stack::surface_oriented::PctPlanner;
 use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped};
@@ -115,6 +116,7 @@ struct SurfacePollDelta {
     retry_support: Option<Option<[f64; 3]>>,
     last_frontiers: Option<Vec<FrontierGoal>>,
     frontier_count: Option<usize>,
+    excluded_count: Option<usize>,
     last_error: Option<Option<String>>,
 }
 
@@ -155,6 +157,7 @@ impl SurfacePollDelta {
             source.retry_support = value;
         }
         if let Some(value) = self.frontier_count { source.frontier_count = value; }
+        if let Some(value) = self.excluded_count { source.excluded_count = value; }
         if let Some(value) = self.last_frontiers {
             source.last_frontiers = value;
         }
@@ -170,8 +173,6 @@ struct FrontierFailure {
     cells: BTreeSet<[i32; 3]>,
     failures: u64,
     reintroduced: bool,
-    #[serde(skip)]
-    cluster: Option<SurfaceFrontierClusterRef>,
 }
 
 struct SelectedGoal {
@@ -181,9 +182,7 @@ struct SelectedGoal {
     /// 选出该目标的几何前沿格。
     frontier_cell: [i32; 3],
     frontier_cells: Arc<Vec<[i32; 3]>>,
-    cluster: Option<SurfaceFrontierClusterRef>,
-    /// 最近一次核对前沿所用的表面快照。
-    checked: Weak<SurfaceSnapshot>,
+    frontier_valid: bool,
 }
 
 /// 由同一可通行表面查询前沿，导航仍由原探索控制器统一派发。
@@ -202,6 +201,8 @@ pub struct SurfaceGoalSourceAdapter {
     deferred_route: Option<DeferredFrontierRoute>,
     selected: Option<SelectedGoal>,
     reached_columns: BTreeSet<[i32; 3]>,
+    reached_version: u64,
+    frontier_cache: RefCell<Option<CachedFrontierGeometry>>,
     failures: Vec<FrontierFailure>,
     excluded_count: usize,
     last_snapshot: Option<Weak<SurfaceSnapshot>>,
@@ -246,6 +247,8 @@ impl SurfaceGoalSourceAdapter {
             deferred_route: None,
             selected: None,
             reached_columns: BTreeSet::new(),
+            reached_version: 0,
+            frontier_cache: RefCell::new(None),
             failures: Vec::new(),
             excluded_count: 0,
             last_snapshot: None,
@@ -307,7 +310,6 @@ impl SurfaceGoalSourceAdapter {
             self.last_frontiers.clear();
             return Ok(ExplorationPoll::SourceUnavailable(reason));
         }
-        self.sync_frontier_records()?;
         if self.selected.is_some() { return Ok(ExplorationPoll::Pending); }
         let input = self.receiver.freeze()?;
         let mut delta = SurfacePollDelta::default();
@@ -399,11 +401,12 @@ impl SurfaceGoalSourceAdapter {
         if !selecting && self.retry_support.is_none() {
             return Ok(ExplorationPoll::Pending);
         }
-        let geometry = frontier_geometry(snapshot, &boundary, &self.reached_columns)
-            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        let mut candidates = geometry.candidates;
-        let observation_targets = geometry.targets;
-        let spans = geometry.spans;
+        let geometry = self.cached_frontier_geometry(snapshot, &boundary)?;
+        delta.excluded_count = Some(geometry.cells.values().filter(|cells|
+            cells.iter().all(|&cell| self.excluded(cell))).count());
+        let mut candidates = geometry.candidates.clone();
+        let observation_targets = &geometry.targets;
+        let spans = &geometry.spans;
         let frontier_ms = compute_started.elapsed().as_secs_f64() * 1000.0 - geometry_ms;
         let native_started = std::time::Instant::now();
         if nuwax_nav_pct_native::planning_cancelled() {
@@ -435,8 +438,8 @@ impl SurfaceGoalSourceAdapter {
             snapshot,
             &mut search,
             candidates,
-            &spans,
-            &observation_targets,
+            spans,
+            observation_targets,
             current_body,
             robot_support,
             selecting,
@@ -528,7 +531,7 @@ impl SurfaceGoalSourceAdapter {
         candidate.support_xyz = snapshot.support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         if let Some(model) = self.observation_model.as_ref() {
-            view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, &observation_targets)
+            view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, observation_targets)
                 .map_err(ExploreError::SourceError)?);
         }
         if self.excluded(candidate.frontier_cell)
@@ -562,7 +565,7 @@ impl SurfaceGoalSourceAdapter {
             source_searches=stats.source_searches, expanded=stats.source_expanded,
             "完整前沿评估阶段耗时");
         Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,
-            Arc::clone(&geometry.cells[&candidate.cluster]),source_snapshot,delta))
+            Arc::clone(&geometry.cells[&candidate.cluster]),delta))
     }
 
     /// 从当前位置一次按需展开的单源搜索，候选按端点绑定规则（支撑点±10格内最近的有效地面层）绑定到节点，
@@ -826,7 +829,6 @@ impl SurfaceGoalSourceAdapter {
         vertical_radius_m: f64,
         frontier_cell: [i32; 3],
         frontier_cells: Arc<Vec<[i32; 3]>>,
-        snapshot: &Arc<SurfaceSnapshot>,
         delta: &mut SurfacePollDelta,
     ) -> ExplorationPoll {
         delta.last_frontiers = Some(vec![goal.clone()]);
@@ -836,8 +838,7 @@ impl SurfaceGoalSourceAdapter {
             vertical_radius_m,
             frontier_cell,
             frontier_cells,
-            cluster: Some(snapshot.frontier_cluster_ref(frontier_cell, &self.boundary_vertices()).expect("候选属于物理前沿簇")),
-            checked: Arc::downgrade(snapshot),
+            frontier_valid: true,
         }));
         delta.last_no_frontier = Some(false);
         delta.last_error = Some(None);
@@ -854,24 +855,33 @@ impl SurfaceGoalSourceAdapter {
             && entry.cells.contains(&cell))
     }
 
-    /// 物理簇拆散或重连即清除失败记录；恢复进度的记录首次查询时绑定当前簇。
-    fn sync_frontier_records(&mut self) -> ExploreResult<()> {
-        let Some(snapshot) = self.receiver.snapshot()? else { return Ok(()); };
-        let boundary = self.boundary_vertices();
-        self.failures.retain_mut(|entry| {
-            let current = entry.cells.iter().next().and_then(|&cell| snapshot.frontier_cluster_ref(cell, &boundary));
-            match &entry.cluster {
-                Some(previous) => current.as_ref() == Some(previous),
-                None => { entry.cluster = current; entry.cluster.is_some() }
+    /// 索引对象或标记版本变化时替换查询缓存，选点和途中核对共用按簇惰性结果。
+    fn with_frontier_query<T>(&self, snapshot: &SurfaceSnapshot, boundary: &[[f64; 2]],
+        apply: impl FnOnce(&mut CachedFrontierGeometry) -> ExploreResult<T>) -> ExploreResult<T> {
+        let index = snapshot.frontier_index(boundary);
+        let mut cache = self.frontier_cache.borrow_mut();
+        if cache.as_ref().is_none_or(|cache| !Arc::ptr_eq(&cache.index, &index) || cache.reached_version != self.reached_version) {
+            let query = snapshot.frontier_query(Arc::clone(&index), &self.reached_columns);
+            *cache = Some(CachedFrontierGeometry { index, reached_version: self.reached_version, query, selection: None });
+        }
+        apply(cache.as_mut().unwrap())
+    }
+
+    fn cached_frontier_geometry(&self, snapshot: &SurfaceSnapshot, boundary: &[[f64; 2]]) -> ExploreResult<Arc<FrontierGeometry>> {
+        self.with_frontier_query(snapshot, boundary, |cache| {
+            if cache.selection.is_none() {
+                let clusters = snapshot.frontier_clusters_from_query(&mut cache.query, &self.reached_columns);
+                cache.selection = Some(Arc::new(frontier_geometry_from_clusters(snapshot, boundary, &self.reached_columns, clusters)
+                    .map_err(|error| ExploreError::SourceError(error.to_string()))?));
             }
-        });
-        self.excluded_count = if self.failures.iter().any(|entry| entry.failures > u64::from(self.max_navigation_retries)) {
-            snapshot.frontier_clusters_with_reached(&boundary, &self.reached_columns)
-                .map_err(|error| ExploreError::SourceError(error.to_string()))?
-                .iter().filter(|cluster| cluster.frontiers.iter().all(|frontier|
-                    self.excluded([frontier.cell.0, frontier.cell.1, frontier.cell.2]))).count()
-        } else { 0 };
-        Ok(())
+            Ok(Arc::clone(cache.selection.as_ref().unwrap()))
+        })
+    }
+
+    fn extend_reached_columns(&mut self, columns: impl IntoIterator<Item = [i32; 3]>) {
+        let before = self.reached_columns.len();
+        self.reached_columns.extend(columns);
+        if self.reached_columns.len() != before { self.reached_version += 1; }
     }
 
     fn reintroduce_failed_frontiers(&mut self) -> bool {
@@ -895,7 +905,7 @@ impl SurfaceGoalSourceAdapter {
         if let Some(snapshot) = self.receiver.snapshot()? {
             let columns = snapshot.reached_frontier_columns(&selected.frontier_cells,
                 selected.support_xyz, self.blacklist_radius_m, &self.boundary_vertices());
-            self.reached_columns.extend(columns);
+            self.extend_reached_columns(columns);
         }
         self.failures.retain(|entry| !entry.cells.contains(&selected.frontier_cell));
         Ok(())
@@ -908,7 +918,7 @@ impl SurfaceGoalSourceAdapter {
         } else {
             self.failures.push(FrontierFailure {
                 cells: selected.frontier_cells.iter().copied().collect(), failures: 0,
-                reintroduced: false, cluster: selected.cluster.clone(),
+                reintroduced: false,
             });
             self.failures.last_mut().expect("刚写入失败记录")
         };
@@ -939,6 +949,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.deferred_route = None;
         self.reached_columns = reached_columns;
+        self.reached_version += 1;
+        self.frontier_cache.get_mut().take();
         self.failures = failures;
         self.last_snapshot = None;
         self.last_notification = None;
@@ -955,6 +967,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.active = true;
         self.selected = None;
         self.reached_columns.clear();
+        self.reached_version += 1;
+        self.frontier_cache.get_mut().take();
         self.failures.clear();
         self.excluded_count = 0;
         self.last_snapshot = None;
@@ -1010,11 +1024,11 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 self.last_error = Some(format!("等待导航输入恢复：{reason}"));
             }
             ExplorationGoalFeedback::Reached => {
-                if selected.cluster.is_some() { self.record_reached(&selected)?; }
+                if selected.frontier_valid { self.record_reached(&selected)?; }
                 self.last_error = None;
             }
             ExplorationGoalFeedback::Failed(reason) => {
-                if selected.cluster.is_some() {
+                if selected.frontier_valid {
                     let failures = self.record_failure(&selected);
                     if failures <= u64::from(self.max_navigation_retries) {
                         self.retry_support = Some(selected.support_xyz);
@@ -1028,7 +1042,6 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 self.last_error = Some("surface navigation goal cancelled".into());
             }
         }
-        self.sync_frontier_records()?;
         self.last_frontiers.clear();
         Ok(())
     }
@@ -1036,25 +1049,21 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     /// 子目标执行期间每张新表面快照核对一次所选簇是否还在：所选前沿格周围水平黑名单半径、竖直该候选高度范围以内
     /// 已没有达到最小尺寸的簇的前沿格时（簇已不存在或缩到最小尺寸以下）返回真；还有就继续走原目标。
     fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
-        self.sync_frontier_records()?;
         let Some(snapshot) = self.receiver.snapshot()? else {
             return Ok(false);
         };
         let Some(selected) = self.selected.as_mut().filter(|selected| selected.goal.id == goal_id) else {
             return Ok(false);
         };
-        if selected.cluster.is_none() { return Ok(false); }
-        if Weak::ptr_eq(&selected.checked, &Arc::downgrade(&snapshot)) {
-            return Ok(false);
-        }
-        selected.checked = Arc::downgrade(&snapshot);
+        if !selected.frontier_valid { return Ok(false); }
         let (cell, vertical_radius) = (selected.frontier_cell, selected.vertical_radius_m);
         let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
             boundary.vertices().iter().map(|point| [point.x, point.y]).collect()
         });
-        let near = snapshot.frontier_near_with_reached(cell, self.blacklist_radius_m, vertical_radius,
-            &boundary, &self.reached_columns).map_err(|error| ExploreError::SourceError(error.to_string()))?;
-        Ok(!near)
+        self.with_frontier_query(&snapshot, &boundary, |cache| {
+            Ok(!snapshot.frontier_near_from_query(&mut cache.query, cell, self.blacklist_radius_m,
+                vertical_radius, &self.reached_columns))
+        })
     }
 
     fn frontier_snapshot(&self) -> Vec<FrontierGoal> {
@@ -1068,13 +1077,15 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
 
     fn clear_after_map_replay(&mut self) {
         self.reached_columns.clear();
+        self.reached_version += 1;
+        self.frontier_cache.get_mut().take();
         self.failures.clear();
         self.excluded_count = 0;
         self.retry_support = None;
         self.deferred_route = None;
         self.last_snapshot = None;
         self.last_no_frontier = false;
-        if let Some(selected) = self.selected.as_mut() { selected.cluster = None; }
+        if let Some(selected) = self.selected.as_mut() { selected.frontier_valid = false; }
     }
 
     fn diagnostics(&self) -> ExplorationSourceDiagnostics {
@@ -1126,6 +1137,13 @@ struct DeferredFrontierRoute {
     examined: std::collections::BTreeSet<[i32; 3]>,
 }
 
+struct CachedFrontierGeometry {
+    index: Arc<SurfaceFrontierIndex>,
+    reached_version: u64,
+    query: SurfaceFrontierQuery,
+    selection: Option<Arc<FrontierGeometry>>,
+}
+
 struct FrontierGeometry {
     candidates: Vec<FrontierCandidate>,
     /// 达到最小尺寸的簇：簇号 → 簇平面跨度（米）。
@@ -1151,10 +1169,19 @@ fn snap_support_heights(search: &nuwax_nav_pct_native::MultiGoalSearch<'_>, cand
     }
 }
 
+#[cfg(test)]
 fn frontier_geometry(
     snapshot: &SurfaceSnapshot,
     boundary: &[[f64; 2]],
     reached: &BTreeSet<[i32; 3]>,
+) -> Result<FrontierGeometry, nuwax_nav_mls_planner::SurfaceError> {
+    let clusters = snapshot.frontier_clusters_with_reached(boundary, reached)?;
+    frontier_geometry_from_clusters(snapshot, boundary, reached, clusters)
+}
+
+fn frontier_geometry_from_clusters(
+    snapshot: &SurfaceSnapshot, boundary: &[[f64; 2]], reached: &BTreeSet<[i32; 3]>,
+    clusters: Vec<SurfaceFrontierCluster>,
 ) -> Result<FrontierGeometry, nuwax_nav_mls_planner::SurfaceError> {
     use std::collections::BTreeMap;
     let size = f64::from(snapshot.config().voxel_size);
@@ -1163,7 +1190,7 @@ fn frontier_geometry(
     let mut spans = BTreeMap::new();
     let mut cells = BTreeMap::new();
     // 候选只取达到最小尺寸的簇的格，收益取簇收益。
-    for cluster in snapshot.frontier_clusters_with_reached(boundary, reached)? {
+    for cluster in clusters {
         cells.insert(cluster.id, Arc::new(cluster.frontiers.iter().map(|f| [f.cell.0, f.cell.1, f.cell.2]).collect()));
         spans.insert(cluster.id, cluster.span_m);
         for frontier in cluster.frontiers {
@@ -1903,7 +1930,7 @@ mod tests {
         let another_lower = goal(source.poll_goal(&state(0.4, 4)).unwrap());
         assert!((another_lower.pose.pose.position.z - 0.35).abs() < 1e-6);
         assert_eq!(another_lower.pose.pose.position, lower.pose.pose.position,
-            "全量重建后的旧失败记录失效；上层到达列不影响下层同坐标视点");
+            "旧失败格保留，E2放回一次后允许再试；上层到达列不影响下层同坐标视点");
     }
 
     pub(super) fn far_connected_floors() -> Arc<SurfaceSnapshot> {
@@ -1981,7 +2008,7 @@ mod tests {
             if reached { clean.reached_columns = source.reached_columns.clone(); }
             let expected = goal(clean.poll_goal(&upper_state).unwrap());
             assert_eq!(upper.pose.pose.position, expected.pose.pose.position,
-                "同簇相距3米内的列按规则标记；重建后失败记录失效，不另加楼层排除条件");
+                "到达仍按半径内列标记；失败格保留，E2放回后允许再试");
         }
     }
 

@@ -799,7 +799,7 @@ fn reached_columns_only_affect_the_selected_cluster_even_inside_the_old_ball() {
 }
 
 #[test]
-fn failed_cluster_records_survive_unrelated_changes_and_clear_on_cluster_rebuild() {
+fn failed_cells_survive_map_changes_and_new_frontier_cells_can_be_selected() {
     let make_points = |removed: Option<(i32, i32)>| -> Vec<_> {
         (0..80).flat_map(|x| (0..80).map(move |y| (x, y)))
             .filter(|&(x, y)| !in_hole(&[(40, 40)], x, y) && removed != Some((x, y)))
@@ -808,7 +808,7 @@ fn failed_cluster_records_survive_unrelated_changes_and_clear_on_cluster_rebuild
     let mut builder = nuwax_nav_mls_planner::SurfaceMapBuilder::new(map().config().clone());
     let surface = builder.build(&make_points(None), 0.1).unwrap().snapshot;
     let receiver = SurfaceInputReceiver::new();
-    receiver.observe(surface).unwrap();
+    receiver.observe(surface.clone()).unwrap();
     let mut source = adapter(&receiver, Some(inset(8.0)), false);
     source.configure_constraints(Some(inset(8.0)), 1, 0.75).unwrap();
     let first = goal_of(source.poll_goal(&pose(4.05, 2.05, 1)).unwrap());
@@ -817,18 +817,29 @@ fn failed_cluster_records_survive_unrelated_changes_and_clear_on_cluster_rebuild
     let retry = goal_of(source.poll_goal(&pose(4.05, 2.05, 2)).unwrap());
     source.report_goal_feedback(&retry.id, ExplorationGoalFeedback::Failed("重试失败".into())).unwrap();
     assert!(source.failures[0].cells.iter().all(|&cell| source.excluded(cell)));
+    let failed_cells = source.failures[0].cells.clone();
+    // 先真实走完E2的一次放回，之后再失败到上限，检查选点统计的排除簇。
+    receiver.observe(surface.clone()).unwrap();
+    let restored = goal_of(source.poll_goal(&pose(4.05, 2.05, 3)).unwrap());
+    assert!(source.failures[0].reintroduced);
+    source.report_goal_feedback(&restored.id, ExplorationGoalFeedback::Failed("放回后失败".into())).unwrap();
+    let retry = goal_of(source.poll_goal(&pose(4.05, 2.05, 4)).unwrap());
+    source.report_goal_feedback(&retry.id, ExplorationGoalFeedback::Failed("放回后重试失败".into())).unwrap();
+    receiver.observe(surface).unwrap();
+    assert_eq!(source.poll_goal(&pose(4.05, 2.05, 5)).unwrap(), ExplorationPoll::NoFrontier);
     assert_eq!(source.excluded_frontiers(), 1);
     let unrelated = builder.build(&make_points(Some((77, 77))), 0.1).unwrap().snapshot;
     receiver.observe(unrelated).unwrap();
-    source.sync_frontier_records().unwrap();
-    assert_eq!(source.excluded_frontiers(), 1, "不相关变化不能清掉失败簇");
+    assert_eq!(source.poll_goal(&pose(4.05, 2.05, 6)).unwrap(), ExplorationPoll::NoFrontier);
+    assert_eq!(source.excluded_frontiers(), 1, "不相关变化不能清掉失败格");
     let changed = builder.build(&make_points(Some((38, 40))), 0.1).unwrap().snapshot;
     receiver.observe(changed).unwrap();
-    source.sync_frontier_records().unwrap();
-    assert!(source.failures.is_empty(), "受影响簇拆散或重连后清掉失败记录");
-    assert_eq!(source.excluded_frontiers(), 0);
-    let selected = source.poll_goal(&pose(4.05, 2.05, 3)).unwrap();
-    assert!(matches!(selected, ExplorationPoll::Goal(_)), "地图变化后的簇允许再试：{selected:?}");
+    let selected = goal_of(source.poll_goal(&pose(4.05, 2.05, 7)).unwrap());
+    assert_eq!(source.failures[0].cells, failed_cells, "簇重建也必须保留失败时的格集合");
+    assert_eq!(source.failures[0].failures, 2);
+    assert_eq!(source.excluded_frontiers(), 0, "新簇有未失败的新格，不是整簇被排除");
+    assert!(!failed_cells.contains(&source.selected.as_ref().unwrap().frontier_cell),
+        "新长出的前沿格可以再选，目标{}", selected.id);
 }
 
 #[test]
@@ -859,7 +870,7 @@ fn inflight_feedback_after_replay_finishes_without_writing_old_cluster_records_o
         let mut source = adapter(&receiver, Some(inset(8.0)), false);
         let first = goal_of(source.poll_goal(&pose(4.05, 2.05, 1)).unwrap());
         source.clear_after_map_replay();
-        assert!(source.selected.as_ref().unwrap().cluster.is_none());
+        assert!(!source.selected.as_ref().unwrap().frontier_valid);
         assert!(!source.frontier_vanished(&first.id).unwrap(), "旧簇作废不能取消在途导航");
         source.report_goal_feedback(&first.id, feedback).unwrap();
         assert!(source.reached_columns.is_empty() && source.failures.is_empty());
@@ -867,4 +878,97 @@ fn inflight_feedback_after_replay_finishes_without_writing_old_cluster_records_o
         assert!(matches!(source.poll_goal(&pose(4.05, 2.05, 2)).unwrap(), ExplorationPoll::Goal(_)),
             "既有流程结束旧目标后继续选下一个");
     }
+}
+
+/// 有到达标记的50米多房间图：分别测索引复用和物理索引增量变化时，每拍途中核对的实际调用。
+#[test]
+#[ignore = "有标记的途中核对耗时，手动运行"]
+fn marked_inflight_frontier_check_timing() {
+    let points: Vec<_> = (0..500_i32).flat_map(|x| (0..500_i32).map(move |y| (x, y)))
+        .filter(|&(x, y)| !((x % 100 == 0 && x > 0 && (y % 100 - 50).abs() > 5)
+            || (y % 100 == 0 && y > 0 && (x % 100 - 50).abs() > 5)))
+        .map(|(x, y)| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05)).collect();
+    let mut builder = nuwax_nav_mls_planner::SurfaceMapBuilder::new(map().config().clone());
+    let surface = builder.build(&points, 0.1).unwrap().snapshot;
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(surface.clone()).unwrap();
+    let mut source = adapter(&receiver, None, true);
+    let first = goal_of(source.poll_goal(&pose(25.25, 25.25, 1)).unwrap());
+    source.report_goal_feedback(&first.id, ExplorationGoalFeedback::Reached).unwrap();
+    assert!(!source.reached_columns.is_empty());
+    receiver.observe(surface.clone()).unwrap();
+    let next = goal_of(source.poll_goal(&pose(25.25, 25.25, 2)).unwrap());
+    for changing in [false, true] {
+        let mut samples = Vec::new();
+        for tick in 0..12 {
+            let current = if changing {
+                let mut points = points.clone();
+                if tick % 2 == 0 {
+                    points.retain(|&(x, y, _)| !((x / 0.1).floor() as i32 == 20 && (y / 0.1).floor() as i32 == 20));
+                }
+                builder.build(&points, 0.1).unwrap().snapshot
+            } else { Arc::new(surface.as_ref().clone()) };
+            receiver.observe(current).unwrap();
+            let started = std::time::Instant::now();
+            let vanished = source.frontier_vanished(&next.id).unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert!(!vanished, "远处增量变化不能取消当前前沿目标");
+        }
+        samples.sort_by(f64::total_cmp);
+        let median = (samples[5] + samples[6]) * 0.5;
+        eprintln!("有标记途中核对 {}：12拍，中位数{median:.4}ms，最小{:.4}ms，最大{:.4}ms，标记{}列",
+            if changing { "索引增量变化" } else { "索引复用" }, samples[0], samples[11], source.reached_columns.len());
+    }
+}
+
+#[test]
+fn frontier_query_cache_reuses_index_and_invalidates_when_marks_or_index_change() {
+    let surface = floor(12.0, |x, y| in_hole(&[(52, 60), (66, 60)], x, y));
+    let receiver = SurfaceInputReceiver::new();
+    let mut source = adapter(&receiver, Some(inset(12.0)), false);
+    let polygon = vertices(&inset(12.0));
+    let first = source.cached_frontier_geometry(&surface, &polygon).unwrap();
+    let wrapper = surface.as_ref().clone();
+    assert!(Arc::ptr_eq(&first, &source.cached_frontier_geometry(&wrapper, &polygon).unwrap()),
+        "同一物理前沿索引的不同快照包装共用结果");
+    let candidate = &first.candidates[0];
+    let columns = surface.reached_frontier_columns(&[candidate.frontier_cell], candidate.support_xyz, 0.2, &polygon);
+    assert!(!columns.is_empty());
+    source.extend_reached_columns(columns.clone());
+    let marked = source.cached_frontier_geometry(&surface, &polygon).unwrap();
+    assert!(!Arc::ptr_eq(&first, &marked), "标记版本变化要失效");
+    source.extend_reached_columns(columns);
+    assert!(Arc::ptr_eq(&marked, &source.cached_frontier_geometry(&surface, &polygon).unwrap()),
+        "没有新增列时不改变标记版本");
+    let rebuilt = floor(12.0, |x, y| in_hole(&[(52, 60), (66, 60)], x, y));
+    assert!(!Arc::ptr_eq(&marked, &source.cached_frontier_geometry(&rebuilt, &polygon).unwrap()),
+        "前沿索引对象变化要失效");
+}
+
+#[test]
+fn arrival_removes_only_matching_failed_cells_and_selection_counts_excluded_clusters_from_shared_geometry() {
+    let surface = floor(12.0, |x, y| in_hole(&[(52, 60), (66, 60)], x, y));
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(surface.clone()).unwrap();
+    let mut source = adapter(&receiver, Some(inset(12.0)), false);
+    source.configure_constraints(Some(inset(12.0)), 0, 2.0).unwrap();
+    let first = goal_of(source.poll_goal(&pose(6.05, 4.05, 1)).unwrap());
+    let geometry = source.cached_frontier_geometry(&surface, &vertices(&inset(12.0))).unwrap();
+    source.report_goal_feedback(&first.id, ExplorationGoalFeedback::Failed("旧格失败".into())).unwrap();
+    let failed_cells = source.failures[0].cells.clone();
+    receiver.observe(surface.clone()).unwrap();
+    let other = goal_of(source.poll_goal(&pose(6.05, 4.05, 2)).unwrap());
+    assert_eq!(source.excluded_frontiers(), 1, "选点时顺带统计整簇被排除的数量");
+    assert!(Arc::ptr_eq(&geometry, &source.cached_frontier_geometry(&surface, &vertices(&inset(12.0))).unwrap()),
+        "失败计数变化不重算同一索引和标记版本的几何");
+    assert!(!failed_cells.contains(&source.selected.as_ref().unwrap().frontier_cell));
+    source.report_goal_feedback(&other.id, ExplorationGoalFeedback::Reached).unwrap();
+    assert_eq!(source.failures[0].cells, failed_cells, "到达其它格不能清除旧失败记录");
+    assert_eq!(source.failures[0].failures, 1);
+    receiver.observe(surface).unwrap();
+    let restored = goal_of(source.poll_goal(&pose(6.05, 4.05, 3)).unwrap());
+    assert!(source.failures[0].reintroduced);
+    assert!(failed_cells.contains(&source.selected.as_ref().unwrap().frontier_cell));
+    source.report_goal_feedback(&restored.id, ExplorationGoalFeedback::Reached).unwrap();
+    assert!(source.failures.is_empty(), "到达记录里的格，才移除对应记录");
 }

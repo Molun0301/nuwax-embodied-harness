@@ -3,6 +3,7 @@
 #include <lcm/lcm-cpp.hpp>
 
 #include <cstddef>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -546,6 +547,49 @@ void verifyActualKeyframeAcceptanceReceiptsAndBound() {
             "existing 2000-node graph limit did not reject additional metadata");
 }
 
+void verifyPartialOverlapRegistration() {
+    PointCloud::Ptr source(new PointCloud), target(new PointCloud);
+    std::mt19937 random(118);
+    const auto unit = [&] { return static_cast<float>(random()) / random.max(); };
+    const Eigen::Vector3f translation(0.08F, -0.04F, 0.02F);
+    for (int index = 0; index < 400; ++index) {
+        const Eigen::Vector3f point(unit() - 0.5F, unit() - 0.5F, unit() - 0.5F);
+        target->push_back(Point(point.x(), point.y(), point.z()));
+        const Eigen::Vector3f shifted = point - translation;
+        source->push_back(Point(shifted.x(), shifted.y(), shifted.z()));
+    }
+    // 当前扫描多看到一簇历史子图没有的几何；它距目标超过 0.3 米。
+    for (int index = 0; index < 160; ++index) {
+        const Eigen::Vector3f point(1.0F + 0.2F * unit(), 0.8F * unit() - 0.4F,
+                                   0.8F * unit() - 0.4F);
+        const Eigen::Vector3f shifted = point - translation;
+        source->push_back(Point(shifted.x(), shifted.y(), shifted.z()));
+    }
+    const auto result = registerLoop(source, target, 0.15, std::make_shared<std::atomic<bool>>(false));
+    require(result.disposition == IcpDisposition::Correction, "部分重叠点云未产生配准结果");
+    const double error = (result.source_correction.block<3, 1>(0, 3) - translation).norm();
+    require(error < 0.01, "部分重叠点云的配准平移偏离真值超过一厘米");
+    const Eigen::Matrix3d rotation = result.source_correction.block<3, 3>(0, 0).cast<double>();
+    require(std::abs(Eigen::AngleAxisd(rotation).angle()) < 0.01,
+            "部分重叠点云的配准旋转偏离真值");
+    // 配准只用近邻，统计仍覆盖原有 10 米范围，包括非重叠点。
+    require(result.inlier_count == static_cast<int64_t>(source->size()), "内点统计范围意外收紧");
+
+    pcl::IterativeClosestPoint<Point, Point> old;
+    old.setInputSource(source);
+    old.setInputTarget(target);
+    old.setMaximumIterations(50);
+    old.setMaxCorrespondenceDistance(10.0);
+    old.setTransformationEpsilon(1e-7);
+    old.setEuclideanFitnessEpsilon(1e-7);
+    old.setRANSACIterations(0);
+    PointCloud aligned;
+    old.align(aligned);
+    const double old_error = (old.getFinalTransformation().block<3, 1>(0, 3) - translation).norm();
+    require(old_error > 0.1, "原十米对应距离未暴露非重叠点引起的明显偏差");
+    std::cout << "部分重叠配准：当前误差=" << error << "米，原十米误差=" << old_error << "米\n";
+}
+
 }  // namespace
 
 int main() {
@@ -560,6 +604,7 @@ int main() {
         verifyCancellationOrdering();
         verifyConcreteCorrectionConflicts();
         verifyActualKeyframeAcceptanceReceiptsAndBound();
+        verifyPartialOverlapRegistration();
     } catch (const std::exception& error) {
         std::cerr << "online owner contract fixture failed: " << error.what() << '\n';
         return 1;

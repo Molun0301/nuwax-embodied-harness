@@ -39,6 +39,24 @@ fn cross(x: f64, y: f64) -> bool {
 const LEFT: [f64; 3] = [-2.5, 0.025, 0.4];
 const UP: [f64; 3] = [0.025, 2.5, 0.4];
 
+/// 一个起点一次单源搜索，展开到全部目标定值或可达范围展开完为止，得到到各目标的路线代价（测试对照用）。
+fn rank_costs(search: &mut MultiGoalSearch<'_>,start: [f64;3],goals: &[[f64;3]]) -> Vec<Result<RouteCost,String>> {
+    let unreachable=|| Err("PCT未找到满足已知占据与机体尺寸的路径".to_string());
+    let mut costs:Vec<_>=goals.iter().map(|_|unreachable()).collect();
+    let mut pending=match search.begin_source(start,goals) {
+        Ok(reachable)=>reachable.into_iter().filter(|value|*value).count(),
+        Err(error)=>return goals.iter().map(|_|Err(error.clone())).collect(),
+    };
+    while pending>0 {
+        match search.next_settled(f64::INFINITY) {
+            Ok(Some(settled))=>{costs[settled.index]=Ok(settled.route);pending-=1;}
+            Ok(None)=>break,
+            Err(error)=>return goals.iter().map(|_|Err(error.clone())).collect(),
+        }
+    }
+    costs
+}
+
 #[test]
 fn narrow_cross_turn_blocks_long_body_while_short_body_turns() {
     let (cells, bands) = scene(cross);
@@ -51,7 +69,7 @@ fn narrow_cross_turn_blocks_long_body_while_short_body_turns() {
     // 不转弯的直行路线不受影响。
     assert!(long.plan(LEFT, None, [2.5, 0.025, 0.4]).is_ok());
     // 单源搜索按同一转移判定：长机身到竖直臂不可达。
-    let costs = long.multi_goal_search().unwrap().rank_costs(LEFT, &[UP, [2.5, 0.025, 0.4]]);
+    let costs = rank_costs(&mut long.multi_goal_search().unwrap(), LEFT, &[UP, [2.5, 0.025, 0.4]]);
     assert!(costs[0].is_err(), "{:?}", costs[0]);
     assert!(costs[1].is_ok(), "{:?}", costs[1]);
 }

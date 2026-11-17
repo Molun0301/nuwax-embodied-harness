@@ -647,6 +647,7 @@ mod tests {
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
     include!("terminal_tests.rs");
+    include!("reference_rejection_tests.rs");
     include!("pose_extrapolation_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.

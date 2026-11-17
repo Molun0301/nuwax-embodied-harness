@@ -844,7 +844,11 @@ impl NavPlanner for SurfaceFollower {
         }))
     }
     fn execution_wait_reason(&self) -> Option<String> {
-        self.wait_reason.clone()
+        match (&self.wait_reason, &self.last_local_failure) {
+            (Some(wait), Some(failure)) if failure.starts_with("原参考路线未被接纳") =>
+                Some(format!("{wait}；{failure}")),
+            _ => self.wait_reason.clone(),
+        }
     }
     fn terminal_phase(&self) -> TerminalPhase {
         self.terminal_phase
@@ -1158,6 +1162,22 @@ mod native_execution_tests {
             (1_000_000_000. / follower.config.controller.control_frequency) as i64;
         follower.update_odometry(current.clone());
         current
+    }
+
+    #[test]
+    fn n4_unaccepted_reference_cause_is_kept_in_public_wait_diagnostics() {
+        let (config, _) = crate::native_test_helpers::fixture();
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let rejected = "原参考路线未被接纳：Original final target is occupied";
+        follower.last_local_failure = Some(rejected.into());
+        follower.wait_reason = Some("等待局部轨迹".into());
+        assert_eq!(follower.execution_wait_reason(), Some(format!("等待局部轨迹；{rejected}")));
+        follower.wait_reason = None;
+        assert_eq!(follower.execution_wait_reason(), None, "正常执行不显示等待原因");
+        follower.configure_goal(&pose(3., 1., 0.), GoalOptions::default()).unwrap();
+        follower.wait_reason = Some("等待局部轨迹".into());
+        assert_eq!(follower.execution_wait_reason(), Some("等待局部轨迹".into()),
+            "新目标不附带上一参考的拒绝原因");
     }
 
     #[test]

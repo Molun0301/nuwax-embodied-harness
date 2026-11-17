@@ -100,12 +100,13 @@ struct PlannerSession {
   std::shared_ptr<GridMap> map=std::make_shared<GridMap>();
   std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
   std::vector<double> reference;
+  std::string reference_rejection;
   Curve produced;
   ScanConfig config{};
   void initialize(const ScanConfig& c) {
     auto p=scan_planner::authorParameters(c);fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(p,map);
     fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s);produced->heading=fsm->manager().local_data_.heading;});
-    config=c;reference.clear();
+    config=c;reference.clear();reference_rejection.clear();
   }
 };
 struct TrackerSession {
@@ -207,8 +208,12 @@ extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void*
     if(incoming!=s.reference) {
       auto path=std::make_shared<nav_msgs::Path>();for(size_t i=0;i<count;++i){geometry_msgs::PoseStamped point;point.pose.position.x=reference[3*i];point.pose.position.y=reference[3*i+1];point.pose.position.z=reference[3*i+2]-c->body_to_ground;path->poses.push_back(point);}
       s.fsm->onReferencePath(path);s.reference=std::move(incoming);
+      // 只保存本次参考首次被拒的原文；后续相同参考不增加接纳或重试。
+      s.reference_rejection=s.fsm->hasTarget()?std::string{}:scan_native_diagnostic;
     }
-    if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()?"原参考路线未被接纳":scan_native_diagnostic);
+    if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()
+        ?"原参考路线未被接纳"+(s.reference_rejection.empty()?std::string{}:"："+s.reference_rejection)
+        :scan_native_diagnostic);
     if(active) {
       auto curve=*static_cast<const Curve*>(active);auto& local=s.fsm->manager().local_data_;
       local.position_traj_=curve->position;local.velocity_traj_=curve->velocity;local.acceleration_traj_=curve->acceleration;

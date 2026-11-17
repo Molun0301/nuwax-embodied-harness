@@ -82,3 +82,25 @@ fn start_heading_turn_is_checked_only_when_heading_is_given() {
     assert!(long.plan(center, None, LEFT).is_ok());
     assert!(long.plan(center, Some(std::f64::consts::PI), LEFT).is_ok());
 }
+
+#[test]
+fn overlapping_current_heading_does_not_add_an_endpoint_admission_check() {
+    let (cells, bands) = scene(|_, y| y.abs() <= 0.2);
+    let start = LEFT;
+    let goal = [2.5, 0.025, 0.4];
+    let yaw = 10_f64.to_radians();
+    // 当前10度姿态的右前角进入墙格；不改变地图或机身，直接从场景格验证重叠。
+    let corner = [start[0] + 0.5 * yaw.cos() - 0.15 * yaw.sin(),
+        start[1] + 0.5 * yaw.sin() + 0.15 * yaw.cos()];
+    let key = corner.map(|v| (v / Q).floor() as i32);
+    assert!(bands.iter().any(|band| band.x == key[0] && band.y == key[1]
+        && band.low < start[2] + 0.15 && band.high > start[2] - 0.2),
+        "当前姿态角点必须与真实障碍格重叠：{corner:?}");
+    let mut planner = Planner::from_cells(config(1.0, 0.3), &cells, &bands).unwrap();
+    let without_heading = planner.plan(start, None, goal).unwrap();
+    let with_heading = planner.plan(start, Some(yaw), goal)
+        .expect("当前朝向的重叠不能作为额外准入条件；前向首边可行且没有中间取样");
+    assert_eq!(with_heading.path, without_heading.path);
+    assert!(with_heading.path[1][0] > start[0]);
+    assert_eq!(with_heading.path[1][1], start[1], "首边保持前向0度");
+}

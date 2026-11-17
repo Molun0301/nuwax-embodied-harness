@@ -304,13 +304,12 @@ struct Planner {
     }
     return grade_sq;
   }
-  // 节点处由上一条边方向转到下一条边方向时机身扫过的朝向：取较短一侧，按π/8（22.5度）的等间隔取样，
-  // 45度转向也检查一个中间朝向，搜索状态维度不变，逐个做与边检查相同的机身
-  // 碰撞判定；包含转入朝向以覆盖起点当前朝向，转出朝向已由边检查覆盖。
+  // 最短转向按π/8（22.5度）等间隔取样，只检查两端之间的朝向；45度转向也有一个中间取样。
+  // 边检查覆盖转出端及中间节点的转入端；起点也不在这里额外检查当前朝向，搜索状态维度不变。
   bool turn_clear(double x,double y,double ground,double from,double to) const {
     const double turn=std::remainder(to-from,2*M_PI);
     const int steps=static_cast<int>(std::ceil(std::abs(turn)/(M_PI/8)-1e-9));
-    for(int k=0;k<steps;++k)if(collision(x,y,ground,from+turn*k/steps))return false;
+    for(int k=1;k<steps;++k)if(collision(x,y,ground,from+turn*k/steps))return false;
     return true;
   }
   bool transition(const Edge& edge,XY from,XY to) {

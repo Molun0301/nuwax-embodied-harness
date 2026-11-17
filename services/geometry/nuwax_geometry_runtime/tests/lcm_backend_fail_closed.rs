@@ -19,6 +19,18 @@ impl Fixture {
         Self::start_with_missing_lio(native, pgo, false).await
     }
     async fn start_with_missing_lio(native: bool, pgo: bool, missing: bool) -> Self {
+        Self::launch(native, pgo, missing, None).await
+    }
+    /// 使用本机编译的原生LIO；`bin/` 下的同名脚本先等 `delay` 秒再执行它，使输入先于子进程订阅到达。
+    async fn start_real_native(program: &std::path::Path, delay: &str) -> Self {
+        Self::launch(true, false, false, Some((program, delay))).await
+    }
+    async fn launch(
+        native: bool,
+        pgo: bool,
+        missing: bool,
+        real: Option<(&std::path::Path, &str)>,
+    ) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/B2行为测试")
             .join(uuid::Uuid::new_v4().to_string());
@@ -86,22 +98,32 @@ impl Fixture {
             .stderr(Stdio::from(log));
         if native {
             use std::os::unix::fs::PermissionsExt;
-            let script = root.join("原生进程夹具");
-            fs::write(
-                            &script,
-                            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE.tmp\"\nmv \"$B2_CHILD_PID_FILE.tmp\" \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
-                        )
-                        .unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-            if !missing {
-                fs::copy(&script, bin.join("fastlio2_native")).unwrap();
+            let identity = r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#;
+            if let Some((program, delay)) = real {
+                let name = program.file_name().unwrap().to_str().unwrap();
+                let wrapper = bin.join(name);
+                fs::write(
+                    &wrapper,
+                    format!("#!/bin/sh\nsleep {delay}\nexec '{}' \"$@\"\n", program.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+                config.set("geometry", "lio_backend", name.strip_suffix("_native").unwrap());
+                config.set("geometry", "lio_body_from_imu", identity);
+            } else {
+                let script = root.join("原生进程夹具");
+                fs::write(
+                                &script,
+                                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE.tmp\"\nmv \"$B2_CHILD_PID_FILE.tmp\" \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
+                            )
+                            .unwrap();
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+                if !missing {
+                    fs::copy(&script, bin.join("fastlio2_native")).unwrap();
+                }
+                command.env("B2_CHILD_PID_FILE", root.join("native.pid"));
             }
-            command.env("B2_CHILD_PID_FILE", root.join("native.pid"));
-            config.set(
-                "geometry",
-                "lio_body_from_sensor",
-                r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
-            );
+            config.set("geometry", "lio_body_from_sensor", identity);
         }
         config.write_install(&root);
         let mut child = command.spawn().unwrap();
@@ -354,6 +376,100 @@ fn points(stamp: u64) -> PublishPointCloudRequest {
     }
 }
 
+/// 合成静止房间的一帧原生输入：类Mid-360扫描落在 10×8×3 米房间内，惯性只有重力。
+/// 惯性样本从 `imu_origin` 起每5毫秒一个；按生产组帧规则，每帧从不晚于上一帧扫描末端
+/// （帧间隔100毫秒、扫描99毫秒，即本帧起点前1毫秒）的最后一个样本取到第一个不早于本帧末端的样本。
+fn native_room_frame(stamp: u64, imu_origin: u64) -> PublishPointCloudRequest {
+    const SENSOR: &str = "utlidar_lidar";
+    let mut directions = Vec::new();
+    for azimuth in 0..180 {
+        for elevation in -7..=26 {
+            let (a, e) = ((azimuth * 2) as f64, (elevation * 2) as f64);
+            let (a, e) = (a.to_radians(), e.to_radians());
+            directions.push([e.cos() * a.cos(), e.cos() * a.sin(), e.sin()]);
+        }
+    }
+    let span = 99_000_000_u64;
+    let count = directions.len() as u64;
+    let mut points = Vec::new();
+    for (index, d) in directions.iter().enumerate() {
+        let reach = |value: f64, low: f64, high: f64| {
+            if value > 0.0 {
+                high / value
+            } else if value < 0.0 {
+                low / value
+            } else {
+                f64::INFINITY
+            }
+        };
+        let t = reach(d[0], -5.0, 5.0)
+            .min(reach(d[1], -4.0, 4.0))
+            .min(reach(d[2], -0.5, 2.5));
+        for value in [d[0] * t, d[1] * t, d[2] * t, 100.0] {
+            points.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        points.extend_from_slice(&((index as u64 * span / count) as u32).to_le_bytes());
+    }
+    let step = 5_000_000;
+    let first = (stamp - 1_000_000 - imu_origin) / step;
+    let last = (stamp + span - imu_origin).div_ceil(step);
+    let imu_samples = (first..=last)
+        .map(|index| LioImuSample {
+            timestamp_ns: imu_origin + index * step,
+            frame_id: SENSOR.into(),
+            accel_mps2_z: 9.81,
+            ..Default::default()
+        })
+        .collect();
+    PublishPointCloudRequest {
+        point_count: count as u32,
+        points,
+        point_step: 20,
+        frame_id: SENSOR.into(),
+        timestamp_ns: stamp,
+        is_dense: true,
+        fields: [("x", 0, 7), ("y", 4, 7), ("z", 8, 7), ("intensity", 12, 7), ("offset_ns", 16, 6)]
+            .into_iter()
+            .map(|(name, offset, datatype)| PointCloudField {
+                name: name.into(),
+                offset,
+                datatype,
+                count: 1,
+            })
+            .collect(),
+        imu_samples,
+        ..Default::default()
+    }
+}
+
+/// 输入在原生子进程订阅完成之前就开始到达：会话不应故障，订阅后里程计持续输出。
+#[tokio::test]
+#[ignore = "需要本机编译的原生LIO：NUWAX_NATIVE_LIO 指向 fastlio2_native 或 pointlio_native"]
+async fn native_input_arriving_before_child_subscribes_does_not_fault() {
+    let program = PathBuf::from(std::env::var("NUWAX_NATIVE_LIO").unwrap());
+    // 子进程启动后先等1秒才执行原生程序，期间送入的帧必然早于它的订阅。
+    let mut f = Fixture::start_real_native(&program, "1").await;
+    f.mapping("启动竞态").await;
+    let start = tokio::time::Instant::now();
+    let base = now();
+    let imu_origin = base - 20_000_000;
+    for k in 0..50_u64 {
+        tokio::time::sleep_until(start + Duration::from_millis(100 * k)).await;
+        let frame = native_room_frame(base + k * 100_000_000, imu_origin);
+        let result = f.client.publish_point_cloud(frame).await.unwrap().into_inner();
+        assert!(result.success, "{}", result.message);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = f.state().await;
+    let log = fs::read_to_string(f.root.join("进程.log")).unwrap();
+    assert_eq!(state.phase, SessionPhase::Mapping as i32, "{}；{log}", state.reason);
+    assert!(state.reason.is_empty(), "{}", state.reason);
+    let quality = state.odometry_quality.expect("订阅完成后原生里程计应持续输出");
+    assert!(
+        quality.timestamp_ns >= base + 40 * 100_000_000,
+        "最近一帧里程计过旧：{quality:?}"
+    );
+}
 #[tokio::test]
 async fn session_transitions_save_collision_and_direct_load() {
     let mut f = Fixture::start(false, false).await;

@@ -222,9 +222,12 @@ static nav_msgs::Odometry make_odometry_message(
     msg.pose.pose.orientation.z = odom.pose.pose.orientation.z;
     msg.pose.pose.orientation.w = odom.pose.pose.orientation.w;
 
-    // Covariance (fixed-size double[36])
-    for (int i = 0; i < 36; ++i) {
-        msg.pose.covariance[i] = odom.pose.covariance[i];
+    // 上游按姿态在前、位置在后填写滤波器协方差；对外改为位置在前、姿态在后。
+    for (int row = 0; row < 6; ++row) {
+        for (int col = 0; col < 6; ++col) {
+            msg.pose.covariance[row * 6 + col] =
+                odom.pose.covariance[((row + 3) % 6) * 6 + (col + 3) % 6];
+        }
     }
 
     // Twist (zero — FAST-LIO doesn't output velocity directly)
@@ -235,6 +238,9 @@ static nav_msgs::Odometry make_odometry_message(
     msg.twist.twist.angular.y = 0;
     msg.twist.twist.angular.z = 0;
     std::memset(msg.twist.covariance, 0, sizeof(msg.twist.covariance));
+    // 速度协方差未使用：前两位放本帧最后一轮滤波更新的有效匹配点数与平均点到平面残差（米）。
+    msg.twist.covariance[0] = effct_feat_num;
+    msg.twist.covariance[1] = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.0;
 
     return msg;
 }
@@ -820,6 +826,7 @@ int main(int argc, char** argv) {
                 imu_subscription, nuwax_lio::kNativeInputImuQueueCapacity,
                 "fastlio2", g_input_imu_topic)) return 1;
         if (debug) { printf("[fastlio2] typed input: %s / %s\\n", g_input_lidar_topic.c_str(), g_input_imu_topic.c_str()); }
+        nuwax_lio::announce_native_input_ready();
     } else {
         // Direct Livox mode is retained for device deployments.
         if (!livox_common::init_livox_sdk(host_ip, lidar_ip, ports, debug)) return 1;

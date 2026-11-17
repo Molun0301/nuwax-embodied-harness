@@ -34,6 +34,8 @@ struct InputRuntime {
     planar: Option<Arc<crate::slam2d_owner::Owner>>,
     odometry_input: mpsc::UnboundedSender<proto::Pose>,
     cloud_input: mpsc::UnboundedSender<(u64, schema::PointCloud2)>,
+    /// 当前原生子进程已建立外部输入订阅。
+    native_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 struct Runtime {
     planar: Option<Arc<crate::slam2d_owner::Owner>>,
@@ -53,6 +55,7 @@ pub(crate) struct Lio {
     sensor_frame: String,
     body_from_sensor: Option<crate::native_lio_owner::BodyFromSensorTransform>,
     auxiliary: Arc<parking_lot::Mutex<VecDeque<AuxiliaryFrame>>>,
+    odometry_quality: Arc<parking_lot::Mutex<Option<proto::OdometryQuality>>>,
 }
 impl Lio {
     pub(crate) async fn start(router: FrameRouter) -> Result<Self, String> {
@@ -120,12 +123,17 @@ impl Lio {
             input_runtime: parking_lot::RwLock::new(None),
             input: Mutex::new(NativeInputDelivery::default()),
             auxiliary: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
+            odometry_quality: Arc::new(parking_lot::Mutex::new(None)),
         };
         result.recover().await?;
         Ok(result)
     }
     pub(crate) fn info(&self) -> proto::RuntimeInfo {
         self.info.clone()
+    }
+    /// 原生LIO最近一帧里程计的质量；设备里程计模式下始终没有。
+    pub(crate) fn odometry_quality(&self) -> Option<proto::OdometryQuality> {
+        *self.odometry_quality.lock()
     }
 
     pub(crate) fn static_transforms(&self) -> Vec<proto::Transform> {
@@ -201,6 +209,7 @@ impl Lio {
         let (odometry_input, odometry_rx) = mpsc::unbounded_channel();
         let (cloud_input, cloud_rx) = mpsc::unbounded_channel();
         let mut tasks = Vec::new();
+        let mut native_ready = Arc::default();
         let planar = if let Some(settings) = &self.planar {
             Some(
                 crate::slam2d_owner::Owner::start(
@@ -239,6 +248,7 @@ impl Lio {
                 )?,
                 transport: transport.clone(),
                 auxiliary: self.auxiliary.clone(),
+                odometry_quality: self.odometry_quality.clone(),
             };
             tasks.push(tokio::spawn(ingress.run(
                 odometry,
@@ -249,6 +259,7 @@ impl Lio {
             )));
             if let Some(native) = &self.native {
                 let process = NativeProcessOwner::spawn(&native.runtime)?;
+                native_ready = process.input_ready();
                 let router = self.router.clone();
                 let stopped = shutdown.clone();
                 tasks.push(tokio::spawn(crate::lio_owner::supervise_native(
@@ -268,6 +279,7 @@ impl Lio {
             planar: planar.clone(),
             odometry_input,
             cloud_input,
+            native_ready,
         });
         *self.runtime.lock().await = Some(Runtime {
             planar,
@@ -321,6 +333,13 @@ impl Lio {
                 return Err(Status::invalid_argument(
                     "原生点云和惯性坐标必须与配置传感器一致",
                 ));
+            }
+            // 子进程订阅完成之前的输入直接丢弃，不计入输入序列。
+            if !runtime
+                .native_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(());
             }
             let request = match &self.native_self_filter {
                 Some(filter) => filter
@@ -514,6 +533,7 @@ struct Ingress {
     self_filter: Option<crate::self_cloud::RobotSelfFilter>,
     transport: LcmTransport,
     auxiliary: Arc<parking_lot::Mutex<VecDeque<AuxiliaryFrame>>>,
+    odometry_quality: Arc<parking_lot::Mutex<Option<proto::OdometryQuality>>>,
 }
 impl Ingress {
     async fn run(
@@ -545,7 +565,10 @@ impl Ingress {
                         let message=decode_odometry(&frame.payload).map_err(|e|e.to_string())?;
                         let pose=pose_from_odometry(&message)?;
                         self.router.publish_pose(self.router.session_id(),pose.clone());
-                        if self.native.is_some(){self.publish_pose_bypass(&message).await?;}
+                        if self.native.is_some(){
+                            *self.odometry_quality.lock()=Some(odometry_quality(&message,pose.timestamp_ns));
+                            self.publish_pose_bypass(&message).await?;
+                        }
                         poses.push_back(pose);
                         while poses.len()>256{poses.pop_front();}
                         self.deliver_auxiliary(&poses)?;

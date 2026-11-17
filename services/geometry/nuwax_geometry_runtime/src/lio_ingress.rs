@@ -35,6 +35,26 @@ pub(crate) fn pose_from_odometry(value: &schema::Odometry) -> Result<crate::prot
     Ok(pose)
 }
 
+/// 原生里程计的质量量：协方差为位置在前、姿态在后的6×6阵，速度协方差前两位为有效匹配点数与平均残差。
+pub(crate) fn odometry_quality(
+    value: &schema::Odometry,
+    timestamp_ns: u64,
+) -> crate::proto::OdometryQuality {
+    let std_max = |start: usize| {
+        nalgebra::Matrix3::from_fn(|row, col| value.pose_covariance[(start + row) * 6 + start + col])
+            .symmetric_eigenvalues()
+            .max()
+            .sqrt()
+    };
+    crate::proto::OdometryQuality {
+        position_std_max_m: std_max(0),
+        orientation_std_max_rad: std_max(3),
+        effective_points: value.twist_covariance[0] as u32,
+        mean_residual_m: value.twist_covariance[1],
+        timestamp_ns,
+    }
+}
+
 pub(crate) fn header_stamp(header: &schema::Header) -> Result<u64, String> {
     if header.stamp_sec < 0 || !(0..1_000_000_000).contains(&header.stamp_nsec) {
         return Err("传感器源时间非法".into());

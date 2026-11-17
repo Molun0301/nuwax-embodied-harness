@@ -1,4 +1,4 @@
-// 原始来源及许可见组件 NOTICE；本地修改：取消、固定队列键、分层连接、物理边检查及单源展开的定值停止。
+// 原始来源及许可见组件 NOTICE；本地修改：取消、固定队列键、分层连接及物理边检查。
 #pragma once
 
 #include <Eigen/Core>
@@ -64,8 +64,6 @@ class Astar {
     traversal_cost_ = std::move(cost);
   }
   void SetCancellation(std::function<bool()> cancelled) { cancelled_ = std::move(cancelled); }
-  // 单源展开中每个节点定值后调用；返回真时停止展开（不是取消），之前已定值的节点不变。
-  void SetStop(std::function<bool(double)> stop) { stop_ = std::move(stop); }
   // 仅在需要逼近结果时启用；评分只遍历本次搜索实际展开的可达节点。
   void SetApproachScore(std::function<double(const Node*)> score) { approach_score_ = std::move(score); }
   std::size_t Expanded() const { return expanded_; }
@@ -112,7 +110,6 @@ class Astar {
   std::function<bool(const Node*, const Node*)> transition_;
   std::function<double(const Node*, const Node*)> traversal_cost_;
   std::function<bool()> cancelled_;
-  std::function<bool(double)> stop_;
   std::function<double(const Node*)> approach_score_;
   std::size_t expanded_ = 0;
   bool was_cancelled_ = false;

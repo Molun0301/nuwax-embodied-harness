@@ -111,14 +111,13 @@ pub struct RouteCost {
     pub elapsed_ms: f64,
     pub expanded: usize,
 }
-/// 本轮真实转移检查及复用次数；逻辑目标预算仍由调用方拥有。
+/// 本轮真实转移检查及复用次数，以及单源搜索与完整查询的工作量。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MultiGoalStats {
     pub checks: usize,
     pub hits: usize,
     pub source_searches: usize,
-    pub rejected: usize,
     pub source_expanded: usize,
     pub exact_queries: usize,
     pub exact_searches: usize,
@@ -181,9 +180,13 @@ unsafe extern "C" {
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
-    fn pct_multi_goal_rank_costs(
-        search: *mut c_void, start: *const f64, goals: *const f64, count: usize, bounded: bool,
-        out: *mut RouteCost, found: *mut u8,
+    fn pct_source_begin(
+        search: *mut c_void, start: *const f64, goals: *const f64, count: usize, reachable: *mut u8,
+        err: *mut c_char, cap: usize,
+    ) -> i32;
+    fn pct_multi_goal_resolution(search: *const c_void) -> f64;
+    fn pct_source_next(
+        search: *mut c_void, index: *mut usize, weighted: *mut f64, out: *mut RouteCost, limit: f64,
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
@@ -209,7 +212,7 @@ pub struct Planner {
 // 原生实例无共享全局可变状态，移动所有权不会产生并发访问。
 unsafe impl Send for Planner {}
 /// 一轮多目标评估共享惰性转移图；可变借用保证地图与机体配置不会在轮内变化。
-/// 完整查询保留原目标窗口与启发式；排名查询使用全图单源父链。
+/// 完整查询保留原目标窗口与启发式；排序使用按需展开的单源父链。
 pub struct MultiGoalSearch<'a> {
     native: NonNull<c_void>,
     _planner: std::marker::PhantomData<&'a mut Planner>,
@@ -217,30 +220,68 @@ pub struct MultiGoalSearch<'a> {
 impl Drop for MultiGoalSearch<'_> {
     fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
 }
+/// 单源搜索中定值的一个已登记目标：绑定节点的加权路径代价，以及到端点的路线长度、端点与末段朝向。
+/// 端点在绑定节点的实测地面上，绑定节点在目标所在格时平面位置取目标，否则取绑定格中心。
+#[derive(Clone, Copy, Debug)]
+pub struct SettledGoal {
+    pub index: usize,
+    pub weighted: f64,
+    pub route: RouteCost,
+}
 impl MultiGoalSearch<'_> {
-    /// 从一个起点做一次单源搜索，得到到多个目标的排序代价；起点不可搜索或已取消时全部失败。
-    /// 代价为同一完整转移图单源父链的真实几何长度，目标只核验真实端点入边；
-    /// 用于前沿排序，允许与目标专属启发式搜索选取不同的等权路线。
-    /// `bounded`为真时单源展开到这批目标全部定值即停，代价与展开全图相同；
-    /// 为假时展开全图，换起点后仍保留这棵父链，回到该起点（含完整查询的前置核对）直接取用。
-    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]], bounded: bool) -> Vec<Result<RouteCost, String>> {
-        // 没有目标时不做单源搜索。
-        if goals.is_empty() {
-            return Vec::new();
-        }
-        let mut costs = vec![RouteCost::default(); goals.len()];
-        let mut found = vec![0_u8; goals.len()];
+    /// 从起点开始一次按需展开的单源搜索并登记目标，替换上一次单源搜索。起点与目标都按完整查询的
+    /// 端点绑定规则绑定到节点：所在格±10格内按三维距离（地面高度为`z`减机体到地面高度）最近的有效节点；
+    /// 返回各目标是否有绑定节点，没有即不可达。绑定只读取附近列，不展开搜索。
+    pub fn begin_source(&mut self, start: [f64; 3], goals: &[[f64; 3]]) -> Result<Vec<bool>, String> {
+        let mut reachable = vec![0_u8; goals.len()];
         let mut error = [0; 512];
-        let status = unsafe { pct_multi_goal_rank_costs(self.native.as_ptr(), start.as_ptr(),
-            goals.as_ptr().cast(), goals.len(), bounded, costs.as_mut_ptr(), found.as_mut_ptr(),
-            cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
+        let status = unsafe { pct_source_begin(self.native.as_ptr(), start.as_ptr(), goals.as_ptr().cast(),
+            goals.len(), reachable.as_mut_ptr(), error.as_mut_ptr(), error.len()) };
         if status != 0 {
-            let message = native_error(&error);
-            return goals.iter().map(|_| Err(message.clone())).collect();
+            return Err(native_error(&error));
         }
-        costs.into_iter().zip(found).map(|(cost, found)| if found != 0 { Ok(cost) } else {
-            Err("PCT未找到满足已知占据与机体尺寸的路径".into())
-        }).collect()
+        Ok(reachable.into_iter().map(|value| value != 0).collect())
+    }
+    /// 继续当前单源搜索到下一个已登记目标的绑定节点定值；节点按加权路径代价从小到大定值，
+    /// 绑定到同一节点的目标按登记顺序返回。可达范围已展开完，或下一个出队的加权代价超过`limit`
+    /// （不出队，之后可用更大的上限继续）时返回`None`。
+    pub fn next_settled(&mut self, limit: f64) -> Result<Option<SettledGoal>, String> {
+        let mut index = 0;
+        let mut weighted = 0.0;
+        let mut route = RouteCost::default();
+        let mut error = [0; 512];
+        let status = unsafe { pct_source_next(self.native.as_ptr(), &mut index, &mut weighted, &mut route, limit,
+            cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
+        match status {
+            0 => Ok(Some(SettledGoal { index, weighted, route })),
+            1 => Ok(None),
+            _ => Err(native_error(&error)),
+        }
+    }
+    /// 一个起点一次单源搜索，展开到全部目标定值或可达范围展开完为止，得到到各目标的路线代价。
+    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]]) -> Vec<Result<RouteCost, String>> {
+        let unreachable = || Err("PCT未找到满足已知占据与机体尺寸的路径".to_string());
+        let mut costs: Vec<_> = goals.iter().map(|_| unreachable()).collect();
+        let mut pending = match self.begin_source(start, goals) {
+            Ok(reachable) => reachable.into_iter().filter(|value| *value).count(),
+            Err(error) => return goals.iter().map(|_| Err(error.clone())).collect(),
+        };
+        while pending > 0 {
+            match self.next_settled(f64::INFINITY) {
+                Ok(Some(settled)) => {
+                    costs[settled.index] = Ok(settled.route);
+                    pending -= 1;
+                }
+                Ok(None) => break,
+                Err(error) => return goals.iter().map(|_| Err(error.clone())).collect(),
+            }
+        }
+        costs
+    }
+    /// 加权路径代价的基础每米代价（不含软代价）：相邻格的距离项按格数计，一格边长为原生分辨率米，
+    /// 所以每米代价为 1/分辨率。
+    pub fn cost_per_meter(&self) -> f64 {
+        1.0 / unsafe { pct_multi_goal_resolution(self.native.as_ptr()) }
     }
     /// 平面点所在原生格的实测地面高度（静态列与本次临时叠加）；缺测列为空，不补造地面。
     pub fn measured_heights(&self, point: [f64; 2]) -> Vec<f64> {

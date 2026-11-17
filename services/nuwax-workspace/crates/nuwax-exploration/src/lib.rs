@@ -456,8 +456,11 @@ pub trait ExplorationGoalSource: Send {
     /// 本次选点时的前沿数；默认取前沿快照条数，三维表面源取达到最小尺寸的簇数。
     fn frontier_count(&self) -> usize { self.frontier_snapshot().len() }
 
-    /// 仍因导航失败超限而排除的历史条目数。
+    /// 仍因导航失败超限而不作为候选的簇数；到达标记不计入。
     fn excluded_frontiers(&self) -> usize { 0 }
+
+    /// 重放替换地图后清空地图坐标历史；二维源沿用原行为。
+    fn clear_after_map_replay(&mut self) {}
 
     /// 保存已经确认的源历史；无支持的源必须明确拒绝。
     fn checkpoint(&self) -> ExploreResult<String> {
@@ -808,9 +811,14 @@ impl ExplorationController {
         self.sources.iter().map(|source| source.frontier_count()).sum()
     }
 
-    /// 各探索源仍因失败排除的条目总数。
+    /// 各探索源仍因失败排除的簇数；到达标记不计入。
     pub fn excluded_frontiers(&self) -> usize {
         self.sources.iter().map(|source| source.excluded_frontiers()).sum()
+    }
+
+    /// 地图重放采用后交给各源清空历史，不变换或取消在途目标。
+    pub fn clear_after_map_replay(&mut self) {
+        for source in &mut self.sources { source.clear_after_map_replay(); }
     }
 
     /// controller diagnostics

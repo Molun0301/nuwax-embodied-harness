@@ -9,6 +9,7 @@ enum Work {
     Fail(String),
     Name(String),
     Progress(Reply<ExplorationProgress>),
+    MapReplayed(u64),
 }
 
 #[cfg(test)]
@@ -67,6 +68,7 @@ mod tests {
 pub(super) struct ExplorerWorker {
     sender: channel::Sender<Work>,
     updates: mpsc::UnboundedReceiver<Result<ExplorerTick, String>>,
+    replay_generation: u64,
 }
 impl ExplorerWorker {
     pub(super) fn start(
@@ -117,6 +119,7 @@ impl ExplorerWorker {
                         active = false;
                     }
                     Some(Work::Name(name)) => worker.explorer.set_map_name(name),
+                    Some(Work::MapReplayed(generation)) => worker.explorer.map_replayed(generation),
                     Some(Work::Progress(reply)) => {
                         let _ = reply.send(worker.explorer.progress());
                     }
@@ -135,7 +138,7 @@ impl ExplorerWorker {
                 }
             }
         });
-        Self { sender, updates }
+        Self { sender, updates, replay_generation: 0 }
     }
     pub(super) async fn next(&mut self) -> Option<Result<ExplorerTick, String>> {
         self.updates.recv().await
@@ -152,6 +155,10 @@ impl ExplorerWorker {
     }
     pub(super) fn set_map_name(&self, name: String) {
         let _ = self.sender.send(Work::Name(name));
+    }
+    pub(super) fn map_replayed(&mut self) {
+        self.replay_generation += 1;
+        let _ = self.sender.send(Work::MapReplayed(self.replay_generation));
     }
     pub(super) fn progress(&self, reply: Reply<ExplorationProgress>) {
         if let Err(channel::SendError(Work::Progress(reply))) =
@@ -241,4 +248,27 @@ async fn forbidden_read_failure_stays_running_and_recovers_after_a_valid_array()
     assert!(recovered.status.message.contains("等待地图位姿"));
     mapper.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn replay_generation_clears_surface_records_through_the_existing_work_queue() {
+    for (id, reached) in [(985, false), (986, true)] {
+        let explorer = crate::explorer::replay_tests::fixture(reached);
+        let before = crate::explorer::replay_tests::source_payload(&explorer.progress().unwrap());
+        assert!(!before[if reached { 1 } else { 2 }].as_array().unwrap().is_empty());
+        let mapper = Mapper::start(id, MapperConfig::default()).unwrap();
+        let (_, pose) = watch::channel(None);
+        let mut worker = ExplorerWorker::start(explorer, mapper.clone(), pose);
+        worker.map_replayed();
+        let (reply, received) = oneshot::channel();
+        worker.progress(reply);
+        let progress = tokio::time::timeout(Duration::from_secs(5), received).await.unwrap().unwrap().unwrap();
+        let after = crate::explorer::replay_tests::source_payload(&progress);
+        assert!(after[1].as_array().unwrap().is_empty() && after[2].as_array().unwrap().is_empty());
+        assert_eq!(worker.replay_generation, 1);
+        worker.stop();
+        drop(worker);
+        mapper.shutdown().await.unwrap();
+    }
 }

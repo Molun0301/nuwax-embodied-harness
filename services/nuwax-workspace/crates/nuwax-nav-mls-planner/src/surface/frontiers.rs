@@ -39,11 +39,11 @@ pub(super) type CacheSlot = Mutex<Option<CachedFrontiers>>;
 
 #[derive(Clone)]
 pub(super) struct CachedFrontiers {
-    seed: Arc<FrontierIndex>,
+    seed: Arc<SurfaceFrontierIndex>,
     dirty: Option<BTreeMap<[i32; 2], DirtyBounds>>,
 }
 
-pub(super) struct FrontierIndex {
+pub struct SurfaceFrontierIndex {
     boundary: Vec<[f64; 2]>,
     /// 达标簇（开口宽度不小于机体宽度）里的前沿格 → 所属簇的收益；选点候选、途中换目标与
     /// `reachable_frontiers` 只读它。
@@ -68,6 +68,18 @@ struct FrontierClusterCells {
     span_m: f64,
     opening_m: f64,
     candidate: bool,
+}
+
+/// 由探索适配器持有的查询结果；仅计算调用者请求的簇。
+pub struct SurfaceFrontierQuery {
+    index: Arc<SurfaceFrontierIndex>,
+    affected: BTreeSet<u32>,
+    clusters: BTreeMap<u32, FilteredFrontierCluster>,
+}
+
+struct FilteredFrontierCluster {
+    changed: bool,
+    parts: Vec<Arc<FrontierClusterCells>>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +128,128 @@ fn dirty_contains(blocks: &BTreeMap<[i32; 2], DirtyBounds>, cell: VoxelKey, radi
 }
 
 impl SurfaceSnapshot {
+    /// 所选簇在到达半径内的前沿格对应的未知列；只标记这些列，不排除邻近视点。
+    pub fn reached_frontier_columns(&self, cells: &[[i32; 3]], position: [f64; 3], radius: f64,
+        boundary: &[[f64; 2]]) -> BTreeSet<[i32; 3]> {
+        cells.iter().filter(|cell| {
+            let p = self.cell_position((cell[0], cell[1], cell[2]));
+            (p[0] - position[0]).hypot(p[1] - position[1]).hypot(p[2] - position[2]) <= radius
+        }).flat_map(|cell| self.frontier_unknown_cells((cell[0], cell[1], cell[2]), boundary))
+            .map(|cell| [cell.0, cell.1, cell.2]).collect()
+    }
+
+    /// 由标记列沿原前瞻方向反查可能受影响的簇，不遍历全图前沿。
+    pub fn frontier_query(&self, index: Arc<SurfaceFrontierIndex>, reached: &BTreeSet<[i32; 3]>) -> SurfaceFrontierQuery {
+        let mut affected = BTreeSet::new();
+        for &[x, y, _] in reached {
+            for (dx, dy) in DIRECTIONS {
+                for distance in 1..=self.frontier_lookahead() {
+                    let (x, y) = (x - dx * distance, y - dy * distance);
+                    affected.extend(index.cells.range((x, y, i32::MIN)..=(x, y, i32::MAX)).map(|(_, info)| info.cluster));
+                }
+            }
+        }
+        SurfaceFrontierQuery { index, affected, clusters: BTreeMap::new() }
+    }
+
+    fn filtered_frontier_cluster<'a>(&self, query: &'a mut SurfaceFrontierQuery, id: u32,
+        reached: &BTreeSet<[i32; 3]>) -> &'a FilteredFrontierCluster {
+        if !query.clusters.contains_key(&id) {
+            let original = Arc::clone(&query.index.clusters[&id]);
+            let mut changed = false;
+            let mut remaining = BTreeMap::new();
+            if query.affected.contains(&id) {
+                for &cell in &original.cells {
+                    let unknown = self.frontier_unknown_cells(cell, &query.index.boundary);
+                    changed |= unknown.iter().any(|c| reached.contains(&[c.0, c.1, c.2]));
+                    let unknown: Vec<_> = unknown.into_iter().filter(|c| !reached.contains(&[c.0, c.1, c.2])).collect();
+                    if !unknown.is_empty() {
+                        remaining.insert(cell, unknown.iter().any(|c| (c.0 - cell.0).abs() + (c.1 - cell.1).abs() == 1));
+                    }
+                }
+            }
+            let mut parts = Vec::new();
+            if !changed { parts.push(original); }
+            let size = f64::from(self.config().voxel_size);
+            while changed && !remaining.is_empty() {
+                let seed = remaining.pop_first().unwrap();
+                let mut members = vec![seed];
+                let mut cursor = 0;
+                while cursor < members.len() {
+                    let cell = members[cursor].0;
+                    cursor += 1;
+                    let mut found = Vec::new();
+                    for_each_neighbor(&remaining, cell, self.data.candidate_step_cells, |key, _| found.push(key));
+                    members.extend(found.into_iter().map(|key| (key, remaining.remove(&key).unwrap())));
+                }
+                let opening: Vec<_> = members.iter().filter(|(_, opening)| *opening).map(|(c, _)| [c.0, c.1]).collect();
+                let opening_m = if opening.is_empty() { 0.0 } else { planar_diameter(opening.into_iter()) * size + size };
+                if opening_m + 1e-9 < self.frontier_body_width() { continue; }
+                let span_m = planar_diameter(members.iter().map(|(c, _)| [c.0, c.1])) * size;
+                let mut cells: Vec<_> = members.into_iter().map(|(cell, _)| cell).collect();
+                cells.sort_unstable();
+                parts.push(Arc::new(FrontierClusterCells { cells, span_m, opening_m, candidate: true }));
+            }
+            query.clusters.insert(id, FilteredFrontierCluster { changed, parts });
+        }
+        &query.clusters[&id]
+    }
+
+    /// 选点请求全部达标簇，复用途中核对已算出的局部结果。
+    pub fn frontier_clusters_from_query(&self, query: &mut SurfaceFrontierQuery, reached: &BTreeSet<[i32; 3]>)
+        -> Vec<SurfaceFrontierCluster> {
+        let index = Arc::clone(&query.index);
+        let mut next_id = index.next_cluster;
+        let area = f64::from(self.config().voxel_size).powi(2);
+        let mut result = Vec::new();
+        for (&id, _) in index.clusters.iter().filter(|(_, cluster)| cluster.candidate) {
+            let filtered = self.filtered_frontier_cluster(query, id, reached);
+            for part in &filtered.parts {
+                let gain = part.cells.len() as f64 * area;
+                let id = if filtered.changed { let id = next_id; next_id += 1; id } else { id };
+                result.push(SurfaceFrontierCluster { id, span_m: part.span_m, opening_m: part.opening_m, gain,
+                    frontiers: part.cells.iter().map(|&cell| SurfaceFrontier {
+                        cell, support_xyz: self.cell_position(cell), gain, travel_cost: f64::INFINITY,
+                    }).collect() });
+            }
+        }
+        result
+    }
+
+    /// 独立几何调用也使用同一反查逻辑；生产适配器保留查询对象以便复用。
+    pub fn frontier_clusters_with_reached(&self, boundary: &[[f64; 2]], reached: &BTreeSet<[i32; 3]>)
+        -> Result<Vec<SurfaceFrontierCluster>, SurfaceError> {
+        validate_boundary(boundary)?;
+        let mut query = self.frontier_query(self.frontier_index(boundary), reached);
+        Ok(self.frontier_clusters_from_query(&mut query, reached))
+    }
+
+    /// 观察目标也去掉到过仍未知的列，和过滤后的前沿使用同一个未知列定义。
+    pub fn observation_targets_with_reached(&self, boundary: &[[f64; 2]], reached: &BTreeSet<[i32; 3]>)
+        -> Result<Vec<nuwax_explore_routing::observation::ObservationTarget>, SurfaceError> {
+        Ok(self.observation_targets(boundary)?.into_iter().filter(|target| !reached.contains(&target.cell)).collect())
+    }
+
+    /// 途中核对先查询半径内的格，只请求这些格所属簇的过滤结果。
+    pub fn frontier_near_from_query(&self, query: &mut SurfaceFrontierQuery, cell: [i32; 3],
+        horizontal_m: f64, vertical_m: f64, reached: &BTreeSet<[i32; 3]>) -> bool {
+        let center = self.cell_position((cell[0], cell[1], cell[2]));
+        let reach = (horizontal_m / f64::from(self.config().voxel_size)).ceil() as i32 + 1;
+        let mut nearby = BTreeMap::<u32, Vec<VoxelKey>>::new();
+        for x in cell[0].saturating_sub(reach)..=cell[0].saturating_add(reach) {
+            for (&key, _) in query.index.gains.range((x, cell[1].saturating_sub(reach), i32::MIN)
+                ..=(x, cell[1].saturating_add(reach), i32::MAX)) {
+                let p = self.cell_position(key);
+                if (p[0] - center[0]).hypot(p[1] - center[1]) <= horizontal_m + 1e-9
+                    && (p[2] - center[2]).abs() <= vertical_m + 1e-9 {
+                    nearby.entry(query.index.cells[&key].cluster).or_default().push(key);
+                }
+            }
+        }
+        nearby.into_iter().any(|(id, cells)| self.filtered_frontier_cluster(query, id, reached).parts.iter()
+            .any(|part| cells.iter().any(|cell| part.cells.binary_search(cell).is_ok())))
+    }
+
     /// 在环境快照上准备可复用的前沿几何；当前机体视图只重算局部变化。
     pub fn prepare_frontier_geometry(
         &self,
@@ -301,7 +435,7 @@ impl SurfaceSnapshot {
         }
     }
 
-    pub(super) fn frontier_index(&self, boundary: &[[f64; 2]]) -> Arc<FrontierIndex> {
+    pub fn frontier_index(&self, boundary: &[[f64; 2]]) -> Arc<SurfaceFrontierIndex> {
         let cache = self
             .data
             .frontier_cache
@@ -414,7 +548,7 @@ impl SurfaceSnapshot {
             clusters.insert(id, Arc::new(FrontierClusterCells { cells: member_cells, span_m, opening_m, candidate }));
         }
         let cluster_ms = cluster_started.elapsed().as_secs_f64() * 1000.0;
-        let index = Arc::new(FrontierIndex {
+        let index = Arc::new(SurfaceFrontierIndex {
             boundary: boundary.to_vec(),
             stats: SurfaceFrontierCacheStats {
                 evaluated_cells,
@@ -532,6 +666,8 @@ impl SurfaceSnapshot {
         }
         for (dx, dy) in DIRECTIONS {
             let mut current = cell;
+            let mut support_height = origin[2];
+            let mut first_unknown = None;
             for _ in 0..lookahead {
                 let (nx, ny) = (current.0 + dx, current.1 + dy);
                 if self.data.virtual_obstacles.as_ref().is_some_and(|mask| {
@@ -555,8 +691,13 @@ impl SurfaceSnapshot {
                     current.2,
                     self.data.candidate_step_cells,
                 );
+                // 缺测后若先遇到此层可接续支撑，结束这一段落差证据查询。
+                if first_unknown.is_some() && next.is_some() { break; }
                 match next {
-                    Some(next) if self.has_geometric_edge(current, next) => current = next,
+                    Some(next) if self.has_geometric_edge(current, next) => {
+                        current = next;
+                        support_height = self.cell_position(current)[2];
+                    },
                     Some(_) => break,
                     None => {
                         let clearance =
@@ -566,13 +707,20 @@ impl SurfaceSnapshot {
                                 zs.iter()
                                     .any(|&z| z > current.2 && z <= current.2 + clearance)
                             });
-                        if !occupied {
-                            unknown.insert((nx, ny, current.2));
+                        if occupied { break; }
+                        // 下层有实测地面，是此层无支撑的证据；沿用原 lookahead，不扩大前瞻。
+                        let step = f64::from(self.data.candidate_step_cells) * f64::from(self.config().voxel_size);
+                        if self.data.graph.surface_lookup.get(&(nx, ny)).is_some_and(|zs|
+                            zs.iter().any(|&z| self.cell_position((nx, ny, z))[2] < support_height - step)) {
+                            first_unknown = None;
+                            break;
                         }
-                        break;
+                        first_unknown.get_or_insert((nx, ny, current.2));
+                        current = (nx, ny, current.2);
                     }
                 }
             }
+            if let Some(cell) = first_unknown { unknown.insert(cell); }
         }
         unknown
     }
@@ -715,4 +863,79 @@ impl SurfaceSnapshot {
 
 pub(super) fn frontier_point_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod e3c_tests {
+    use super::*;
+
+    fn drop_map(lower: Option<f32>, gap: bool) -> SurfaceSnapshot {
+        let points: Vec<_> = (0..24).flat_map(|x| (0..12).filter_map(move |y| {
+            let z = if x < 10 { 0.85 } else { lower? };
+            if gap && x == 10 { return None; }
+            Some(((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z))
+        })).collect();
+        SurfaceSnapshot::from_points(&points, Config {
+            voxel_size: 0.1, wall_clearance_m: 0.1, surface_closing_radius: 0.0,
+            step_threshold_m: 0.2, robot_height: 0.45, wall_buffer_m: 0.1, wall_buffer_weight: 0.0,
+            min_step_tread_depth_m: 0.2, world_frame: "map".into(), node_spacing_m: 0.3,
+            max_slope_deg: 25.0, step_penalty_weight: 1.0, goal_tolerance: 0.1, viz_publish_hz: 0.0
+        }, 0.1).unwrap()
+    }
+
+    #[test]
+    fn lower_returns_remove_drop_frontiers_within_the_existing_lookahead() {
+        for gap in [false, true] {
+            let map = drop_map(Some(0.05), gap);
+            assert!(!map.frontier_unknown_cells((9, 5, 8), &[]).iter().any(|c| c.0 >= 10 && c.1 == 5),
+                "下行边缘或隔一列的下层回波都是此层无支撑的证据");
+        }
+        let map = drop_map(None, false);
+        assert!(map.frontier_unknown_cells((9, 5, 8), &[]).contains(&(10, 5, 8)), "没有下层回波仍是前沿");
+    }
+
+    #[test]
+    fn small_drop_is_support_and_support_before_lower_evidence_keeps_the_gap_unknown() {
+        let map = drop_map(Some(0.75), false);
+        assert!(!map.frontier_unknown_cells((9, 5, 8), &[]).contains(&(10, 5, 8)), "小台阶按可接续支撑处理");
+        let points: Vec<_> = (0..24).flat_map(|x| (0..12).filter_map(move |y| {
+            if x == 10 { return None; }
+            Some(((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, if x <= 11 { 0.85 } else { 0.05 }))
+        })).collect();
+        let map = SurfaceSnapshot::from_points(&points, map.config().clone(), 0.1).unwrap();
+        assert!(map.frontier_unknown_cells((9, 5, 8), &[]).contains(&(10, 5, 8)), "先碰到同层支撑，缺测列仍未知");
+    }
+
+    #[test]
+    fn reached_reverse_lookup_and_nearby_query_only_materialize_requested_clusters() {
+        let config = drop_map(None, false).config().clone();
+        let points: Vec<_> = (0..80_i32).flat_map(|x| (0..80_i32).map(move |y| (x, y)))
+            .filter(|&(x, y)| ![(25, 25), (55, 55)].iter().any(|&(hx, hy)| (x - hx).abs() < 2 && (y - hy).abs() < 2))
+            .map(|(x, y)| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05)).collect();
+        let map = SurfaceSnapshot::from_points(&points, config, 0.1).unwrap();
+        let boundary = [[0.3, 0.3], [7.7, 0.3], [7.7, 7.7], [0.3, 7.7]];
+        let original = map.frontier_clusters(&boundary).unwrap();
+        assert_eq!(original.len(), 2);
+        let first = &original[0];
+        let other = &original[1];
+        let seed = &first.frontiers[0];
+        let reached = map.reached_frontier_columns(&[[seed.cell.0, seed.cell.1, seed.cell.2]], seed.support_xyz, 0.2, &boundary);
+        assert!(!reached.is_empty());
+        let index = map.frontier_index(&boundary);
+        let actual: BTreeSet<_> = index.cells.iter().filter(|(cell, _)|
+            map.frontier_unknown_cells(**cell, &boundary).iter().any(|c| reached.contains(&[c.0, c.1, c.2])))
+            .map(|(_, info)| info.cluster).collect();
+        let mut query = map.frontier_query(index, &reached);
+        assert!(actual.is_subset(&query.affected), "反查必须覆盖逐格核对得到的全部受影响簇");
+        assert!(query.affected.contains(&first.id) && !query.affected.contains(&other.id));
+        let cell = other.frontiers[0].cell;
+        assert!(map.frontier_near_from_query(&mut query, [cell.0, cell.1, cell.2], 0.3, 0.3, &reached));
+        assert_eq!(query.clusters.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([other.id]),
+            "途中核对不计算半径外被标记影响的另一个簇");
+        let combined = map.frontier_clusters_from_query(&mut query, &reached);
+        assert_eq!(combined, map.frontier_clusters_with_reached(&boundary, &reached).unwrap(),
+            "先局部核对再选点与直接全量查询的分簇和收益必须一致");
+        assert_eq!(query.clusters.len(), 2, "选点再补齐其它簇，复用已核对的簇");
+    }
+
 }

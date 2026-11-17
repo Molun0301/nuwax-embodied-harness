@@ -35,6 +35,6 @@ pub mod surfaces;
 pub mod voxel;
 
 pub use surface::{
-    SurfaceObservation, SurfaceObservations, SurfaceBodyEnvelope, SurfaceBodyQueryView, SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceError, SurfaceFrontier, SurfaceFrontierCacheStats, SurfaceFrontierCluster,
+    SurfaceObservation, SurfaceObservations, SurfaceBodyEnvelope, SurfaceBodyQueryView, SurfaceBuildKind, SurfaceBuildStats, SurfaceColumnUpdate, SurfaceError, SurfaceFrontier, SurfaceFrontierCacheStats, SurfaceFrontierIndex, SurfaceFrontierQuery, SurfaceFrontierCluster,
     SurfaceLocation, SurfaceMapBuild, SurfaceMapBuilder, SurfaceSnapshot, SurfaceTransition,
 };

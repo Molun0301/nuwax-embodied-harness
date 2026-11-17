@@ -60,3 +60,50 @@ fn n3_missing_measurements_do_not_extrapolate_their_pose_components() {
     state.measured_velocity=0;state.measured_yaw_rate=1;let angular=state.extrapolated(age);
     assert_eq!(angular.position,state.position);assert!((angular.yaw-0.22).abs()<1e-12);
 }
+
+#[test]
+fn n3_near_obstacle_closed_loop() {
+    let mut cfg=config();cfg.resolution=0.05;cfg.sample_dt=0.05;cfg.max_velocity=0.5;
+    cfg.max_reverse_velocity=0.5;cfg.max_lateral_velocity=0.;cfg.max_acceleration=0.5;cfg.planning_horizon=5.;
+    // 0.5米宽、1米长的通道；0.3米宽机身在中心的真实净空为0.1米。
+    let obstacles:Vec<_>=(16..=36).flat_map(|x| [-0.25,0.25].into_iter().flat_map(move |y|
+        (4..=12).map(move |z| [x as f64*0.05,y,z as f64*0.05]))).collect();
+    let route=[[0.,0.,0.4],[10.,0.,0.4]];
+    let mut owner=MapOwner::new(&cfg).unwrap();owner.seed_occupied(&obstacles,route[0]);
+    owner.update_surface(&obstacles,&[],&[],&[]).unwrap();let map=owner.snapshot();
+    let mut actual=MotionState {position:route[0],velocity:[0.5,0.,0.],planning_velocity:[0.5,0.,0.],
+        timestamp_ns:1_000_000_000,measured_velocity:1,measured_yaw_rate:1,..Default::default()};
+    let curve=ScanPlanner::default().plan(&cfg,&map,&route,&actual,None,0.,None).unwrap();
+    let mut tracker=ScanTracker::default();tracker.install(&curve);
+    let mut sample=actual;let mut previous=[0.5,0.,0.];let mut body_velocity=[0.5_f64,0.];
+    let (mut rejected,mut minimum,mut field_minimum,mut passed)=(0,f64::INFINITY,f64::INFINITY,None);
+    for tick in 0..400 {
+        actual.timestamp_ns=1_000_000_000+tick as i64*50_000_000;
+        if tick%2==0 {sample=actual;}
+        tracker.set_pose_age(std::time::Duration::from_nanos((actual.timestamp_ns-sample.timestamp_ns) as u64));
+        let result=tracker.track_and_check(&cfg,&map,&sample,previous,None).unwrap();
+        if result.no_candidate() {rejected+=1;}
+        let command=result.command;
+        // 独立执行器按原加减速限制响应命令；归零指令不会令真实速度瞬时归零。
+        let dx=command[0]-body_velocity[0];let dy=command[1]-body_velocity[1];let norm=dx.hypot(dy);
+        let gain=if norm>cfg.max_acceleration*cfg.sample_dt {cfg.max_acceleration*cfg.sample_dt/norm} else {1.};
+        body_velocity[0]+=dx*gain;body_velocity[1]+=dy*gain;
+        let w=command[2].clamp(actual.yaw_rate-cfg.max_yaw_acceleration*cfg.sample_dt,actual.yaw_rate+cfg.max_yaw_acceleration*cfg.sample_dt);
+        let (a,b)=if w.abs()>1e-12 {((w*cfg.sample_dt).sin()/w,(1.-(w*cfg.sample_dt).cos())/w)} else {(cfg.sample_dt,0.)};
+        let (sn,cs)=actual.yaw.sin_cos();let x=a*body_velocity[0]-b*body_velocity[1];let y=b*body_velocity[0]+a*body_velocity[1];
+        actual.position[0]+=cs*x-sn*y;actual.position[1]+=sn*x+cs*y;actual.yaw+=w*cfg.sample_dt;
+        actual.velocity=[actual.yaw.cos()*body_velocity[0]-actual.yaw.sin()*body_velocity[1],actual.yaw.sin()*body_velocity[0]+actual.yaw.cos()*body_velocity[1],0.];
+        actual.yaw_rate=w;actual.planning_velocity=actual.velocity;previous=command;
+        // 旋转矩形的轴向外包给出到两段真实墙面的独立保守距离。
+        let half_x=cfg.body_length/2.*actual.yaw.cos().abs()+cfg.body_width/2.*actual.yaw.sin().abs();
+        let half_y=cfg.body_length/2.*actual.yaw.sin().abs()+cfg.body_width/2.*actual.yaw.cos().abs();
+        let xgap=(0.8-actual.position[0]-half_x).max(actual.position[0]-half_x-1.8).max(0.);
+        let ygap=0.25-actual.position[1].abs()-half_y;
+        minimum=minimum.min(if ygap<0. && xgap==0. {ygap} else {xgap.hypot(ygap.max(0.))});
+        field_minimum=field_minimum.min(map.pose_clearance(actual.position,actual.yaw).body_clearance);
+        if actual.position[0]>=2.5 {passed=Some((tick+1) as f64*cfg.sample_dt);break;}
+    }
+    eprintln!("N3贴近障碍闭环 拒绝命令次数={rejected} 最小真实净空={minimum:.9}米 净空场最小={field_minimum:.9}米 通过时间={passed:?}秒 最后位置={:?}",actual.position);
+    assert!(minimum>0.,"独立机身矩形不能穿墙");
+    assert!(passed.is_some(),"原400拍预算内应通过通道");
+}

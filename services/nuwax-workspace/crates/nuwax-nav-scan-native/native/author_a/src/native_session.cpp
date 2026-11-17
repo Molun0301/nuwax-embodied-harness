@@ -254,9 +254,6 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Vector3d sampled_position=Eigen::Map<const Vector3d>(state->position);
     const double sampled_yaw=state->yaw;
     const Vector3d position=Eigen::Map<const Vector3d>(tracking->position);const double yaw=tracking->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
-    // 命令扫掠仍取来源位姿，与跟踪状态分开。
-    const Eigen::Vector2d sampled_command_world(std::cos(sampled_yaw)*previous[0]-std::sin(sampled_yaw)*previous[1],
-        std::sin(sampled_yaw)*previous[0]+std::cos(sampled_yaw)*previous[1]);
     std::pair<double,double> installed_projection;
     if(s.pending){
       const auto projected=s.pending->projectStart(position,std::max(MINIMUM_DEVIATION_M,2.*c->resolution));
@@ -265,7 +262,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       }else{s.pending.reset();out->reason=SCAN_TRACK_REJECTED_TRAJECTORY;}
     }
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
-    const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():sampled_command_world;
+    const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
     s.recovery_context=s.escape.active();
     if(s.escape.hasDecision(state->timestamp_ns)) {
@@ -318,8 +315,8 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
         out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();
         // FINISHED只表示几何曲线走完；仍在运动时按实测边界制动，由运行时统一确认停稳。
         if(!nuwax_scan_motion_stopped(state,c)) {
-          const auto brake=scan_planner::checkAuthorCommand(s.map,*c,sampled_position,sampled_yaw,actual,angular,
-              sampled_command_world,Eigen::Vector2d::Zero(),0.,sampled_position,sampled_yaw,false);
+          const auto brake=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,
+              command_world,Eigen::Vector2d::Zero(),0.,position,yaw,false);
           if(!brake.found){out->reason|=SCAN_TRACK_NO_CANDIDATE;return;}
           out->command[0]=brake.linear.x();out->command[1]=brake.linear.y();out->command[2]=brake.angular;
         }
@@ -352,7 +349,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       }
     }
     // 归档271次停车的滑行P95：≥0.5米/秒为0.105米，0.2—0.3为0.037米，<0.1为0.017米，另需留约0.03米定位抖动。
-    const double clearance=s.map.bodyFieldClearance(sampled_position,sampled_yaw);
+    const double clearance=s.map.bodyFieldClearance(position,yaw);
     double speed_cap=scan_planner::clearanceSpeedCap(*c,clearance);
     if(s.curve&&!std::isfinite(terminal_yaw)) {
       const double horizon=std::max(0.,(scan_planner::deviceSpeedMagnitude(*c)-.10)/c->max_acceleration);
@@ -376,7 +373,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(delta.norm()>step)delta*=step/delta.norm();const auto chosen=(command_world+delta).eval();
     const Eigen::Vector2d preferred(std::clamp(cs*chosen.x()+sn*chosen.y(),-c->max_reverse_velocity,c->max_velocity),std::clamp(-sn*chosen.x()+cs*chosen.y(),-c->max_lateral_velocity,c->max_lateral_velocity));
     const double w=std::clamp(requested_w,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
-    const auto checked=scan_planner::checkAuthorCommand(s.map,*c,sampled_position,sampled_yaw,actual,angular,sampled_command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
+    const auto checked=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
     out->limited=checked.limited;if(!checked.found){out->reason=SCAN_TRACK_NO_CANDIDATE;s.curve.reset();return;}
     out->command[0]=checked.linear.x();out->command[1]=checked.linear.y();out->command[2]=checked.angular;
     if(scan_planner::authorTraceEnabled()){auto trace=scan_planner::authorTraceStream();trace<<"{\"event\":\"track\",\"phase\":"<<out->phase<<",\"remaining\":"<<out->remaining<<",\"reason\":"<<out->reason<<"}\n";}

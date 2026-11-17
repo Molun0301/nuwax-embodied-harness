@@ -959,6 +959,7 @@ impl Session {
     }
     async fn apply_correction(&mut self, event: crate::mapper::CorrectionEvent) {
         self.last_correction = Some(event.clone());
+        if let Some(explorer) = self.explorer.as_mut() { explorer.map_replayed(); }
         let Some(status) = self.state.navigation.as_mut().filter(|status| !terminal(status.status)) else { return };
         let target = status.target.as_ref().unwrap();
         let position = crate::mapper::pose_isometry(target).translation.vector;

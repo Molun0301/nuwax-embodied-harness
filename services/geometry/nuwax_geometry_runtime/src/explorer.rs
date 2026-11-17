@@ -42,6 +42,7 @@ pub(crate) struct ExploreStartConfig {
     pub return_policy: ReturnPolicy,
     pub stop_conditions: ExploreStopConditions,
     pub max_navigation_retries: u32,
+    /// 三维探索到达列标记与途中换目标的半径；二维沿用安全距离语义。
     pub blacklist_radius_m: f64,
 }
 
@@ -94,6 +95,7 @@ pub struct Explorer {
     config: Option<ExploreStartConfig>,
     id: String,
     motion_generation: u64,
+    replay_generation: u64,
     child: Option<Child>,
     /// 本拍因前沿消失而结束的子导航；本拍没有派发新目标时随结果取消。
     vanished_child: Option<String>,
@@ -149,6 +151,7 @@ impl Explorer {
             config: None,
             id: String::new(),
             motion_generation: 0,
+            replay_generation: 0,
             child: None,
             vanished_child: None,
             reached_goals: 0,
@@ -166,6 +169,12 @@ impl Explorer {
     }
 
     pub(crate) fn uses_surface(&self) -> bool { self.surface_config.is_some() }
+
+    /// 只由重放替换地图的事件触发，小校正不会进入这条工作队列消息。
+    pub(crate) fn map_replayed(&mut self, generation: u64) {
+        self.replay_generation = generation;
+        self.controller.clear_after_map_replay();
+    }
 
     pub fn set_map_name(&mut self, name: String) {
         self.map_name = name;
@@ -214,7 +223,7 @@ impl Explorer {
                 .max_coverage_pct
                 .is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
         {
-            return Err(Status::invalid_argument("探索停止条件或黑名单半径无效"));
+            return Err(Status::invalid_argument("探索停止条件或到达标记/途中换目标半径无效"));
         }
         let config = ExploreStartConfig {
             boundary,
@@ -1031,3 +1040,48 @@ pub fn apply_forbidden(
 #[cfg(test)]
 #[path = "explorer_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+pub(crate) mod replay_tests {
+    use super::*;
+
+    pub(crate) fn fixture(reached: bool) -> Explorer {
+        let (mut explorer, surface) = tests::vanishing_fixture();
+        let tick = explorer.tick(Some(tests::vanishing_pose()), None, Ok(surface), Ok(())).unwrap();
+        let (goal_id, _) = tick.goal.expect("规则夹具必须实际派发目标");
+        explorer.navigation_feedback(&proto::NavigationStatus {
+            goal_id,
+            status: if reached { proto::GoalStatus::Succeeded as i32 } else { proto::GoalStatus::Failed as i32 },
+            message: "可计数的测试导航反馈".into(),
+            ..Default::default()
+        }).unwrap();
+        explorer
+    }
+
+    pub(crate) fn source_payload(progress: &proto::ExplorationProgress) -> serde_json::Value {
+        let saved: Progress = serde_json::from_str(&progress.progress_json).unwrap();
+        serde_json::from_str(&saved.sources.iter().find(|s| s.name == "surface").unwrap().payload).unwrap()
+    }
+
+    #[test]
+    fn pose_updates_preserve_history_and_replay_clears_both_kinds() {
+        for reached in [false, true] {
+            let mut explorer = fixture(reached);
+            let before = source_payload(&explorer.progress().unwrap());
+            let part = if reached { 1 } else { 2 };
+            assert!(!before[part].as_array().unwrap().is_empty());
+            // 小校正只更新位姿与变换，不发送重放消息；已有记录应保留。
+            let mut pose = tests::vanishing_pose();
+            pose.position.as_mut().unwrap().x += 0.01;
+            let surface = explorer.surface_input.snapshot().unwrap().unwrap();
+            explorer.tick(Some(pose), None, Ok(surface), Ok(())).unwrap();
+            assert_eq!(source_payload(&explorer.progress().unwrap()), before);
+            let child = explorer.child.as_ref().map(|child| child.id.clone());
+            explorer.map_replayed(1);
+            let after = source_payload(&explorer.progress().unwrap());
+            assert!(after[1].as_array().unwrap().is_empty() && after[2].as_array().unwrap().is_empty());
+            assert_eq!(explorer.replay_generation, 1);
+            assert_eq!(explorer.child.as_ref().map(|child| child.id.clone()), child);
+        }
+    }
+}

@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
-use nuwax_nav_mls_planner::SurfaceSnapshot;
+use nuwax_nav_mls_planner::{SurfaceSnapshot, SurfaceFrontierClusterRef};
+use std::collections::{BTreeMap, BTreeSet};
 use nuwax_nav_stack::surface_oriented::PctPlanner;
 use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped};
 use nuwax_nav_types_messages::visual::FrontierGoal;
@@ -165,12 +166,12 @@ impl SurfacePollDelta {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GoalHistory {
-    support_xyz: [f64; 3],
-    vertical_radius_m: f64,
-    reached: bool,
+struct FrontierFailure {
+    cells: BTreeSet<[i32; 3]>,
     failures: u64,
     reintroduced: bool,
+    #[serde(skip)]
+    cluster: Option<SurfaceFrontierClusterRef>,
 }
 
 struct SelectedGoal {
@@ -179,15 +180,10 @@ struct SelectedGoal {
     vertical_radius_m: f64,
     /// 选出该目标的几何前沿格。
     frontier_cell: [i32; 3],
+    frontier_cells: Arc<Vec<[i32; 3]>>,
+    cluster: Option<SurfaceFrontierClusterRef>,
     /// 最近一次核对前沿所用的表面快照。
     checked: Weak<SurfaceSnapshot>,
-}
-
-impl GoalHistory {
-    fn contains(&self, point: [f64; 3], radius: f64, vertical_radius: f64) -> bool {
-        (self.support_xyz[2] - point[2]).abs() <= self.vertical_radius_m.min(vertical_radius) + 1e-9
-            && distance(self.support_xyz, point) <= radius
-    }
 }
 
 /// 由同一可通行表面查询前沿，导航仍由原探索控制器统一派发。
@@ -205,7 +201,9 @@ pub struct SurfaceGoalSourceAdapter {
     next_goal_id: u64,
     deferred_route: Option<DeferredFrontierRoute>,
     selected: Option<SelectedGoal>,
-    history: Vec<GoalHistory>,
+    reached_columns: BTreeSet<[i32; 3]>,
+    failures: Vec<FrontierFailure>,
+    excluded_count: usize,
     last_snapshot: Option<Weak<SurfaceSnapshot>>,
     last_notification: Option<u64>,
     last_query_body: Option<[f64; 3]>,
@@ -247,7 +245,9 @@ impl SurfaceGoalSourceAdapter {
             next_goal_id: 0,
             deferred_route: None,
             selected: None,
-            history: Vec::new(),
+            reached_columns: BTreeSet::new(),
+            failures: Vec::new(),
+            excluded_count: 0,
             last_snapshot: None,
             last_notification: None,
             last_query_body: None,
@@ -276,7 +276,7 @@ impl SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    /// 边界在候选搜索前生效；历史需同时满足三维距离和可跨台阶的局部高度范围。
+    /// 边界在候选搜索前生效；半径用于到达列标记和途中换目标，失败记录按簇前沿格生效。
     pub fn configure_constraints(
         &mut self,
         boundary: Option<ExplorationBoundary>,
@@ -285,7 +285,7 @@ impl SurfaceGoalSourceAdapter {
     ) -> ExploreResult<()> {
         if !blacklist_radius_m.is_finite() || blacklist_radius_m < 0.0 {
             return Err(ExploreError::SourceError(
-                "surface blacklist radius must be finite and nonnegative".into(),
+                "到达标记与途中换目标半径必须有限且非负".into(),
             ));
         }
         self.deferred_route = None;
@@ -307,6 +307,7 @@ impl SurfaceGoalSourceAdapter {
             self.last_frontiers.clear();
             return Ok(ExplorationPoll::SourceUnavailable(reason));
         }
+        self.sync_frontier_records()?;
         if self.selected.is_some() { return Ok(ExplorationPoll::Pending); }
         let input = self.receiver.freeze()?;
         let mut delta = SurfacePollDelta::default();
@@ -398,7 +399,7 @@ impl SurfaceGoalSourceAdapter {
         if !selecting && self.retry_support.is_none() {
             return Ok(ExplorationPoll::Pending);
         }
-        let geometry = frontier_geometry(snapshot, &boundary)
+        let geometry = frontier_geometry(snapshot, &boundary, &self.reached_columns)
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let mut candidates = geometry.candidates;
         let observation_targets = geometry.targets;
@@ -421,7 +422,7 @@ impl SurfaceGoalSourceAdapter {
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
         delta.last_query_orientation = Some(Some(quaternion));
         delta.last_frontiers = Some(Vec::new());
-        // 默认3米策略半径不能跨越另一楼层；高度只覆盖局部可跨台阶及量化差。
+        // 途中换目标的高度范围沿用局部可跨台阶高度及量化差。
         let vertical_radius =
             f64::from(snapshot.config().step_threshold_m) + f64::from(snapshot.config().voxel_size);
         // 状态里的前沿数是当前达到最小尺寸的簇数。
@@ -438,7 +439,6 @@ impl SurfaceGoalSourceAdapter {
             &observation_targets,
             current_body,
             robot_support,
-            vertical_radius,
             selecting,
             deferred.map_or_else(Default::default, |route| route.examined.clone()),
         )?;
@@ -531,7 +531,7 @@ impl SurfaceGoalSourceAdapter {
             view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, &observation_targets)
                 .map_err(ExploreError::SourceError)?);
         }
-        if self.excluded(candidate.support_xyz, vertical_radius)
+        if self.excluded(candidate.frontier_cell)
             || view.as_ref().is_some_and(|view| view.cells.is_empty()) {
             delta.deferred_route = Some(Some(continuation));
             delta.last_no_frontier = Some(false);
@@ -561,7 +561,8 @@ impl SurfaceGoalSourceAdapter {
             candidates=geometric_candidate_count, targets=observation_targets.len(),
             source_searches=stats.source_searches, expanded=stats.source_expanded,
             "完整前沿评估阶段耗时");
-        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,source_snapshot,delta))
+        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,candidate.frontier_cell,
+            Arc::clone(&geometry.cells[&candidate.cluster]),source_snapshot,delta))
     }
 
     /// 从当前位置一次按需展开的单源搜索，候选按端点绑定规则（支撑点±10格内最近的有效地面层）绑定到节点，
@@ -580,7 +581,6 @@ impl SurfaceGoalSourceAdapter {
         observation_targets: &[nuwax_explore_routing::observation::ObservationTarget],
         current_body: BodyPose,
         robot_support: [f64; 3],
-        vertical_radius: f64,
         selecting: bool,
         mut examined: std::collections::BTreeSet<[i32; 3]>,
     ) -> ExploreResult<Discovery> {
@@ -593,7 +593,7 @@ impl SurfaceGoalSourceAdapter {
         // 历史排除与离当前位置过近在搜索前确定；旧图只允许重试原视点；
         // 续处理时上一批已检查的候选不再参与。
         candidates.retain(|candidate| {
-            !self.excluded(candidate.support_xyz, vertical_radius)
+            !self.excluded(candidate.frontier_cell)
                 && distance(robot_support, candidate.support_xyz) > minimum_distance
                 && (selecting || retry_matches(candidate.support_xyz))
                 && !examined.contains(&candidate.frontier_cell)
@@ -731,7 +731,7 @@ impl SurfaceGoalSourceAdapter {
             candidate.support_xyz = snapshot
                 .support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-            if self.excluded(candidate.support_xyz, vertical_radius) {
+            if self.excluded(candidate.frontier_cell) {
                 continue;
             }
             candidate.travel_cost = settled.route.cost;
@@ -825,6 +825,7 @@ impl SurfaceGoalSourceAdapter {
         support_xyz: [f64; 3],
         vertical_radius_m: f64,
         frontier_cell: [i32; 3],
+        frontier_cells: Arc<Vec<[i32; 3]>>,
         snapshot: &Arc<SurfaceSnapshot>,
         delta: &mut SurfacePollDelta,
     ) -> ExplorationPoll {
@@ -834,6 +835,8 @@ impl SurfaceGoalSourceAdapter {
             support_xyz,
             vertical_radius_m,
             frontier_cell,
+            frontier_cells,
+            cluster: Some(snapshot.frontier_cluster_ref(frontier_cell, &self.boundary_vertices()).expect("候选属于物理前沿簇")),
             checked: Arc::downgrade(snapshot),
         }));
         delta.last_no_frontier = Some(false);
@@ -841,65 +844,86 @@ impl SurfaceGoalSourceAdapter {
         ExplorationPoll::Goal(goal)
     }
 
-    fn excluded(&self, point: [f64; 3], vertical_radius: f64) -> bool {
-        self.history.iter().any(|history| {
-            history.contains(point, self.blacklist_radius_m, vertical_radius)
-                && (history.reached || history.failures > u64::from(self.max_navigation_retries))
-        })
+    fn boundary_vertices(&self) -> Vec<[f64; 2]> {
+        self.boundary.as_ref().map_or_else(Vec::new, |boundary|
+            boundary.vertices().iter().map(|point| [point.x, point.y]).collect())
+    }
+
+    fn excluded(&self, cell: [i32; 3]) -> bool {
+        self.failures.iter().any(|entry| entry.failures > u64::from(self.max_navigation_retries)
+            && entry.cells.contains(&cell))
+    }
+
+    /// 物理簇拆散或重连即清除失败记录；恢复进度的记录首次查询时绑定当前簇。
+    fn sync_frontier_records(&mut self) -> ExploreResult<()> {
+        let Some(snapshot) = self.receiver.snapshot()? else { return Ok(()); };
+        let boundary = self.boundary_vertices();
+        self.failures.retain_mut(|entry| {
+            let current = entry.cells.iter().next().and_then(|&cell| snapshot.frontier_cluster_ref(cell, &boundary));
+            match &entry.cluster {
+                Some(previous) => current.as_ref() == Some(previous),
+                None => { entry.cluster = current; entry.cluster.is_some() }
+            }
+        });
+        self.excluded_count = if self.failures.iter().any(|entry| entry.failures > u64::from(self.max_navigation_retries)) {
+            snapshot.frontier_clusters_with_reached(&boundary, &self.reached_columns)
+                .map_err(|error| ExploreError::SourceError(error.to_string()))?
+                .iter().filter(|cluster| cluster.frontiers.iter().all(|frontier|
+                    self.excluded([frontier.cell.0, frontier.cell.1, frontier.cell.2]))).count()
+        } else { 0 };
+        Ok(())
     }
 
     fn reintroduce_failed_frontiers(&mut self) -> bool {
         let mut restored = false;
-        for entry in &mut self.history {
-            if !entry.reached && !entry.reintroduced
-                && entry.failures > u64::from(self.max_navigation_retries)
-            {
+        for entry in &mut self.failures {
+            if !entry.reintroduced && entry.failures > u64::from(self.max_navigation_retries) {
                 entry.failures = 0;
                 entry.reintroduced = true;
                 restored = true;
             }
         }
         if restored {
+            self.excluded_count = 0;
             self.last_no_frontier = false;
             self.last_snapshot = None;
         }
         restored
     }
 
-    fn record_feedback(&mut self, point: [f64; 3], vertical_radius: f64, reached: bool) -> u64 {
-        let index = self
-            .history
-            .iter()
-            .position(|entry| entry.contains(point, self.blacklist_radius_m, vertical_radius));
-        let entry = if let Some(index) = index {
-            &mut self.history[index]
-        } else {
-            self.history.push(GoalHistory {
-                support_xyz: point,
-                vertical_radius_m: vertical_radius,
-                reached: false,
-                failures: 0,
-                reintroduced: false,
-            });
-            self.history.last_mut().expect("history was just inserted")
-        };
-        entry.vertical_radius_m = entry.vertical_radius_m.min(vertical_radius);
-        if reached {
-            entry.reached = true;
-            entry.failures = 0;
-        } else {
-            entry.failures = entry.failures.saturating_add(1);
+    fn record_reached(&mut self, selected: &SelectedGoal) -> ExploreResult<()> {
+        if let Some(snapshot) = self.receiver.snapshot()? {
+            let columns = snapshot.reached_frontier_columns(&selected.frontier_cells,
+                selected.support_xyz, self.blacklist_radius_m, &self.boundary_vertices());
+            self.reached_columns.extend(columns);
         }
+        self.failures.retain(|entry| !entry.cells.contains(&selected.frontier_cell));
+        Ok(())
+    }
+
+    fn record_failure(&mut self, selected: &SelectedGoal) -> u64 {
+        let index = self.failures.iter().position(|entry| entry.cells.contains(&selected.frontier_cell));
+        let entry = if let Some(index) = index {
+            &mut self.failures[index]
+        } else {
+            self.failures.push(FrontierFailure {
+                cells: selected.frontier_cells.iter().copied().collect(), failures: 0,
+                reintroduced: false, cluster: selected.cluster.clone(),
+            });
+            self.failures.last_mut().expect("刚写入失败记录")
+        };
+        entry.failures = entry.failures.saturating_add(1);
         entry.failures
     }
+
 }
 
 impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     fn checkpoint(&self) -> ExploreResult<String> {
-        if self.history.len() > 65536 {
+        if self.failures.len() > 65536 {
             return Err(ExploreError::SourceError("三维探索历史超过持久容量".into()));
         }
-        serde_json::to_string(&(2_u32, &self.history))
+        serde_json::to_string(&(3_u32, &self.reached_columns, &self.failures))
             .map_err(|e| ExploreError::SourceError(e.to_string()))
     }
     fn restore_checkpoint(&mut self, payload: &str) -> ExploreResult<()> {
@@ -908,24 +932,14 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 "三维探索恢复时已有目标或载荷过大".into(),
             ));
         }
-        let (version, history): (u32, Vec<GoalHistory>) =
+        let (version, reached_columns, failures): (u32, BTreeSet<[i32; 3]>, Vec<FrontierFailure>) =
             serde_json::from_str(payload).map_err(|e| ExploreError::SourceError(e.to_string()))?;
-        if version != 2
-            || history.len() > 65536
-            || history.iter().any(|h| {
-                h.support_xyz
-                    .iter()
-                    .any(|v| !v.is_finite() || v.abs() > 1e9)
-                    || !h.vertical_radius_m.is_finite()
-                    || !(0.0..=1e6).contains(&h.vertical_radius_m)
-            })
-        {
-            return Err(ExploreError::SourceError(
-                "三维探索进度无效或版本不支持".into(),
-            ));
+        if version != 3 || failures.len() > 65536 {
+            return Err(ExploreError::SourceError("三维探索进度无效或版本不支持".into()));
         }
         self.deferred_route = None;
-        self.history = history;
+        self.reached_columns = reached_columns;
+        self.failures = failures;
         self.last_snapshot = None;
         self.last_notification = None;
         self.retry_support = None;
@@ -940,7 +954,9 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.deferred_route = None;
         self.active = true;
         self.selected = None;
-        self.history.clear();
+        self.reached_columns.clear();
+        self.failures.clear();
+        self.excluded_count = 0;
         self.last_snapshot = None;
         self.last_notification = None;
         self.last_query_body = None;
@@ -994,21 +1010,25 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
                 self.last_error = Some(format!("等待导航输入恢复：{reason}"));
             }
             ExplorationGoalFeedback::Reached => {
-                self.record_feedback(selected.support_xyz, selected.vertical_radius_m, true);
+                if selected.cluster.is_some() { self.record_reached(&selected)?; }
                 self.last_error = None;
             }
             ExplorationGoalFeedback::Failed(reason) => {
-                let failures =
-                    self.record_feedback(selected.support_xyz, selected.vertical_radius_m, false);
-                if failures <= u64::from(self.max_navigation_retries) {
-                    self.retry_support = Some(selected.support_xyz);
+                if selected.cluster.is_some() {
+                    let failures = self.record_failure(&selected);
+                    if failures <= u64::from(self.max_navigation_retries) {
+                        self.retry_support = Some(selected.support_xyz);
+                    }
+                    self.last_error = Some(format!("三维导航失败（{failures}次）：{reason}"));
+                } else {
+                    self.last_error = Some(reason);
                 }
-                self.last_error = Some(format!("surface navigation failed ({failures}): {reason}"));
             }
             ExplorationGoalFeedback::Cancelled => {
                 self.last_error = Some("surface navigation goal cancelled".into());
             }
         }
+        self.sync_frontier_records()?;
         self.last_frontiers.clear();
         Ok(())
     }
@@ -1016,12 +1036,14 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     /// 子目标执行期间每张新表面快照核对一次所选簇是否还在：所选前沿格周围水平黑名单半径、竖直该候选高度范围以内
     /// 已没有达到最小尺寸的簇的前沿格时（簇已不存在或缩到最小尺寸以下）返回真；还有就继续走原目标。
     fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
+        self.sync_frontier_records()?;
         let Some(snapshot) = self.receiver.snapshot()? else {
             return Ok(false);
         };
         let Some(selected) = self.selected.as_mut().filter(|selected| selected.goal.id == goal_id) else {
             return Ok(false);
         };
+        if selected.cluster.is_none() { return Ok(false); }
         if Weak::ptr_eq(&selected.checked, &Arc::downgrade(&snapshot)) {
             return Ok(false);
         }
@@ -1030,9 +1052,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         let boundary: Vec<_> = self.boundary.as_ref().map_or_else(Vec::new, |boundary| {
             boundary.vertices().iter().map(|point| [point.x, point.y]).collect()
         });
-        let near = snapshot
-            .frontier_near(cell, self.blacklist_radius_m, vertical_radius, &boundary)
-            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        let near = snapshot.frontier_near_with_reached(cell, self.blacklist_radius_m, vertical_radius,
+            &boundary, &self.reached_columns).map_err(|error| ExploreError::SourceError(error.to_string()))?;
         Ok(!near)
     }
 
@@ -1043,9 +1064,17 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
     /// 最近一次选点时达到最小尺寸的前沿簇数。
     fn frontier_count(&self) -> usize { self.frontier_count }
 
-    fn excluded_frontiers(&self) -> usize {
-        self.history.iter().filter(|entry| !entry.reached
-            && entry.failures > u64::from(self.max_navigation_retries)).count()
+    fn excluded_frontiers(&self) -> usize { self.excluded_count }
+
+    fn clear_after_map_replay(&mut self) {
+        self.reached_columns.clear();
+        self.failures.clear();
+        self.excluded_count = 0;
+        self.retry_support = None;
+        self.deferred_route = None;
+        self.last_snapshot = None;
+        self.last_no_frontier = false;
+        if let Some(selected) = self.selected.as_mut() { selected.cluster = None; }
     }
 
     fn diagnostics(&self) -> ExplorationSourceDiagnostics {
@@ -1102,6 +1131,7 @@ struct FrontierGeometry {
     /// 达到最小尺寸的簇：簇号 → 簇平面跨度（米）。
     spans: std::collections::BTreeMap<u32, f64>,
     targets: Vec<nuwax_explore_routing::observation::ObservationTarget>,
+    cells: BTreeMap<u32, Arc<Vec<[i32; 3]>>>,
 }
 
 /// 候选支撑点高度取所在原生格最接近的实测地面。
@@ -1124,14 +1154,17 @@ fn snap_support_heights(search: &nuwax_nav_pct_native::MultiGoalSearch<'_>, cand
 fn frontier_geometry(
     snapshot: &SurfaceSnapshot,
     boundary: &[[f64; 2]],
+    reached: &BTreeSet<[i32; 3]>,
 ) -> Result<FrontierGeometry, nuwax_nav_mls_planner::SurfaceError> {
     use std::collections::BTreeMap;
     let size = f64::from(snapshot.config().voxel_size);
     let key = |point: [f64; 3]| point.map(|value| (value / size).floor() as i32);
     let mut candidates = BTreeMap::new();
     let mut spans = BTreeMap::new();
+    let mut cells = BTreeMap::new();
     // 候选只取达到最小尺寸的簇的格，收益取簇收益。
-    for cluster in snapshot.frontier_clusters(boundary)? {
+    for cluster in snapshot.frontier_clusters_with_reached(boundary, reached)? {
+        cells.insert(cluster.id, Arc::new(cluster.frontiers.iter().map(|f| [f.cell.0, f.cell.1, f.cell.2]).collect()));
         spans.insert(cluster.id, cluster.span_m);
         for frontier in cluster.frontiers {
             candidates.insert(
@@ -1147,7 +1180,7 @@ fn frontier_geometry(
         }
     }
     let targets: BTreeMap<_, _> = snapshot
-        .observation_targets(boundary)?
+        .observation_targets_with_reached(boundary, reached)?
         .into_iter()
         .map(|target| (target.cell, target))
         .collect();
@@ -1156,6 +1189,7 @@ fn frontier_geometry(
         candidates: candidates.into_values().collect(),
         spans,
         targets: targets.into_values().collect(),
+        cells,
     })
 }
 
@@ -1292,12 +1326,13 @@ mod tests {
 
     #[test]
     fn exhausted_surface_history_is_reintroduced_once_before_no_frontier() {
+        let unchanged = map();
         let receiver = SurfaceInputReceiver::new();
-        receiver.observe(map()).unwrap();
+        receiver.observe(Arc::clone(&unchanged)).unwrap();
         let mut source = source(receiver.clone(), 0);
         source.configure_constraints(None, 0, 10.0).unwrap();
         for round in 0..2 {
-            receiver.observe(map()).unwrap();
+            receiver.observe(Arc::clone(&unchanged)).unwrap();
             let mut outcome = source.poll_goal(&state(0.4, round + 1)).unwrap();
             for _ in 0..16 {
                 if outcome != ExplorationPoll::Pending { break; }
@@ -1306,16 +1341,16 @@ mod tests {
             let selected = goal(outcome);
             source.report_goal_feedback(&selected.id, ExplorationGoalFeedback::Failed("无法到达".into())).unwrap();
         }
-        receiver.observe(map()).unwrap();
+        receiver.observe(Arc::clone(&unchanged)).unwrap();
         let mut outcome = source.poll_goal(&state(0.4, 3)).unwrap();
         for _ in 0..16 {
             if outcome != ExplorationPoll::Pending { break; }
             outcome = source.poll_goal(&state(0.4, 3)).unwrap();
         }
         assert_eq!(outcome, ExplorationPoll::NoFrontier);
-        assert!(source.history[0].reintroduced);
-        assert_eq!(source.history[0].failures, 1);
-        source.record_feedback([1.0, 1.0, 0.05], 0.3, true);
+        assert!(source.failures[0].reintroduced);
+        assert_eq!(source.failures[0].failures, 1);
+        source.failures.clear();
         assert!(!source.reintroduce_failed_frontiers());
     }
 
@@ -1456,21 +1491,17 @@ mod tests {
             let body = snapshot.body_position_from_support(p, q, 0.3).unwrap();
             if snapshot.validate_body_pose(body, q).is_ok() {
                 radial_valid += 1;
-                adapter.history.push(GoalHistory {
-                    support_xyz: p,
-                    vertical_radius_m: 0.3,
-                    reached: true,
-                    failures: 0,
-                    reintroduced: false,
-                });
+                adapter.reached_columns.extend(snapshot.reached_frontier_columns(
+                    &[[frontier.cell.0, frontier.cell.1, frontier.cell.2]], p, 0.01, &[]));
             }
         }
         let excluded = frontiers
             .iter()
-            .filter(|f| adapter.excluded(f.support_xyz, 0.3))
+            .filter(|f| !snapshot.frontier_clusters_with_reached(&[], &adapter.reached_columns).unwrap()
+                .iter().flat_map(|c| &c.frontiers).any(|candidate| candidate.cell == f.cell))
             .count();
         eprintln!("original_long_body_fixture frontier_count={} radial_valid_count={} history_count={} excluded_count={}",
-            frontiers.len(), radial_valid, adapter.history.len(), excluded);
+            frontiers.len(), radial_valid, adapter.reached_columns.len(), excluded);
         assert!(!frontiers.is_empty());
         assert_eq!(radial_valid, frontiers.len());
         assert_eq!(excluded, frontiers.len());
@@ -1561,13 +1592,8 @@ mod tests {
             let q = snapshot.body_orientation_at(p, yaw).unwrap();
             let body = snapshot.body_position_from_support(p, q, 0.3).unwrap();
             if snapshot.validate_body_pose(body, q).is_ok() {
-                adapter.history.push(GoalHistory {
-                    support_xyz: p,
-                    vertical_radius_m: 0.3,
-                    reached: true,
-                    failures: 0,
-                    reintroduced: false,
-                });
+                adapter.reached_columns.extend(snapshot.reached_frontier_columns(
+                    &[[frontier.cell.0, frontier.cell.1, frontier.cell.2]], p, 0.01, &[]));
             } else {
                 radial_collisions += 1;
             }
@@ -1578,16 +1604,19 @@ mod tests {
         );
         let excluded = frontiers
             .iter()
-            .filter(|f| adapter.excluded(f.support_xyz, 0.3))
+            .filter(|f| !snapshot.frontier_clusters_with_reached(&[], &adapter.reached_columns).unwrap()
+                .iter().flat_map(|c| &c.frontiers).any(|candidate| candidate.cell == f.cell))
             .count();
         assert!(
             excluded < frontiers.len(),
             "visited history must leave collision-blocked radial candidates"
         );
         eprintln!("occupied_ring_fixture calibrated={calibrated} frontier_count={} radial_clear_history={} radial_collisions={radial_collisions} excluded_count={excluded}",
-            frontiers.len(), adapter.history.len());
+            frontiers.len(), adapter.reached_columns.len());
+        let mut orientation_adapter = self::source(adapter.receiver.clone(), 1);
+        orientation_adapter.configure_constraints(None, 1, 0.01).unwrap();
         if calibrated {
-            adapter
+            orientation_adapter
                 .set_observation_model(nuwax_nav_types_messages::ObservationModel {
                     kind: nuwax_nav_types_messages::ObservationKind::Volume,
                     min_range_m: 0.05,
@@ -1601,13 +1630,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        let selected = goal(adapter.poll_goal(&current).unwrap());
+        let selected = goal(orientation_adapter.poll_goal(&current).unwrap());
         let p = selected.pose.pose.position;
         let q = selected.pose.pose.orientation;
         snapshot
             .validate_body_pose([p.x, p.y, p.z], [q.x, q.y, q.z, q.w])
             .unwrap();
-        // 新PCT可选择其它已知可行候选；最终长机体姿态仍须在真实占据下可停留。
+        assert_eq!(adapter.poll_goal(&current).unwrap(), ExplorationPoll::NoFrontier,
+            "到达列覆盖开口后剩余带状格无达标开口，不能继续派发旧视点");
+        // 最终长机体姿态仍须在同一真实占据下可停留。
         if calibrated {
             assert!(selected.information_gain.unwrap() > 0.0);
         }
@@ -1643,28 +1674,16 @@ mod tests {
         });
         assert!(candidates.len() > 64);
         for candidate in candidates.iter().take(64) {
-            adapter.history.push(GoalHistory {
-                // 反馈保存本夹具的真实测量高度0.05米，不能继续写旧粗格顶0.10米。
-                support_xyz: [candidate.support_xyz[0],candidate.support_xyz[1],f64::from(0.05_f32)],
-                vertical_radius_m: 0.3,
-                reached: true,
-                failures: 0,
-                reintroduced: false,
-            });
+            adapter.reached_columns.extend(snapshot.reached_frontier_columns(
+                &[[candidate.cell.0, candidate.cell.1, candidate.cell.2]], candidate.support_xyz, 0.001, &[]));
         }
         let selected = goal(adapter.poll_goal(&state(0.4, 1)).unwrap());
         assert!(selected.information_gain.unwrap() > 0.0);
-        assert!(candidates
-            .iter()
-            .take(64)
-            .all(|c| (c.support_xyz[0] - selected.pose.pose.position.x)
-                .hypot(c.support_xyz[1] - selected.pose.pose.position.y)
-                > 0.001),
-            "已选目标={:?}，此前候选={:?}", selected.pose.pose.position,
-            candidates.iter().take(64).filter(|c|
-                (c.support_xyz[0]-selected.pose.pose.position.x).hypot(
-                    c.support_xyz[1]-selected.pose.pose.position.y)<=0.001)
-                .map(|c|c.support_xyz).collect::<Vec<_>>());
+        let p = selected.pose.pose.position;
+        let cell = [(p.x / 0.1).floor() as i32, (p.y / 0.1).floor() as i32, 0];
+        let columns = snapshot.reached_frontier_columns(&[cell], [p.x, p.y, 0.1], 0.2, &[]);
+        assert!(columns.iter().any(|cell| !adapter.reached_columns.contains(cell)),
+            "到达列之外还有未知收益；同一视点可观察其它列");
     }
 
     #[test]
@@ -1680,7 +1699,7 @@ mod tests {
                 ExplorationGoalFeedback::InputUnavailable("位姿过期，已停车".into()),
             )
             .unwrap();
-        assert!(source.history.is_empty());
+        assert!(source.failures.is_empty() && source.reached_columns.is_empty());
         assert_eq!(
             source.poll_goal(&state(0.4, 2)).unwrap(),
             ExplorationPoll::Pending
@@ -1883,14 +1902,8 @@ mod tests {
         receiver.replace(Some(map())).unwrap();
         let another_lower = goal(source.poll_goal(&state(0.4, 4)).unwrap());
         assert!((another_lower.pose.pose.position.z - 0.35).abs() < 1e-6);
-        assert!(
-            another_lower
-                .pose
-                .pose
-                .position
-                .distance(lower.pose.pose.position)
-                > 0.3
-        );
+        assert_eq!(another_lower.pose.pose.position, lower.pose.pose.position,
+            "全量重建后的旧失败记录失效；上层到达列不影响下层同坐标视点");
     }
 
     pub(super) fn far_connected_floors() -> Arc<SurfaceSnapshot> {
@@ -1924,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn default_three_meter_history_radius_does_not_merge_floors_2_7m_apart() {
+    fn three_meter_reached_radius_and_failures_follow_the_selected_cluster() {
         let surface = far_connected_floors();
         assert!(surface
             .navigation_measured_points()
@@ -1943,32 +1956,40 @@ mod tests {
             lower_state.robot_pose.pose.position.x = 0.85;
             lower_state.robot_pose.pose.position.y = 0.85;
             let lower = goal(source.poll_goal(&lower_state).unwrap());
+            let cells = source.selected.as_ref().unwrap().frontier_cells.clone();
+            assert!(cells.iter().any(|cell| cell[2] >= 27), "缓坡把两层前沿接成同一簇");
+            let expected_columns = surface.reached_frontier_columns(&cells,
+                source.selected.as_ref().unwrap().support_xyz, 3.0, &[]);
+            let reached = feedback == ExplorationGoalFeedback::Reached;
             source.report_goal_feedback(&lower.id, feedback).unwrap();
+            if reached {
+                assert_eq!(source.reached_columns, expected_columns);
+                assert_eq!(source.excluded_frontiers(), 0);
+            } else {
+                assert_eq!(source.failures[0].cells, cells.iter().copied().collect());
+            }
             receiver.replace(Some(far_connected_floors())).unwrap();
             let mut upper_state = lower_state.clone();
             upper_state.robot_pose.pose.position.z = 3.1;
             upper_state.now = Timestamp::from_unix(2, 0);
             let upper = goal(source.poll_goal(&upper_state).unwrap());
             assert!((upper.pose.pose.position.z - lower.pose.pose.position.z - 2.7).abs() < 1e-5);
-            assert!(
-                upper
-                    .pose
-                    .pose
-                    .position
-                    .to_2d()
-                    .distance(lower.pose.pose.position.to_2d())
-                    < 1e-5,
-                "3米历史半径不能排除相差2.7米且同XY的另一层前沿：lower={:?}, upper={:?}",
-                lower.pose.pose.position,
-                upper.pose.pose.position
-            );
+            let clean_receiver = SurfaceInputReceiver::new();
+            clean_receiver.observe(far_connected_floors()).unwrap();
+            let mut clean = self::source(clean_receiver, 0);
+            clean.configure_constraints(None, 0, 3.0).unwrap();
+            if reached { clean.reached_columns = source.reached_columns.clone(); }
+            let expected = goal(clean.poll_goal(&upper_state).unwrap());
+            assert_eq!(upper.pose.pose.position, expected.pose.pose.position,
+                "同簇相距3米内的列按规则标记；重建后失败记录失效，不另加楼层排除条件");
         }
     }
 
     #[test]
     fn retry_budget_and_cancellation_have_distinct_feedback_semantics() {
         let receiver = SurfaceInputReceiver::new();
-        receiver.replace(Some(map())).unwrap();
+        let snapshot = map();
+        receiver.observe(snapshot.clone()).unwrap();
         let mut source = source(receiver.clone(), 1);
         let first = goal(source.poll_goal(&state(0.4, 1)).unwrap());
         source
@@ -1984,7 +2005,7 @@ mod tests {
             source.poll_goal(&state(0.4, 3)).unwrap(),
             ExplorationPoll::Pending
         );
-        receiver.replace(Some(map())).unwrap();
+        receiver.observe(snapshot.clone()).unwrap();
         let after_cancel = goal(source.poll_goal(&state(0.4, 4)).unwrap());
         assert_eq!(
             first.pose.pose.position, after_cancel.pose.pose.position,
@@ -2000,16 +2021,11 @@ mod tests {
             source.poll_goal(&state(0.4, 5)).unwrap(),
             ExplorationPoll::Pending
         );
-        receiver.replace(Some(map())).unwrap();
+        receiver.observe(snapshot.clone()).unwrap();
         let alternative = goal(source.poll_goal(&state(0.4, 6)).unwrap());
-        assert!(
-            alternative
-                .pose
-                .pose
-                .position
-                .distance(first.pose.pose.position)
-                > 0.3
-        );
+        assert_eq!(alternative.pose.pose.position, first.pose.pose.position,
+            "失败记录按整个簇排除；无前沿前放回一次允许重新尝试该簇");
+        assert!(source.failures[0].reintroduced);
         source.end().unwrap();
         source.begin().unwrap();
         let fresh_session = goal(source.poll_goal(&state(0.4, 1)).unwrap());

@@ -213,123 +213,136 @@ impl Corrector {
         last_pose: Option<Isometry3<f64>>,
         seed: Option<proto::PlanarSeed>,
     ) -> Result<proto::RelocalizationResult, tonic::Status> {
-        let backend = mapper.correction_backend();
-        if matches!(backend, "library_pgo" | "native_pgo") {
-            return Err(tonic::Status::failed_precondition(
-                "当前配置使用回环校正，不能执行重定位",
-            ));
-        }
-        let target = mapper
-            .surface_map()
-            .await
-            .map_err(tonic::Status::unavailable)?;
-        let initial = mapper.map_from_odom();
-        let cached = cache.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let Some(target) = target else {
-                return Ok((failed("已加载地图没有可匹配的点云", 0), None, cached));
-            };
-            if frames.is_empty() {
-                return Ok((failed("最近两秒没有可用雷达帧", 0), None, cached));
+        let mut attempts = Vec::new();
+        let result: Result<proto::RelocalizationResult, tonic::Status> = async {
+            let backend = mapper.correction_backend();
+            if matches!(backend, "library_pgo" | "native_pgo") {
+                return Err(tonic::Status::failed_precondition(
+                    "当前配置使用回环校正，不能执行重定位",
+                ));
             }
-            let target_cache = match cached {
-                Some(cache) => cache,
-                None => {
-                    let mut receiver = nuwax_map_chunks::Receiver::new(target.repository.clone());
-                    let mut target_points = Vec::new();
-                    let size = f64::from(target.manifest().voxel_size_m);
-                    for reference in &target.manifest().blocks {
-                        let block = receiver.block(reference)?;
-                        if (target_points.len() + block.len()) * std::mem::size_of::<Point3<f64>>()
-                            > 120 * 1024 * 1024
-                        {
-                            return Err("重定位目标点云超过原120MiB预算".into());
-                        }
-                        target_points.extend(
-                            block
-                                .keys()
-                                .map(|key| nuwax_map_chunks::global_key(reference.key, *key))
-                                .collect::<Result<Vec<_>, _>>()?
-                                .into_iter()
-                                .map(|key| {
-                                    Point3::new(
-                                        (f64::from(key[0]) + 0.5) * size,
-                                        (f64::from(key[1]) + 0.5) * size,
-                                        (f64::from(key[2]) + 0.5) * size,
-                                    )
-                                }),
-                        );
-                    }
-                    Arc::new(TargetCache::new(
-                        &target_points,
-                        RelocalizationConfig::default(),
-                    ))
-                }
-            };
-            let source = SourceCloud::from_rays(frames.iter().flat_map(|frame| {
-                let odom = pose_isometry(&frame.odom_pose);
-                let origin = odom * Point3::from(frame.ray_origin_body);
-                frame
-                    .points_body
-                    .iter()
-                    .map(move |p| (odom * Point3::from(*p), origin))
-            }));
-            let odom = pose_isometry(&frames.last().unwrap().odom_pose);
-            let initials = relocalization_initials(initial, last_pose, seed, odom);
-            let (transform, fitness, outcome) =
-                compute_relocalization(&source, &target_cache, &initials, odom);
-            let succeeded = outcome == Outcome::Accepted;
-            let last = frames.last().unwrap();
-            let result = proto::RelocalizationResult {
-                succeeded,
-                message: match outcome {
-                    Outcome::Accepted => "重定位成功",
-                    Outcome::OneDirection => "重定位无法确定位置：周围只有一个方向的墙面，沿墙方向的位置不确定。请移动到能看到拐角或其它方向结构的位置后重试，或给出大致位置",
-                    Outcome::Ambiguous => "重定位有歧义：两个位置同样吻合，请转动或移动一小段后重试",
-                    Outcome::Unmatched => "重定位未匹配到已加载地图",
-                }
-                .into(),
-                pose: succeeded.then(|| {
-                    pose_from_isometry(
-                        transform * pose_isometry(&last.odom_pose),
-                        &target.manifest().domain.session,
-                        last.odom_pose.timestamp_ns,
-                    )
-                }),
-                fitness,
-                frames_used: frames.len() as u32,
-                finished_at_ns: now_ns(),
-            };
-            Ok::<_, String>((result, succeeded.then_some(transform), Some(target_cache)))
-        })
-        .await
-        .map_err(|e| tonic::Status::internal(e.to_string()))?
-        .map_err(tonic::Status::unavailable)?;
-        let (mut result, transform, cached) = result;
-        *cache = cached;
-        if let Some(transform) = transform {
-            mapper
-                .set_map_from_odom(transform)
+            let target = mapper
+                .surface_map()
                 .await
                 .map_err(tonic::Status::unavailable)?;
-            if let Some(pose) = result.pose.as_mut() {
-                pose.frame_id = mapper.map_frame_id().into();
+            let initial = mapper.map_from_odom();
+            let cached = cache.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut recorded = Vec::new();
+                let result = (|| {
+                    let Some(target) = target else {
+                        return Ok((failed("已加载地图没有可匹配的点云", 0), None, cached));
+                    };
+                    if frames.is_empty() {
+                        return Ok((failed("最近两秒没有可用雷达帧", 0), None, cached));
+                    }
+                    let target_cache = match cached {
+                        Some(cache) => cache,
+                        None => {
+                            let mut receiver = nuwax_map_chunks::Receiver::new(target.repository.clone());
+                            let mut target_points = Vec::new();
+                            let size = f64::from(target.manifest().voxel_size_m);
+                            for reference in &target.manifest().blocks {
+                                let block = receiver.block(reference)?;
+                                if (target_points.len() + block.len()) * std::mem::size_of::<Point3<f64>>()
+                                    > 120 * 1024 * 1024
+                                {
+                                    return Err("重定位目标点云超过原120MiB预算".into());
+                                }
+                                target_points.extend(
+                                    block
+                                        .keys()
+                                        .map(|key| nuwax_map_chunks::global_key(reference.key, *key))
+                                        .collect::<Result<Vec<_>, _>>()?
+                                        .into_iter()
+                                        .map(|key| {
+                                            Point3::new(
+                                                (f64::from(key[0]) + 0.5) * size,
+                                                (f64::from(key[1]) + 0.5) * size,
+                                                (f64::from(key[2]) + 0.5) * size,
+                                            )
+                                        }),
+                                );
+                            }
+                            Arc::new(TargetCache::new(
+                                &target_points,
+                                RelocalizationConfig::default(),
+                            ))
+                        }
+                    };
+                    let source = SourceCloud::from_rays(frames.iter().flat_map(|frame| {
+                        let odom = pose_isometry(&frame.odom_pose);
+                        let origin = odom * Point3::from(frame.ray_origin_body);
+                        frame
+                            .points_body
+                            .iter()
+                            .map(move |p| (odom * Point3::from(*p), origin))
+                    }));
+                    let odom = pose_isometry(&frames.last().unwrap().odom_pose);
+                    let initials = relocalization_initials(initial, last_pose, seed, odom);
+                    let (transform, fitness, outcome) =
+                        compute_relocalization(&source, &target_cache, &initials, odom, &mut recorded);
+                    let succeeded = outcome == Outcome::Accepted;
+                    let last = frames.last().unwrap();
+                    let result = proto::RelocalizationResult {
+                        succeeded,
+                        message: match outcome {
+                            Outcome::Accepted => "重定位成功",
+                            Outcome::OneDirection => "重定位无法确定位置：周围只有一个方向的墙面，沿墙方向的位置不确定。请移动到能看到拐角或其它方向结构的位置后重试，或给出大致位置",
+                            Outcome::Ambiguous => "重定位有歧义：两个位置同样吻合，请转动或移动一小段后重试",
+                            Outcome::Unmatched => "重定位未匹配到已加载地图",
+                        }
+                        .into(),
+                        pose: succeeded.then(|| {
+                            pose_from_isometry(
+                                transform * pose_isometry(&last.odom_pose),
+                                &target.manifest().domain.session,
+                                last.odom_pose.timestamp_ns,
+                            )
+                        }),
+                        fitness,
+                        frames_used: frames.len() as u32,
+                        finished_at_ns: now_ns(),
+                    };
+                    Ok::<_, String>((result, succeeded.then_some(transform), Some(target_cache)))
+                })();
+                (result, recorded)
+            })
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            let (computed, recorded) = result;
+            attempts = recorded;
+            let result = computed.map_err(tonic::Status::unavailable)?;
+            let (mut result, transform, cached) = result;
+            *cache = cached;
+            if let Some(transform) = transform {
+                mapper
+                    .set_map_from_odom(transform)
+                    .await
+                    .map_err(tonic::Status::unavailable)?;
+                if let Some(pose) = result.pose.as_mut() {
+                    pose.frame_id = mapper.map_frame_id().into();
+                }
             }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        let final_result = match &result {
+            Ok(result) => result.message.clone(),
+            Err(error) => error.to_string(),
+        };
+        tracing::info!(attempts = ?attempts, final_result = %final_result, "三维重定位尝试汇总");
+        result
     }
 }
-/// 局部阶段的初值；第二项为真表示自动得到（当前 map→odom、保存的最后位姿），结果要求水平约束度。
+/// 调用方初值独占局部阶段；没有调用方初值时依次使用当前变换和保存位姿。
+/// 第二项为真表示自动得到，结果要求水平约束度。
 fn relocalization_initials(
     current: Isometry3<f64>,
     last_pose: Option<Isometry3<f64>>,
     seed: Option<proto::PlanarSeed>,
     odom: Isometry3<f64>,
 ) -> Vec<(Isometry3<f64>, bool)> {
-    let mut initials = vec![(current, true)];
-    if let Some(saved) = last_pose {
-        initials.push((saved * odom.inverse(), true));
-    }
     if let Some(seed) = seed {
         let (roll, pitch, _) = odom.rotation.euler_angles();
         let body_pose = Isometry3::from_parts(
@@ -337,7 +350,11 @@ fn relocalization_initials(
             UnitQuaternion::from_euler_angles(roll, pitch, seed.yaw),
         );
         // 调用方给的初值：位置由调用方决定，配准只负责对齐，不要求水平约束度。
-        initials.push((body_pose * odom.inverse(), false));
+        return vec![(body_pose * odom.inverse(), false)];
+    }
+    let mut initials = vec![(current, true)];
+    if let Some(saved) = last_pose {
+        initials.push((saved * odom.inverse(), true));
     }
     initials
 }
@@ -356,25 +373,48 @@ fn compute_relocalization(
     target: &TargetCache,
     initials: &[(Isometry3<f64>, bool)],
     odom: Isometry3<f64>,
+    attempts: &mut Vec<String>,
 ) -> (Isometry3<f64>, f64, Outcome) {
     let config = RelocalizationConfig::default();
     let mut one_direction = false;
-    for (initial, automatic) in initials {
-        let Ok(local) = local_registration(source, target, *initial, odom) else {
-            continue;
+    let mut last = (Isometry3::identity(), 0.0);
+    for (index, (initial, automatic)) in initials.iter().enumerate() {
+        let origin = match (*automatic, index) {
+            (false, _) => "调用方初值",
+            (true, 0) => "当前 map→odom",
+            (true, _) => "保存的最后位姿",
+        };
+        let local = match local_registration(source, target, *initial, odom) {
+            Ok(local) => local,
+            Err(error) => {
+                attempts.push(format!("来源={origin}，墙面适配度=未计算，射线穿透比例=未计算，水平约束度=未计算，拒绝：局部配准出错：{error}"));
+                continue;
+            }
         };
         let transform = local.transformation;
         let score = score_relocalization(source, transform, target);
+        last = (transform, score.wall_fitness);
         if !score.accepts(&transform) {
+            attempts.push(score.diagnostic(
+                origin,
+                &transform,
+                &format!("拒绝：{}", score.rejection_reason(&transform)),
+            ));
             continue;
         }
         if *automatic && !score.constrained() {
             one_direction = true;
+            attempts.push(score.diagnostic(origin, &transform, "拒绝：水平约束度未达到0.05"));
             continue;
         }
+        attempts.push(score.diagnostic(origin, &transform, "接受"));
         return (transform, score.wall_fitness, Outcome::Accepted);
     }
+    if initials.iter().any(|(_, automatic)| !automatic) {
+        return (last.0, last.1, Outcome::Unmatched);
+    }
     let global = relocation_pipeline_cached(source, target, config);
+    attempts.extend(global.attempts);
     let outcome = if global.registration.converged {
         Outcome::Accepted
     } else if one_direction || global.one_direction {

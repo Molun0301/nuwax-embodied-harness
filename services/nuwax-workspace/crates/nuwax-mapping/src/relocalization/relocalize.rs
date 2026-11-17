@@ -444,6 +444,33 @@ impl RelocalizationScore {
     pub fn constrained(&self) -> bool {
         self.horizontal_constraint >= 0.05
     }
+
+    /// 只用于日志，逐项说明原接受条件未通过的原因。
+    pub fn rejection_reason(&self, transform: &Isometry3<f64>) -> String {
+        let mut reasons = Vec::new();
+        if !(self.wall_fitness >= 0.45) {
+            reasons.push("墙面适配度未达到0.45");
+        }
+        if !(self.penetration <= 0.15) {
+            reasons.push("射线穿透比例未满足不高于0.15");
+        }
+        if !is_upright(transform, GRAVITY_TILT_MAX_DEG) {
+            reasons.push("竖直偏角未满足不大于10度");
+        }
+        if !self.rmse.is_finite() {
+            reasons.push("均方根误差非有限值");
+        }
+        reasons.join("、")
+    }
+
+    /// 评分与处理结果汇入同一次重定位的日志，不参与接受判断。
+    pub fn diagnostic(&self, source: &str, transform: &Isometry3<f64>, decision: &str) -> String {
+        format!(
+            "来源={source}，墙面适配度={:.6}，射线穿透比例={:.6}，水平约束度={:.6}，竖直偏角={:.6}度，均方根误差={:.6}，{decision}",
+            self.wall_fitness, self.penetration, self.horizontal_constraint,
+            gravity_tilt_deg(transform), self.rmse,
+        )
+    }
 }
 
 /// 对带所属帧射线原点的降采样源点评分。
@@ -592,7 +619,7 @@ impl Default for RelocalizationConfig {
 }
 
 /// Stage diagnostics and accepted registration produced by relocalization.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RelocalizationResult {
     /// Accepted source-to-target registration, or a non-converged identity on rejection.
     pub registration: IcpResult,
@@ -606,6 +633,8 @@ pub struct RelocalizationResult {
     pub ambiguous: bool,
     /// 最好的结果其它条件都满足、只差水平约束度而未接受。
     pub one_direction: bool,
+    /// 本次全局阶段的逐候选评分与处理原因，交给入口汇总日志。
+    pub attempts: Vec<String>,
 }
 
 /// Run the complete multi-scale FPFH, deterministic RANSAC, and seeded ICP pipeline.
@@ -627,7 +656,9 @@ pub fn relocation_pipeline_cached(
 ) -> RelocalizationResult {
     let fine_source = &source.points;
     if !valid_relocalization_config(config) || fine_source.len() < 3 || target.points.len() < 3 {
-        return rejected_relocalization(0, 0, 0);
+        let mut result = rejected_relocalization(0, 0, 0);
+        result.attempts.push("全局阶段：原配置或点数条件未通过，无可评分候选".into());
+        return result;
     }
     let mut maximum_feature_matches = 0;
     let mut maximum_ransac_inliers = 0;
@@ -702,7 +733,7 @@ fn different_positions(a: &Isometry3<f64>, b: &Isometry3<f64>) -> bool {
         || (a.rotation.inverse() * b.rotation).angle().to_degrees() > 20.0
 }
 
-fn sort_candidates(candidates: &mut [(Isometry3<f64>, RelocalizationScore)]) {
+fn sort_candidates(candidates: &mut [(Isometry3<f64>, RelocalizationScore, usize)]) {
     candidates.sort_by(|a, b| {
         b.1.wall_fitness
             .total_cmp(&a.1.wall_fitness)
@@ -714,22 +745,44 @@ fn finish_global_candidates(
     source: &SourceCloud,
     target: &TargetCache,
     config: RelocalizationConfig,
-    mut candidates: Vec<(Isometry3<f64>, RelocalizationScore)>,
+    candidates: Vec<(Isometry3<f64>, RelocalizationScore)>,
     feature_matches: usize,
     ransac_inliers: usize,
     mut iterations: usize,
 ) -> RelocalizationResult {
+    // 编号只用于日志，贯穿初评和精配准，不改变候选排序。
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, (transform, score))| (transform, score, index + 1))
+        .collect();
     sort_candidates(&mut candidates);
     let Some(first) = candidates.first().copied() else {
-        return rejected_relocalization(feature_matches, ransac_inliers, iterations);
+        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+        result.attempts.push("全局阶段：没有生成可评分候选".into());
+        return result;
     };
     let second = candidates
         .iter()
         .skip(1)
         .find(|candidate| different_positions(&first.0, &candidate.0))
         .copied();
+    let mut attempts = Vec::new();
+    for (transform, score, number) in &candidates {
+        let decision =
+            if *number == first.2 || second.is_some_and(|candidate| candidate.2 == *number) {
+                "未直接接受：进入精配准"
+            } else {
+                "拒绝：未进入评分最高的两个不同位置的精配准"
+            };
+        attempts.push(score.diagnostic(
+            &format!("全局第{number}候选（初评）"),
+            transform,
+            decision,
+        ));
+    }
     let mut refined = Vec::new();
-    for (candidate, _) in std::iter::once(first).chain(second) {
+    for (candidate, _, number) in std::iter::once(first).chain(second) {
         let seeded: Vec<_> = source.points.iter().map(|p| candidate * p).collect();
         let mut icp = config.icp;
         icp.max_correspondence_distance = icp
@@ -738,44 +791,71 @@ fn finish_global_candidates(
         let refinement = IcpSolver::new(icp).align_indexed(&seeded, &target.points, &target.index);
         iterations += refinement.iterations;
         let transform = refinement.transformation * candidate;
-        refined.push((transform, score_relocalization(source, transform, target)));
+        refined.push((
+            transform,
+            score_relocalization(source, transform, target),
+            number,
+        ));
     }
     sort_candidates(&mut refined);
-    let (transformation, score) = refined[0];
-    if !score.accepts(&transformation) {
-        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
-        result.fitness = score.wall_fitness;
-        return result;
+    let (transformation, score, _) = refined[0];
+    let mut result = (|| {
+        if !score.accepts(&transformation) {
+            let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+            result.fitness = score.wall_fitness;
+            return result;
+        }
+        if !score.constrained() {
+            let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+            result.fitness = score.wall_fitness;
+            result.one_direction = true;
+            return result;
+        }
+        if refined.get(1).is_some_and(|(second, runner_up, _)| {
+            different_positions(&transformation, second)
+                && runner_up.accepts(second)
+                && runner_up.wall_fitness >= score.wall_fitness * 0.9
+        }) {
+            let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
+            result.ambiguous = true;
+            result.fitness = score.wall_fitness;
+            return result;
+        }
+        RelocalizationResult {
+            registration: IcpResult {
+                transformation,
+                mse: score.rmse * score.rmse,
+                iterations,
+                converged: true,
+            },
+            feature_matches,
+            ransac_inliers,
+            fitness: score.wall_fitness,
+            ambiguous: false,
+            one_direction: false,
+            attempts: Vec::new(),
+        }
+    })();
+    for (rank, (transform, score, number)) in refined.iter().enumerate() {
+        let decision = if rank == 0 && result.registration.converged {
+            "接受".to_owned()
+        } else if !score.accepts(transform) {
+            format!("拒绝：{}", score.rejection_reason(transform))
+        } else if rank == 0 && result.one_direction {
+            "拒绝：水平约束度未达到0.05".into()
+        } else if result.ambiguous {
+            "拒绝：两个不同位置同样吻合，存在歧义".into()
+        } else {
+            "拒绝：评分排序不是首位，仅用于原歧义判断".into()
+        };
+        attempts.push(score.diagnostic(
+            &format!("全局第{number}候选（精配准）"),
+            transform,
+            &decision,
+        ));
     }
-    if !score.constrained() {
-        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
-        result.fitness = score.wall_fitness;
-        result.one_direction = true;
-        return result;
-    }
-    if refined.get(1).is_some_and(|(second, runner_up)| {
-        different_positions(&transformation, second)
-            && runner_up.accepts(second)
-            && runner_up.wall_fitness >= score.wall_fitness * 0.9
-    }) {
-        let mut result = rejected_relocalization(feature_matches, ransac_inliers, iterations);
-        result.ambiguous = true;
-        result.fitness = score.wall_fitness;
-        return result;
-    }
-    RelocalizationResult {
-        registration: IcpResult {
-            transformation,
-            mse: score.rmse * score.rmse,
-            iterations,
-            converged: true,
-        },
-        feature_matches,
-        ransac_inliers,
-        fitness: score.wall_fitness,
-        ambiguous: false,
-        one_direction: false,
-    }
+    result.attempts = attempts;
+    result
 }
 
 /// Run relocalization with parity-oriented defaults.
@@ -845,6 +925,7 @@ fn rejected_relocalization(
         fitness: 0.0,
         ambiguous: false,
         one_direction: false,
+        attempts: Vec::new(),
     }
 }
 
@@ -998,12 +1079,18 @@ mod tests {
             .collect();
         let result = finish_global_candidates(&source, &target, config, candidates, 0, 0, 0);
         assert!(result.ambiguous, "两个平移不同的房间须进入歧义出口");
+        assert_eq!(result.attempts.len(), 5, "三个初评、两个精配准都应有记录");
+        assert!(result.attempts.iter().any(|entry| entry.contains("全局第2候选（初评）")
+            && entry.contains("拒绝：未进入评分最高的两个不同位置的精配准")));
+        for number in [1, 3] {
+            assert!(result.attempts.iter().any(|entry| entry.contains(&format!("全局第{number}候选（精配准）"))
+                && entry.contains("拒绝：两个不同位置同样吻合，存在歧义")));
+        }
         let single = vec![(a, score_relocalization(&source, a, &target))];
-        assert!(
-            finish_global_candidates(&source, &target, config, single, 0, 0, 0)
-                .registration
-                .converged
-        );
+        let single = finish_global_candidates(&source, &target, config, single, 0, 0, 0);
+        assert!(single.registration.converged);
+        assert_eq!(single.attempts.len(), 2);
+        assert!(single.attempts[1].contains("全局第1候选（精配准）") && single.attempts[1].ends_with("，接受"));
         assert!(!different_positions(
             &a,
             &(a * Isometry3::translation(1.0, 0.0, 0.0))

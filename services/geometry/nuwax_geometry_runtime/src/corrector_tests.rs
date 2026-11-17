@@ -237,7 +237,7 @@ fn compute_for_test(
     let source = SourceCloud::from_rays(source.iter().map(|p| (*p, Point3::origin())));
     let target = TargetCache::new(target, RelocalizationConfig::default());
     let (pose, fitness, outcome) =
-        compute_relocalization(&source, &target, &[(initial, true)], Isometry3::identity());
+        compute_relocalization(&source, &target, &[(initial, true)], Isometry3::identity(), &mut Vec::new());
     (pose, fitness, outcome == Outcome::Accepted)
 }
 
@@ -259,12 +259,10 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
         }),
         odom,
     );
-    assert_eq!(initials.len(), 3);
-    assert_eq!(initials.iter().map(|(_, automatic)| *automatic).collect::<Vec<_>>(), [true, true, false],
+    assert_eq!(initials.len(), 1);
+    assert_eq!(initials.iter().map(|(_, automatic)| *automatic).collect::<Vec<_>>(), [false],
         "只有调用方给的初值不要求水平约束度");
-    assert_transform(initials[0].0, current);
-    assert_transform(initials[1].0 * odom, saved);
-    let body = initials[2].0 * odom;
+    let body = initials[0].0 * odom;
     assert_transform(
         body,
         Isometry3::from_parts(
@@ -276,6 +274,11 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
         relocalization_initials(current, None, None, odom),
         vec![(current, true)]
     );
+    let automatic = relocalization_initials(current, Some(saved), None, odom);
+    assert_eq!(automatic.len(), 2);
+    assert!(automatic.iter().all(|(_, automatic)| *automatic));
+    assert_transform(automatic[0].0, current);
+    assert_transform(automatic[1].0 * odom, saved);
     let without_saved = relocalization_initials(
         current,
         None,
@@ -286,7 +289,8 @@ fn relocalization_initials_keep_order_saved_height_and_odometry_tilt() {
         }),
         odom,
     );
-    assert!(((without_saved[1].0 * odom).translation.z).abs() < 1e-9);
+    assert_eq!(without_saved.len(), 1);
+    assert!(((without_saved[0].0 * odom).translation.z).abs() < 1e-9);
 }
 
 fn local_consensus_source() -> Vec<Point3<f64>> {
@@ -357,17 +361,17 @@ fn relocalization_local_consensus_uses_second_initial_after_first_fails() {
     let initials = relocalization_initials(
         odom,
         Some(truth),
-        Some(proto::PlanarSeed {
-            x: 150.0,
-            y: 160.0,
-            yaw: 0.0,
-        }),
+        None,
         odom,
     );
+    let mut attempts = Vec::new();
     let (actual, _, outcome) =
-        compute_relocalization(&source, &target, &initials, odom);
+        compute_relocalization(&source, &target, &initials, odom, &mut attempts);
     assert_eq!(outcome, Outcome::Accepted);
     assert_transform(actual, truth);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert!(attempts[0].contains("来源=当前 map→odom") && attempts[0].contains("拒绝"));
+    assert!(attempts[1].contains("来源=保存的最后位姿") && attempts[1].contains("接受"));
 }
 
 #[test]
@@ -382,13 +386,13 @@ fn relocalization_local_error_continues_to_second_initial_and_then_global() {
     let odom = Isometry3::identity();
     assert!(local_registration(&source, &target, bad, odom).is_err());
     let (pose, fitness, outcome) =
-        compute_relocalization(&source, &target, &[(bad, true), (odom, true)], odom);
+        compute_relocalization(&source, &target, &[(bad, true), (odom, true)], odom, &mut Vec::new());
     assert_eq!(outcome, Outcome::Accepted);
     assert!(fitness >= 0.45);
     assert_transform(pose, odom);
     let global = relocation_pipeline_cached(&source, &target, RelocalizationConfig::default());
     assert!(global.fitness >= 0.45);
-    let actual = compute_relocalization(&source, &target, &[(bad, true), (bad, true)], odom);
+    let actual = compute_relocalization(&source, &target, &[(bad, true), (bad, true)], odom, &mut Vec::new());
     assert_eq!(actual.0, global.registration.transformation);
     assert_eq!(actual.1, global.fitness);
     assert_eq!(actual.2 == Outcome::Accepted, global.registration.converged);
@@ -408,7 +412,7 @@ fn relocalization_local_consensus_preserves_nonzero_anchor_and_reuses_registrati
         Isometry3::from_parts(Translation3::new(2.03, -3.02, 0.41), truth.rotation);
     for _ in 0..2 {
         let (actual, _, outcome) =
-            compute_relocalization(&source, &target, &[(registration, true)], Isometry3::identity());
+            compute_relocalization(&source, &target, &[(registration, true)], Isometry3::identity(), &mut Vec::new());
         assert_eq!(outcome, Outcome::Accepted);
         assert_transform(actual, truth);
         registration = actual;
@@ -430,6 +434,7 @@ fn relocalization_local_consensus_rejects_tilted_estimate() {
 #[tokio::test]
 async fn relocalization_global_ambiguity_keeps_mapper_transform_and_exact_message() {
     use crate::mapper::MapperConfig;
+    use tracing::instrument::WithSubscriber;
     let source = local_consensus_source();
     let a = Isometry3::translation(6.0, 0.0, 0.0);
     let b = Isometry3::translation(18.0, 0.0, 0.0);
@@ -450,9 +455,9 @@ async fn relocalization_global_ambiguity_keeps_mapper_transform_and_exact_messag
     let mut current = crate::mapper::tests::room_frame(992, 2_000_000_000);
     current.points_body = source.iter().map(|p| [p.x, p.y, p.z]).collect();
     current.ray_origin_body = [0.0; 3];
+    let (buffer, subscriber) = relocalization_log_capture();
     let result = Corrector::relocalize(&loaded, vec![current], &mut None, None, None)
-        .await
-        .unwrap();
+        .with_subscriber(subscriber).await.unwrap();
     assert!(!result.succeeded);
     assert_eq!(
         result.message,
@@ -460,6 +465,11 @@ async fn relocalization_global_ambiguity_keeps_mapper_transform_and_exact_messag
     );
     assert!(result.pose.is_none());
     assert_eq!(loaded.map_from_odom(), before);
+    let attempts = assert_relocalization_log(&buffer, &result.message);
+    assert!(attempts.contains("来源=当前 map→odom"));
+    assert!(!attempts.contains("来源=保存的最后位姿"));
+    assert!(attempts.contains("来源=全局第") && attempts.contains("精配准"));
+    assert!(attempts.contains("拒绝：两个不同位置同样吻合，存在歧义"));
     loaded.shutdown().await.unwrap();
 }
 
@@ -578,6 +588,129 @@ fn horizontal_constraint_needs_walls_in_two_directions() {
         assert!(score.accepts(&Isometry3::identity()), "{score:?}");
         assert_eq!(score.constrained(), constrained, "{score:?}");
     }
+}
+
+#[tokio::test]
+async fn caller_seed_replaces_an_accepted_wrong_map_transform() {
+    use crate::mapper::MapperConfig;
+    use tracing::instrument::WithSubscriber;
+    let points = local_consensus_source();
+    let truth = Isometry3::translation(6.0, 0.0, 0.0);
+    let wrong = Isometry3::translation(18.0, 0.0, 0.0);
+    let mut frame = crate::mapper::tests::room_frame(995, 1_000_000_000);
+    frame.ray_origin_body = [6.0, 0.0, 0.0];
+    // 两个相同房间都能通过原有接受条件，复现错误结果抢先被采用。
+    frame.points_body = points.iter().flat_map(|p| [truth * p, wrong * p])
+        .map(|p| [p.x, p.y, p.z]).collect();
+    let mapper = Mapper::start(995, MapperConfig::default()).unwrap();
+    mapper.feed(frame);
+    let snapshot = mapper.snapshot().await.unwrap();
+    mapper.shutdown().await.unwrap();
+    let loaded = Mapper::load(996, MapperConfig::default(), snapshot, true).unwrap();
+    loaded.set_map_from_odom(Isometry3::translation(100.0, 100.0, 0.0)).await.unwrap();
+    let mut current = crate::mapper::tests::room_frame(996, 2_000_000_000);
+    current.points_body = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+    current.ray_origin_body = [0.0; 3];
+    let mut cache = None;
+    let first = Corrector::relocalize(&loaded, vec![current.clone()], &mut cache, None,
+        Some(proto::PlanarSeed { x: 18.0, y: 0.0, yaw: 0.0 })).await.unwrap();
+    assert!(first.succeeded, "{}", first.message);
+    assert_transform(loaded.map_from_odom(), wrong);
+    let (buffer, subscriber) = relocalization_log_capture();
+    let second = Corrector::relocalize(&loaded, vec![current.clone()], &mut cache, Some(wrong),
+        Some(proto::PlanarSeed { x: 6.0, y: 0.0, yaw: 0.0 }))
+        .with_subscriber(subscriber).await.unwrap();
+    assert!(second.succeeded, "{}", second.message);
+    let attempts = assert_relocalization_log(&buffer, &second.message);
+    assert!(attempts.contains("来源=调用方初值") && attempts.contains("接受"));
+    assert!(!attempts.contains("map→odom") && !attempts.contains("保存的最后位姿") && !attempts.contains("全局"));
+    let actual = loaded.map_from_odom();
+    assert_transform(actual, truth);
+    // 自动初值已经正确，错误调用方初值仍必须失败，并保留已采用的变换。
+    let (buffer, subscriber) = relocalization_log_capture();
+    let failed = Corrector::relocalize(&loaded, vec![current], &mut cache, Some(truth),
+        Some(proto::PlanarSeed { x: 150.0, y: 160.0, yaw: 0.0 }))
+        .with_subscriber(subscriber).await.unwrap();
+    assert!(!failed.succeeded && failed.pose.is_none());
+    assert_eq!(failed.message, "重定位未匹配到已加载地图");
+    assert_eq!(loaded.map_from_odom(), actual);
+    let attempts = assert_relocalization_log(&buffer, &failed.message);
+    assert!(attempts.contains("来源=调用方初值") && attempts.contains("拒绝：墙面适配度"));
+    assert!(!attempts.contains("map→odom") && !attempts.contains("保存的最后位姿") && !attempts.contains("全局"));
+    // 没有帧时同样只有一条汇总日志，没有伪造任何初值评分。
+    let (buffer, subscriber) = relocalization_log_capture();
+    let empty = Corrector::relocalize(&loaded, Vec::new(), &mut cache, None, None)
+        .with_subscriber(subscriber).await.unwrap();
+    assert_eq!(empty.message, "最近两秒没有可用雷达帧");
+    assert_eq!(assert_relocalization_log(&buffer, &empty.message), "[]");
+    loaded.shutdown().await.unwrap();
+}
+
+#[derive(Clone)]
+struct RelocalizationLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for RelocalizationLogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+fn relocalization_log_capture() -> (Arc<std::sync::Mutex<Vec<u8>>>, impl tracing::Subscriber + Send + Sync) {
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = RelocalizationLogBuffer(Arc::clone(&buffer));
+    let subscriber = tracing_subscriber::fmt().json().with_ansi(false)
+        .with_writer(move || writer.clone()).finish();
+    (buffer, subscriber)
+}
+fn assert_relocalization_log(buffer: &Arc<std::sync::Mutex<Vec<u8>>>, message: &str) -> String {
+    let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let logs: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap())
+        .filter(|row: &serde_json::Value| row["fields"]["message"] == "三维重定位尝试汇总").collect();
+    assert_eq!(logs.len(), 1, "一次重定位只能有一条汇总日志：{text}");
+    assert_eq!(logs[0]["level"], "INFO");
+    assert_eq!(logs[0]["fields"]["final_result"], message);
+    let attempts = logs[0]["fields"]["attempts"].as_str().unwrap();
+    if attempts != "[]" {
+        for field in ["墙面适配度=", "射线穿透比例=", "水平约束度="] {
+            assert!(attempts.contains(field), "缺少{field}：{text}");
+        }
+    }
+    eprintln!("重定位日志样例：{}", logs[0]);
+    attempts.into()
+}
+
+#[test]
+fn caller_seed_mismatch_does_not_use_automatic_initials_or_global() {
+    let points = local_consensus_source();
+    let target = TargetCache::new(&points, RelocalizationConfig::default());
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    let odom = Isometry3::identity();
+    let initials = relocalization_initials(odom, Some(odom),
+        Some(proto::PlanarSeed { x: 150.0, y: 160.0, yaw: 0.0 }), odom);
+    let mut attempts = Vec::new();
+    let (_, _, outcome) = compute_relocalization(&source, &target, &initials, odom, &mut attempts);
+    assert_eq!(outcome, Outcome::Unmatched);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert!(attempts[0].contains("来源=调用方初值") && attempts[0].contains("拒绝"));
+    assert!(!attempts[0].contains("全局"));
+}
+
+#[test]
+fn caller_seed_registration_error_does_not_enter_global() {
+    let points = local_consensus_source();
+    let mut target_points = points.clone();
+    target_points.extend(points.iter().map(|p| Point3::new(1e40, p.y, p.z)));
+    let target = TargetCache::new(&target_points, RelocalizationConfig::default());
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    let bad = Isometry3::translation(1e40, 0.0, 0.0);
+    let mut attempts = Vec::new();
+    let (_, _, outcome) = compute_relocalization(&source, &target, &[(bad, false)],
+        Isometry3::identity(), &mut attempts);
+    assert_eq!(outcome, Outcome::Unmatched);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert!(attempts[0].contains("来源=调用方初值") && attempts[0].contains("局部配准出错"));
+    assert!(attempts[0].contains("墙面适配度=未计算"));
+    assert!(!attempts[0].contains("全局"));
 }
 
 #[test]

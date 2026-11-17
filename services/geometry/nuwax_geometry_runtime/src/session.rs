@@ -594,8 +594,9 @@ impl Session {
         }
     }
     fn localization_update(&mut self, update: localizer::TrackingUpdate) {
-        // 只有最近一轮吻合才写入地图；吻合差的这一轮起回到只读，恢复吻合再写入。
-        self.mapper().expect("跟踪器运行期间路由上有地图").set_writing(update.bad_rounds == 0);
+        // 最近一轮吻合且修正未被限幅截断才写入；吻合差或尚未追上时只读。
+        self.mapper().expect("跟踪器运行期间路由上有地图")
+            .set_writing(update.bad_rounds == 0 && !update.limited);
         if update.bad_rounds >= 10 {
             self.state.reason = LOCALIZATION_DEGRADED.into();
         } else if update.bad_rounds == 0 && self.state.reason == LOCALIZATION_DEGRADED {

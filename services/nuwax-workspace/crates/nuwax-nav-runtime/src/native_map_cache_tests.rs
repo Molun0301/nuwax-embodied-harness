@@ -118,10 +118,10 @@ fn check_sequence(baseline: Option<&baseline_native::Baseline>) {
                 .unwrap();
                 baseline.plan(&config, &cells, &bands, start, goal, false)
             } else {
-                reference.plan(start, goal)
+                reference.plan(start, None, goal)
             };
             complete += usize::from(expected.is_ok());
-            same_route(cache.planner().plan(start, goal), expected);
+            same_route(cache.planner().plan(start, None, goal), expected);
             let expected = if let Some(baseline) = baseline {
                 let (config, cells, bands) = match source {
                     PctTerrainSource::Tomography => {
@@ -139,7 +139,7 @@ fn check_sequence(baseline: Option<&baseline_native::Baseline>) {
                     true,
                 )
             } else {
-                reference.plan_progressive(start, [9.1, 1.1, offset + 0.01], None)
+                reference.plan_progressive(start, None, [9.1, 1.1, offset + 0.01], None)
             };
             boundary_rejected += usize::from(step >= 8 && expected.is_err());
             approach += usize::from(
@@ -150,7 +150,7 @@ fn check_sequence(baseline: Option<&baseline_native::Baseline>) {
             same_route(
                 cache
                     .planner()
-                    .plan_progressive(start, [9.1, 1.1, offset + 0.01], None),
+                    .plan_progressive(start, None, [9.1, 1.1, offset + 0.01], None),
                 expected,
             );
         }
@@ -180,9 +180,9 @@ fn cached_fine_ground_records_refresh_only_changed_geometry_and_preserve_routes(
             let mut reference = full(&map, source, &[], 0.4);
             let start = [0.125, 0.025, 0.41];
             let goal = [3.875, 0.025, 0.41];
-            let expected = reference.plan(start, goal);
+            let expected = reference.plan(start, None, goal);
             assert!(expected.is_ok());
-            same_route(cache.planner().plan(start, goal), expected);
+            same_route(cache.planner().plan(start, None, goal), expected);
         }
     }
 }
@@ -255,13 +255,13 @@ fn n1_global_cache_benchmark() {
     let goal = [50.125, 45.125, 0.41];
     let mut cache = CachedPctPlanner::new(PctTerrainSource::Tomography);
     cache.update(&initial, 0.4, &[]).unwrap();
-    cache.planner().plan(start, goal).unwrap();
+    cache.planner().plan(start, None, goal).unwrap();
     for (label, base) in [("近期障碍变化", &initial), ("地图变化32列", &changed)] {
         let mut old_ms = Vec::new();
         let mut new_ms = Vec::new();
         for run in 0..7 {
             cache.update(&initial, 0.4, &[]).unwrap();
-            cache.planner().plan(start, goal).unwrap();
+            cache.planner().plan(start, None, goal).unwrap();
             let map = base
                 .with_recent_obstacle_points(
                     run + 1,
@@ -278,7 +278,7 @@ fn n1_global_cache_benchmark() {
             let old = began.elapsed().as_secs_f64() * 1000.;
             let began = Instant::now();
             cache.update(&map, 0.4, &[]).unwrap();
-            let actual = cache.planner().plan(start, goal);
+            let actual = cache.planner().plan(start, None, goal);
             let new = began.elapsed().as_secs_f64() * 1000.;
             assert!(expected.is_ok());
             same_route(actual, expected);
@@ -390,7 +390,7 @@ fn registered_static_columns_update_only_those_columns_and_match_full_rebuild() 
         assert_eq!(cache.planner().geometry(), full.planner().geometry(), "第{step}步原生几何与全量重建不同");
         let start = [0.125, 0.025, 0.41];
         let goal = [3.875, 0.025, 0.41];
-        same_route(cache.planner().plan(start, goal), full.planner().plan(start, goal));
+        same_route(cache.planner().plan(start, None, goal), full.planner().plan(start, None, goal));
         previous = Some(map);
     }
     assert_eq!(partial_steps, 4, "每一步都应有实际变化列");
@@ -480,23 +480,23 @@ fn n3_registered_columns_benchmark() {
             };
             let first = follow(&initial, false);
             cache.update(&first, 0.4, &[]).unwrap();
-            cache.planner().plan(start, goal).unwrap();
+            cache.planner().plan(start, None, goal).unwrap();
             let mut samples = Vec::new();
             for run in 0..7u64 {
                 let back = follow(&initial, false);
                 cache.update(&back, 0.4, &[]).unwrap();
-                cache.planner().plan(start, goal).unwrap();
+                cache.planner().plan(start, None, goal).unwrap();
                 let map = follow(base, is_changed).with_recent_obstacle_points(run + 1, run + 1, 0, &[],
                     [(0, [47.125 + run as f64 * 0.25, 47.125, 0.5])]).unwrap();
                 let began = Instant::now();
                 cache.update(&map, 0.4, &[]).unwrap();
-                let route = cache.planner().plan(start, goal);
+                let route = cache.planner().plan(start, None, goal);
                 let elapsed = began.elapsed().as_secs_f64() * 1000.;
                 let mut full = CachedPctPlanner::new(PctTerrainSource::Tomography);
                 full.update(&map, 0.4, &[]).unwrap();
                 assert_eq!(cache.planner().geometry(), full.planner().geometry());
                 assert!(route.is_ok());
-                same_route(route, full.planner().plan(start, goal));
+                same_route(route, full.planner().plan(start, None, goal));
                 if run > 0 { samples.push(elapsed); }
             }
             samples.sort_by(f64::total_cmp);
@@ -507,4 +507,42 @@ fn n3_registered_columns_benchmark() {
         eprintln!("N3耗时 {label}：整图比对中位数={:.3}ms，登记变化列中位数={:.3}ms，整图比对={full_ms:?}，登记变化列={registered_ms:?}",
             full_ms[3], registered_ms[3]);
     }
+}
+
+/// 拐点扫掠的跨版本对照：窄十字原版给出经中心转向的路线、本版无路线；宽通道两版逐点相同。
+#[test]
+#[ignore = "显式加载ba90c30d原生桥进行跨版本对照"]
+fn n3_turn_sweep_against_original_native() {
+    let baseline = baseline_native::Baseline::open();
+    let q = 0.05;
+    let config = Config {
+        resolution: q, point_resolution: 0.03, robot_height: 0.45, body_to_ground: 0.4,
+        max_step: 0.16, max_step_down: 0.16, body_z_min: -0.2, body_z_max: 0.15, search_margin: 1.0,
+        footprint: vec![[-0.5, -0.15], [0.5, -0.15], [0.5, 0.15], [-0.5, 0.15]],
+        ..Default::default()
+    };
+    let scene = |free: &dyn Fn(f64, f64) -> bool| {
+        let cells: Vec<_> = (-80..80).flat_map(|x| (-80..80).map(move |y| Cell { x, y, ground: 0., ceiling: f64::INFINITY })).collect();
+        let bands: Vec<_> = cells.iter().filter(|c| !free((f64::from(c.x) + 0.5) * q, (f64::from(c.y) + 0.5) * q))
+            .map(|c| Band { x: c.x, y: c.y, low: 0., high: 1.5 }).collect();
+        (cells, bands)
+    };
+    let (left, up) = ([-2.5, 0.025, 0.4], [0.025, 2.5, 0.4]);
+    let (cells, bands) = scene(&|x, y| y.abs() <= 0.2 || x.abs() <= 0.2);
+    let original = baseline.plan(&config, &cells, &bands, left, up, false).unwrap();
+    assert!(original.path.iter().any(|p| p[0].abs() <= 0.2 && p[1].abs() <= 0.2), "原版经十字中心转向");
+    let mut current = Planner::from_cells(config.clone(), &cells, &bands).unwrap();
+    assert!(current.plan(left, None, up).is_err());
+    eprintln!("N3拐点 窄十字：原版路线点数={}，本版无路线", original.path.len());
+    // 2 米宽的直角通道：转向空间充足，两版路线逐点相同（起点朝向给与不给都相同）。
+    let (cells, bands) = scene(&|x, y| ((-4.0..=1.0).contains(&x) && (-1.0..=1.0).contains(&y))
+        || ((-1.0..=1.0).contains(&x) && (-1.0..=4.0).contains(&y)));
+    let (start, goal) = ([-3.5, 0.025, 0.4], [0.025, 3.5, 0.4]);
+    let original = baseline.plan(&config, &cells, &bands, start, goal, false).unwrap();
+    let mut current = Planner::from_cells(config.clone(), &cells, &bands).unwrap();
+    assert_eq!(current.plan(start, None, goal).unwrap().path, original.path);
+    assert_eq!(current.plan(start, Some(0.), goal).unwrap().path, original.path);
+    let original = baseline.plan(&config, &cells, &bands, start, goal, true).unwrap();
+    assert_eq!(current.plan_progressive(start, Some(0.), goal, None).unwrap().path, original.path);
+    eprintln!("N3拐点 宽直角通道：两版路线逐点相同，点数={}", original.path.len());
 }

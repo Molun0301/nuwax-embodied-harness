@@ -194,6 +194,7 @@ unsafe extern "C" {
     fn pct_plan(
         planner: *mut c_void,
         start: *const f64,
+        start_yaw: f64,
         goal: *const f64,
         result: *mut ResultRaw,
         cancel: extern "C" fn(*const c_void) -> bool,
@@ -404,24 +405,27 @@ impl Planner {
         }
         (cells, bands)
     }
-    pub fn plan(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<Route, String> {
-        self.plan_inner(start, goal, std::ptr::null(), false)
+    /// `start_yaw` 为起点当前朝向；给出时检查起点从它转到第一条边方向的机身扫掠，`None` 时不查起点。
+    pub fn plan(&mut self, start: [f64; 3], start_yaw: Option<f64>, goal: [f64; 3]) -> Result<Route, String> {
+        self.plan_inner(start, start_yaw, goal, std::ptr::null(), false)
     }
     pub fn plan_cancellable(
         &mut self,
         start: [f64; 3],
+        start_yaw: Option<f64>,
         goal: [f64; 3],
         cancel: &AtomicBool,
     ) -> Result<Route, String> {
-        self.plan_inner(start, goal, (cancel as *const AtomicBool).cast(), false)
+        self.plan_inner(start, start_yaw, goal, (cancel as *const AtomicBool).cast(), false)
     }
     /// 完整路线优先；失败时返回本次搜索已展开区域内三维距离最近的可达格。
-    pub fn plan_progressive(&mut self, start: [f64; 3], goal: [f64; 3], cancel: Option<&AtomicBool>) -> Result<Route, String> {
-        self.plan_inner(start, goal, cancel.map_or(std::ptr::null(), |flag| (flag as *const AtomicBool).cast()), true)
+    pub fn plan_progressive(&mut self, start: [f64; 3], start_yaw: Option<f64>, goal: [f64; 3], cancel: Option<&AtomicBool>) -> Result<Route, String> {
+        self.plan_inner(start, start_yaw, goal, cancel.map_or(std::ptr::null(), |flag| (flag as *const AtomicBool).cast()), true)
     }
     fn plan_inner(
         &mut self,
         start: [f64; 3],
+        start_yaw: Option<f64>,
         goal: [f64; 3],
         cancel: *const c_void,
         progressive: bool,
@@ -433,6 +437,7 @@ impl Planner {
             pct_plan(
                 self.native.as_ptr(),
                 start.as_ptr(),
+                start_yaw.unwrap_or(f64::NAN),
                 goal.as_ptr(),
                 &mut result,
                 cancelled,
@@ -495,8 +500,8 @@ mod tests {
             .filter(|c|c.x<15 || c.x>=25).collect();
         let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
         let start=[0.35,0.05,0.4];let goal=[3.65,0.05,0.4];
-        assert!(p.plan(start,goal).is_err(),"完整接口不能交付逼近结果");
-        let route=p.plan_progressive(start,goal,None).unwrap();
+        assert!(p.plan(start, None,goal).is_err(),"完整接口不能交付逼近结果");
+        let route=p.plan_progressive(start, None,goal,None).unwrap();
         assert_eq!(route.kind,RouteKind::Approach);
         let end=route.path.last().unwrap();
         assert!((end[0]-1.45).abs()<1e-9 && (end[1]-0.05).abs()<1e-9 && (end[2]-0.4).abs()<1e-9);
@@ -509,8 +514,8 @@ mod tests {
     fn progressive_missing_goal_still_searches_measured_reachable_region() {
         let cells=flat_cells(0..20,-4..5);
         let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
-        assert!(p.plan([0.35,0.05,0.4],[8.05,0.05,0.4]).is_err());
-        let route=p.plan_progressive([0.35,0.05,0.4],[8.05,0.05,0.4],None).unwrap();
+        assert!(p.plan([0.35,0.05,0.4], None,[8.05,0.05,0.4]).is_err());
+        let route=p.plan_progressive([0.35,0.05,0.4], None,[8.05,0.05,0.4],None).unwrap();
         assert_eq!(route.kind,RouteKind::Approach);
         assert!((route.path.last().unwrap()[0]-1.95).abs()<1e-9);
         assert_eq!(p.geometry().0.len(),cells.len(),"缺测目标不能创建地面节点");
@@ -521,14 +526,14 @@ mod tests {
         let cells=flat_cells(0..40,-4..5);
         let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
         let start=[0.35,0.05,0.4];let goal=[3.65,0.05,0.4];
-        let original=p.plan(start,goal).unwrap();
-        let route=p.plan_progressive(start,goal,None).unwrap();
+        let original=p.plan(start, None,goal).unwrap();
+        let route=p.plan_progressive(start, None,goal,None).unwrap();
         assert_eq!(route.kind,RouteKind::Complete);
         assert_eq!(route.path,original.path);
         assert_eq!(route.expanded,original.expanded,"不得额外执行全图搜索");
         let cancelled=AtomicBool::new(true);
-        assert!(p.plan_progressive(start,goal,Some(&cancelled)).unwrap_err().contains("取消"));
-        assert_eq!(p.plan_progressive(start,goal,None).unwrap().path,original.path);
+        assert!(p.plan_progressive(start, None,goal,Some(&cancelled)).unwrap_err().contains("取消"));
+        assert_eq!(p.plan_progressive(start, None,goal,None).unwrap().path,original.path);
     }
 
     #[test]
@@ -536,7 +541,7 @@ mod tests {
         let cells=flat_cells(0..40,-4..5);
         let wall:Vec<_>=(-6..7).map(|y|Band{x:15,y,low:0.0,high:1.5}).collect();
         let mut p=Planner::from_cells(config(),&cells,&wall).unwrap();
-        let route=p.plan_progressive([0.35,0.05,0.4],[3.65,0.05,0.4],None).unwrap();
+        let route=p.plan_progressive([0.35,0.05,0.4], None,[3.65,0.05,0.4],None).unwrap();
         assert_eq!(route.kind,RouteKind::Approach);
         assert!(route.path.iter().all(|p|p[0]+config().footprint_radius<1.5));
     }
@@ -551,7 +556,7 @@ mod tests {
         let distance=|cell:&Cell|((f64::from(cell.x)+0.5)*0.1-goal[0]).powi(2)+(cell.ground+cfg.body_to_ground-goal[2]).powi(2);
         let closest=cells.iter().min_by(|a,b|distance(a).total_cmp(&distance(b))).unwrap();
         let mut planner=Planner::from_cells(cfg,&cells,&[]).unwrap();
-        let route=planner.plan_progressive([0.35,0.05,0.4],goal,None).unwrap();
+        let route=planner.plan_progressive([0.35,0.05,0.4], None,goal,None).unwrap();
         assert_eq!(route.kind,RouteKind::Approach);
         let endpoint=route.path.last().unwrap();
         assert!((endpoint[0]-(f64::from(closest.x)+0.5)*0.1).abs()<1e-9);
@@ -561,38 +566,38 @@ mod tests {
     #[test]
     fn entirely_unknown_space_has_no_native_surface_route() {
         let mut p = Planner::new(config(), &[]).unwrap();
-        assert!(p.plan([0.05, 0.05, 0.4], [3.05, 0.05, 0.4]).is_err());
+        assert!(p.plan([0.05, 0.05, 0.4], None, [3.05, 0.05, 0.4]).is_err());
     }
     #[test]
     fn missing_ground_strip_does_not_connect_known_platforms() {
         let cells: Vec<_> = flat_cells(0..40,-4..5).into_iter()
             .filter(|c| c.x<15 || c.x>=25).collect();
         let mut p = Planner::from_cells(config(), &cells, &[]).unwrap();
-        assert!(p.plan([0.35, 0.05, 0.4], [3.65, 0.05, 0.4]).is_err());
-        assert!(p.plan([0.35, 0.05, 0.4], [1.05, 0.05, 0.4]).is_ok());
+        assert!(p.plan([0.35, 0.05, 0.4], None, [3.65, 0.05, 0.4]).is_err());
+        assert!(p.plan([0.35, 0.05, 0.4], None, [1.05, 0.05, 0.4]).is_ok());
     }
     #[test]
     fn missing_endpoint_binds_to_an_existing_surface_without_filling_the_map() {
         let cells: Vec<_> = flat_cells(0..40,-4..5).into_iter()
             .filter(|c| [c.x,c.y]!=[0,0]).collect();
         let mut p = Planner::from_cells(config(), &cells, &[]).unwrap();
-        let route = p.plan([0.05,0.05,0.4],[3.65,0.05,0.4]).unwrap();
+        let route = p.plan([0.05,0.05,0.4], None,[3.65,0.05,0.4]).unwrap();
         assert!(route.path.iter().all(|point| {
             let x=(point[0]/0.1).floor() as i32;
             let y=(point[1]/0.1).floor() as i32;
             cells.iter().any(|cell|cell.x==x&&cell.y==y)
         }));
         assert_eq!(p.geometry().0.len(),cells.len());
-        assert!(p.plan([0.05,0.05,0.4],[8.0,0.05,0.4]).is_err());
+        assert!(p.plan([0.05,0.05,0.4], None,[8.0,0.05,0.4]).is_err());
     }
     #[test]
     fn upstream_clearance_cost_prefers_the_interior_without_closing_a_corridor() {
         let cells=flat_cells(0..60,-10..10);
         let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
-        let route=p.plan([0.35,-0.85,0.4],[5.65,-0.85,0.4]).unwrap();
+        let route=p.plan([0.35,-0.85,0.4], None,[5.65,-0.85,0.4]).unwrap();
         assert!(route.path.iter().any(|p|p[0]>1.5&&p[0]<4.5&&p[1]>-0.75));
         let mut narrow=Planner::from_cells(config(),&flat_cells(0..60,-2..2),&[]).unwrap();
-        assert!(narrow.plan([0.35,0.05,0.4],[5.65,0.05,0.4]).is_ok());
+        assert!(narrow.plan([0.35,0.05,0.4], None,[5.65,0.05,0.4]).is_ok());
     }
     #[test]
     fn observed_wall_is_avoided_on_measured_ground() {
@@ -606,8 +611,8 @@ mod tests {
             .collect();
         let cells = flat_cells(-5..36,-15..16);
         let mut p = Planner::from_cells(config(), &cells, &bands).unwrap();
-        assert!(p.plan([1.55, 0.05, 0.4], [1.56, 0.06, 0.4]).is_err());
-        let r = p.plan([0.05, 0.05, 0.4], [3.05, 0.05, 0.4]).unwrap();
+        assert!(p.plan([1.55, 0.05, 0.4], None, [1.56, 0.06, 0.4]).is_err());
+        let r = p.plan([0.05, 0.05, 0.4], None, [3.05, 0.05, 0.4]).unwrap();
         assert!(r.path.iter().any(|p| p[1].abs() > 0.7));
         assert!(r
             .path
@@ -617,7 +622,7 @@ mod tests {
         cfg.footprint_radius = 0.0;
         let route = Planner::from_cells(cfg, &cells, &bands)
             .unwrap()
-            .plan([0.05, 0.05, 0.4], [3.05, 0.05, 0.4])
+            .plan([0.05, 0.05, 0.4], None, [3.05, 0.05, 0.4])
             .unwrap();
         assert!(route.path.iter().any(|p| p[1] < -0.6 || p[1] > 0.7));
     }
@@ -632,7 +637,7 @@ mod tests {
             }
         }
         let mut p = Planner::new(config(), &points).unwrap();
-        let r = p.plan([0.05, 0.05, 0.4], [2.85, 0.05, 0.4]).unwrap();
+        let r = p.plan([0.05, 0.05, 0.4], None, [2.85, 0.05, 0.4]).unwrap();
         assert!(r.path.iter().all(|p| (p[2] - 0.402).abs() < 1e-6));
     }
     #[test]
@@ -663,7 +668,7 @@ mod tests {
             })
             .collect();
         let mut p = Planner::from_cells(cfg, &cells, &bands).unwrap();
-        let r = p.plan([0.25, 0.05, 0.4], [3.75, 0.05, 1.24]).unwrap();
+        let r = p.plan([0.25, 0.05, 0.4], None, [3.75, 0.05, 1.24]).unwrap();
         assert!(r.path.iter().any(|p| p[2] > 1.0));
         assert!(r
             .path
@@ -686,7 +691,7 @@ mod tests {
             })
             .collect();
         let mut p = Planner::from_cells(cfg, &flat_cells(0..40,-2..2), &bands).unwrap();
-        let r = p.plan([0.55, 0.05, 0.4], [3.45, 0.05, 0.4]).unwrap();
+        let r = p.plan([0.55, 0.05, 0.4], None, [3.45, 0.05, 0.4]).unwrap();
         assert!(r.path.iter().all(|p| p[1].abs() < 0.1));
     }
     #[test]
@@ -694,12 +699,12 @@ mod tests {
         let mut p = Planner::from_cells(config(), &flat_cells(-5..56,-5..6), &[]).unwrap();
         let cancel = AtomicBool::new(true);
         assert!(p
-            .plan_cancellable([0.0, 0.0, 0.4], [5.0, 0.0, 0.4], &cancel)
+            .plan_cancellable([0.0, 0.0, 0.4], None, [5.0, 0.0, 0.4], &cancel)
             .unwrap_err()
             .contains("取消"));
         cancel.store(false, Ordering::Relaxed);
         assert!(p
-            .plan_cancellable([0.0, 0.0, 0.4], [5.0, 0.0, 0.4], &cancel)
+            .plan_cancellable([0.0, 0.0, 0.4], None, [5.0, 0.0, 0.4], &cancel)
             .is_ok());
     }
     #[test]
@@ -728,8 +733,8 @@ mod tests {
             })
             .collect();
         let mut p = Planner::from_cells(cfg, &cells, &bands).unwrap();
-        assert!(p.plan([0.35, 0.05, 0.6], [2.65, 0.05, 0.4]).is_ok());
-        assert!(p.plan([2.65, 0.05, 0.4], [0.35, 0.05, 0.6]).is_err());
+        assert!(p.plan([0.35, 0.05, 0.6], None, [2.65, 0.05, 0.4]).is_ok());
+        assert!(p.plan([2.65, 0.05, 0.4], None, [0.35, 0.05, 0.6]).is_err());
     }
     #[test]
     fn distinct_floors_do_not_teleport_between_layers() {
@@ -766,8 +771,8 @@ mod tests {
             })
             .collect();
         let mut p = Planner::from_cells(cfg, &cells, &bands).unwrap();
-        assert!(p.plan([0.35, 0.05, 0.4], [2.65, 0.05, 1.4]).is_err());
-        assert!(p.plan([0.35, 0.05, 1.4], [2.65, 0.05, 1.4]).is_ok());
+        assert!(p.plan([0.35, 0.05, 0.4], None, [2.65, 0.05, 1.4]).is_err());
+        assert!(p.plan([0.35, 0.05, 1.4], None, [2.65, 0.05, 1.4]).is_ok());
     }
     #[test]
     fn shared_raw_classification_has_no_wall_interior_floors() {
@@ -795,7 +800,7 @@ mod tests {
             })
             .collect();
         let mut p = Planner::new(cfg, &points).unwrap();
-        assert!(p.plan([0.35, 0.05, 0.402], [2.65, 0.05, 0.402]).is_ok());
+        assert!(p.plan([0.35, 0.05, 0.402], None, [2.65, 0.05, 0.402]).is_ok());
     }
     #[test]
     fn owner_cancellation_scope_reaches_plan_and_restores() {
@@ -804,16 +809,16 @@ mod tests {
         with_planning_cancellation(flag, || {
             assert!(planning_cancelled());
             assert!(p
-                .plan([0.0, 0.0, 0.4], [1.0, 0.0, 0.4])
+                .plan([0.0, 0.0, 0.4], None, [1.0, 0.0, 0.4])
                 .unwrap_err()
                 .contains("取消"));
             let explicit = AtomicBool::new(false);
             assert!(p
-                .plan_cancellable([0.0, 0.0, 0.4], [1.0, 0.0, 0.4], &explicit)
+                .plan_cancellable([0.0, 0.0, 0.4], None, [1.0, 0.0, 0.4], &explicit)
                 .is_ok());
         });
         assert!(!planning_cancelled());
-        assert!(p.plan([0.0, 0.0, 0.4], [1.0, 0.0, 0.4]).is_ok());
+        assert!(p.plan([0.0, 0.0, 0.4], None, [1.0, 0.0, 0.4]).is_ok());
     }
     #[test]
     fn bounded_map_search_expands_for_a_long_observed_wall() {
@@ -829,7 +834,7 @@ mod tests {
             })
             .collect();
         let mut p = Planner::from_cells(cfg, &flat_cells(-5..36,-30..31), &bands).unwrap();
-        let route = p.plan([0.05, 0.05, 0.4], [3.05, 0.05, 0.4]).unwrap();
+        let route = p.plan([0.05, 0.05, 0.4], None, [3.05, 0.05, 0.4]).unwrap();
         assert!(route.path.iter().any(|point| point[1].abs() > 2.1));
     }
     #[test]
@@ -860,7 +865,7 @@ mod tests {
             let mut p = Planner::from_cells(cfg, &cells, &bands).unwrap();
             assert_eq!(
                 p.plan(
-                    [0.25, 0.05, 0.4 + 0.25 * gradient],
+                    [0.25, 0.05, 0.4 + 0.25 * gradient], None,
                     [1.75, 0.05, 0.4 + 1.75 * gradient]
                 )
                 .is_ok(),
@@ -872,3 +877,6 @@ mod tests {
 
 #[cfg(test)]
 mod multi_goal_tests;
+
+#[cfg(test)]
+mod turn_tests;

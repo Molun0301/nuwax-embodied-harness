@@ -79,14 +79,17 @@ impl PctPlanner {
         let cached = cache.get_or_insert_with(|| native_map::CachedPctPlanner::new(terrain_source));
         cached.update(map, offset, boundary)?;
         let resolution = cached.config().resolution;
+        // 起点当前朝向：全局搜索据此检查从它转到第一条边方向的机身扫掠。
+        let [x, y, z, w] = start.1;
+        let start_yaw = Some(nuwax_nav_types_messages::Quaternion { x, y, z, w }.yaw());
         let route = if progressive {
             cached
                 .planner()
-                .plan_progressive(start.0, goal.0, cancelled)?
+                .plan_progressive(start.0, start_yaw, goal.0, cancelled)?
         } else {
             match cancelled {
-                Some(flag) => cached.planner().plan_cancellable(start.0, goal.0, flag)?,
-                None => cached.planner().plan(start.0, goal.0)?,
+                Some(flag) => cached.planner().plan_cancellable(start.0, start_yaw, goal.0, flag)?,
+                None => cached.planner().plan(start.0, start_yaw, goal.0)?,
             }
         };
         tracing::debug!(

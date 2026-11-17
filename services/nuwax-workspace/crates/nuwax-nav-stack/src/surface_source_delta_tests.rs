@@ -134,7 +134,7 @@ fn registered_static_columns_keep_global_tomography_equal_to_full_rebuild() {
         let mut full=CachedPctPlanner::new(PctTerrainSource::Tomography);
         full.update(&map,offset,&[]).unwrap();
         assert_eq!(planner.planner().geometry(),full.planner().geometry(),"第{step}步原生几何与全量重建不同");
-        let (route,expected)=(planner.planner().plan(start,goal),full.planner().plan(start,goal));
+        let (route,expected)=(planner.planner().plan(start, None,goal),full.planner().plan(start, None,goal));
         assert!(expected.is_ok(),"第{step}步应有完整路线：{expected:?}");
         assert_eq!(route.unwrap().path,expected.unwrap().path);
         previous=Some(map);

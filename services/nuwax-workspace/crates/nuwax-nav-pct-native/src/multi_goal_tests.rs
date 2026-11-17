@@ -17,8 +17,25 @@ fn summarize(route: &Route) -> (f64,[f64;3],f64) {
     let yaw=route.path.windows(2).last().map_or(0.,|e|(e[1][1]-e[0][1]).atan2(e[1][0]-e[0][0]));
     (cost,*route.path.last().unwrap(),yaw)
 }
+/// 一个起点一次单源搜索，展开到全部目标定值或可达范围展开完为止，得到到各目标的路线代价（测试对照用）。
+fn rank_costs(search: &mut MultiGoalSearch<'_>,start: [f64;3],goals: &[[f64;3]]) -> Vec<Result<RouteCost,String>> {
+    let unreachable=|| Err("PCT未找到满足已知占据与机体尺寸的路径".to_string());
+    let mut costs:Vec<_>=goals.iter().map(|_|unreachable()).collect();
+    let mut pending=match search.begin_source(start,goals) {
+        Ok(reachable)=>reachable.into_iter().filter(|value|*value).count(),
+        Err(error)=>return goals.iter().map(|_|Err(error.clone())).collect(),
+    };
+    while pending>0 {
+        match search.next_settled(f64::INFINITY) {
+            Ok(Some(settled))=>{costs[settled.index]=Ok(settled.route);pending-=1;}
+            Ok(None)=>break,
+            Err(error)=>return goals.iter().map(|_|Err(error.clone())).collect(),
+        }
+    }
+    costs
+}
 fn rank(search: &mut MultiGoalSearch<'_>,start: [f64;3],goal: [f64;3]) -> Result<RouteCost,String> {
-    search.rank_costs(start,&[goal]).remove(0)
+    rank_costs(search,start,&[goal]).remove(0)
 }
 #[test]
 fn one_source_search_ranks_many_goals_like_separate_queries_and_reads_measured_heights() {
@@ -29,7 +46,7 @@ fn one_source_search_ranks_many_goals_like_separate_queries_and_reads_measured_h
     let goals:Vec<_>=(0..40).map(|i|[0.35+(i%10) as f64*0.5,0.45+(i/10) as f64*0.7,0.4]).collect();
     let mut planner=Planner::from_cells(config(),&cells,&bands).unwrap();
     let mut search=planner.multi_goal_search().unwrap();
-    let batch=search.rank_costs(start,&goals);
+    let batch=rank_costs(&mut search,start,&goals);
     assert_eq!(search.stats().source_searches,1,"同一起点只做一次单源搜索");
     assert!(batch.iter().any(Result::is_ok) && batch.iter().any(Result::is_err));
     assert_eq!(search.measured_heights([0.35,0.35]),vec![0.,0.9]);
@@ -44,7 +61,7 @@ fn one_source_search_ranks_many_goals_like_separate_queries_and_reads_measured_h
         }
     }
     with_planning_cancellation(Arc::new(AtomicBool::new(true)),|| {
-        assert!(planner.multi_goal_search().unwrap().rank_costs(start,&goals[..2]).iter()
+        assert!(rank_costs(&mut planner.multi_goal_search().unwrap(),start,&goals[..2]).iter()
             .all(|cost|cost.as_ref().unwrap_err().contains("取消")));
     });
 }
@@ -157,7 +174,7 @@ fn source_tree_bounds_many_reachable_goals_and_preserves_exact_navigation() {
         let mut search=planner.multi_goal_search().unwrap();
         let goals:Vec<_>=std::iter::once([1.55,1.55,0.4]).chain((0..128).map(|i|
             [1.05+(i%35) as f64*0.1,0.65+(i%20) as f64*0.1,0.4])).collect();
-        let routes=search.rank_costs(start,&goals);
+        let routes=rank_costs(&mut search,start,&goals);
         assert!(routes[0].as_ref().unwrap().cost>=2_f64.sqrt()-1e-10);
         for (goal,route) in goals.iter().zip(routes) {
             let route=route.unwrap();
@@ -376,4 +393,26 @@ fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
         &differences[..differences.len().min(10)]);
     assert!(reached > 400 && reference.iter().any(|node| node.2 == 0.6 && node.3.is_finite()),
         "夹具覆盖大部分地图并经台阶到达上层平台");
+}
+
+#[test]
+fn tree_distance_follows_parent_chains_of_settled_goals() {
+    let mut planner=Planner::from_cells(config(),&flat(),&[]).unwrap();
+    let mut search=planner.multi_goal_search().unwrap();
+    let start=[0.55,0.55,0.4];
+    // 沿x直线上的两个目标一个是另一个的祖先；沿y的目标与它们只在起点汇合；远处目标最后定值。
+    let goals=[[1.55,0.55,0.4],[2.55,0.55,0.4],[0.55,1.55,0.4],[4.55,2.55,0.4]];
+    assert!(search.begin_source(start,&goals).unwrap().into_iter().all(|bound|bound));
+    let mut lengths=BTreeMap::new();
+    while lengths.len()<3 {
+        let settled=search.next_settled(f64::INFINITY).unwrap().unwrap();
+        lengths.insert(settled.index,settled.route.cost);
+    }
+    assert!(!lengths.contains_key(&3));
+    let tree=|a,b|search.tree_distance(a,b).unwrap();
+    assert_eq!(tree(0,0),Some(0.0));
+    assert!((tree(0,1).unwrap()-(lengths[&1]-lengths[&0])).abs()<1e-9,"祖先关系时为两条父链长度之差");
+    assert!((tree(0,2).unwrap()-(lengths[&0]+lengths[&2])).abs()<1e-9,"只在起点汇合时为两条父链长度之和");
+    assert_eq!(tree(1,2),tree(2,1));
+    assert_eq!(tree(0,3),None,"未定值的目标没有树上距离");
 }

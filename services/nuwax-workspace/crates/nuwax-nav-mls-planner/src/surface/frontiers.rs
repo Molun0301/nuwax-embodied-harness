@@ -370,7 +370,7 @@ impl SurfaceSnapshot {
         // 受影响的簇整体拆散，仍是前沿的格与新前沿格一起重新连通。
         let mut pool = fresh;
         for id in &touched {
-            let Some(cluster) = clusters.remove(id) else { continue };
+            let cluster = clusters.remove(id).expect("前沿格所属的簇都在索引里");
             for cell in &cluster.cells {
                 gains.remove(cell);
                 if let Some(info) = cells.remove(cell) {

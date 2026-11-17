@@ -430,7 +430,7 @@ impl SurfaceGoalSourceAdapter {
         let native_ms = native_started.elapsed().as_secs_f64() * 1000.0;
         let ranking_started = std::time::Instant::now();
         delta.deferred_route = Some(None);
-        let Discovery { admissible, retry_index, examined } = self.discover(
+        let Discovery { admissible, goals, retry_index, examined } = self.discover(
             snapshot,
             &mut search,
             candidates,
@@ -478,13 +478,14 @@ impl SurfaceGoalSourceAdapter {
                 &routing_candidates,
                 &clusters,
                 self.observation_model.as_ref().map(|_| observed.as_slice()),
-                |source, goals| {
-                    // 每个代表一次单源搜索，展开到其余代表全部定值为止。
-                    let targets: Vec<_> = goals.iter().map(|&target| admissible[target].1 .0).collect();
-                    search
-                        .rank_costs(admissible[source].1 .0, &targets)
-                        .into_iter()
-                        .map(|cost| cost.map_or(f64::INFINITY, |route| route.cost))
+                |source, targets| {
+                    // 簇间代价取发现阶段那棵单源搜索树上的距离（两条父链长度之和减两倍最近公共祖先的父链长度），
+                    // 不再从各代表另做单源搜索；当前位置到各代表仍是搜索给出的精确路程。
+                    targets
+                        .iter()
+                        .map(|&target| {
+                            search.tree_distance(goals[source], goals[target]).ok().flatten().unwrap_or(f64::INFINITY)
+                        })
                         .collect()
                 },
             )
@@ -625,6 +626,7 @@ impl SurfaceGoalSourceAdapter {
             .zip(reachable.iter().flatten())
             .position(|(candidate, reachable)| *reachable && retry_matches(candidate.support_xyz));
         let mut admissible: Vec<(FrontierCandidate, BodyPose, Option<nuwax_explore_routing::observation::ViewEstimate>)> = Vec::new();
+        let mut goals = Vec::new();
         let mut represented = std::collections::BTreeSet::<u32>::new();
         let mut retry_index = None;
         let mut retry_settled = false;
@@ -761,6 +763,7 @@ impl SurfaceGoalSourceAdapter {
             }
             candidate.travel_cost = settled.route.cost;
             admissible.push((candidate, (body, candidate_quaternion), view));
+            goals.push(index);
             // 重试候选仍最先被选。
             if is_retry {
                 retry_index = Some(admissible.len() - 1);
@@ -774,7 +777,7 @@ impl SurfaceGoalSourceAdapter {
                 }
             }
         }
-        Ok(Discovery { admissible, retry_index, examined })
+        Ok(Discovery { admissible, goals, retry_index, examined })
     }
 
     fn make_candidate_goal(
@@ -1104,6 +1107,8 @@ struct FrontierCandidate {
 /// 一次单源搜索发现的可达候选（附停留位姿与视域）、重试候选位置与已检查的前沿格。
 struct Discovery {
     admissible: Vec<(FrontierCandidate, BodyPose, Option<nuwax_explore_routing::observation::ViewEstimate>)>,
+    /// 各可达候选在本次单源搜索里的目标序号（与`admissible`一一对应），用于取搜索树上的簇间距离。
+    goals: Vec<usize>,
     retry_index: Option<usize>,
     examined: std::collections::BTreeSet<[i32; 3]>,
 }
@@ -2242,7 +2247,7 @@ mod tests {
         let selected = goal(adapter.poll_goal(&state(0.4, 1)).unwrap());
         assert_eq!(selected.metadata["route_exact_queries"], "1");
         assert!(selected.metadata["geometric_candidate_count"].parse::<usize>().unwrap() > 64);
-        assert!(selected.metadata["route_source_searches"].parse::<usize>().unwrap() <= 9);
+        assert_eq!(selected.metadata["route_source_searches"], "1", "簇间代价取发现搜索树上的距离，只做一次单源搜索");
         assert!(selected.metadata["route_expanded_nodes"].parse::<usize>().unwrap() > 0);
         assert_eq!(selected.metadata["route_cost_basis"], "source_settle_order_then_selected_astar");
     }

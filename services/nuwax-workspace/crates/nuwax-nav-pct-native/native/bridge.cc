@@ -604,10 +604,11 @@ struct SourceSearch {
           (std::hash<int>{}(key.k)*0x9e3779b97f4a7c15ull);
     }
   };
-  // 已定值节点的加权代价、沿父链的几何长度，以及最后一条入边的起点（供目标端点计长度与朝向）。
+  // 已定值节点的加权代价、沿父链的几何长度、父节点，以及最后一条入边的起点（供目标端点计长度与朝向）。
   struct State {
     double g=INFINITY,length=0,ground=0;
     double from_x=0,from_y=0,from_ground=0,from_length=0;
+    Key parent{};
     bool from_source=true,closed=false;
   };
   struct Entry { double g; uint64_t sequence; Key key; };
@@ -629,6 +630,8 @@ struct SourceSearch {
   double start_x=0,start_y=0;
   std::unordered_map<Key,std::vector<size_t>,KeyHash> waiting;
   std::vector<std::array<double,2>> targets;
+  // 各目标的绑定节点（没有绑定节点的目标不会定值）。
+  std::vector<Key> bound;
   std::deque<std::pair<size_t,Key>> ready;
   size_t expanded=0;
 
@@ -711,14 +714,31 @@ struct SourceSearch {
     auto& source=states[start];
     source.g=0;source.ground=node(start.x,start.y,start.k)->ground;
     open.push({0,sequence++,start});
+    bound.assign(count,Key{});
     for(size_t i=0;i<count;++i) {
       const double* goal=goals+3*i;
       targets.push_back({goal[0],goal[1]});
       Key key{};
       if(!snap(goal,goal[2]-p.cfg.body_to_ground,key,targets.back()))continue;
       reachable[i]=1;
+      bound[i]=key;
       waiting[key].push_back(i);
     }
+    return true;
+  }
+  // 两个已定值目标的绑定节点在搜索树上的距离：两条父链长度之和减去两倍最近公共祖先的父链长度。
+  // 任一目标尚未定值时返回假。
+  bool tree_distance(size_t i,size_t j,double& out) const {
+    const auto a=states.find(bound.at(i)),b=states.find(bound.at(j));
+    if(a==states.end()||b==states.end()||!a->second.closed||!b->second.closed)return false;
+    std::unordered_set<Key,KeyHash> ancestors;
+    for(Key key=bound[i];;key=states.at(key).parent) {
+      ancestors.insert(key);
+      if(key==start)break;
+    }
+    Key key=bound[j];
+    while(!ancestors.count(key))key=states.at(key).parent;
+    out=a->second.length+b->second.length-2*states.at(key).length;
     return true;
   }
   void relax(const Key& from,const State& state) {
@@ -741,7 +761,7 @@ struct SourceSearch {
         next.g=g;next.ground=layer.ground;
         next.length=state.length+std::hypot(std::hypot(bx-ax,by-ay),layer.ground-state.ground);
         next.from_x=ax;next.from_y=ay;next.from_ground=state.ground;next.from_length=state.length;
-        next.from_source=false;
+        next.parent=from;next.from_source=false;
         open.push({g,sequence++,key});
       };
       for(auto& layer:layers)if(layer.k==from.k)visit(layer);
@@ -856,6 +876,13 @@ extern "C" int pct_source_next(void* search,size_t* index,double* weighted,PctCo
     s.transitions.stats.source_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
     if(status==2)error(err,cap,"PCT规划已取消");
     return status;
+  }catch(const std::exception& e){error(err,cap,e.what());return 3;}
+}
+// 当前单源搜索里两个已定值目标的绑定节点在搜索树上的距离（米）：0为得到距离，1为没有单源搜索或目标未定值。
+extern "C" int pct_source_tree_distance(const void* search,size_t i,size_t j,double* out,char* err,size_t cap) {
+  try {
+    const auto& s=*static_cast<const MultiGoalSearch*>(search);
+    return s.source&&s.source->tree_distance(i,j,*out)?0:1;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
 }
 // 平面点所在原生格的实测地面高度个数，并复制至多cap个；缺测列为零个，不补造地面。

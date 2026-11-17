@@ -190,6 +190,8 @@ unsafe extern "C" {
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
+    fn pct_source_tree_distance(search: *const c_void, i: usize, j: usize, out: *mut f64,
+        err: *mut c_char, cap: usize) -> i32;
     fn pct_multi_goal_grounds(search: *const c_void, x: f64, y: f64, out: *mut f64, cap: usize) -> usize;
     fn pct_plan(
         planner: *mut c_void,
@@ -258,25 +260,18 @@ impl MultiGoalSearch<'_> {
             _ => Err(native_error(&error)),
         }
     }
-    /// 一个起点一次单源搜索，展开到全部目标定值或可达范围展开完为止，得到到各目标的路线代价。
-    pub fn rank_costs(&mut self, start: [f64; 3], goals: &[[f64; 3]]) -> Vec<Result<RouteCost, String>> {
-        let unreachable = || Err("PCT未找到满足已知占据与机体尺寸的路径".to_string());
-        let mut costs: Vec<_> = goals.iter().map(|_| unreachable()).collect();
-        let mut pending = match self.begin_source(start, goals) {
-            Ok(reachable) => reachable.into_iter().filter(|value| *value).count(),
-            Err(error) => return goals.iter().map(|_| Err(error.clone())).collect(),
-        };
-        while pending > 0 {
-            match self.next_settled(f64::INFINITY) {
-                Ok(Some(settled)) => {
-                    costs[settled.index] = Ok(settled.route);
-                    pending -= 1;
-                }
-                Ok(None) => break,
-                Err(error) => return goals.iter().map(|_| Err(error.clone())).collect(),
-            }
+    /// 当前单源搜索里两个已定值目标的绑定节点在搜索树上的距离（米）：两条父链长度之和减去两倍
+    /// 最近公共祖先节点的父链长度。是两节点间真实最短路的上界；任一目标尚未定值时为`None`。
+    pub fn tree_distance(&self, a: usize, b: usize) -> Result<Option<f64>, String> {
+        let mut distance = 0.0;
+        let mut error = [0; 512];
+        let status = unsafe { pct_source_tree_distance(self.native.as_ptr(), a, b, &mut distance,
+            error.as_mut_ptr(), error.len()) };
+        match status {
+            0 => Ok(Some(distance)),
+            1 => Ok(None),
+            _ => Err(native_error(&error)),
         }
-        costs
     }
     /// 加权路径代价的基础每米代价（不含软代价）：相邻格的距离项按格数计，一格边长为原生分辨率米，
     /// 所以每米代价为 1/分辨率。

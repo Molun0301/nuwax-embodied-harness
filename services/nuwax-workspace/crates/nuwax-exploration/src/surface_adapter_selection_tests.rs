@@ -540,3 +540,110 @@ fn long_frontier_line_across_the_old_four_meter_grid_line_is_one_candidate() {
     assert_eq!(goal.metadata["available_clusters"], "1");
     assert_eq!(goal.information_gain, Some(clusters[0].gain as f32), "收益取簇的格数×格面积");
 }
+
+/// 单向台阶与门洞图：24米×12米，6米见方的房间以一格缺测相隔、门洞相通，房间内有螺线缺测；
+/// x≥12米的地面高0.1米，外形最大上阶0.15米、最大下阶0.05米，所以 x=12 米处只能上不能下，
+/// 回到低处只能走 y<2 米的一段缓坡（每格降0.01米）。
+fn one_way_step_rooms() -> Arc<SurfaceSnapshot> {
+    let holes: Vec<_> = spiral(60, 8).into_iter().chain(spiral(180, 8)).filter(|&(x, y)| (0..240).contains(&x) && (0..120).contains(&y)).collect();
+    let points: Vec<_> = (0..240_i32)
+        .flat_map(|x| (0..120_i32).map(move |y| (x, y)))
+        .filter(|&(x, y)| {
+            let gap_x = x % 60 == 0 && x > 0 && x != 120 && (y % 60 - 30).abs() > 5;
+            let gap_y = y % 60 == 0 && y > 0 && (x % 60 - 30).abs() > 5;
+            !(gap_x || gap_y || in_hole(&holes, x, y))
+        })
+        .map(|(x, y)| {
+            let height = if x >= 120 { 0.1 } else if y < 20 && x >= 110 { f64::from(x - 110) * 0.01 } else { 0.0 };
+            ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, (0.05 + height) as f32)
+        })
+        .collect();
+    Arc::new(SurfaceSnapshot::from_points(&points, map().config().clone(), 0.1).unwrap()
+        .with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
+            footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+            z_bounds_m: [-0.15, 0.15],
+            body_to_support_z_m: 0.3,
+            max_step_up_m: 0.15,
+            max_step_down_m: 0.05,
+            max_cross_slope_deg: 15.0,
+            support_uncertainty_m: 0.0,
+        })
+        .unwrap())
+}
+
+/// 簇间代价两种求法派发的第一个目标逐拍对比：树上距离（生产）与从各代表另做单源搜索的精确矩阵。
+/// 每拍按生产做一次发现，先用树上距离求访问顺序，再从各代表单源搜索求精确矩阵；机器人按树上距离的结果
+/// 走到目标并记为已到达，进入下一拍。
+/// `cargo test --release -p nuwax-exploration --all-features tree_versus_exact -- --ignored --nocapture`
+#[test]
+#[ignore = "手动对比"]
+fn tree_versus_exact_cluster_costs_first_target() {
+    let scenes: Vec<(&str, Arc<SurfaceSnapshot>, Option<ExplorationBoundary>, bool, [f64; 2], usize)> = vec![
+        ("50米多房间（门洞）", rooms(50.0, 10.0), None, true, [25.25, 25.25], 8),
+        ("24米螺线缺测，无视域", floor(24.0, |x, y| in_hole(&spiral(120, 14), x, y)), Some(inset(24.0)), false, [12.05, 12.05], 12),
+        ("24米螺线缺测，有视域", floor(24.0, |x, y| in_hole(&spiral(120, 14), x, y)), Some(inset(24.0)), true, [12.05, 12.05], 12),
+        ("单向台阶与门洞，无视域", one_way_step_rooms(), Some(inset(24.0)), false, [3.05, 3.05], 12),
+        ("单向台阶与门洞，有视域", one_way_step_rooms(), Some(inset(24.0)), true, [3.05, 3.05], 12),
+        ("50米，前沿在10米内，有视域", open_floor(50.0, true), Some(inset(50.0)), true, [25.05, 25.05], 12),
+    ];
+    let (mut total, mut differ) = (0, 0);
+    for (name, surface, boundary, model, start, ticks) in scenes {
+        let polygon = boundary.as_ref().map_or_else(Vec::new, vertices);
+        let receiver = SurfaceInputReceiver::new();
+        let mut source = adapter(&receiver, boundary, model);
+        let mut position = start;
+        let mut height = 0.35;
+        for tick in 0..ticks {
+            surface.prepare_frontier_geometry(&polygon).unwrap();
+            let planner = Arc::clone(&source.planner);
+            let mut routes = planner.route_costs(&surface, 0.3, &polygon).unwrap();
+            let mut search = routes.search().unwrap();
+            let geometry = frontier_geometry(&surface, &polygon).unwrap();
+            let mut candidates = geometry.candidates;
+            snap_support_heights(&search, &mut candidates);
+            let body = [position[0], position[1], height];
+            let robot_support = surface.support_position_from_body(body, IDENTITY, 0.3).unwrap();
+            let vertical_radius = f64::from(surface.config().step_threshold_m) + f64::from(surface.config().voxel_size);
+            let discovery = source.discover(&surface, &mut search, candidates, &geometry.spans, &geometry.targets,
+                (body, IDENTITY), robot_support, vertical_radius, true, Default::default()).unwrap();
+            if discovery.admissible.is_empty() {
+                eprintln!("{name} 第{tick}拍：没有可达候选");
+                break;
+            }
+            let routing: Vec<_> = discovery.admissible.iter().map(|(c, _, _)| nuwax_explore_routing::Candidate {
+                position: c.support_xyz, gain: c.gain, travel_cost: c.travel_cost }).collect();
+            let observed: Vec<_> = discovery.admissible.iter()
+                .map(|(_, _, view)| view.as_ref().map(|view| view.cells.clone()).unwrap_or_default()).collect();
+            let clusters: Vec<_> = discovery.admissible.iter().map(|(c, _, _)| c.cluster).collect();
+            let observations = model.then_some(observed.as_slice());
+            let tree = nuwax_explore_routing::select_clusters(&routing, &clusters, observations, |a, targets| {
+                targets.iter().map(|&b| search.tree_distance(discovery.goals[a], discovery.goals[b]).unwrap().unwrap()).collect()
+            }).unwrap();
+            let exact = nuwax_explore_routing::select_clusters(&routing, &clusters, observations, |a, targets| {
+                let goals: Vec<_> = targets.iter().map(|&b| discovery.admissible[b].1 .0).collect();
+                let mut costs = vec![f64::INFINITY; goals.len()];
+                search.begin_source(discovery.admissible[a].1 .0, &goals).unwrap();
+                while let Some(settled) = search.next_settled(f64::INFINITY).unwrap() {
+                    costs[settled.index] = settled.route.cost;
+                    if costs.iter().all(|cost| cost.is_finite()) { break; }
+                }
+                costs
+            }).unwrap();
+            total += 1;
+            let (picked, other) = (&discovery.admissible[tree.index], &discovery.admissible[exact.index]);
+            if tree.index != exact.index {
+                differ += 1;
+                eprintln!("{name} 第{tick}拍：不同；树上距离选 {:?} 路程{:.2}，精确矩阵选 {:?} 路程{:.2}，差{:.2}米（簇{}个）",
+                    picked.1 .0, picked.0.travel_cost, other.1 .0, other.0.travel_cost,
+                    picked.0.travel_cost - other.0.travel_cost, tree.regional_order.len());
+            } else {
+                eprintln!("{name} 第{tick}拍：相同 {:?} 路程{:.2}（簇{}个）", picked.1 .0, picked.0.travel_cost, tree.regional_order.len());
+            }
+            source.record_feedback(picked.0.support_xyz, vertical_radius, true);
+            position = [picked.1 .0[0], picked.1 .0[1]];
+            height = picked.1 .0[2];
+        }
+    }
+    eprintln!("合计{total}拍，第一个目标不同{differ}拍（{:.1}%）", 100.0 * f64::from(differ) / f64::from(total));
+}

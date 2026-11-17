@@ -449,6 +449,8 @@ enum LocalExecutionPayload {
 
 /// Synchronous deterministic planner boundary.
 pub trait NavPlanner: Send + 'static {
+    /// 当拍来源年龄；未配置位姿新鲜时限时为零，仅供三维跟踪外推。
+    fn set_control_pose_age(&mut self, _age: Duration) {}
     /// 由调度器在启动时传入实际控制周期。
     fn set_control_period(&mut self, _period: Duration) {}
     /// Refresh only actual source/pose/carried-ground observations. This must
@@ -915,11 +917,13 @@ where
     }
 
     fn sample_input_status(&mut self) {
+        let mut control_pose_age = Duration::ZERO;
         let reason = if !self.obstacle_source_available {
             Some("recent obstacle source revoked".into())
         } else if let Some(receipt) = self.pose_receipt {
             self.pose_source_max_age.and_then(|maximum| {
                 check_pose_data_age(receipt.source_timestamp_ns, maximum)
+                    .map(|age| control_pose_age = age.min(maximum))
                     .err()
                     .map(|e| e.to_string())
             })
@@ -931,6 +935,7 @@ where
                 .is_none()
                 .then(|| "costmap has no consumed observation".into())
         });
+        self.planner.set_control_pose_age(control_pose_age);
         self.status.planner_inputs_fresh = reason.is_none();
         self.status.input_wait_reason = reason;
     }
@@ -1802,7 +1807,7 @@ fn production_surface_backend(config:SurfaceFollowerConfig)->Result<SurfaceFollo
 
 enum SchedulerEvent{Input(Option<InputCommand>),Tick}
 
-fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeError> {
+fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<Duration, RuntimeError> {
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
         .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
     let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source,
@@ -1811,7 +1816,7 @@ fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeE
         return Err(RuntimeError::StaleInput(format!(
             "pose source deadline elapsed (source_timestamp_ns={source_ns}, source_age_ms={})", age / 1_000_000)));
     }
-    Ok(())
+    Ok(Duration::from_nanos(age))
 }
 
 struct InputCommand {
@@ -2073,6 +2078,7 @@ mod tests {
         display_reads: usize,
         costmap_updates: usize,
         odometry_updates: usize,
+        control_pose_age: Duration,
         stops: usize,
     }
 
@@ -2089,6 +2095,7 @@ mod tests {
                     display_reads: 0,
                     costmap_updates: 0,
                     odometry_updates: 0,
+                    control_pose_age: Duration::ZERO,
                     stops: 0,
                 })),
             }
@@ -2096,6 +2103,7 @@ mod tests {
     }
 
     impl NavPlanner for FakePlanner {
+        fn set_control_pose_age(&mut self, age: Duration) { self.state.lock().unwrap().control_pose_age=age; }
         fn local_path_for_display(&self) -> Vec<[f64; 3]> {
             self.state.lock().unwrap().display_reads += 1;
             Vec::new()
@@ -2728,6 +2736,21 @@ mod tests {
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn n3_control_age_uses_the_existing_pose_deadline_and_is_zero_without_configuration() {
+        let planner=FakePlanner::commanding();let observed=planner.state.clone();
+        let mut scheduler=NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),planner,SchedulerConfig::default()).unwrap();
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        scheduler.pose_receipt=Some(PlannerInputReceipt {source_timestamp_ns:now-100_000_000,received_at:Instant::now()});
+        scheduler.sample_input_status();assert_eq!(observed.lock().unwrap().control_pose_age,Duration::ZERO);
+        scheduler.pose_source_max_age=Some(Duration::from_millis(500));scheduler.sample_input_status();
+        let age=observed.lock().unwrap().control_pose_age;
+        assert!(age>=Duration::from_millis(100) && age<=Duration::from_millis(500));
+        scheduler.pose_receipt.as_mut().unwrap().source_timestamp_ns=now-600_000_000;
+        scheduler.sample_input_status();assert!(!scheduler.status.planner_inputs_fresh);
+        assert_eq!(observed.lock().unwrap().control_pose_age,Duration::ZERO,"过期输入继续等待，不能外推后执行");
     }
 
     #[tokio::test]

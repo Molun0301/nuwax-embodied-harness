@@ -80,6 +80,21 @@ pub struct MotionState {
     pub measured_yaw_rate: u32,
 }
 impl MotionState {
+    /// 实测世界线速度与偏航速度分别外推；缺失的量保留来源值，不把命令当测量。
+    fn extrapolated(&self, age: std::time::Duration) -> Self {
+        if age.is_zero() { return *self; }
+        let mut current = *self;
+        let seconds = age.as_secs_f64();
+        if self.measured_velocity != 0 {
+            for axis in 0..3 { current.position[axis] += self.velocity[axis] * seconds; }
+        }
+        if self.measured_yaw_rate != 0 { current.yaw += self.yaw_rate * seconds; }
+        if self.measured_velocity != 0 || self.measured_yaw_rate != 0 {
+            current.timestamp_ns += age.as_nanos() as i64;
+        }
+        current
+    }
+
     /// 实测停稳：平移与偏航速度都有实测且低于停稳门槛；缺少测速不充当静止。
     pub fn stopped(&self) -> bool {
         self.measured_velocity != 0 && self.measured_yaw_rate != 0
@@ -269,6 +284,7 @@ extern "C" {
         config: *const Config,
         map: *const c_void,
         state: *const MotionState,
+        tracking: *const MotionState,
         previous: *const f64,
         terminal_yaw: f64,
         terminal_position: *const f64,
@@ -519,14 +535,16 @@ impl Drop for ScanPlanner {
     }
 }
 /// 快控制会话；这里只做相位、控制与原命令检查。
-pub struct ScanTracker(NonNull<c_void>);
+pub struct ScanTracker(NonNull<c_void>, std::time::Duration);
 unsafe impl Send for ScanTracker {}
 impl Default for ScanTracker {
     fn default() -> Self {
-        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap())
+        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap(), std::time::Duration::ZERO)
     }
 }
 impl ScanTracker {
+    /// 调度器传入已按位姿新鲜时限限制的来源年龄。
+    pub fn set_pose_age(&mut self, age: std::time::Duration) { self.1 = age; }
     /// 读取原生脱困事件状态，不改变事件预算或退出判定。
     pub fn recovery_active(&self) -> bool {
         unsafe { nuwax_scan_tracker_recovery_active(self.0.as_ptr()) != 0 }
@@ -563,6 +581,7 @@ impl ScanTracker {
         terminal_yaw: Option<f64>,
         terminal_position: Option<[f64; 3]>,
     ) -> Result<TrackResult, TrackFailure> {
+        let tracking = state.extrapolated(self.1);
         let mut result = TrackRaw::default();
         let mut recovery = SamplesRaw::default();
         let mut error = [0 as c_char; 1024];
@@ -572,6 +591,7 @@ impl ScanTracker {
                 config,
                 map.0 .0.as_ptr(),
                 state,
+                &tracking,
                 previous.as_ptr(),
                 terminal_yaw.unwrap_or(f64::NAN),
                 terminal_position.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
@@ -627,6 +647,7 @@ mod tests {
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
     include!("terminal_tests.rs");
+    include!("pose_extrapolation_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

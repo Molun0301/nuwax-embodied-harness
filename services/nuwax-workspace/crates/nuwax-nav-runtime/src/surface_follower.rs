@@ -722,6 +722,9 @@ impl SurfaceFollower {
     }
 }
 impl NavPlanner for SurfaceFollower {
+    fn set_control_pose_age(&mut self, age: std::time::Duration) {
+        self.tracker.set_pose_age(age);
+    }
     fn set_control_period(&mut self, period: std::time::Duration) {
         self.config.controller.control_frequency = 1. / period.as_secs_f64();
     }

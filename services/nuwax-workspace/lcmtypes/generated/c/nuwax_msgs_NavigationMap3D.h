@@ -40,7 +40,8 @@ struct _nuwax_msgs_NavigationMap3D
     int8_t     cleared;
 
     /**
-     * 仅表示同次提交的虚拟禁区，不包含二维物理投影。
+     * 虚拟禁区，不包含二维物理投影；内容、原点尺寸或会话变化时携带，至少每秒补带一次。
+     * 未携带时沿用本进程本会话最近一份；进程启动、换会话或清空后未收到过则等待。
      */
     int8_t     has_virtual_obstacles;
     nav_msgs_OccupancyGrid virtual_obstacles;

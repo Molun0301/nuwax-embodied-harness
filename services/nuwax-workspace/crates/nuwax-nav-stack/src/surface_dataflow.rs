@@ -208,6 +208,7 @@ where
 #[derive(Default)]
 struct SurfaceMapOrder {
     current: Option<(String, i64)>,
+    mask: Option<schema::OccupancyGrid>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -222,6 +223,7 @@ impl SurfaceMapOrder {
     fn observe(&mut self, message: &schema::NavigationMap3D) -> MapIngress {
         if message.cleared {
             self.current = None;
+            self.mask = None;
             return MapIngress::Clear;
         }
         let ingress = match &self.current {
@@ -229,9 +231,17 @@ impl SurfaceMapOrder {
             Some((_, revision)) if message.revision <= *revision => return MapIngress::Ignore,
             _ => MapIngress::Update,
         };
+        if ingress == MapIngress::Replace { self.mask = None; }
         self.current = Some((message.session_id.clone(), message.revision));
         ingress
     }
+    /// 仅沿用本进程、本会话最近收到的掩码；尚未收到时等待后续完整携带包。
+    fn retain_mask(&mut self, message: &mut schema::NavigationMap3D) -> bool {
+        if let Some(mask) = &message.virtual_obstacles { self.mask = Some(mask.clone()); }
+        else { message.virtual_obstacles = self.mask.clone(); }
+        message.virtual_obstacles.is_some()
+    }
+
 }
 
 fn map_authority(map: &schema::NavigationMap3D) -> GuardedMapAuthority {
@@ -704,8 +714,8 @@ async fn run_surface_planner_with_computer(
             frame = maps.next() => {
                 let frame = required_frame(frame, "surface planner map")?;
                 let received_at = Instant::now();
-                let message = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
-                    Ok((message, _)) => Arc::new(message),
+                let mut message = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
+                    Ok((message, _)) => message,
                     Err(error) => { diagnostics.reject("surface map", &error.to_string()); continue; }
                 };
                 let ingress = order.observe(&message);
@@ -731,8 +741,15 @@ async fn run_surface_planner_with_computer(
                         continue;
                     }
                 }
+                if !order.retain_mask(&mut message) {
+                    let waiting = PreparedSurfaceMap { authority, source_timestamp_ns: message.source_timestamp_ns,
+                        received_at, awaiting_build: true, snapshot: Err("等待本会话禁行掩码".into()),
+                        change_basis: None, geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown) };
+                    hub.publish(waiting.clone()); latest_map = Some(waiting); pending_map = None;
+                    continue;
+                }
                 map_retry_after = Instant::now();
-                pending_map = Some((message, received_at, map_epoch));
+                pending_map = Some((Arc::new(message), received_at, map_epoch));
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
@@ -1217,7 +1234,7 @@ mod tests {
                 }
             }
         }
-        schema::NavigationMap3D {
+        let mut message = schema::NavigationMap3D {
             session_id: session.into(),
             frame_id: "map".into(),
 
@@ -1253,7 +1270,9 @@ mod tests {
                 data,
                 is_dense: true,
             },
-        }
+        };
+        message.virtual_obstacles = Some(virtual_mask(&message, false));
+        message
     }
 
     fn goal_for(
@@ -1574,6 +1593,63 @@ goal: schema::PoseStamped {
             if twist != Twist2::ZERO { moving = true; break; }
         }
         assert!(moving, "作者A初始化后真实生成路径必须启动运动");
+    }
+
+
+    #[test]
+    fn sparse_masks_keep_the_same_effective_sequence_and_clear_on_domain_change() {
+        let mut order=SurfaceMapOrder::default();
+        let mut full=map_message(1,"掩码等价");
+        for k in 0..30 {
+            full.revision=k+1;
+            let mask=virtual_mask(&full,k>=7 && k<17);
+            full.virtual_obstacles=Some(mask.clone());
+            let mut sparse=full.clone();
+            if ![0,7,10,17,20].contains(&k) { sparse.virtual_obstacles=None; }
+            order.observe(&sparse);
+            assert!(order.retain_mask(&mut sparse));
+            let effective=sparse.virtual_obstacles.unwrap();
+            assert_eq!((effective.info,effective.data),(mask.info,mask.data),"第{k}包有效掩码相同");
+        }
+        let mut other=map_message(1,"另一个会话");other.virtual_obstacles=None;
+        assert_eq!(order.observe(&other),MapIngress::Replace);
+        assert!(!order.retain_mask(&mut other));
+        other.virtual_obstacles=Some(virtual_mask(&other,false));assert!(order.retain_mask(&mut other));
+        other.cleared=true;assert_eq!(order.observe(&other),MapIngress::Clear);
+        other.cleared=false;other.virtual_obstacles=None;order.observe(&other);
+        assert!(!order.retain_mask(&mut other));
+    }
+
+    #[test]
+    fn lost_mask_update_recovers_on_the_one_second_refresh_without_revision_continuity() {
+        let mut order=SurfaceMapOrder::default();
+        let mut first=map_message(1,"丢包恢复");order.observe(&first);assert!(order.retain_mask(&mut first));
+        let changed=virtual_mask(&first,true);
+        // 修订2携带变化掩码但丢失；后续省略包仍沿用旧掩码，修订不要求连续。
+        for tick in 1..=10 {
+            let mut packet=map_message(tick+2,"丢包恢复");
+            packet.virtual_obstacles=if tick==10 {Some(changed.clone())} else {None};
+            order.observe(&packet);assert!(order.retain_mask(&mut packet));
+            let mask=packet.virtual_obstacles.unwrap();
+            assert_eq!(mask.data.iter().any(|v|*v==100),tick==10,"第{}毫秒恢复状态",tick*100);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_without_mask_waits_until_a_packet_carries_one() {
+        let mut harness=Harness::start().await;
+        harness.feed.lock().unwrap().map.virtual_obstacles=None;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let waiting=harness.hub.latest.lock().unwrap().clone().unwrap();
+        assert!(waiting.awaiting_build);
+        assert!(waiting.snapshot.err().unwrap().contains("等待本会话禁行掩码"));
+        {
+            let mut feed=harness.feed.lock().unwrap();
+            feed.map.virtual_obstacles=Some(virtual_mask(&feed.map,false));
+        }
+        harness.wait_ready().await;
+        assert!(harness.hub.latest.lock().unwrap().as_ref().unwrap().snapshot.is_ok());
+        harness.shutdown().await;
     }
 
     fn advance_scan(message: &mut schema::NavigationMap3D) {

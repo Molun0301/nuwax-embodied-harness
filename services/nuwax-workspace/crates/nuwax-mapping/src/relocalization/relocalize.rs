@@ -510,13 +510,17 @@ pub fn score_relocalization(
         let origin = transform * origin;
         let direction = point - origin;
         let length = direction.norm();
-        if length <= 0.8 {
+        let direction = direction / length;
+        let normal = transform.rotation * normal;
+        let endpoint_exclusion = 0.3_f64.max(2.0 * 0.1 / direction.dot(&normal).abs());
+        let sample_end = length - endpoint_exclusion;
+        // 扣除两端后没有取样点的射线不计入分子和分母。
+        if sample_end <= 0.5 {
             continue;
         }
         rays += 1;
-        let direction = direction / length;
         let mut distance = 0.5;
-        while distance < length - 0.3 {
+        while distance < sample_end {
             if target
                 .occupied
                 .contains(&voxel_key(&(origin + direction * distance)))
@@ -1171,6 +1175,29 @@ mod tests {
         let endpoints = TargetCache::new(&endpoints, RelocalizationConfig::default());
         let score = score_relocalization(&through, Isometry3::identity(), &endpoints);
         assert_eq!(score.penetration, 0.0, "两端排除段不能计为穿透：{score:?}");
+    }
+
+    #[test]
+    fn rays_without_samples_do_not_dilute_penetration_at_rotated_pose() {
+        let source = SourceCloud {
+            points: vec![point![0.8, 0.0, 0.0], point![2.0, 2.0, 0.0], point![2.0, 4.0, 0.0]],
+            origins: vec![point![0.0, 0.0, 0.0], point![0.0, 2.0, 0.0], point![0.0, 4.0, 0.0]],
+            normals: vec![vector![1.0, 0.0, 0.0], vector![0.0, 1.0, 0.0], vector![1.0, 0.0, 0.0]],
+            walls: vec![true; 3],
+        };
+        // 第一条恰好没有剩余长度，第二条与端点平面平行；只有第三条参评且穿透。
+        // 同时旋转点、原点和法线，验证评分使用相同坐标系中的射线方向与法线。
+        for yaw in [0.0, core::f64::consts::FRAC_PI_2] {
+            let transform = Isometry3::from_parts(Translation3::identity(),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, yaw));
+            let points: Vec<_> = source.points.iter().map(|point| transform * point).collect();
+            let mut target = TargetCache::new(&points, RelocalizationConfig::default());
+            target.occupied = std::collections::HashSet::from([
+                voxel_key(&(transform * point![0.5, 4.0, 0.0])),
+            ]);
+            let score = score_relocalization(&source, transform, &target);
+            assert_eq!(score.penetration, 1.0, "没有取样点的射线不能稀释分母：{score:?}");
+        }
     }
 
     #[test]

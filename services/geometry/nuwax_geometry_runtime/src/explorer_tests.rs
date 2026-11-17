@@ -670,7 +670,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
         let update = explorer
             .tick(Some(position.clone()), grid, Ok(surface.clone()), Ok(()))
             .unwrap();
-        assert!(update.status.frontier_count > 1, "三维前沿数应统计未排除格子");
+        assert!(update.status.frontier_count > 1, "三维前沿数是达到最小尺寸的簇数");
         let (_, target) = update.goal.expect("实际曲面源应产生目标");
         let target = target.pose.unwrap();
         assert!(
@@ -919,10 +919,11 @@ fn surface_child_switches_when_its_frontier_vanishes_and_cancels_only_without_ne
     // 但0.75米内仍有前沿格时也不换目标。
     let advanced = floor(move |x, _| x >= cell[0] + 5);
     let boundary = explorer.boundary();
-    let original = advanced.frontier_candidates(&boundary).unwrap().into_iter()
-        .find(|frontier| [frontier.cell.0, frontier.cell.1] == cell);
+    let frontiers: Vec<_> = advanced.frontier_clusters(&boundary).unwrap().into_iter()
+        .flat_map(|cluster| cluster.frontiers).collect();
+    let original = frontiers.iter().find(|frontier| [frontier.cell.0, frontier.cell.1] == cell);
     assert!(original.is_none(), "前移后原前沿格不再是前沿");
-    let z = advanced.frontier_candidates(&boundary).unwrap()[0].cell.2;
+    let z = frontiers[0].cell.2;
     assert!(advanced.frontier_near([cell[0], cell[1], z], 0.75, 0.3, &boundary).unwrap());
     assert!(!distant_hole().frontier_near([cell[0], cell[1], z], 0.75, 0.3, &boundary).unwrap());
     for surface in [partial, floor(|x, _| x >= 12), advanced] {

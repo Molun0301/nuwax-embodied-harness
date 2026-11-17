@@ -453,7 +453,7 @@ pub trait ExplorationGoalSource: Send {
         Vec::new()
     }
 
-    /// 本次选点时未被排除的前沿格数。
+    /// 本次选点时的前沿数；默认取前沿快照条数，三维表面源取达到最小尺寸的簇数。
     fn frontier_count(&self) -> usize { self.frontier_snapshot().len() }
 
     /// 仍因导航失败超限而排除的历史条目数。
@@ -803,7 +803,7 @@ impl ExplorationController {
             .collect()
     }
 
-    /// 当前选点的未排除前沿格数。
+    /// 各源最近一次选点的前沿数之和。
     pub fn frontier_count(&self) -> usize {
         self.sources.iter().map(|source| source.frontier_count()).sum()
     }

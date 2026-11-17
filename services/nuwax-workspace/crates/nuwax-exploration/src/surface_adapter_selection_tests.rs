@@ -1,7 +1,6 @@
-//! 三维选点规则的性质：候选按路程由近到远发现、区域代表、搜到8个区域即停、规模无关、重试优先。
+//! 三维选点规则的性质：候选按路程由近到远发现、簇代表、搜到8个簇即停、规模无关、重试优先。
 use super::tests::{map, volume_model};
 use super::*;
-use nuwax_explore_routing::region_key;
 use nuwax_nav_runtime::native_map::PctTerrainSource;
 use nuwax_nav_types_messages::geometry::{Point2, Quaternion, Timestamp};
 use nuwax_nav_types_messages::NavFrameId;
@@ -73,12 +72,13 @@ fn pose(x: f64, y: f64, sequence: i64) -> ExplorationStateSnapshot<'static> {
     )
 }
 
-/// 一次发现与同一起点展开到可达范围尽头的对照：对照给出每个可达候选（前沿格、区域）的加权路径代价。
+/// 一次发现与同一起点展开到可达范围尽头的对照：对照给出每个可达候选（前沿格、簇）的加权路径代价。
 struct Run {
     discovery: Discovery,
     expanded: usize,
-    truth: Vec<([i32; 3], [i64; 3], f64)>,
+    truth: Vec<([i32; 3], u32, f64)>,
     truth_expanded: usize,
+    spans: BTreeMap<u32, f64>,
 }
 
 /// 只做一次发现，返回发现结果、展开节点数与基础每米代价。
@@ -93,7 +93,7 @@ fn discover_only(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, b
     let robot_support = surface.support_position_from_body(start, IDENTITY, 0.3).unwrap();
     let vertical_radius = f64::from(surface.config().step_threshold_m) + f64::from(surface.config().voxel_size);
     let discovery = source
-        .discover(surface, &mut search, candidates, &geometry.targets, (start, IDENTITY),
+        .discover(surface, &mut search, candidates, &geometry.spans, &geometry.targets, (start, IDENTITY),
             robot_support, vertical_radius, true, Default::default())
         .unwrap();
     (discovery, search.stats().source_expanded, search.cost_per_meter())
@@ -109,7 +109,7 @@ fn run(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, boundary: &
     let robot_support = surface.support_position_from_body(start, IDENTITY, 0.3).unwrap();
     let vertical_radius = f64::from(surface.config().step_threshold_m) + f64::from(surface.config().voxel_size);
     let discovery = source
-        .discover(surface, &mut search, candidates.clone(), &geometry.targets, (start, IDENTITY),
+        .discover(surface, &mut search, candidates.clone(), &geometry.spans, &geometry.targets, (start, IDENTITY),
             robot_support, vertical_radius, true, Default::default())
         .unwrap();
     let expanded = search.stats().source_expanded;
@@ -120,31 +120,31 @@ fn run(source: &SurfaceGoalSourceAdapter, surface: &SurfaceSnapshot, boundary: &
     let mut truth = Vec::new();
     while let Some(settled) = search.next_settled(f64::INFINITY).unwrap() {
         let candidate = &kept[settled.index];
-        truth.push((candidate.frontier_cell, region_key(candidate.support_xyz), settled.weighted));
+        truth.push((candidate.frontier_cell, candidate.cluster, settled.weighted));
     }
-    Run { discovery, expanded, truth, truth_expanded: search.stats().source_expanded - expanded }
+    Run { discovery, expanded, truth, truth_expanded: search.stats().source_expanded - expanded, spans: geometry.spans }
 }
 
-fn cheapest_by_region(truth: &[([i32; 3], [i64; 3], f64)]) -> BTreeMap<[i64; 3], f64> {
+fn cheapest_by_cluster(truth: &[([i32; 3], u32, f64)]) -> BTreeMap<u32, f64> {
     let mut best = BTreeMap::new();
-    for &(_, region, weighted) in truth {
-        let entry = best.entry(region).or_insert(f64::INFINITY);
+    for &(_, cluster, weighted) in truth {
+        let entry = best.entry(cluster).or_insert(f64::INFINITY);
         *entry = f64::min(*entry, weighted);
     }
     best
 }
 
-fn representatives(run: &Run) -> BTreeMap<[i64; 3], f64> {
+fn representatives(run: &Run) -> BTreeMap<u32, f64> {
     let weighted: BTreeMap<_, _> = run.truth.iter().map(|&(cell, _, w)| (cell, w)).collect();
     run.discovery
         .admissible
         .iter()
-        .map(|(candidate, _, _)| (region_key(candidate.support_xyz), weighted[&candidate.frontier_cell]))
+        .map(|(candidate, _, _)| (candidate.cluster, weighted[&candidate.frontier_cell]))
         .collect()
 }
 
 #[test]
-fn representative_is_cheapest_reachable_candidate_and_selected_regions_are_the_eight_cheapest() {
+fn representative_is_cheapest_reachable_candidate_and_selected_clusters_are_the_eight_cheapest() {
     let center = 12.05;
     let holes = spiral(120, 14);
     let surface = floor(24.0, |x, y| in_hole(&holes, x, y));
@@ -152,21 +152,21 @@ fn representative_is_cheapest_reachable_candidate_and_selected_regions_are_the_e
     let receiver = SurfaceInputReceiver::new();
     let source = adapter(&receiver, Some(boundary.clone()), false);
     let run = run(&source, &surface, &vertices(&boundary), [center, center, 0.35]);
-    let best = cheapest_by_region(&run.truth);
-    assert!(best.len() > 8, "夹具应有8个以上可达区域：{}", best.len());
+    let best = cheapest_by_cluster(&run.truth);
+    assert!(best.len() > 8, "夹具应有8个以上可达簇：{}", best.len());
     let chosen = representatives(&run);
-    assert_eq!(chosen.len(), 8, "每个区域一个代表，凑满8个区域");
-    // 1. 每个区域的代表是该区域全部可达候选里路径代价最小的。
-    for (region, weighted) in &chosen {
-        assert_eq!(*weighted, best[region], "区域{region:?}");
+    assert_eq!(chosen.len(), 8, "每个簇一个代表，凑满8个簇");
+    // 1. 每个簇的代表是该簇全部可达候选里路径代价最小的。
+    for (cluster, weighted) in &chosen {
+        assert_eq!(*weighted, best[cluster], "簇{cluster}");
     }
-    // 2. 被选入的8个区域正是代表路径代价最小的8个。
-    let mut ranked: Vec<_> = best.iter().map(|(region, w)| (*w, *region)).collect();
+    // 2. 被选入的8个簇正是代表路径代价最小的8个。
+    let mut ranked: Vec<_> = best.iter().map(|(cluster, w)| (*w, *cluster)).collect();
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-    assert!(ranked[7].0 < ranked[8].0, "夹具第8与第9个区域代价不应相同");
-    let cheapest: BTreeSet<_> = ranked.iter().take(8).map(|(_, region)| *region).collect();
+    assert!(ranked[7].0 < ranked[8].0, "夹具第8与第9个簇代价不应相同");
+    let cheapest: BTreeSet<_> = ranked.iter().take(8).map(|(_, cluster)| *cluster).collect();
     assert_eq!(chosen.keys().copied().collect::<BTreeSet<_>>(), cheapest);
-    assert!(run.expanded < run.truth_expanded, "凑满8个区域即停，未展开到可达范围尽头：{} 对 {}",
+    assert!(run.expanded < run.truth_expanded, "凑满8个簇即停，未展开到可达范围尽头：{} 对 {}",
         run.expanded, run.truth_expanded);
 }
 
@@ -193,19 +193,19 @@ fn far_unreachable_candidates_neither_change_the_result_nor_expand_the_whole_map
     assert_eq!(near.expanded, with_island.expanded);
     let total = 240 * 240;
     assert!(with_island.expanded * 4 < total, "展开{}个节点，全图{total}", with_island.expanded);
-    // 可达范围只有一个封闭房间（可达区域不足8个）：搜索展开完房间即停，不碰隔开的远处平台。
+    // 可达范围只有一个封闭房间（可达簇不足8个）：搜索展开完房间即停，不碰隔开的远处平台。
     let room = |x: i32, y: i32| {
         let d = (x - 120).abs().max((y - 120).abs());
         (31..=33).contains(&d) || (d < 31 && in_hole(&[(100, 120), (140, 125)], x, y))
     };
     let closed = run(&source, &floor(24.0, |x, y| room(x, y) || island(x, y)), &polygon, start);
     assert!(!closed.discovery.admissible.is_empty());
-    assert_eq!(closed.expanded, closed.truth_expanded, "可达区域不足8个时展开完可达范围");
+    assert_eq!(closed.expanded, closed.truth_expanded, "可达簇不足8个时展开完可达范围");
     assert!(closed.expanded <= 61 * 61, "只展开房间内：{}", closed.expanded);
 }
 
 #[test]
-fn with_view_model_selected_region_candidates_settle_up_to_the_representative_bound() {
+fn with_view_model_selected_cluster_candidates_settle_up_to_the_representative_bound() {
     let center = 12.05;
     let holes = spiral(120, 14);
     let surface = floor(24.0, |x, y| in_hole(&holes, x, y));
@@ -214,17 +214,18 @@ fn with_view_model_selected_region_candidates_settle_up_to_the_representative_bo
     let source = adapter(&receiver, Some(boundary.clone()), true);
     let run = run(&source, &surface, &vertices(&boundary), [center, center, 0.35]);
     let weighted: BTreeMap<_, _> = run.truth.iter().map(|&(cell, _, w)| (cell, w)).collect();
-    // 每个区域第一个收下的候选是该区域的代表；上限 = 代表最大代价 + 区域对角线 × 每米代价（0.1米格，每米10）。
+    // 每个簇第一个收下的候选是该簇的代表；上限 = 代表最大代价 + 8个簇里最大的平面跨度 × 每米代价（0.1米格，每米10）。
     let mut representatives = BTreeMap::new();
     for (candidate, _, _) in &run.discovery.admissible {
-        representatives.entry(region_key(candidate.support_xyz)).or_insert(weighted[&candidate.frontier_cell]);
+        representatives.entry(candidate.cluster).or_insert(weighted[&candidate.frontier_cell]);
     }
     assert_eq!(representatives.len(), 8);
-    let bound = representatives.values().copied().fold(f64::NEG_INFINITY, f64::max)
-        + nuwax_explore_routing::REGION_SIZE_M * std::f64::consts::SQRT_2 * 10.0;
+    let span = representatives.keys().map(|cluster| run.spans[cluster]).fold(0.0, f64::max);
+    assert!(span > 0.0);
+    let bound = representatives.values().copied().fold(f64::NEG_INFINITY, f64::max) + span * 10.0;
     let (mut within, mut beyond) = (0, 0);
-    for &(cell, region, w) in &run.truth {
-        if !representatives.contains_key(&region) { continue; }
+    for &(cell, cluster, w) in &run.truth {
+        if !representatives.contains_key(&cluster) { continue; }
         if w <= bound {
             within += 1;
             assert!(run.discovery.examined.contains(&cell), "上限内的候选{cell:?}应已定值");
@@ -233,17 +234,17 @@ fn with_view_model_selected_region_candidates_settle_up_to_the_representative_bo
             assert!(!run.discovery.examined.contains(&cell), "超出上限的候选{cell:?}按不可达处理");
         }
     }
-    assert!(run.discovery.admissible.len() > representatives.len(), "区域内全部候选按视域规则另选代表");
-    eprintln!("选中区域内候选：上限内{within}，超出{beyond}");
+    assert!(run.discovery.admissible.len() > representatives.len(), "簇内全部候选按视域规则另选代表");
+    eprintln!("选中簇内候选：上限内{within}，超出{beyond}");
 }
 
 #[test]
-fn view_model_with_unreachable_wall_tops_does_not_expand_with_map_area() {
+fn view_model_with_unreachable_wall_top_cluster_does_not_expand_with_map_area() {
     let mut runs = Vec::new();
     for (size, cell) in [(50.0, 250), (100.0, 490)] {
         let center = (f64::from(cell) + 0.5) * 0.1;
         let holes = spiral(cell, 14);
-        // 机器人东侧3米一道1米高、4米长的墙：墙顶格是前沿候选，但不可达。
+        // 机器人东侧3米一道1米高、4米长的墙：墙顶自成一个达标簇，但不可达。
         let wall = move |x: i32, y: i32| x == cell + 30 && (cell - 20..cell + 20).contains(&y);
         let cells = (size / 0.1_f64).round() as i32;
         let points: Vec<_> = (0..cells)
@@ -261,12 +262,13 @@ fn view_model_with_unreachable_wall_tops_does_not_expand_with_map_area() {
         let receiver = SurfaceInputReceiver::new();
         let source = adapter(&receiver, Some(boundary), true);
         let (discovery, expanded, _) = discover_only(&source, &surface, &polygon, [center, center, 0.35]);
-        let regions: BTreeSet<_> = discovery.admissible.iter().map(|(c, _, _)| region_key(c.support_xyz)).collect();
-        let tops = surface.frontier_candidates(&polygon).unwrap().iter()
-            .filter(|f| f.support_xyz[2] > 0.5 && regions.contains(&region_key([f.support_xyz[0], f.support_xyz[1], 0.05]))).count();
-        eprintln!("{size}米：展开{expanded}，区域{}，选中区域内墙顶候选{tops}", regions.len());
-        assert!(tops > 0, "选中区域内应有不可达的墙顶候选");
-        assert_eq!(regions.len(), 8);
+        let clusters: BTreeSet<_> = discovery.admissible.iter().map(|(c, _, _)| c.cluster).collect();
+        let tops: BTreeSet<_> = surface.frontier_clusters(&polygon).unwrap().iter()
+            .filter(|cluster| cluster.frontiers.iter().all(|f| f.support_xyz[2] > 0.5)).map(|cluster| cluster.id).collect();
+        eprintln!("{size}米：展开{expanded}，簇{}，墙顶簇{tops:?}", clusters.len());
+        assert!(!tops.is_empty(), "墙顶应自成达标簇");
+        assert!(clusters.is_disjoint(&tops), "不可达的墙顶簇没有代表，不会被选入8个簇");
+        assert_eq!(clusters.len(), 8);
         let relative: Vec<_> = discovery.admissible.iter()
             .map(|(c, _, _)| [c.support_xyz[0] - center, c.support_xyz[1] - center].map(|v| (v * 10.0).round() as i64)).collect();
         runs.push((expanded, relative, (size / 0.1 * size / 0.1) as usize));
@@ -279,7 +281,7 @@ fn view_model_with_unreachable_wall_tops_does_not_expand_with_map_area() {
 #[test]
 fn single_selection_effort_does_not_grow_with_map_area_when_frontiers_are_near() {
     let mut runs = Vec::new();
-    // 两张图上场景相对4米区域网格的位置相同（中心相差24米）。
+    // 两张图上场景的整数格位置相对中心相同（中心相差24米）。
     for (size, cell) in [(50.0, 250), (100.0, 490)] {
         let center = (f64::from(cell) + 0.5) * 0.1;
         let holes = spiral(cell, 14);
@@ -309,7 +311,8 @@ fn single_selection_effort_does_not_grow_with_map_area_when_frontiers_are_near()
     }
     let ((small, small_goals), (large, large_goals)) = (&runs[0], &runs[1]);
     for (a, b) in small_goals.iter().zip(large_goals) {
-        assert!((a.0[0] - b.0[0]).abs() < 1e-6 && (a.0[1] - b.0[1]).abs() < 1e-6, "同一场景选出同一相对目标：{a:?} {b:?}");
+        // 地面点是f32，绝对坐标50米处的f32间隔约3.8e-6米，同一相对目标在两张图上的差在这个量级。
+        assert!((a.0[0] - b.0[0]).abs() < 1e-5 && (a.0[1] - b.0[1]).abs() < 1e-5, "同一场景选出同一相对目标：{a:?} {b:?}");
         assert_eq!(a.1, b.1, "展开节点数相同");
     }
     assert!(*large < small * 1.5 + 50.0, "耗时不随地图面积增长：50米{small:.1}ms，100米{large:.1}ms");
@@ -420,9 +423,37 @@ fn selection_timing_against_baseline_scenes() {
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             let ExplorationPoll::Goal(goal) = outcome else { panic!("{name}: {outcome:?}") };
             let fields = stages.0.lock().unwrap().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
-            eprintln!("{name} 第{round}拍（{polls}次轮询）：总耗时{elapsed:.1}ms {fields}\n  区域{} 目标{:?} 代价{:?}",
-                goal.metadata["route_regions"], [goal.pose.pose.position.x, goal.pose.pose.position.y], goal.distance_cost);
+            eprintln!("{name} 第{round}拍（{polls}次轮询）：总耗时{elapsed:.1}ms {fields}\n  簇{}/{} 目标{:?} 代价{:?}",
+                goal.metadata["route_clusters"], goal.metadata["available_clusters"],
+                [goal.pose.pose.position.x, goal.pose.pose.position.y], goal.distance_cost);
             source.report_goal_feedback(&goal.id, ExplorationGoalFeedback::Reached).unwrap();
         }
     }
+}
+
+/// 8米×4米地面，探索边界向上越过地面上缘：只有上缘一条长前沿线，横跨原来4米世界栅格的 x=4 米线。
+#[test]
+fn long_frontier_line_across_the_old_four_meter_grid_line_is_one_candidate() {
+    let surface = floor(8.0, |_, y| y >= 40);
+    let boundary = ExplorationBoundary::from_vertices(vec![
+        Point2::new(0.3, 0.3),
+        Point2::new(7.7, 0.3),
+        Point2::new(7.7, 6.0),
+        Point2::new(0.3, 6.0),
+    ])
+    .unwrap();
+    let polygon = vertices(&boundary);
+    let clusters = surface.frontier_clusters(&polygon).unwrap();
+    assert_eq!(clusters.len(), 1, "上缘前沿线是一个簇");
+    let sides: BTreeSet<_> = clusters[0].frontiers.iter().map(|f| (f.support_xyz[0] / 4.0).floor() as i64).collect();
+    assert_eq!(sides.len(), 2, "簇横跨原来的4米栅格线");
+    let receiver = SurfaceInputReceiver::new();
+    let mut source = adapter(&receiver, Some(boundary), false);
+    let (discovery, _, _) = discover_only(&source, &surface, &polygon, [4.05, 2.05, 0.35]);
+    assert_eq!(discovery.admissible.len(), 1, "一个簇只有一个代表");
+    receiver.observe(Arc::clone(&surface)).unwrap();
+    let goal = goal_of(source.poll_goal(&pose(4.05, 2.05, 1)).unwrap());
+    assert_eq!(goal.metadata["route_clusters"], "1");
+    assert_eq!(goal.metadata["available_clusters"], "1");
+    assert_eq!(goal.information_gain, Some(clusters[0].gain as f32), "收益取簇的格数×格面积");
 }

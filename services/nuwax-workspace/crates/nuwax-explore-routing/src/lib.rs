@@ -25,11 +25,11 @@ pub struct Selection {
     pub priority_wait_rounds: u64,
     /// 输入候选数组的下标。
     pub index: usize,
-    /// 本轮有限区域访问顺序，各项仍是输入候选下标。
+    /// 本轮有限分组（二维为区域，三维为前沿簇）的访问顺序，各项仍是输入候选下标。
     pub regional_order: Vec<usize>,
     /// 完整访问顺序的路径代价。
     pub route_cost: f64,
-    /// 输入中实际有效的区域总数，可以大于本轮参与排序的上限。
+    /// 输入中实际有效的分组总数，可以大于本轮参与排序的上限。
     pub region_count: usize,
 }
 
@@ -106,14 +106,14 @@ pub fn select(
     candidates: &[Candidate],
     costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
 ) -> Option<Selection> {
-    select_with_priority(candidates, None, None, costs)
+    select_with_priority(candidates, |i| region_key(candidates[i].position), None, None, costs)
 }
 
 /// 区域平面边长（米）；区域按平面边长与一米高度分组。
-pub const REGION_SIZE_M: f64 = 4.0;
+const REGION_SIZE_M: f64 = 4.0;
 
-/// 前沿代表筛选和区域等待账本共用的空间分组，不代表已识别房间。
-pub fn region_key(p: [f64; 3]) -> [i64; 3] {
+/// 二维波前链的区域分组与区域等待账本共用的空间分组，不代表已识别房间。
+fn region_key(p: [f64; 3]) -> [i64; 3] {
     [
         (p[0] / REGION_SIZE_M).floor() as i64,
         (p[1] / REGION_SIZE_M).floor() as i64,
@@ -235,6 +235,7 @@ impl RegionalSchedule {
             .map(|(&key, &served)| (key, self.round.saturating_sub(served)));
         let mut result = select_with_priority(
             candidates,
+            |i| region_key(candidates[i].position),
             priority.map(|(key, _)| key),
             observations,
             costs,
@@ -268,19 +269,22 @@ impl RegionalSchedule {
     }
 }
 
-/// 不带等待优先的区域代表与访问顺序：每个区域取收益÷（1+路程）最大的候选作代表
-/// （有视域时只取视域非空的），至多8个区域，访问顺序由动态规划求出。
-pub fn select_regions(
+/// 三维链按前沿簇分组的代表与访问顺序（不带等待优先）：`clusters[i]`是候选`i`所属的簇；
+/// 每个簇取收益÷（1+路程）最大的候选作代表（有视域时只取视域非空的），至多8个簇，访问顺序由动态规划求出。
+pub fn select_clusters(
     candidates: &[Candidate],
+    clusters: &[u32],
     observations: Option<&[BTreeSet<[i32; 3]>]>,
     costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
 ) -> Option<Selection> {
-    select_with_priority(candidates, None, observations, costs)
+    select_with_priority(candidates, |i| clusters[i], None, observations, costs)
 }
 
-fn select_with_priority(
+/// `group`给出候选所属的分组；每组一个代表。
+fn select_with_priority<K: Ord + Copy>(
     candidates: &[Candidate],
-    priority: Option<[i64; 3]>,
+    group: impl Fn(usize) -> K,
+    priority: Option<K>,
     observations: Option<&[std::collections::BTreeSet<[i32; 3]>]>,
     mut costs: impl FnMut(usize, &[usize]) -> Vec<f64>,
 ) -> Option<Selection> {
@@ -293,13 +297,13 @@ fn select_with_priority(
             .then_with(|| candidates[a].position[2].total_cmp(&candidates[b].position[2]))
     };
     let mut regions = BTreeMap::new();
-    for (i, candidate) in candidates
+    for (i, _) in candidates
         .iter()
         .enumerate()
         .filter(|(i, c)| valid_candidate(c) && observations.is_none_or(|sets| !sets[*i].is_empty()))
     {
         regions
-            .entry(region_key(candidate.position))
+            .entry(group(i))
             .and_modify(|best: &mut usize| {
                 if compare(i, *best).is_lt() {
                     *best = i;
@@ -498,6 +502,7 @@ mod tests {
             .map(|(&key, &served)| (key, schedule.round.saturating_sub(served)));
         let mut result = select_with_priority(
             candidates,
+            |i| region_key(candidates[i].position),
             priority.map(|(key, _)| key),
             observations,
             costs,

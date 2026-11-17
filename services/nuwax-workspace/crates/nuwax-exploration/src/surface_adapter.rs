@@ -402,6 +402,7 @@ impl SurfaceGoalSourceAdapter {
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let mut candidates = geometry.candidates;
         let observation_targets = geometry.targets;
+        let spans = geometry.spans;
         let frontier_ms = compute_started.elapsed().as_secs_f64() * 1000.0 - geometry_ms;
         let native_started = std::time::Instant::now();
         if nuwax_nav_pct_native::planning_cancelled() {
@@ -423,10 +424,9 @@ impl SurfaceGoalSourceAdapter {
         // 默认3米策略半径不能跨越另一楼层；高度只覆盖局部可跨台阶及量化差。
         let vertical_radius =
             f64::from(snapshot.config().step_threshold_m) + f64::from(snapshot.config().voxel_size);
-        delta.frontier_count = Some(candidates.iter()
-            .filter(|candidate| !self.excluded(candidate.support_xyz, vertical_radius)).count());
+        // 状态里的前沿数是当前达到最小尺寸的簇数。
+        delta.frontier_count = Some(spans.len());
         let geometric_candidate_count = candidates.len();
-        let voxel = f64::from(snapshot.config().voxel_size);
         let native_ms = native_started.elapsed().as_secs_f64() * 1000.0;
         let ranking_started = std::time::Instant::now();
         delta.deferred_route = Some(None);
@@ -434,6 +434,7 @@ impl SurfaceGoalSourceAdapter {
             snapshot,
             &mut search,
             candidates,
+            &spans,
             &observation_targets,
             current_body,
             robot_support,
@@ -471,9 +472,11 @@ impl SurfaceGoalSourceAdapter {
                     .unwrap_or_default()
             })
             .collect();
+        let clusters: Vec<_> = admissible.iter().map(|(candidate, _, _)| candidate.cluster).collect();
         let selection = if retry_index.is_none() {
-            nuwax_explore_routing::select_regions(
+            nuwax_explore_routing::select_clusters(
                 &routing_candidates,
+                &clusters,
                 self.observation_model.as_ref().map(|_| observed.as_slice()),
                 |source, goals| {
                     // 每个代表一次单源搜索，展开到其余代表全部定值为止。
@@ -526,7 +529,6 @@ impl SurfaceGoalSourceAdapter {
         if let Some(model) = self.observation_model.as_ref() {
             view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, &observation_targets)
                 .map_err(ExploreError::SourceError)?);
-            candidate.gain = view.as_ref().map_or(0, |v| v.cells.len()) as f64 * voxel.powi(2);
         }
         if self.excluded(candidate.support_xyz, vertical_radius)
             || view.as_ref().is_some_and(|view| view.cells.is_empty()) {
@@ -544,12 +546,12 @@ impl SurfaceGoalSourceAdapter {
             ("route_expanded_nodes",stats.source_expanded.to_string()),
             ("geometric_candidate_count",geometric_candidate_count.to_string()),
             ("admissible_candidate_count",admissible.len().to_string()),
-            ("selection_method",if retry_index.is_some(){"navigation_retry"}else{"regional_route"}.into()),
+            ("selection_method",if retry_index.is_some(){"navigation_retry"}else{"cluster_route"}.into()),
         ] {goal.metadata.insert(key.into(),value);}
         if let Some(selection)=selection {
             for (key,value) in [
-                ("route_regions",selection.regional_order.len().to_string()),
-                ("available_regions",selection.region_count.to_string()),
+                ("route_clusters",selection.regional_order.len().to_string()),
+                ("available_clusters",selection.region_count.to_string()),
                 ("route_cost_m",selection.route_cost.to_string()),
             ] {goal.metadata.insert(key.into(),value);}
         }
@@ -563,15 +565,16 @@ impl SurfaceGoalSourceAdapter {
 
     /// 从当前位置一次按需展开的单源搜索，候选按端点绑定规则（支撑点±10格内最近的有效地面层）绑定到节点，
     /// 在绑定节点定值时按路径代价由近到远成为可达候选：
-    /// 无视域时每个区域第一个定值的可达候选是代表；已有8个区域有代表或可达范围展开完即停；
-    /// 有视域时再续到这8个区域内的候选全部定值，或出队代价超过8个代表里的最大代价加一个区域对角线路程。
-    /// 重试候选仍最先被选。
+    /// 无视域时每个前沿簇第一个定值并通过检查的可达候选是代表；已有8个簇有代表或可达范围展开完即停；
+    /// 有视域时再续到这8个簇的全部格定值，或出队代价超过8个代表里的最大代价加8个簇里最大的平面跨度路程。
+    /// 重试候选仍最先被选。`spans`是簇号到簇平面跨度（米）。
     #[allow(clippy::too_many_arguments)]
     fn discover(
         &self,
         snapshot: &SurfaceSnapshot,
         search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
         mut candidates: Vec<FrontierCandidate>,
+        spans: &std::collections::BTreeMap<u32, f64>,
         observation_targets: &[nuwax_explore_routing::observation::ObservationTarget],
         current_body: BodyPose,
         robot_support: [f64; 3],
@@ -606,40 +609,36 @@ impl SurfaceGoalSourceAdapter {
                 [support[0], support[1], support[2] + self.body_to_support_z_m]
             })
             .collect();
-        let regions: Vec<_> = candidates
-            .iter()
-            .map(|candidate| nuwax_explore_routing::region_key(candidate.support_xyz))
-            .collect();
+        let clusters: Vec<_> = candidates.iter().map(|candidate| candidate.cluster).collect();
         // 起点没有可搜索的实测地面时所有候选都不可达；10格内没有绑定节点的候选不可达。
         let reachable = search.begin_source(current_body.0, &targets).ok();
-        let mut unsettled = std::collections::BTreeMap::<[i64; 3], usize>::new();
-        for (region, _) in regions
+        let mut unsettled = std::collections::BTreeMap::<u32, usize>::new();
+        for (cluster, _) in clusters
             .iter()
             .zip(reachable.iter().flatten())
             .filter(|(_, reachable)| **reachable)
         {
-            *unsettled.entry(*region).or_default() += 1;
+            *unsettled.entry(*cluster).or_default() += 1;
         }
         let retry_target = candidates
             .iter()
             .zip(reachable.iter().flatten())
             .position(|(candidate, reachable)| *reachable && retry_matches(candidate.support_xyz));
         let mut admissible: Vec<(FrontierCandidate, BodyPose, Option<nuwax_explore_routing::observation::ViewEstimate>)> = Vec::new();
-        let mut represented = std::collections::BTreeSet::<[i64; 3]>::new();
+        let mut represented = std::collections::BTreeSet::<u32>::new();
         let mut retry_index = None;
         let mut retry_settled = false;
-        // 有视域时8个区域确定后的续搜上限：8个代表里的最大加权代价加一个区域对角线路程，超出的候选按不可达处理。
-        // 区域对角线 = 区域平面边长 × √2（米）；路程换算成代价用搜索的基础每米代价（不含软代价）。
-        let diagonal_cost = nuwax_explore_routing::REGION_SIZE_M * std::f64::consts::SQRT_2 * search.cost_per_meter();
+        // 有视域时8个簇确定后的续搜上限：8个代表里的最大加权代价加8个簇里最大的平面跨度路程，超出的候选按不可达处理。
+        // 路程换算成代价用搜索的基础每米代价（不含软代价）。
         let mut representative_cost = f64::NEG_INFINITY;
         let mut limit = f64::INFINITY;
         while reachable.is_some() {
-            // 已有8个区域的代表（有视域时这些区域的候选也全部定值），且重试候选已处理，即停止。
+            // 已有8个簇的代表（有视域时这些簇的格也全部定值），且重试候选已处理，即停止。
             let retry_pending = retry_target.is_some() && !retry_settled;
-            let regions_done = represented.len() >= 8
+            let clusters_done = represented.len() >= 8
                 && (self.observation_model.is_none()
-                    || represented.iter().all(|region| unsettled.get(region).is_none_or(|count| *count == 0)));
-            if !retry_pending && (regions_done || !selecting) {
+                    || represented.iter().all(|cluster| unsettled.get(cluster).is_none_or(|count| *count == 0)));
+            if !retry_pending && (clusters_done || !selecting) {
                 break;
             }
             let settled = match search.next_settled(if retry_pending { f64::INFINITY } else { limit }) {
@@ -651,20 +650,20 @@ impl SurfaceGoalSourceAdapter {
                 Err(error) => return Err(ExploreError::SourceError(error)),
             };
             let index = settled.index;
-            let region = regions[index];
-            if let Some(count) = unsettled.get_mut(&region) {
+            let cluster = clusters[index];
+            if let Some(count) = unsettled.get_mut(&cluster) {
                 *count -= 1;
             }
             let mut candidate = candidates[index].clone();
             examined.insert(candidate.frontier_cell);
             let is_retry = retry_target == Some(index);
             retry_settled |= is_retry;
-            // 无视域时每个区域第一个定值的可达候选是代表；有视域时只收已选区域内的候选。
+            // 无视域时每个簇第一个定值的可达候选是代表；有视域时只收已选簇内的候选。
             if !is_retry
                 && (if self.observation_model.is_none() {
-                    represented.contains(&region) || represented.len() >= 8
+                    represented.contains(&cluster) || represented.len() >= 8
                 } else {
-                    !represented.contains(&region) && represented.len() >= 8
+                    !represented.contains(&cluster) && represented.len() >= 8
                 })
             {
                 continue;
@@ -760,9 +759,6 @@ impl SurfaceGoalSourceAdapter {
                         .map_err(ExploreError::SourceError)?,
                 );
             }
-            if let Some(view) = &view {
-                candidate.gain = view.cells.len() as f64 * voxel.powi(2);
-            }
             candidate.travel_cost = settled.route.cost;
             admissible.push((candidate, (body, candidate_quaternion), view));
             // 重试候选仍最先被选。
@@ -770,10 +766,11 @@ impl SurfaceGoalSourceAdapter {
                 retry_index = Some(admissible.len() - 1);
                 break;
             }
-            if represented.insert(region) {
+            if represented.insert(cluster) {
                 representative_cost = representative_cost.max(settled.weighted);
                 if self.observation_model.is_some() && represented.len() == 8 {
-                    limit = representative_cost + diagonal_cost;
+                    let span = represented.iter().map(|cluster| spans[cluster]).fold(0.0, f64::max);
+                    limit = representative_cost + span * search.cost_per_meter();
                 }
             }
         }
@@ -815,11 +812,9 @@ impl SurfaceGoalSourceAdapter {
             (candidate.gain / (1.0 + travel)) as f32,
         );
         goal.information_gain = Some(candidate.gain as f32);
+        // 收益是所属前沿簇的格数 × 格面积；视域只决定能否看到、朝向与联合覆盖。
+        goal.metadata.insert("gain_basis".into(), "frontier_cluster_cells".into());
         if let Some(view) = view {
-            goal.metadata.insert(
-                "gain_basis".into(),
-                "calibrated_visible_support_cells".into(),
-            );
             goal.metadata
                 .insert("visibility_rays".into(), view.rays.to_string());
             goal.metadata.insert(
@@ -1039,8 +1034,8 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    /// 子目标执行期间每张新表面快照核对一次：所选前沿格周围水平黑名单半径、竖直该候选高度范围以内
-    /// 已没有任何前沿格时返回真；范围内还有前沿格就继续走原目标。
+    /// 子目标执行期间每张新表面快照核对一次所选簇是否还在：所选前沿格周围水平黑名单半径、竖直该候选高度范围以内
+    /// 已没有达到最小尺寸的簇的前沿格时（簇已不存在或缩到最小尺寸以下）返回真；还有就继续走原目标。
     fn frontier_vanished(&mut self, goal_id: &str) -> ExploreResult<bool> {
         let Some(snapshot) = self.receiver.snapshot()? else {
             return Ok(false);
@@ -1066,6 +1061,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.last_frontiers.clone()
     }
 
+    /// 最近一次选点时达到最小尺寸的前沿簇数。
     fn frontier_count(&self) -> usize { self.frontier_count }
 
     fn excluded_frontiers(&self) -> usize {
@@ -1097,7 +1093,10 @@ type BodyPose = ([f64; 3], [f64; 4]);
 #[derive(Clone, Debug)]
 struct FrontierCandidate {
     frontier_cell: [i32; 3],
+    /// 所属前沿簇。
+    cluster: u32,
     support_xyz: [f64; 3],
+    /// 簇收益：簇的格数 × 格面积。
     gain: f64,
     travel_cost: f64,
 }
@@ -1119,6 +1118,8 @@ struct DeferredFrontierRoute {
 
 struct FrontierGeometry {
     candidates: Vec<FrontierCandidate>,
+    /// 达到最小尺寸的簇：簇号 → 簇平面跨度（米）。
+    spans: std::collections::BTreeMap<u32, f64>,
     targets: Vec<nuwax_explore_routing::observation::ObservationTarget>,
 }
 
@@ -1147,16 +1148,22 @@ fn frontier_geometry(
     let size = f64::from(snapshot.config().voxel_size);
     let key = |point: [f64; 3]| point.map(|value| (value / size).floor() as i32);
     let mut candidates = BTreeMap::new();
-    for candidate in snapshot.frontier_candidates(boundary)? {
-        candidates.insert(
-            key(candidate.support_xyz),
-            FrontierCandidate {
-                frontier_cell: [candidate.cell.0, candidate.cell.1, candidate.cell.2],
-                support_xyz: candidate.support_xyz,
-                gain: candidate.gain,
-                travel_cost: f64::INFINITY,
-            },
-        );
+    let mut spans = BTreeMap::new();
+    // 候选只取达到最小尺寸的簇的格，收益取簇收益。
+    for cluster in snapshot.frontier_clusters(boundary)? {
+        spans.insert(cluster.id, cluster.span_m);
+        for frontier in cluster.frontiers {
+            candidates.insert(
+                key(frontier.support_xyz),
+                FrontierCandidate {
+                    frontier_cell: [frontier.cell.0, frontier.cell.1, frontier.cell.2],
+                    cluster: cluster.id,
+                    support_xyz: frontier.support_xyz,
+                    gain: cluster.gain,
+                    travel_cost: f64::INFINITY,
+                },
+            );
+        }
     }
     let targets: BTreeMap<_, _> = snapshot
         .observation_targets(boundary)?
@@ -1166,6 +1173,7 @@ fn frontier_geometry(
     // 运动候选只取已观测地面的前沿；未知观察目标只参与感知收益，不补造成可走节点。
     Ok(FrontierGeometry {
         candidates: candidates.into_values().collect(),
+        spans,
         targets: targets.into_values().collect(),
     })
 }
@@ -1724,14 +1732,14 @@ mod tests {
         let selected = goal(source.poll_goal(&state(0.4, 1)).unwrap());
         assert_eq!(
             selected.metadata.get("gain_basis").map(String::as_str),
-            Some("calibrated_visible_support_cells")
+            Some("frontier_cluster_cells")
         );
         assert!(selected.information_gain.unwrap() > 0.0);
         assert!(selected.pose.pose.position.z < 1.0);
     }
 
     #[test]
-    fn production_surface_source_reports_shared_regional_selection() {
+    fn production_surface_source_reports_shared_cluster_selection() {
         let receiver = SurfaceInputReceiver::new();
         receiver.observe(map()).unwrap();
         let mut source = source(receiver, 1);
@@ -1739,14 +1747,14 @@ mod tests {
         let goal = goal(source.poll_goal(&state(0.3, 1)).unwrap());
         assert_eq!(
             goal.metadata.get("selection_method").map(String::as_str),
-            Some("regional_route")
+            Some("cluster_route")
         );
         assert!(goal
             .distance_cost
             .is_some_and(|cost| cost.is_finite() && cost > 0.0));
         assert!(
             goal.metadata
-                .get("route_regions")
+                .get("route_clusters")
                 .unwrap()
                 .parse::<usize>()
                 .unwrap()

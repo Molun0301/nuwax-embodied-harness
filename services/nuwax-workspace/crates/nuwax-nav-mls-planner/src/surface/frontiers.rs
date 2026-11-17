@@ -1,6 +1,6 @@
 //! 前沿几何索引与局部失效；不缓存机器人可达关系或路径代价。
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 /// 最近一次实际前沿几何计算工作量；可达图搜索另计。
@@ -14,6 +14,25 @@ pub struct SurfaceFrontierCacheStats {
     pub frontier_count: usize,
     /// 是否使用了局部变化范围。
     pub incremental: bool,
+    /// 本次重新连通聚类的前沿格数（脏范围内的新前沿格加受影响簇的原有格）。
+    pub reclustered_cells: usize,
+    /// 开口宽度不小于机体宽度的簇数。
+    pub candidate_clusters: usize,
+}
+
+/// 开口宽度不小于机体宽度的前沿簇；簇号只用于同一索引内分组。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceFrontierCluster {
+    /// 簇号。
+    pub id: u32,
+    /// 簇内全部格两两之间的最大格心平面距离（米）。
+    pub span_m: f64,
+    /// 开口宽度（米）：簇里紧邻未知列的格两两之间的最大格心平面距离加一个格边长。
+    pub opening_m: f64,
+    /// 簇收益：簇的格数 × 格面积。
+    pub gain: f64,
+    /// 簇内前沿格，按格号排序；收益取簇收益，路程未求（无穷）。
+    pub frontiers: Vec<SurfaceFrontier>,
 }
 
 pub(super) type CacheSlot = Mutex<Option<CachedFrontiers>>;
@@ -26,8 +45,29 @@ pub(super) struct CachedFrontiers {
 
 pub(super) struct FrontierIndex {
     boundary: Vec<[f64; 2]>,
+    /// 达标簇（开口宽度不小于机体宽度）里的前沿格 → 所属簇的收益；选点候选、途中换目标与
+    /// `reachable_frontiers` 只读它。
     pub(super) gains: BTreeMap<VoxelKey, f64>,
+    /// 全部前沿格（含未达标的簇）→ 所属簇号与是否紧邻未知列。
+    cells: BTreeMap<VoxelKey, FrontierCell>,
+    /// 簇号 → 簇；增量更新时未受影响的簇共用原对象。
+    clusters: BTreeMap<u32, Arc<FrontierClusterCells>>,
+    next_cluster: u32,
     stats: SurfaceFrontierCacheStats,
+}
+
+#[derive(Clone, Copy)]
+struct FrontierCell {
+    cluster: u32,
+    /// 四邻域里有未知列（簇的开口线）。
+    opening: bool,
+}
+
+struct FrontierClusterCells {
+    cells: Vec<VoxelKey>,
+    span_m: f64,
+    opening_m: f64,
+    candidate: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -102,24 +142,32 @@ impl SurfaceSnapshot {
             }
     }
 
-    /// Geometric viewpoint seeds only. Reachability must be checked by the active
-    /// planner; absence of an observed start cell does not invalidate this query.
-    pub fn frontier_candidates(
+    /// 达标前沿簇及其格，只是几何视点种子；可达性由当前规划器核验。
+    pub fn frontier_clusters(
         &self,
         boundary: &[[f64; 2]],
-    ) -> Result<Vec<SurfaceFrontier>, SurfaceError> {
+    ) -> Result<Vec<SurfaceFrontierCluster>, SurfaceError> {
         validate_boundary(boundary)?;
-        Ok(self.frontier_index(boundary).gains.iter().map(|(&cell, &gain)| {
-            SurfaceFrontier {
-                support_xyz: self.cell_position(cell),
+        let index = self.frontier_index(boundary);
+        let area = f64::from(self.config().voxel_size).powi(2);
+        Ok(index.clusters.iter().filter(|(_, cluster)| cluster.candidate).map(|(&id, cluster)| {
+            let gain = cluster.cells.len() as f64 * area;
+            SurfaceFrontierCluster {
+                id,
+                span_m: cluster.span_m,
+                opening_m: cluster.opening_m,
                 gain,
-                travel_cost: f64::INFINITY,
-                cell,
+                frontiers: cluster.cells.iter().map(|&cell| SurfaceFrontier {
+                    support_xyz: self.cell_position(cell),
+                    gain,
+                    travel_cost: f64::INFINITY,
+                    cell,
+                }).collect(),
             }
         }).collect())
     }
 
-    /// 某格中心水平`horizontal_m`、竖直`vertical_m`以内是否还有前沿格；索引与选点共用，只局部重算变化范围。
+    /// 某格中心水平`horizontal_m`、竖直`vertical_m`以内是否还有达标簇的前沿格；索引与选点共用，只局部重算变化范围。
     pub fn frontier_near(
         &self,
         cell: [i32; 3],
@@ -267,26 +315,32 @@ impl SurfaceSnapshot {
             }
         }
         let dirty = cache.as_ref().and_then(|cache| cache.dirty.as_ref());
-        let mut gains: BTreeMap<_, _> = cache.as_ref().map_or_else(BTreeMap::new, |cache| {
-            cache
-                .seed
-                .gains
-                .iter()
-                .filter(|(cell, _)| !dirty_contains(dirty.unwrap(), **cell, self.frontier_dirty_radius()))
-                .map(|(&cell, &gain)| (cell, gain))
+        let radius = self.frontier_dirty_radius();
+        // 继承脏范围外的前沿格；脏范围内原有前沿格所在的簇要重新聚类。
+        let mut touched = BTreeSet::new();
+        let mut cells: BTreeMap<_, _> = cache.as_ref().map_or_else(BTreeMap::new, |cache| {
+            cache.seed.cells.iter()
+                .filter(|(cell, info)| {
+                    let inside = dirty_contains(dirty.unwrap(), **cell, radius);
+                    if inside { touched.insert(info.cluster); }
+                    !inside
+                })
+                .map(|(&cell, &info)| (cell, info))
                 .collect()
         });
-        let retained_frontiers = gains.len();
+        let retained_frontiers = cells.len();
         let mut evaluated_cells = 0;
-        let mut evaluate = |cell| {
+        // 脏范围内重新评估出的前沿格 → 是否紧邻未知列。
+        let mut fresh = BTreeMap::new();
+        let mut evaluate = |cell: VoxelKey| {
             evaluated_cells += 1;
-            let gain = self.frontier_gain(cell, boundary);
-            if gain > 0.0 {
-                gains.insert(cell, gain);
+            let unknown = self.frontier_unknown_cells(cell, boundary);
+            if !unknown.is_empty() {
+                fresh.insert(cell, unknown.iter().any(|u| (u.0 - cell.0).abs() + (u.1 - cell.1).abs() == 1));
             }
         };
         if let Some(blocks) = dirty {
-            let mut affected = std::collections::BTreeSet::new();
+            let mut affected = BTreeSet::new();
             for bounds in blocks.values() {
                 if let Some((xs, ys)) = bounds.column_ranges(self.data.graph.cells.slot_capacity()) {
                     for x in xs {
@@ -304,15 +358,76 @@ impl SurfaceSnapshot {
         } else {
             for cell in self.cell_keys() { evaluate(cell); }
         }
+        let cluster_started = std::time::Instant::now();
+        let step = self.data.candidate_step_cells;
+        // 与新前沿格相邻的原有簇也受影响（可能合并）。
+        for &cell in fresh.keys() {
+            for_each_neighbor(&cells, cell, step, |_, info| { touched.insert(info.cluster); });
+        }
+        let (mut clusters, mut gains, mut next_cluster) = cache.as_ref().map_or_else(
+            || (BTreeMap::new(), BTreeMap::new(), 0),
+            |cache| (cache.seed.clusters.clone(), cache.seed.gains.clone(), cache.seed.next_cluster));
+        // 受影响的簇整体拆散，仍是前沿的格与新前沿格一起重新连通。
+        let mut pool = fresh;
+        for id in &touched {
+            let Some(cluster) = clusters.remove(id) else { continue };
+            for cell in &cluster.cells {
+                gains.remove(cell);
+                if let Some(info) = cells.remove(cell) {
+                    pool.insert(*cell, info.opening);
+                }
+            }
+        }
+        let reclustered_cells = pool.len();
+        let width = self.frontier_body_width();
+        let size = f64::from(self.config().voxel_size);
+        let area = size.powi(2);
+        while let Some((seed, opening)) = pool.pop_first() {
+            let mut members = vec![(seed, opening)];
+            let mut next = 0;
+            while next < members.len() {
+                let (cell, _) = members[next];
+                next += 1;
+                let mut found = Vec::new();
+                for_each_neighbor(&pool, cell, step, |neighbor, _| found.push(neighbor));
+                members.extend(found.into_iter().map(|neighbor| (neighbor, pool.remove(&neighbor).unwrap())));
+            }
+            let span_m = planar_diameter(members.iter().map(|(cell, _)| [cell.0, cell.1])) * size;
+            let opening_cells: Vec<_> = members.iter().filter(|(_, opening)| *opening).map(|(cell, _)| [cell.0, cell.1]).collect();
+            // 簇里没有紧邻未知列的格时开口宽度为零。
+            let opening_m = if opening_cells.is_empty() {
+                0.0
+            } else {
+                planar_diameter(opening_cells.into_iter()) * size + size
+            };
+            let candidate = opening_m + 1e-9 >= width;
+            let id = next_cluster;
+            next_cluster += 1;
+            let mut member_cells: Vec<_> = members.iter().map(|(cell, _)| *cell).collect();
+            member_cells.sort_unstable();
+            for &(cell, opening) in &members {
+                cells.insert(cell, FrontierCell { cluster: id, opening });
+                if candidate {
+                    gains.insert(cell, member_cells.len() as f64 * area);
+                }
+            }
+            clusters.insert(id, Arc::new(FrontierClusterCells { cells: member_cells, span_m, opening_m, candidate }));
+        }
+        let cluster_ms = cluster_started.elapsed().as_secs_f64() * 1000.0;
         let index = Arc::new(FrontierIndex {
             boundary: boundary.to_vec(),
             stats: SurfaceFrontierCacheStats {
                 evaluated_cells,
                 retained_frontiers,
-                frontier_count: gains.len(),
+                frontier_count: cells.len(),
                 incremental: dirty.is_some(),
+                reclustered_cells,
+                candidate_clusters: clusters.values().filter(|cluster| cluster.candidate).count(),
             },
             gains,
+            cells,
+            clusters,
+            next_cluster,
         });
         *self
             .data
@@ -324,9 +439,18 @@ impl SurfaceSnapshot {
         });
         // 仅真实重建发出工作量事件；命中旧索引不重复报告上一次统计。
         tracing::trace!(target: "navigation.surface.frontier.rebuild",
-            evaluated_cells, retained_frontiers, incremental = dirty.is_some(),
+            evaluated_cells, retained_frontiers, incremental = dirty.is_some(), reclustered_cells, cluster_ms,
             "前沿几何索引重建");
         index
+    }
+
+    /// 机体宽度：有外形时取外形包络矩形的横向宽度，没有外形时取规划器所用圆的直径（2×`wall_clearance_m`）。
+    fn frontier_body_width(&self) -> f64 {
+        self.data.body_envelope.as_ref().map_or(2.0 * f64::from(self.config().wall_clearance_m), |body| {
+            let (low, high) = body.footprint_xy_m.iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| (low.min(point[1]), high.max(point[1])));
+            high - low
+        })
     }
 
     fn frontier_dirty_radius(&self) -> i64 {
@@ -344,11 +468,6 @@ impl SurfaceSnapshot {
             });
         ((radius / f64::from(self.config().voxel_size)).ceil() as i32 + 2).min(MAX_PROFILE_CELLS)
     }
-    fn frontier_gain(&self, cell: VoxelKey, boundary: &[[f64; 2]]) -> f64 {
-        self.frontier_unknown_cells(cell, boundary).len() as f64
-            * f64::from(self.config().voxel_size).powi(2)
-    }
-
     /// 当前几何前沿的未知支撑单元，作为可观察收益样本；不表示已有真实支撑。
     pub fn observation_targets(
         &self,
@@ -356,7 +475,7 @@ impl SurfaceSnapshot {
     ) -> Result<Vec<nuwax_explore_routing::observation::ObservationTarget>, SurfaceError> {
         validate_boundary(boundary)?;
         let mut cells = std::collections::BTreeSet::new();
-        for &cell in self.frontier_index(boundary).gains.keys() {
+        for &cell in self.frontier_index(boundary).cells.keys() {
             cells.extend(self.frontier_unknown_cells(cell, boundary));
         }
         Ok(cells
@@ -456,6 +575,50 @@ impl SurfaceSnapshot {
         }
         unknown
     }
+}
+
+/// 平面8邻接、支撑高度差不超过接续台阶高度（`candidate_step_cells`格）的前沿格。
+fn for_each_neighbor<V>(cells: &BTreeMap<VoxelKey, V>, cell: VoxelKey, step: i32, mut visit: impl FnMut(VoxelKey, &V)) {
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let (x, y) = (cell.0 + dx, cell.1 + dy);
+            for (&neighbor, value) in cells.range((x, y, cell.2 - step)..=(x, y, cell.2 + step)) {
+                visit(neighbor, value);
+            }
+        }
+    }
+}
+
+/// 平面格点两两之间的最大距离（格）：先求凸包（单调链），再在凸包顶点间两两比较。
+fn planar_diameter(points: impl Iterator<Item = [i32; 2]>) -> f64 {
+    let mut points: Vec<[i64; 2]> = points.map(|p| [i64::from(p[0]), i64::from(p[1])]).collect();
+    points.sort_unstable();
+    points.dedup();
+    let cross = |o: [i64; 2], a: [i64; 2], b: [i64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut hull: Vec<[i64; 2]> = Vec::new();
+    let extend = |hull: &mut Vec<[i64; 2]>, point: [i64; 2], start: usize| {
+        while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0 {
+            hull.pop();
+        }
+        hull.push(point);
+    };
+    for &point in &points {
+        extend(&mut hull, point, 0);
+    }
+    let start = hull.len() - 1;
+    for &point in points.iter().rev().skip(1) {
+        extend(&mut hull, point, start);
+    }
+    let mut best = 0_i64;
+    for (i, a) in hull.iter().enumerate() {
+        for b in &hull[i + 1..] {
+            best = best.max((a[0] - b[0]).pow(2) + (a[1] - b[1]).pow(2));
+        }
+    }
+    (best as f64).sqrt()
 }
 
 #[cfg(test)]

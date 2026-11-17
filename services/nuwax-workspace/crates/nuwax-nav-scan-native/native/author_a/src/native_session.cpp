@@ -251,6 +251,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
   *out={};*recovery={};scan_native_diagnostic.clear();try {
     auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
+    s.escape.observeSource(state->timestamp_ns);
     const Vector3d sampled_position=Eigen::Map<const Vector3d>(state->position);
     const double sampled_yaw=state->yaw;
     const Vector3d position=Eigen::Map<const Vector3d>(tracking->position);const double yaw=tracking->yaw,cs=std::cos(yaw),sn=std::sin(yaw);

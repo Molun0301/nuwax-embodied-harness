@@ -11,8 +11,12 @@ class AuthorOverlapEscape {
   bool active_=false,latched_=false,recontact_=false,waiting_for_stop_=false;
   std::optional<int64_t> clear_since_;
   std::optional<int64_t> decision_stamp_;
+  std::optional<int64_t> source_stamp_;
+  int64_t source_interval_=0;
   std::vector<ScanSample> decision_samples_;
   ScanOutput decision_output_{};
+  unsigned hold_ticks_=1,issued_ticks_=0;
+  std::vector<double> issued_bounds_;
   int64_t began_=0,last_stamp_=0;
   unsigned ticks_=0;
   double traveled_=0.;
@@ -191,6 +195,12 @@ class AuthorOverlapEscape {
  public:
   bool active() const { return active_; }
   bool hasDecision(int64_t stamp) const {return decision_stamp_&&*decision_stamp_==stamp;}
+  void observeSource(int64_t stamp) {
+    if(!source_stamp_||stamp!=*source_stamp_) {
+      source_interval_=source_stamp_?stamp-*source_stamp_:0;
+      source_stamp_=stamp;
+    }
+  }
   void observeOverlap() {
     if(clear_since_){recontact_=true;clear_since_.reset();}
   }
@@ -205,16 +215,22 @@ class AuthorOverlapEscape {
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
       const double* velocity,double angular,int64_t stamp,const double previous[3],ScanOutput& output) {
     if(hasDecision(stamp)) {
-      // 同源重复只停车，沿用首拍证明样本，不重新准入、记账或失败。
+      // 同源只消费首拍保持段的证明；每个重发拍计入原未确认运动预算。
       output=decision_output_;
-      output.command_forward=output.command_lateral=output.command_yaw_rate=0.;
+      if(issued_ticks_<issued_bounds_.size()) {
+        if(latched_)admitted_+=issued_bounds_[issued_ticks_];
+        ++issued_ticks_;
+      } else output.command_forward=output.command_lateral=output.command_yaw_rate=0.;
       output.samples=static_cast<ScanSample*>(std::calloc(decision_samples_.size(),sizeof(ScanSample)));
       std::copy(decision_samples_.begin(),decision_samples_.end(),output.samples);return;
     }
     // 缺测尚不能开始恢复证明，保留原输入等待语义，不宣告几何恢复失败。
     if(!velocity||!std::isfinite(angular))
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
+    hold_ticks_=decision_stamp_?static_cast<unsigned>(std::max(1.,std::ceil(
+        source_interval_/(c.sample_dt*1e9)))):1;
     decision_stamp_=stamp;decision_samples_.clear();decision_output_={};
+    issued_ticks_=0;issued_bounds_.clear();
     try {
       planImpl(map,c,p,yaw,velocity,angular,stamp,previous,recontact_,output);
       recontact_=false;
@@ -347,10 +363,16 @@ class AuthorOverlapEscape {
       State state=actual;
       double path_bound=0.;
       std::vector<State> samples{actual};
-      if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound,budget_exhausted,stopped))continue;
-      const double issued_bound=path_bound;
-      samples.push_back(state);
+      std::vector<double> issued_bounds;
       bool safe=true;
+      // 从实测边界证明同一命令保持k拍，再沿原加速度上限制动到零。
+      for(unsigned tick=0;tick<hold_ticks_;++tick) {
+        const double before=path_bound;
+        if(!advance(map,c,state,command.linear,command.angular,deadline,exhausted,path_bound,
+            budget_exhausted,stopped&&tick==0)){safe=false;break;}
+        issued_bounds.push_back(path_bound-before);samples.push_back(state);
+      }
+      if(!safe)continue;
       while(!state.linear.isZero(0.)||state.angular!=0.) {
         if(!advance(map,c,state,Eigen::Vector2d::Zero(),0.,deadline,exhausted,path_bound,budget_exhausted)){safe=false;break;}
         samples.push_back(state);
@@ -396,10 +418,11 @@ class AuthorOverlapEscape {
           out.acceleration[j]=(out.velocity[j]-output.samples[i-1].velocity[j])/c.sample_dt;
       }
       output.motion_boundary_sources[0]=0;output.motion_boundary_sources[1]=2;output.motion_boundary_sources[2]=0;
-      // 首次非零输出起计；同源输出由缓存复用，只计一次未确认整拍运动。
+      issued_bounds_=std::move(issued_bounds);issued_ticks_=1;
+      // 首次非零输出起计；首拍和后续同源重发各消费对应一拍的证明路程界。
       if(latched_||output.command_forward!=0.||output.command_lateral!=0.||output.command_yaw_rate!=0.) {
         if(!latched_){began_=last_stamp_=stamp;last_=p;active_=true;}
-        admitted_+=issued_bound;
+        admitted_+=issued_bounds_.front();
       }
       contacts_=std::move(exits);
       for(auto& contact:contacts_) {

@@ -292,6 +292,7 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
         let mut fence = map_message(next.revision + 1, &first.session_id);
         if clear {
             fence.cleared = true;
+            fence.virtual_obstacles = None;
             fence.cloud.width = 0;
             fence.cloud.row_step = 0;
             fence.cloud.data.clear();

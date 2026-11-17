@@ -2720,7 +2720,8 @@ goal: schema::PoseStamped {
         }
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
         assert_eq!(starts.lock().unwrap().len(), 1, "远端变化仍由局部跟踪先检查");
-        harness.feed.lock().unwrap().position[0] = 1.6;
+        // 墙从x=1.8开始；0.3米方形机身旋转最大半宽约0.212米，留0.3米才有完整转向空间。
+        harness.feed.lock().unwrap().position[0] = 1.5;
         let replacement = harness.path_for(&goal).await;
         assert!(replacement.path_revision > 1, "局部连续缺轨2秒后必须更新全局修订");
         assert!(starts.lock().unwrap().len() >= 2);
@@ -2892,7 +2893,7 @@ goal: schema::PoseStamped {
             let mut feed = first.feed.lock().unwrap();
             feed.map.revision += 1;
 
-            feed.map.virtual_obstacles = None;
+            feed.map.virtual_obstacles = Some(virtual_mask(&feed.map, false));
         }
         first.wait_controlling().await;
 

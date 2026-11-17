@@ -33,7 +33,7 @@ pub use body_query::{BodyGroundEvidence, BodyGroundSourceRelation, BodyGroundSta
 mod body_witness;
 pub use body_witness::{BodyFailureWitness, BodyRejection, CollisionCheck, OccupancySource};
 mod frontiers;
-pub use frontiers::SurfaceFrontierCacheStats;
+pub use frontiers::{SurfaceFrontierCacheStats, SurfaceFrontierCluster};
 mod wall;
 use frontiers::frontier_point_distance;
 mod update;

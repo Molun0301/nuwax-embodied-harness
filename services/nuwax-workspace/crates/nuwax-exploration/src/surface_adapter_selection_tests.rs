@@ -431,6 +431,89 @@ fn selection_timing_against_baseline_scenes() {
     }
 }
 
+/// 只收集前沿索引重建事件（`navigation.surface.frontier.rebuild`）的计数与聚类耗时。
+#[derive(Clone, Default)]
+struct Rebuilds(Arc<std::sync::Mutex<Vec<(String, f64)>>>);
+struct RebuildVisitor<'a>(&'a mut Vec<(String, f64)>);
+impl tracing::field::Visit for RebuildVisitor<'_> {
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.0.push((field.name().into(), value));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.push((field.name().into(), value as f64));
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Rebuilds {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().fields().field("cluster_ms").is_some() {
+            let mut fields = Vec::new();
+            event.record(&mut RebuildVisitor(&mut fields));
+            *self.0.lock().unwrap() = fields;
+        }
+    }
+}
+
+/// 聚类维护每拍耗时：同一构建器逐拍去掉少量地面列（模拟机器人附近的新观测改变前沿），每拍取一次前沿索引，
+/// 记录重新评估的格数、重新聚类的格数与聚类耗时（索引重建事件里的`cluster_ms`）。第0行是首次全图建索引。
+/// `cargo test --release -p nuwax-exploration --all-features cluster_maintenance_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "耗时，手动运行"]
+fn cluster_maintenance_timing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let rebuilds = Rebuilds::default();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(rebuilds.clone()));
+    let room = |x: i32, y: i32| {
+        let gap_x = x % 100 == 0 && x > 0 && (y % 100 - 50).abs() > 5;
+        let gap_y = y % 100 == 0 && y > 0 && (x % 100 - 50).abs() > 5;
+        gap_x || gap_y
+    };
+    let holes = |center: i32| move |x: i32, y: i32| (0..12).any(|i| {
+        let a = i as f64 * std::f64::consts::TAU / 12.0;
+        let (hx, hy) = (center as f64 + 60.0 * a.cos(), center as f64 + 60.0 * a.sin());
+        (x as f64 - hx).abs() < 2.0 && (y as f64 - hy).abs() < 2.0
+    });
+    let near50 = holes(250);
+    let near100 = holes(500);
+    // 场景：名称、边长、缺测、是否用内缩边界、每拍新去掉的格。
+    let scenes: Vec<(&str, f64, Box<dyn Fn(i32, i32) -> bool>, bool, Vec<(i32, i32)>)> = vec![
+        ("50米多房间：每拍机器人所在房间墙边少一格（触及房间一圈前沿簇）", 50.0, Box::new(room), false,
+            (0..10).map(|i| (201, 210 + 7 * i)).collect()),
+        ("50米，前沿在10米内：每拍东侧缺测扩大一格", 50.0, Box::new(near50), true,
+            (0..10).map(|i| (312 + i, 250)).collect()),
+        ("100米，前沿在10米内：每拍东侧缺测扩大一格", 100.0, Box::new(near100), true,
+            (0..10).map(|i| (562 + i, 500)).collect()),
+        ("50米空地只有四边（上限参考）：每拍地图边缘少一格（触及整圈前沿簇）", 50.0, Box::new(|_, _| false), false,
+            (0..10).map(|i| (0, 100 + 7 * i)).collect()),
+    ];
+    for (name, size, missing, bounded, ticks) in scenes {
+        let cells = (size / 0.1_f64).round() as i32;
+        let polygon = if bounded { vertices(&inset(size)) } else { Vec::new() };
+        let mut removed = BTreeSet::new();
+        let cloud = |removed: &BTreeSet<(i32, i32)>| -> Vec<(f32, f32, f32)> {
+            (0..cells).flat_map(|x| (0..cells).map(move |y| (x, y)))
+                .filter(|&(x, y)| !missing(x, y) && !removed.contains(&(x, y)))
+                .map(|(x, y)| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05))
+                .collect()
+        };
+        let mut builder = nuwax_nav_mls_planner::SurfaceMapBuilder::new(map().config().clone());
+        eprintln!("{name}");
+        for tick in 0..=ticks.len() {
+            if tick > 0 {
+                removed.insert(ticks[tick - 1]);
+            }
+            let surface = builder.build(&cloud(&removed), 0.1).unwrap().snapshot;
+            let started = std::time::Instant::now();
+            let stats = surface.prepare_frontier_geometry(&polygon).unwrap();
+            let total = started.elapsed().as_secs_f64() * 1000.0;
+            let fields: BTreeMap<_, _> = rebuilds.0.lock().unwrap().iter().cloned().collect();
+            eprintln!("  第{tick}拍：前沿索引{total:.3}ms 聚类{:.3}ms 评估{}格 重新聚类{}格 前沿格{} 达标簇{} 增量{}",
+                fields["cluster_ms"], stats.evaluated_cells, stats.reclustered_cells, stats.frontier_count,
+                stats.candidate_clusters, stats.incremental);
+        }
+    }
+}
+
 /// 8米×4米地面，探索边界向上越过地面上缘：只有上缘一条长前沿线，横跨原来4米世界栅格的 x=4 米线。
 #[test]
 fn long_frontier_line_across_the_old_four_meter_grid_line_is_one_candidate() {

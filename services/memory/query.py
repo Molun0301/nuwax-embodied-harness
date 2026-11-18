@@ -1,7 +1,7 @@
 """记忆检索与原有文本、空间、时间评分。"""
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from difflib import SequenceMatcher
 import math
 import re
@@ -12,7 +12,6 @@ from contracts.geometry import Pose
 from contracts.memory import MemoryPayloadFilter, MemoryQueryMatch, MemoryQueryResult, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
 from contracts.spatial_memory import NavigationCandidate, ObservationEvent, SceneSpace, SemanticInstance, SceneSpaceReviewStatus
 from core.errors import GatewayError
-from core.source_time import acquired_unix_ns, SourceTimeError
 from services.memory.semantic_map.scene_mapping_state import MANAGED_KEY
 from services.memory.store import EmbeddingVector
 IMAGE_VECTOR_NAME = 'image'
@@ -186,17 +185,7 @@ class QueryMixin:
     def _build_scene_memory_metadata(self, perception_context) -> Dict[str, object]:
         scene_summary = perception_context.scene_summary
         frame_timestamp = perception_context.metadata.get('frame_timestamp')
-        frame_acquired_timestamp = perception_context.metadata.get('frame_acquired_timestamp')
-        if frame_timestamp and (not frame_acquired_timestamp):
-            timestamp = datetime.fromisoformat(str(frame_timestamp).replace('Z', '+00:00'))
-            if timestamp.tzinfo is not None:
-                source_ns = perception_context.metadata.get('source_timestamp_ns') or round(timestamp.timestamp() * 1000000000.0)
-                try:
-                    real_ns = acquired_unix_ns(source_ns)
-                except SourceTimeError as exc:
-                    raise GatewayError('图像真实采集时间不可用：' + str(exc), error_code='frame_source_time_unavailable', http_status=409) from exc
-                frame_acquired_timestamp = datetime.fromtimestamp(real_ns / 1000000000.0, timezone.utc).isoformat()
-        return {'frame_timestamp': frame_timestamp, 'frame_acquired_timestamp': frame_acquired_timestamp, 'frame_timestamp_source': perception_context.metadata.get('frame_timestamp_source'), 'visual_labels': self._collect_scene_visual_labels(scene_summary), 'vision_tags': self._collect_scene_vision_tags(scene_summary), 'semantic_relations': self._normalize_aliases(scene_summary.metadata.get('semantic_relations')), 'scene_backend_chain': self._normalize_aliases(scene_summary.metadata.get('scene_backend_chain')), 'cloud_vision_model': str(scene_summary.metadata.get('cloud_vision_model', '') or ''), 'detector_backend': perception_context.detector_backend, 'tracker_backend': perception_context.tracker_backend}
+        return {'frame_timestamp': frame_timestamp, 'frame_timestamp_source': perception_context.metadata.get('frame_timestamp_source'), 'visual_labels': self._collect_scene_visual_labels(scene_summary), 'vision_tags': self._collect_scene_vision_tags(scene_summary), 'semantic_relations': self._normalize_aliases(scene_summary.metadata.get('semantic_relations')), 'scene_backend_chain': self._normalize_aliases(scene_summary.metadata.get('scene_backend_chain')), 'cloud_vision_model': str(scene_summary.metadata.get('cloud_vision_model', '') or ''), 'detector_backend': perception_context.detector_backend, 'tracker_backend': perception_context.tracker_backend}
 
     def _flatten_metadata_strings(self, value: object) -> List[str]:
         if value is None:

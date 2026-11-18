@@ -12,7 +12,7 @@ IDENTITY = {'translation_m': [0.0, 0.0, 0.0], 'rotation_row_major': [1.0, 0.0, 0
 
 def configure(values, root, home):
     model = values['unitree_sim.model']
-    backend = capabilities(values['unitree_sim.base_url'], model)
+    backend = capabilities(values['unitree_sim.base_url'], model)['backend']
     sensors, limits = backend['sensors'], backend['command_limits']
     calibration = sensors['calibration']
     reference = sensors['registration_frame_id']

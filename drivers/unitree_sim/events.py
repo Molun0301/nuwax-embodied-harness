@@ -15,8 +15,8 @@ def utc(stamp):
 
 
 class EventDecoder:
-    def __init__(self, providers, device, capture_times):
-        self.providers, self.device, self.capture_times = providers, device, capture_times
+    def __init__(self, providers, device):
+        self.providers, self.device = providers, device
 
     def accept(self, event):
         kind, payload = event['type'], event['payload']
@@ -29,7 +29,6 @@ class EventDecoder:
                           calibration_ref=payload['calibration_ref'])
             if kind == 'imu':
                 stamp = source_timestamp(payload, event['sim_time_ns'])
-                self.capture_times.record(payload, stamp)
                 sample = CanonicalImuSample(**common, timestamp_ns=stamp,
                                            accel_mps2=tuple(payload['accel_mps2']), gyro_rps=tuple(payload['gyro_rad_s']))
             else:

@@ -2,8 +2,9 @@
 from __future__ import annotations
 import asyncio
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import RLock, Thread
-import time
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -14,6 +15,8 @@ import websockets
 from contracts.geometry import Twist
 from contracts.motion_feedback import MotionExecutionFeedback
 from contracts.motion_limits import MotionCommandLimits
+from core import clock
+from core.config import install_home
 from .clock import source_timestamp
 
 LOGGER = logging.getLogger(__name__)
@@ -26,7 +29,7 @@ def capabilities(base_url, model):
         result = response.json()
     if result['protocol'] != 'unitree-sim/1' or result['backend']['robot'] != model:
         raise ValueError('设备协议或当前机器人型号与方案不一致。')
-    return result['backend']
+    return result
 
 
 class Device:
@@ -52,7 +55,8 @@ class Device:
             self.http = httpx.Client(base_url=self.base_url, trust_env=False)
         self.error = self.registration = self.feedback = self.limits = None
         try:
-            self.backend = capabilities(self.base_url, self.model)
+            declaration = capabilities(self.base_url, self.model)
+            self.backend = declaration["backend"]
             response = self.http.get('/api/v1/status')
             response.raise_for_status()
             status = response.json()
@@ -61,6 +65,13 @@ class Device:
             self.scope = (status['session'], status['epoch'])
             if self.scope[0] is None:
                 raise RuntimeError('仿真设备没有当前物理运行。')
+            link = install_home() / "run/device_clock"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            # 网关和守卫都可能绑定。原子替换可让其他进程继续打开此路径。
+            with TemporaryDirectory(dir=link.parent) as temp:
+                staging = Path(temp) / link.name
+                staging.symlink_to(declaration["clock"]["shared_memory_path"])
+                staging.replace(link)
             self._status(status['robot_status'], status['sim_time_ns'])
         except Exception:
             self.http.close()
@@ -125,8 +136,7 @@ class Device:
     def _status(self, payload, sim_stamp=None):
         with self.lock:
             self.feedback = self.limits = None
-            mapping = payload['source_clock_mapping']
-            if payload['state'] != 'running' or mapping['mode'] != 'realtime':
+            if payload['state'] != 'running':
                 return
             velocity = payload['velocity']
             if self.model == 'g1':
@@ -155,7 +165,7 @@ class Device:
                 input_origin_in_command_x_m=float(origin[0]), input_origin_in_command_y_m=float(origin[1]))
             self.feedback = MotionExecutionFeedback(
                 source_timestamp_ns=source_timestamp(payload, payload['sim_time_ns'] if sim_stamp is None else sim_stamp),
-                received_monotonic_ns=time.monotonic_ns(),
+                received_monotonic_ns=clock.monotonic_ns(),
                 frame_id=self.frame_id, linear_x_mps=float(linear[0]), linear_y_mps=float(linear[1]),
                 linear_z_mps=float(linear[2]), angular_x_rps=float(angular[0]), angular_y_rps=float(angular[1]),
                 angular_z_rps=float(angular[2]), source_id='unitree-sim/%s/%s/%s' % (*self.scope, mapping['clock_id']),

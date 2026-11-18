@@ -8,11 +8,10 @@ from typing import Optional
 from contracts.calibration import SensorTopology
 from contracts.capabilities import CapabilityMatrix
 from contracts.sensors import SensorStreamFailure
-from core.config import install_home, value
+from core.config import value
 from drivers.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.common.manifest import RobotDefaults, RobotManifest, RobotProfile
 from drivers.customrobot.providers import CustomRobotProviderBundle
-from .clock import CaptureTimes, source_time_path
 from .device import Device
 from .events import EventDecoder
 
@@ -58,7 +57,6 @@ class UnitreeSimAssembly(RobotAssemblyBase):
                                       topics={'state': 'robot.unitree_sim.state'}, parameters={'robot_model': model})
         self.device = Device(value('unitree_sim.base_url'), model, base_frame)
         self.providers = Providers(motion_control=self.device)
-        self.clock = None
 
     def has_motion_actuator(self):
         return True
@@ -70,8 +68,7 @@ class UnitreeSimAssembly(RobotAssemblyBase):
         if self.providers.is_available():
             return
         self.device.bind()
-        self.clock = CaptureTimes(source_time_path(install_home()))
-        decoder = EventDecoder(self.providers, self.device, self.clock)
+        decoder = EventDecoder(self.providers, self.device)
         self.providers.start()
         try:
             self.device.subscribe(decoder.accept, self.providers.fail)
@@ -81,8 +78,6 @@ class UnitreeSimAssembly(RobotAssemblyBase):
                 self.providers.stop()
             finally:
                 self.device.close()
-                self.clock.close()
-                self.clock = None
             raise
 
     def stop(self):
@@ -90,9 +85,6 @@ class UnitreeSimAssembly(RobotAssemblyBase):
             self.providers.stop()
         finally:
             self.device.close()
-            if self.clock is not None:
-                self.clock.close()
-                self.clock = None
             self.stop_registered_adapters()
 
     def get_status(self):

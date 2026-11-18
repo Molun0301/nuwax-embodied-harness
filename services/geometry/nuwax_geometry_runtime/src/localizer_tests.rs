@@ -726,6 +726,93 @@ async fn l6_only_persistent_structure_far_from_the_base_is_saved_and_reloaded() 
     }
 }
 
+#[tokio::test]
+async fn l6_sparse_floor_accumulates_frame_hits_in_coarse_cells() {
+    use crate::pointcloud::{voxel_key, VOXEL_SIZE};
+    use crate::proto::{PlanarSeed, RelocalizeRequest};
+    use std::collections::BTreeSet;
+
+    let root = std::env::temp_dir().join(format!("nuwax-l6-floor-{}", uuid::Uuid::new_v4()));
+    let mut session = l6_loaded_session(1604, root.clone()).await;
+    let mapper = session.mapper().unwrap();
+    let id = mapper.session_id();
+    let start = super::super::now_ns();
+    l6_feed(&session, &mapper, l6_frame(id, start, 0., 0., 0., None)).await;
+    let matched = session
+        .relocalize(RelocalizeRequest {
+            seed: Some(PlanarSeed::default()),
+        })
+        .await
+        .unwrap();
+    assert!(matched.succeeded, "{}", matched.message);
+    session.stop_localizer().await;
+    let initial = mapper.surface_map().await.unwrap().unwrap();
+    let base = l6_keys(&initial);
+    let stamp = start + 2_000_000_000;
+    let target = session.relocalization_target.clone().unwrap();
+    let round = compute_round(
+        &[l6_frame(id, stamp, 0., 0., 0., None)],
+        mapper.map_from_odom(),
+        &target,
+    )
+    .unwrap();
+    assert!(round.correction.is_some() && !round.limited, "{:?}", round.score);
+    round.apply(&session.router, id).await;
+
+    let map_from_odom = mapper.map_from_odom();
+    let mut before_confirmation = BTreeSet::new();
+    let mut expected = BTreeSet::new();
+    for (i, elapsed_ms) in [0, 250, 500, 800, 900, 1000, 1250].into_iter().enumerate() {
+        let mut frame = l6_frame(id, stamp + elapsed_ms * 1_000_000, 0., 0., 0., None);
+        // 每帧每个 0.20 米粗格有两个回波，七帧落在互不重复的精细体素。
+        for x in 15..19 {
+            for y in -3..3 {
+                for slot in [i, i + 8] {
+                    let p = Point3::new(
+                        f64::from(x * 4 + (slot % 4) as i32) * 0.05 + 0.025,
+                        f64::from(y * 4 + (slot / 4) as i32) * 0.05 + 0.025,
+                        0.025,
+                    );
+                    let (x, y, z) = voxel_key((map_from_odom * p).into(), VOXEL_SIZE).unwrap();
+                    let key = [x, y, z];
+                    assert!(!base.contains(&key));
+                    if elapsed_ms < 1000 {
+                        assert!(before_confirmation.insert(key));
+                    } else {
+                        assert!(expected.insert(key));
+                    }
+                    frame.points_body.push(p.into());
+                }
+            }
+        }
+        l6_feed(&session, &mapper, frame).await;
+        let after = mapper.surface_map().await.unwrap().unwrap();
+        let keys = l6_keys(&after);
+        assert!(base.is_subset(&keys));
+        assert!(before_confirmation.is_disjoint(&keys), "确认前的回波不补写");
+        let added: BTreeSet<_> = keys.difference(&base).copied().collect();
+        assert_eq!(added, expected, "源时间经过 {elapsed_ms} 毫秒");
+    }
+
+    let after = mapper.surface_map().await.unwrap().unwrap();
+    let mut reader = after.reader();
+    let mut ground_keys = BTreeSet::new();
+    for reference in &after.manifest().blocks {
+        for (_, record) in reader.ground_records(reference).unwrap().iter() {
+            if let nuwax_map_chunks::GroundRecordRef::HeightfieldV1(fragment) = record {
+                for &(local, _) in &fragment.members {
+                    ground_keys.insert(nuwax_map_chunks::global_key(reference.key, local).unwrap());
+                }
+            }
+        }
+    }
+    assert!(expected.is_subset(&ground_keys), "新地面回波应封存为地面成员");
+    session.end_current().await.unwrap();
+    session.lio().unwrap().shutdown().await;
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn pending_relocalization_command_has_no_tracking_writes() {
     use crate::proto::{RelocalizeRequest, SessionPhase};

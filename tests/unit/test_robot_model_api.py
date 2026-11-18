@@ -14,6 +14,7 @@ import pytest
 
 from contracts.geometry import Pose, Vector3
 from contracts.robot_state import JointState, RobotState
+from core import clock
 from core.robot_geometry import RobotGeometryConfig
 from core.robot_visual import RobotVisualAssetStore
 from drivers.go2.data_plane import Go2DirectDdsBridge
@@ -24,7 +25,7 @@ from gateways.http.robot_model import RobotModelView, build_robot_model_router
 
 @pytest.fixture
 def model_runtime(tmp_path, monkeypatch):
-    monkeypatch.delenv("NUWAX_SOURCE_TIME_FILE", raising=False)
+    monkeypatch.delenv("NUWAX_DEVICE_CLOCK", raising=False)
     path = tmp_path / "robot.urdf"
     path.write_text('''<robot name="fixture"><link name="base"><visual><geometry>
       <box size="1 0.5 0.4"/></geometry></visual><collision><geometry>
@@ -112,30 +113,25 @@ def test_aggregate_refresh_cannot_refresh_joint_source(model_runtime):
     assert result["joint_source_timestamp"] == old.isoformat()
 
 
-def test_slow_simulation_uses_original_acquisition_clock(model_runtime, tmp_path, monkeypatch):
+def test_slow_simulation_uses_device_source_clock(model_runtime, tmp_path, monkeypatch):
     runtime, snapshot, geometry = model_runtime
     source_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
     snapshot.robot_state.timestamp = source_stamp
     geometry.value = replace(geometry.value, timestamp_ns=int(source_stamp.timestamp()*1_000_000_000))
     source_ns = int(source_stamp.timestamp() * 1_000_000_000)
-    path = tmp_path / "source-time.bin"
-    def write_record(age_sec):
-        ago = int(age_sec * 1_000_000_000)
-        path.write_bytes(b"NEHTIME1" + struct.pack("<Q", 1) + struct.pack("<QQQQ", 1, source_ns,
-                         time.time_ns() - ago, time.monotonic_ns() - ago))
-    write_record(0)
-    monkeypatch.setenv("NUWAX_SOURCE_TIME_FILE", str(path))
+    path = tmp_path / "device-clock.bin"
+    path.write_bytes(struct.pack("<8sQQdQ", b"USIMCLK1", 2, source_ns + 1_000_000, 0.5, 0))
+    monkeypatch.setenv("NUWAX_DEVICE_CLOCK", str(path))
+    monkeypatch.setattr(clock, "_mapping", None)
     view = view_for(runtime)
     live = view.state()
     assert live["mode"] == "live"
     assert live["joint_source_timestamp"] == source_stamp.isoformat()
     assert 0 <= live["joint_age_sec"] < .5
-    write_record(2)
-    snapshot.robot_state.timestamp = source_stamp
-    stale = view.state()
-    assert stale["reason"] == "joint_state_stale"
-    path.unlink()
-    assert view.state()["reason"] == "source_time_unavailable"
+    with path.open("r+b") as stream:
+        stream.seek(8)
+        stream.write(struct.pack("<QQdQ", 4, source_ns + 2_000_000_000, 0.5, 0))
+    assert view.state()["reason"] == "joint_state_stale"
 
 
 def test_unsafe_model_does_not_reenter_navigation_parser(model_runtime, tmp_path, monkeypatch):

@@ -3467,10 +3467,7 @@
         }
         // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
         const receiptKey = JSON.stringify([state.appliedMapIdentity?.key, pose.frame_id, pose.timestamp]);
-        const acquired = state.poseAcquisitions?.get(receiptKey);
-        const sourceTime = state.poseAcquisitions?.has(receiptKey)
-          ? (typeof acquired === "number" ? acquired / 1e6 : NaN)
-          : (typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN);
+        const sourceTime = typeof pose.timestamp === "string" ? Date.parse(pose.timestamp) : NaN;
         const rawAgeMs = displayedAt - sourceTime;
         const estimate = activeStreamClockEstimate();
         const age = rawAgeMs + (estimate?.offsetMs || 0);
@@ -3582,12 +3579,6 @@
         const incomingPose = data.pose || (pointFromPose(data) ? data : null);
         if (pointFromPose(incomingPose)) state.latestPose = incomingPose;
         else if (envelope.type === "localization.pose") state.latestPose = null;
-        if (incomingPose && Object.hasOwn(envelope.metadata || {}, "source_acquired_unix_ns")) {
-          state.poseAcquisitions ||= new Map();
-          const key = JSON.stringify([state.appliedMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
-          state.poseAcquisitions.set(key, envelope.metadata.source_acquired_unix_ns);
-          if (state.poseAcquisitions.size > 256) state.poseAcquisitions.delete(state.poseAcquisitions.keys().next().value);
-        }
         if (incomingPose && envelope.metadata?.scan_received_unix_ns) {
           state.poseReceipts ||= new Map();
           const key = JSON.stringify([state.appliedMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);

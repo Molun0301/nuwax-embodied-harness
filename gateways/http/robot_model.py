@@ -17,7 +17,7 @@ from core.config import value
 from core.robot_geometry import RobotGeometryError, resolve_robot_geometry, resolve_robot_model_config
 from core.robot_kinematics import RobotKinematicsError
 from core.robot_visual import RobotVisualAssetStore, RobotVisualError
-from core.source_time import acquired_times, SourceTimeError
+from core import clock
 from gateways.serialization import to_jsonable
 
 if TYPE_CHECKING:
@@ -52,7 +52,7 @@ def _acquired(stamp, metadata=None):
         monotonic = metadata.get("joint_received_monotonic")
         return source_ns, (int(monotonic * 1_000_000_000)
                            if isinstance(monotonic, (int, float)) and math.isfinite(monotonic) else None)
-    return acquired_times(source_ns)
+    return source_ns, None
 
 
 def _sample_age(sample, now_unix_ns, now_monotonic_ns):
@@ -142,16 +142,9 @@ class RobotModelView:
                          "orientation": {"x": pose.qx, "y": pose.qy, "z": pose.qz, "w": pose.qw},
                          "frame_id": pose.frame_id, "timestamp": pose_stamp.isoformat()}
                         if pose is not None else None)
-        joint_clock_error = pose_clock_error = None
-        try:
-            joint_acquired = _acquired(source_stamp, metadata)
-        except SourceTimeError as exc:
-            joint_acquired, joint_clock_error = (None, None), str(exc)
-        try:
-            pose_acquired = _acquired(pose_stamp)
-        except SourceTimeError as exc:
-            pose_acquired, pose_clock_error = (None, None), str(exc)
-        now_unix_ns, now_monotonic_ns = time.time_ns(), time.monotonic_ns()
+        joint_acquired = _acquired(source_stamp, metadata)
+        pose_acquired = _acquired(pose_stamp)
+        now_unix_ns, now_monotonic_ns = clock.source_now_ns(), time.monotonic_ns()
         age = _sample_age(joint_acquired, now_unix_ns, now_monotonic_ns)
         pose_age = _sample_age(pose_acquired, now_unix_ns, now_monotonic_ns)
         index = 1 if joint_acquired[1] is not None and pose_acquired[1] is not None else 0
@@ -165,12 +158,11 @@ class RobotModelView:
             "joint_source_timestamp": source_stamp.isoformat() if source_stamp else None,
             "joint_timestamp_basis": metadata.get("joint_timestamp_basis", "robot_state_source"),
             "joint_source_sequence": metadata.get("joint_source_sequence"),
-            "joint_acquired_unix_ns": joint_acquired[0],
             "joint_age_sec": age, "max_age_sec": _MAX_AGE_SEC, "valid_for_sec": 0.0,
             "pose": pose_payload, "pose_source": "geometry",
             "pose_timestamp": pose_stamp.isoformat() if pose_stamp else None,
             "pose_frame_id": getattr(pose, "frame_id", None), "pose_age_sec": pose_age,
-            "pose_acquired_unix_ns": pose_acquired[0], "pose_joint_source_skew_sec": source_skew,
+            "pose_joint_source_skew_sec": source_skew,
             "pose_joint_skew_sec": skew, "max_skew_sec": _MAX_SKEW_SEC,
             "sync_basis": ("joint_receive_time" if metadata.get("joint_timestamp_basis") == "dds_receive_time"
                            else "source_acquisition_time"),
@@ -188,8 +180,6 @@ class RobotModelView:
                     reason, message = "joint_state_invalid", "关节状态含重复名称或非法角度，显示参考姿态"
                     break
                 values[name] = value
-        if reason is None and joint_clock_error:
-            reason, message = "source_time_unavailable", joint_clock_error + "，显示参考姿态"
         if reason is None and (age is None or age < -0.1):
             reason, message = "joint_timestamp_invalid", "关节来源时间不可用，显示参考姿态"
         if reason is None and age > _MAX_AGE_SEC:
@@ -201,10 +191,7 @@ class RobotModelView:
             except RobotKinematicsError as exc:
                 reason, message = exc.code, str(exc) + "，显示参考姿态"
         if reason is None:
-            if pose_clock_error:
-                response["sync_status"] = "pose_stale"
-                reason, message = "source_time_unavailable", pose_clock_error + "，显示参考姿态"
-            elif pose_stamp is None:
+            if pose_stamp is None:
                 response["sync_status"] = "pose_missing"
                 reason, message = "pose_missing", "缺少定位位姿，显示参考姿态"
             elif pose_age < -0.1 or pose_age > _MAX_AGE_SEC:

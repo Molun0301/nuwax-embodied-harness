@@ -590,6 +590,76 @@ void verifyPartialOverlapRegistration() {
     std::cout << "部分重叠配准：当前误差=" << error << "米，原十米误差=" << old_error << "米\n";
 }
 
+void verifyLoopReview(double shift_m, int patch_count, bool wide_passes, bool grid_passes) {
+    PointCloud::Ptr source(new PointCloud), target(new PointCloud);
+    for (int patch = -patch_count / 2; patch <= patch_count / 2; ++patch) {
+        for (int z = 0; z < 5; ++z) {
+            for (int y = 0; y < 5; ++y) {
+                const Point p(0.02F * ((y + 2 * z) % 3), 2.0F * patch + 0.08F * y, 0.08F * z);
+                source->push_back(p);
+                target->emplace_back(p.x + shift_m, p.y, p.z);
+                // 小漂移组是真回环，另两组用错位副本让原配准落在局部解。
+                if ((patch_count == 3 && patch == 0) || (patch_count == 5 && patch != 0)) {
+                    target->push_back(p);
+                }
+            }
+        }
+    }
+    OnlinePgoOptions options;
+    options.loop_submap_half_range = 0;
+    options.submap_resolution_m = 0.01;
+    const auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    const auto origin = Eigen::Vector3d::Zero();
+    const auto original = registerLoop(source, target, options.loop_score_threshold, cancelled);
+    require(original.disposition == IcpDisposition::Correction, "复核夹具未通过原配准");
+    require(wideLoopAgrees(source, target, options.loop_score_threshold, origin, original, cancelled) ==
+                wide_passes, "宽窄复核的决定错误");
+    if (wide_passes) {
+        require(gridLoopAgrees(source, target, options.loop_score_threshold, origin, original, cancelled) ==
+                    grid_passes, "平移网格复核的决定错误");
+    }
+
+    // 将同一对点云送入真实请求路径，验证关键帧与回环边分别受到的影响。
+    GraphState state(options.graph);
+    const auto submit = [&](int sequence, int time_s, double x, const PointCloud& cloud) {
+        auto request = fixtureRequest();
+        request.request_sequence = sequence;
+        request.mapping_commit_sequence = sequence;
+        request.occupancy_revision = sequence;
+        request.cloud_revision = sequence;
+        request.registered_cloud_source_sequence = sequence;
+        request.source_timestamp_ns = time_s * 1'000'000'000LL;
+        request.registered_cloud_source_timestamp_ns = request.source_timestamp_ns;
+        request.committed_map_source_timestamp_ns = request.source_timestamp_ns;
+        request.frozen_odom_translation_m[0] = x;
+        request.registered_body_point_count = cloud.size();
+        request.registered_cloud_point_count = cloud.size();
+        request.registered_body_coordinate_count = 3 * cloud.size();
+        request.registered_body_points_xyz.clear();
+        for (const auto& p : cloud) {
+            request.registered_body_points_xyz.insert(request.registered_body_points_xyz.end(),
+                                                      {p.x, p.y, p.z});
+        }
+        auto result = processRequest(state, sequence - 1, request, options, cancelled);
+        require(result.terminal_kind == TerminalKind::Succeeded && result.accepted_keyframe &&
+                    result.proposed_state, "复核请求没有保留关键帧");
+        state = std::move(*result.proposed_state);
+        return result.result.result_disposition;
+    };
+    submit(1, 1, 0.0, *target);
+    submit(2, 31, 2.0, *target);
+    const auto disposition = submit(3, 62, 0.0, *source);
+    require(state.keyframes.size() == 3 && state.graph.keyPosesSe3().size() == 3,
+            "复核改变了已接受关键帧的数量");
+    const bool accepts_loop = wide_passes && grid_passes;
+    require(state.loop_pairs.size() == (accepts_loop ? 1U : 0U) &&
+                state.last_loop_timestamp_ns.has_value() == accepts_loop,
+            "复核与回环入图状态不一致");
+    require(accepts_loop ? disposition == Result::DISPOSITION_CORRECTION
+                         : disposition == Result::DISPOSITION_NO_CANDIDATE,
+            "复核请求回执类型错误");
+}
+
 }  // namespace
 
 int main() {
@@ -605,6 +675,9 @@ int main() {
         verifyConcreteCorrectionConflicts();
         verifyActualKeyframeAcceptanceReceiptsAndBound();
         verifyPartialOverlapRegistration();
+        verifyLoopReview(0.03, 1, true, true);
+        verifyLoopReview(0.45, 3, false, false);
+        verifyLoopReview(0.80, 5, true, false);
     } catch (const std::exception& error) {
         std::cerr << "online owner contract fixture failed: " << error.what() << '\n';
         return 1;

@@ -11,13 +11,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from contracts.base import utc_now
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
-from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import DeferredProjectionInput, InstanceConfirmationState, InstanceSupportEvidence, InstanceDynamicState, InstanceLifecycleState, InstanceMovability, InstanceObservationWindowSample, SemanticInstance
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.instance_consolidation import InstanceConsolidator, InstanceMerge
 from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, measurement_sigma_m, observation_support_points, accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label, cross_label_geometry_compatible, record_support_evidence, cooccurrence_evidence, cooccurrence_sources, observation_source_key, observation_window_sources, remember_coobserved_instances, instance_identity_ids, observation_source_index, historical_coobserved_ids, geometry_overlap_diagnostics, measurement_geometry_fit
 from services.memory.object_extent import merge_object_extent, resolve_object_extent
+from services.memory.correction_buckets import add_observation
+from services.memory.map_correction import SAMPLE_SOURCE, SESSION_KEY
 from services.memory.spatial_candidate_index import SpatialCandidateIndex, overlaps
 from services.memory.vectorizer import TextEmbedder
 from services.memory.vision_to_map_projection_service import ProjectedObservation
@@ -672,6 +673,14 @@ class InstanceAssociationService:
         updates = {'label': label, 'display_name': self._label_display(current, observation, label), 'support_evidence': evidence, 'pose': blended_pose, 'map_name': map_name or current.map_name, 'topo_node_id': observation.topo_node_id or current.topo_node_id, 'semantic_region_id': observation.semantic_region_id or current.semantic_region_id, 'confidence': max(float(current.confidence), float(observation.score)), 'observation_count': updated_count, 'last_seen_ts': current.last_seen_ts if repeated else now, 'artifact_ids': artifact_ids, 'semantic_labels': semantic_labels, 'visual_labels': visual_labels, 'vision_tags': self._merge_strings(current.vision_tags, observation.semantic_labels), 'dynamic_state': dynamic_state, 'observation_window': observation_window, 'deferred_projection_cache': deferred_cache, 'lifecycle_state': merged_lifecycle, 'metadata': metadata, 'attributes': self._observer_attributes(observation, previous=current.attributes), 'supporting_observation_event_ids': supporting_event_ids}
         isolated_updates = {key: copy.deepcopy(value) for key, value in updates.items()}
         merged = current.model_copy(update=isolated_updates)
+        if observation.pose.session_id:
+            dynamic = dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}
+            merged.correction_buckets = add_observation(current, observation, sigma, self._association_config,
+                position=dynamic or not repeated or replaces_reliable,
+                removed=(prior_sample.pose, prior_weight) if replaces_reliable else None,
+                reset_position=dynamic or not self._instance_pose_is_reliable(current),
+                reset_voxels=(dynamic and not repeated) or not self._instance_pose_is_reliable(current))
+            merged.metadata[SESSION_KEY] = max(current.metadata.get(SESSION_KEY, 0), observation.pose.session_id)
         merged.inspection_poses = copy.deepcopy(self._inspection_pose_planner.plan_for_target(
             target_pose=merged.pose, observer_body_pose=self._positive_observer_pose(observation),
             occupancy_grid=occupancy_grid, cost_map=cost_map, existing_poses=current.inspection_poses,
@@ -712,6 +721,9 @@ class InstanceAssociationService:
             target_pose=instance.pose, observer_body_pose=self._positive_observer_pose(observation),
             occupancy_grid=occupancy_grid, cost_map=cost_map,
             target_clearance=self._inspection_pose_planner.object_clearance(instance)))
+        if observation.pose.session_id:
+            instance.correction_buckets = add_observation(None, observation, sigma, self._association_config)
+            instance.metadata[SESSION_KEY] = observation.pose.session_id
         return instance
 
     @classmethod
@@ -807,6 +819,8 @@ class InstanceAssociationService:
             navigable = False
             non_navigable_reason = 'current_pose_fallback_no_geometry'
         metadata = {**previous_metadata, 'last_track_id': observation.track_id or '', 'last_camera_id': observation.camera_id or '', 'last_source_observation_id': observation.source_observation_id, 'last_observation_label': observation.label.strip().lower(), 'last_observation_projection_method': str(observation.attributes.get('projection_method') or ''), 'last_observation_projection_confidence': observation.attributes.get('projection_confidence'), 'association_policy': movability.value, 'uncertain_after_sec': self._UNCERTAIN_AFTER_SEC[movability], 'stale_after_sec': self._STALE_AFTER_SEC[movability], 'removed_after_sec': self._REMOVED_AFTER_SEC[movability], 'projection_method': projection_method, 'projection_confidence': projection_confidence, 'pose_quality_level': observation.attributes.get('pose_quality_level', observation.pose_quality_level), 'observation_only': self._is_fallback_observation(observation), 'support_point_count': support_point_count, 'coverage': coverage, 'depth_coverage': depth_coverage, 'map_projection_coverage': map_projection_coverage, 'reprojection_error': reprojection_error, 'projection_degradation_reason': projection_degradation_reason, 'geometry_projection_method': geometry_projection_method, 'geometry_projection_status': geometry_projection_status, 'segmentation_projection_status': segmentation_projection_status, 'support_points_2d': support_points_2d, 'support_points_3d': support_points_3d, 'support_points_map': support_points_map, 'centroid_map': centroid_map, 'bbox_3d_map': bbox_3d_map, 'object_3d_bbox': object_3d_bbox, 'segmentation_bbox_xyxy': segmentation_bbox_xyxy, 'centroid_uv': centroid_uv, 'mask_center_px': mask_center_px, 'segmentation_area_ratio': segmentation_area_ratio, 'segmentation_occlusion_flags': self._coerce_flags(segmentation_occlusion_flags), 'segmentation_truncation_flags': self._coerce_flags(segmentation_truncation_flags), 'has_structured_segmentation': has_structured_segmentation, 'segmentation_score': segmentation_score, 'predicted_iou': predicted_iou, 'segmentation_quality_score': segmentation_quality_score, 'stability_score': stability_score, 'segmentation_support_point_count': segmentation_support_point_count, 'navigable': navigable, 'non_navigable_reason': non_navigable_reason, 'backend': backend, 'backend_type': backend_type}
+        if SAMPLE_SOURCE in observation.attributes:
+            metadata[SAMPLE_SOURCE] = observation.attributes[SAMPLE_SOURCE]
         metadata.update(self._summarize_segmentation_metadata(metadata))
         return metadata
 
@@ -840,7 +854,8 @@ class InstanceAssociationService:
             return None
         try:
             from contracts.geometry import Vector3
-            return Pose(frame_id=DEFAULT_MAP_FRAME, position=Vector3(x=float(origin[0]), y=float(origin[1]), z=float(origin[2])), orientation=observation.pose.orientation)
+            return observation.pose.model_copy(update={
+                "position": Vector3(x=float(origin[0]), y=float(origin[1]), z=float(origin[2]))})
         except (TypeError, ValueError):
             return None
 

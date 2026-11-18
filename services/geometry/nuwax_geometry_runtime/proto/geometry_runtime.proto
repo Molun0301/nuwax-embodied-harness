@@ -116,7 +116,10 @@ service GeometryRuntime {
   rpc SubscribeState(Empty) returns (stream GeometryState);
 
   // 位姿流：只推最新位姿，订阅者慢时丢弃中间值。首条为当前位姿（尚无位姿时等第一帧）。
-  rpc SubscribePose(Empty) returns (stream Pose);
+  rpc SubscribePose(Empty) returns (stream PoseUpdate);
+
+  // 读取当前会话指定序号的回环事件；会话或事件不存在时返回 NOT_FOUND。
+  rpc GetMapCorrection(MapCorrectionRequest) returns (MapCorrection);
 
   // 地图流：占据栅格每次更新推一条，只推最新，订阅者慢时丢弃中间值。
   // 首条为当前栅格（尚无栅格时等第一次更新）。会话切换后推送新会话的第一张栅格。
@@ -162,6 +165,31 @@ message Pose {
   Quat orientation = 2;
   string frame_id = 3;
   uint64 timestamp_ns = 4;   // 产生该位姿的传感器源时间（Unix 纳秒）
+}
+
+message PoseUpdate {
+  Vec3 position = 1;
+  Quat orientation = 2;
+  string frame_id = 3;
+  uint64 timestamp_ns = 4;
+  uint64 session_id = 5;
+  uint64 correction_seq = 6;
+}
+
+message MapCorrectionRequest {
+  uint64 session_id = 1;
+  uint64 seq = 2;
+}
+
+message MapCorrection {
+  repeated MapCorrectionKeyframe keyframes = 1;
+}
+
+message MapCorrectionKeyframe {
+  uint64 timestamp_ns = 1;
+  Vec3 old_position = 2;
+  Vec3 translation = 3;
+  Quat rotation = 4;
 }
 
 message Transform {
@@ -217,6 +245,8 @@ message GeometryState {
   // 原生LIO最近一帧里程计的质量；设备里程计模式或尚无原生里程计输出时不设置。
   // 与位姿一样随读取刷新，单独变化不唤醒状态订阅。
   OdometryQuality odometry_quality = 12;
+  uint64 session_id = 13;
+  uint64 correction_seq = 14;
 }
 
 // 原生LIO随里程计输出的质量量，只用于显示，不改变阶段、帧准入或原因文本。

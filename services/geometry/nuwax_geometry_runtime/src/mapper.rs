@@ -151,7 +151,8 @@ pub struct Mapper {
     errors: watch::Receiver<Option<String>>,
     correction_stopped: watch::Receiver<Option<String>>,
     correction_events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<CorrectionEvent>>>,
-    transform: watch::Receiver<Isometry3<f64>>,
+    transform: watch::Receiver<(Isometry3<f64>, u64)>,
+    corrections: Arc<parking_lot::RwLock<Vec<proto::MapCorrection>>>,
     config: MapperConfig,
     forbidden: watch::Receiver<Option<proto::OccupancyGrid>>,
     forbidden_status: watch::Receiver<Result<(), String>>,
@@ -181,6 +182,8 @@ enum Command {
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
     Forbidden(PathBuf, oneshot::Sender<Result<(), String>>),
+    #[cfg(test)]
+    TestCorrection(PgoUpdate, oneshot::Sender<Result<(), String>>),
 }
 impl Mapper {
     pub fn start(session_id: u64, config: MapperConfig) -> Result<Arc<Self>, String> {
@@ -228,7 +231,7 @@ impl Mapper {
         let (map_tx, maps) = watch::channel(None);
         let (fine_root_tx, fine_root) = watch::channel(None);
         let (error_tx, errors) = watch::channel(None);
-        let (transform_tx, transform) = watch::channel(Isometry3::identity());
+        let (transform_tx, transform) = watch::channel((Isometry3::identity(), 0));
         let (forbidden_tx, forbidden) = watch::channel(None);
         let (recent_cloud_tx, recent_cloud) = watch::channel(None);
         let mut worker = Worker::new(
@@ -246,6 +249,7 @@ impl Mapper {
             attach_shared,
         )?;
         let correction_stopped = worker.correction_stopped.subscribe();
+        let corrections = worker.corrections.clone();
         let correction_events = Arc::new(tokio::sync::Mutex::new(worker.correction_receiver.take().unwrap()));
         let worker_handle = std::thread::Builder::new()
             .name(format!("geometry-map-{session_id}"))
@@ -259,6 +263,7 @@ impl Mapper {
                 };
                 if matches!(command, Command::Shutdown) {
                     worker.corrector.take();
+                    worker.corrections.write().clear();
                     break;
                 }
                 let result = if matches!(command, Command::InputReady) {
@@ -292,6 +297,7 @@ impl Mapper {
             correction_stopped,
             correction_events,
             transform,
+            corrections,
             config,
             forbidden,
             forbidden_status,
@@ -357,8 +363,12 @@ impl Mapper {
         })
     }
     pub fn transform_pose(&self, pose: &proto::Pose) -> proto::Pose {
-        pose_from_isometry(
-            *self.transform.borrow() * pose_isometry(pose),
+        self.versioned_pose(pose).0
+    }
+    pub(crate) fn versioned_pose(&self, pose: &proto::Pose) -> (proto::Pose, u64) {
+        let (transform, seq) = *self.transform.borrow();
+        (pose_from_isometry(
+            transform * pose_isometry(pose),
             self.maps
                 .borrow()
                 .as_ref()
@@ -366,10 +376,17 @@ impl Mapper {
                 .map(|m| m.frame_id.as_str())
                 .unwrap_or(&self.config.map_frame_id),
             pose.timestamp_ns,
-        )
+        ), seq)
     }
     pub fn map_from_odom(&self) -> Isometry3<f64> {
-        *self.transform.borrow()
+        self.transform.borrow().0
+    }
+    pub(crate) fn correction_seq(&self) -> u64 {
+        self.transform.borrow().1
+    }
+    pub(crate) fn map_correction(&self, seq: u64) -> Option<proto::MapCorrection> {
+        let index = usize::try_from(seq.checked_sub(1)?).ok()?;
+        self.corrections.read().get(index).cloned()
     }
     pub fn map_frame_id(&self) -> &str {
         &self.config.map_frame_id
@@ -478,7 +495,8 @@ struct Worker {
     poses: watch::Sender<Option<proto::Pose>>,
     maps: watch::Sender<Option<proto::MapUpdate>>,
     fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
-    transform: watch::Sender<Isometry3<f64>>,
+    transform: watch::Sender<(Isometry3<f64>, u64)>,
+    corrections: Arc<parking_lot::RwLock<Vec<proto::MapCorrection>>>,
     corrector: Option<CorrectionWorker>,
     correction_stopped: watch::Sender<Option<String>>,
     correction_events: tokio::sync::mpsc::UnboundedSender<CorrectionEvent>,
@@ -512,7 +530,7 @@ impl Worker {
         poses: watch::Sender<Option<proto::Pose>>,
         maps: watch::Sender<Option<proto::MapUpdate>>,
         fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
-        transform: watch::Sender<Isometry3<f64>>,
+        transform: watch::Sender<(Isometry3<f64>, u64)>,
         forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
         recent_cloud: watch::Sender<Option<RecentPublication>>,
         forbidden_status: watch::Sender<Result<(), String>>,
@@ -586,6 +604,7 @@ impl Worker {
             maps,
             fine_root,
             transform,
+            corrections: Default::default(),
             corrector,
             correction_stopped: watch::channel(None).0,
             correction_events,
@@ -626,7 +645,7 @@ impl Worker {
                 .map_or(0, |m| m.timestamp_ns),
         };
         value.fine_root.send_replace(value.cloud.surface());
-        value.transform.send_replace(map_from_odom);
+        value.transform.send_replace((map_from_odom, 0));
         value.publish_grid().map_err(Status::unavailable)?;
         Ok(value)
     }
@@ -683,10 +702,15 @@ impl Worker {
                 }
                 if let Some(transform) = correction {
                     self.map_from_odom = transform;
-                    self.transform.send_replace(transform);
+                    self.transform.send_modify(|current| current.0 = transform);
                     self.publish_pose();
                 }
                 let _ = reply.send(Ok(()));
+                Ok(())
+            }
+            #[cfg(test)]
+            Command::TestCorrection(update, reply) => {
+                let _ = reply.send(self.apply_pgo(update));
                 Ok(())
             }
             Command::Shutdown => Ok(()),
@@ -789,7 +813,7 @@ impl Worker {
             self.base_anchor = self.map_from_odom;
             self.built_corrections.push((frame.odom_pose.timestamp_ns, self.map_from_odom));
             self.anchored = true;
-            self.transform.send_replace(self.map_from_odom);
+            self.transform.send_modify(|current| current.0 = self.map_from_odom);
         }
         let odom = pose_isometry(&frame.odom_pose);
         if !frame.mapping_only
@@ -955,7 +979,7 @@ impl Worker {
     fn apply_small(&mut self, update: PgoUpdate) {
         self.map_from_odom = update.latest;
         self.built_corrections.push((self.last_input.as_ref().unwrap().source_timestamp_ns, update.latest));
-        self.transform.send_replace(update.latest);
+        self.transform.send_modify(|current| current.0 = update.latest);
         self.publish_pose();
     }
     fn adopt_rebuilt(&mut self, mut rebuilt: Rebuilt) -> Result<(), String> {
@@ -976,7 +1000,23 @@ impl Worker {
         self.built_corrections.clear();
         self.built_corrections.push((rebuilt.stamp, self.map_from_odom));
         self.built_timeline = Some(rebuilt.update);
-        self.transform.send_replace(self.map_from_odom);
+        let seq = {
+            let mut corrections = self.corrections.write();
+            corrections.push(proto::MapCorrection {
+                keyframes: event.keyframes.iter().map(|keyframe| {
+                    let old = (keyframe.old * keyframe.local_pose).translation.vector;
+                    let delta = pose_from_isometry(keyframe.new * keyframe.old.inverse(), "", keyframe.stamp);
+                    proto::MapCorrectionKeyframe {
+                        timestamp_ns: keyframe.stamp,
+                        old_position: Some(proto::Vec3 { x: old.x, y: old.y, z: old.z }),
+                        translation: delta.position,
+                        rotation: delta.orientation,
+                    }
+                }).collect(),
+            });
+            corrections.len() as u64
+        };
+        self.transform.send_replace((self.map_from_odom, seq));
         self.publish_pose();
         if let Err(error) = self.publish_grid() {
             tracing::warn!(%error,"禁行区尚未刷新，等待输入");

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
@@ -10,6 +10,7 @@ from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.runtime_views import PerceptionContext
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
+from services.memory.map_correction import SAMPLE_SOURCE
 from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
 from services.perception.ray_triangulation import triangulate_rays, triangulation_confidence
 from services.perception.self_body import is_self_body
@@ -171,7 +172,9 @@ class VisionToMapProjectionService:
                 frame_tree, effective_pose, target_frame_id=map_context.frame_id)
         if observer_body_pose is not None:
             observer_body_pose = observer_body_pose.model_copy(update={
-                "frame_id": map_context.frame_id, "timestamp": effective_pose.timestamp})
+                "frame_id": map_context.frame_id, "timestamp": effective_pose.timestamp,
+                "source_timestamp_ns": effective_pose.source_timestamp_ns,
+                "session_id": effective_pose.session_id, "correction_seq": effective_pose.correction_seq})
         projected: List[ProjectedObservation] = []
         track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
@@ -270,7 +273,12 @@ class VisionToMapProjectionService:
                     attributes=projection_attributes,
                 )
             )
-        return tuple(projected)
+        provenance = {"source_timestamp_ns": effective_pose.source_timestamp_ns,
+            "session_id": effective_pose.session_id, "correction_seq": effective_pose.correction_seq}
+        sample = {"session_id": effective_pose.session_id, "source_timestamp_ns": effective_pose.source_timestamp_ns}
+        return tuple(replace(item, pose=item.pose.model_copy(update=provenance), attributes={
+            **item.attributes, **({SAMPLE_SOURCE: sample} if effective_pose.source_timestamp_ns is not None else {})})
+            for item in projected)
 
     def _build_track_pose_index(self, perception_context: PerceptionContext) -> Dict[str, Pose]:
         result: Dict[str, Pose] = {}

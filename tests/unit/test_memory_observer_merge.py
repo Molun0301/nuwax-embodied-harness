@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
+import math
 
 import pytest
 from contracts.geometry import FrameTree, Pose, Transform, Vector3
@@ -163,6 +164,174 @@ def test_planner_rejects_mismatched_observer_frame():
     with pytest.raises(ValueError, match='地图坐标系'):
         InspectionPosePlanner().plan_for_target(target_pose=Pose(frame_id='map'),
             observer_body_pose=Pose(frame_id='odom'))
+
+
+def test_map_correction_reopens_advances_and_rebases_in_flight_observations(tmp_path):
+    from contracts.naming import build_scene_space_id
+    from contracts.spatial_memory import NavigationTrajectoryEvent, NavigationTrajectoryEventKind
+    from contracts.spatial_memory import SceneObservationSample, SceneSpace, SceneSpaceBoundary
+    from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+    from services.memory.map_correction import SESSION_KEY
+    from services.perception.observation_geometry import _interpolate_pose
+
+    stamp_first, stamp_second = 1_000_000_000, 7_000_000_000
+    session = 37
+
+    def keyframe(stamp, shift, angle=0.0, shift_y=0.0, old_x=0.0):
+        return pb.MapCorrectionKeyframe(timestamp_ns=stamp, old_position=pb.Vec3(x=old_x),
+            translation=pb.Vec3(x=shift, y=shift_y),
+            rotation=pb.Quat(w=math.cos(angle / 2), z=math.sin(angle / 2)))
+
+    events = {
+        1: pb.MapCorrection(keyframes=[keyframe(stamp_first, .1), keyframe(stamp_second, .2)]),
+        2: pb.MapCorrection(keyframes=[keyframe(stamp_first, .5),
+            keyframe(stamp_second, 3.8, angle=math.pi / 2, shift_y=-1.1, old_x=6.0)]),
+    }
+    calls = []
+    published = []
+
+    def get_event(owner, seq):
+        assert owner == session
+        calls.append(seq)
+        return events[seq]
+
+    def source(seq, stamp, x=0.0, *, owner=session, frame='map'):
+        return Pose(frame_id=frame, position=Vector3(x=x, y=1, z=.7),
+            session_id=owner, correction_seq=seq, source_timestamp_ns=stamp)
+
+    def state(geometry, seq, pose_seq=None, x=0.0):
+        geometry.value = replace(geometry.value, session_id=session, correction_seq=seq,
+            pose=replace(geometry.value.pose, session_id=session, x=x, y=1,
+                         correction_seq=seq if pose_seq is None else pose_seq, timestamp_ns=stamp_second))
+        for callback in tuple(geometry.callbacks):
+            callback(geometry.value)
+
+    class Bus:
+        def publish_frame(self, frame):
+            published.append(frame.topic)
+
+    def door(x):
+        detection = integration.detection3d('door', x=x)
+        detection.attributes.update(dynamic_state="static",
+            support_points_map={"frame_id": "map", "points": [[x, 1.0, .7], [x, 1.1, .7]]},
+            camera_points={"frame_id": "camera", "points": [[0.0, 0.0, 1.0]]})
+        return detection
+
+    def remember(service, title, pose, detection=None, *, automatic=True):
+        items = () if detection is None else (detection,)
+        return service.remember_current_scene(map_name='house', title=title,
+            perception_context=integration.observed(items), observation_pose=pose,
+            metadata={"source": "perception_video_runtime"} if automatic else {})
+
+    with integration.memory_at(tmp_path, stream_bus=Bus()) as (service, geometry):
+        geometry.get_map_correction = get_event
+        state(geometry, 0)
+        first = source(0, stamp_first, 2.0)
+        remember(service, '校正前', first, door(2.0))
+        remember(service, '他会话', source(0, stamp_first, 9.0, owner=36))
+        remember(service, '里程计', source(0, stamp_first, 8.0, frame='odom'))
+        service.ingest_perception_observation(map_name='house',
+            perception_context=integration.observed((door(2.1),)),
+            current_pose=source(1, stamp_second, 2.1), admission='explicit')
+        assert calls == [1]
+        before = service.records("instance")[0]
+        assert before.pose.position.x == pytest.approx(2.1)
+        assert len(before.correction_buckets) == 2
+        fixed = source(0, stamp_first, -4.0)
+        space = SceneSpace(scene_space_id=build_scene_space_id('test'), map_name='house', frame_id='map',
+            boundary=SceneSpaceBoundary(frame_id='map', centroid=fixed),
+            inspection_poses=[fixed], metadata={"source": "room_segmentation", SESSION_KEY: 36},
+            observation_samples=[SceneObservationSample(sample_id='source', pose=source(1, stamp_first, 2.1))])
+        service.write(lambda store: store.put("scene_space", space))
+        kind = NavigationTrajectoryEventKind.VISITED_POSE
+        trajectory = NavigationTrajectoryEvent(trajectory_event_id=service._build_navigation_trajectory_event_id(
+            kind, "test", "external"), event_kind=kind, map_name="house", pose=source(1, stamp_first, 2.1),
+            target_pose=Pose(frame_id="map", position=Vector3(x=4.0)))
+        service.write(lambda store: service._upsert_navigation_trajectory_event(trajectory))
+        remember(service, '两次之间', source(1, stamp_first, 2.1))
+        assert service.write(lambda store: store.correction_progress()) == (session, 1)
+
+    calls.clear()
+    published.clear()
+    with integration.memory_at(tmp_path, stream_bus=Bus()) as (service, geometry):
+        geometry.get_map_correction = get_event
+        state(geometry, 2, x=42.0)
+        service.flush_observations()
+        assert calls == [2]
+        assert {'memory.instances', 'memory.scene_spaces'} <= set(published)
+        assert service.write(lambda store: store.correction_progress()) == (session, 2)
+        after = service.records("instance")[0]
+        assert after.instance_id == before.instance_id
+        assert after.pose.position.x == pytest.approx(2.7)
+        assert after.pose.position.y == pytest.approx(1.0)
+        assert after.pose.orientation.z == pytest.approx(math.sin(math.pi / 4))
+        assert after.support_evidence.voxel_keys
+        observed = service.records("observation")[0]
+        assert observed.pose.position.x == pytest.approx(2.6)
+        assert observed.metadata["support_points_map"]["points"][0] == pytest.approx([2.6, 1.0, .7])
+        assert observed.metadata["camera_points"] == {"frame_id": "camera", "points": [[0.0, 0.0, 1.0]]}
+        travelled = service.records("trajectory")[0]
+        assert travelled.pose.position.x == pytest.approx(2.6)
+        assert travelled.target_pose.position.model_dump() == pytest.approx({"x": 3.8, "y": 2.9, "z": 0.0})
+        previous_station, current_station = before.inspection_poses[0], after.inspection_poses[0]
+        assert current_station.position.x - after.pose.position.x == pytest.approx(
+            -(previous_station.position.y - before.pose.position.y))
+        assert current_station.position.y - after.pose.position.y == pytest.approx(
+            previous_station.position.x - before.pose.position.x)
+        stored_space = service.records("scene_space")[0]
+        assert stored_space.boundary == space.boundary and stored_space.inspection_poses == [fixed]
+        assert stored_space.observation_samples[0].pose.position.x == pytest.approx(2.6)
+
+        remember(service, '第二次之后', source(2, stamp_first, 2.6))
+        remember(service, '在途', source(0, stamp_first, 2.0))
+        mixed = _interpolate_pose([(stamp_first, source(1, stamp_first, 3.0)),
+            (stamp_first + 2, source(2, stamp_first + 2, 3.0))], stamp_first + 1)
+        assert mixed.mixed_correction
+        assert remember(service, '混合关键帧', mixed) is None
+        explicit = remember(service, '显式写入', mixed, automatic=False)
+        assert explicit.pose.position.x == pytest.approx(3.5)
+        assert explicit.pose.correction_seq == 2
+        locations = {entry.title: entry.pose.position.x for entry in service.records("memory")}
+        assert locations == pytest.approx({'校正前': 2.6, '两次之间': 2.6, '第二次之后': 2.6,
+            '在途': 2.6, '他会话': 9.0, '里程计': 8.0, '显式写入': 3.5})
+        assert calls == [2, 1, 2, 2]
+
+    calls.clear()
+    with integration.memory_at(tmp_path) as (service, geometry):
+        geometry.get_map_correction = get_event
+        state(geometry, 2)
+        service.flush_observations()
+        assert calls == []
+        assert service.records("instance")[0].pose == after.pose
+        assert service.records("instance")[0].metadata[SESSION_KEY] == session
+
+
+def test_map_correction_explicit_writes_use_the_supplied_observation_pose(tmp_path):
+    from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+
+    session_id = 37
+    stamp = 1_000_000_000
+    correction = pb.MapCorrection(keyframes=[pb.MapCorrectionKeyframe(
+        timestamp_ns=stamp, translation=pb.Vec3(x=5), rotation=pb.Quat(w=1))])
+    observed_pose = Pose(frame_id="map", position=Vector3(x=2), source_timestamp_ns=stamp,
+                         session_id=session_id)
+    corrected_pose = observed_pose.model_copy(update={"position": Vector3(x=7), "correction_seq": 1})
+    with integration.memory_at(tmp_path) as (service, geometry):
+        geometry.get_map_correction = lambda owner, seq: {(session_id, 1): correction}[owner, seq]
+        geometry.value = replace(geometry.value, session_id=session_id, correction_seq=1,
+            pose=replace(geometry.value.pose, x=42, session_id=session_id, correction_seq=1))
+        geometry.change("house")
+        service.flush_observations()
+
+        scene = service.remember_current_scene(map_name="house", perception_context=integration.observed(),
+                                               observation_pose=observed_pose)
+        location, note = service.tag_location("观察点", map_name="house", observation_pose=observed_pose,
+                                              attach_latest_observation=False, attach_latest_perception=False)
+
+        assert service.current_pose().x == 42
+        assert service.get_record("memory", scene.memory_id).pose == corrected_pose
+        assert service.get_record("location", location.location_id).pose == corrected_pose
+        assert service.get_record("memory", note.memory_id).pose == corrected_pose
 
 
 def test_find_target_navigates_to_a_written_door_observation(tmp_path):

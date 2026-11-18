@@ -70,17 +70,18 @@ class PlacesMixin:
             image_bytes = self._artifact_store.read_bytes(source.image_artifact.artifact_id)
         def save(store):
             self._require_library(store, map_name)
+            corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, source, image_bytes) if source is not None else []
             photo_refs = [self.photo_ref(identity, library_name=map_name).model_dump(mode="json") for identity in photos]
-            value = location.model_copy(update={"metadata": {**location.metadata,
+            value = location.model_copy(update={"pose": corrected, "metadata": {**location.metadata,
                 "artifact_ids": photos, "photo_refs": photo_refs}})
             memory = None
-            store.put("location", value)
+            value = store.put("location", value)
             if entry is not None:
-                prepared = entry.model_copy(update={"artifact_ids": photos,
+                prepared = entry.model_copy(update={"pose": corrected, "artifact_ids": photos,
                     "metadata": {**entry.metadata, "photo_refs": photo_refs}})
                 memory = self._save_scene_record(store, prepared, source=source, context=perception,
-                    projected=projected, captured=captured, photos=photos)
+                    projected=prepared_observations, captured=captured, photos=photos)
                 value = value.model_copy(update={"memory_id": memory.memory_id})
                 store.put("location", value)
             return value, memory

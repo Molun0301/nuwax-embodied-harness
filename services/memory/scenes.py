@@ -43,13 +43,14 @@ class ScenesMixin:
                     frame_tree=frame_tree) if perception_context is not None and pose is not None else ())
         def save(store):
             self._require_library(store, map_name)
+            corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, perception_context, image_bytes)
-            value = entry.model_copy(update={"artifact_ids": photos})
+            value = entry.model_copy(update={"pose": corrected, "artifact_ids": photos})
             value = self._save_scene_record(store, value, source=perception_context, context=perception_context,
-                projected=projected, captured=captured, photos=photos)
+                projected=prepared_observations, captured=captured, photos=photos)
             identity = ""
-            if pose is not None:
-                space = self._build_semantic_exploration_scene_space(query=query, pose=pose, map_name=map_name,
+            if corrected is not None:
+                space = self._build_semantic_exploration_scene_space(query=query, pose=corrected, map_name=map_name,
                     reason=reason, memory_id=value.memory_id, frontier_metadata=frontier_metadata, metadata=metadata)
                 self.upsert_scene_space(space, map_name=map_name)
                 identity = space.scene_space_id
@@ -99,6 +100,8 @@ class ScenesMixin:
         if context is None and observation is None:
             raise GatewayError('当前没有可写入记忆的观察或感知结果', error_code='observation_unavailable', http_status=409)
         pose = self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
+        if (metadata or {}).get("source") == "perception_video_runtime" and pose is not None and pose.mixed_correction:
+            return None
         source = context if context is not None else observation
         headline = context.scene_summary.headline if context is not None else observation.observation.summary
         title = title if title is not None else (headline if context is not None else "观察记录：%s" % source.camera_id)
@@ -131,16 +134,17 @@ class ScenesMixin:
             if (store is None or store.name != map_name) and entry.metadata.get("source") == "perception_video_runtime":
                 return None
             self._require_library(store, map_name)
+            corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, source, image_bytes)
-            value = entry.model_copy(update={'artifact_ids': photos, 'metadata': {**entry.metadata, 'photo_refs': [self.photo_ref(identity, library_name=map_name).model_dump(mode='json') for identity in photos]}})
+            value = entry.model_copy(update={'pose': corrected, 'artifact_ids': photos, 'metadata': {**entry.metadata, 'photo_refs': [self.photo_ref(identity, library_name=map_name).model_dump(mode='json') for identity in photos]}})
             return self._save_scene_record(store, value, source=source, context=context,
-                                           projected=projected, captured=captured, photos=photos)
+                                           projected=prepared_observations, captured=captured, photos=photos)
         return self.write(save)
 
     def _save_scene_record(self, store, value, *, source, context, projected, captured, photos):
         from dataclasses import replace
         projected = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in projected)
-        store.put("memory", value)
+        value = store.put("memory", value)
         outcomes = (self._associate_observations(store, projected,
             admission=ADMISSION_AUTOMATIC if value.metadata.get("source") == "perception_video_runtime" else ADMISSION_EXPLICIT,
             occupancy_grid=self.current_grid(), now=value.timestamp)[1] if projected else ())
@@ -340,7 +344,9 @@ class ScenesMixin:
         return self._writer.store.put("summary", value)
 
     def _upsert_navigation_trajectory_event(self, value):
-        return self._writer.store.put("trajectory", value)
+        store = self._writer.store
+        pose, _ = self._prepare_map_sample(store, value.pose)
+        return store.put("trajectory", value.model_copy(update={"pose": pose}))
 
     def _record_semantic_graph_relation(self, relation_kind, source_node_kind, source_node_id,
                                        target_node_kind, target_node_id, *, map_name, confidence=1.0,

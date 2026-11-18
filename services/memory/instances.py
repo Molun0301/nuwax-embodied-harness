@@ -204,7 +204,7 @@ class InstancesMixin:
         if not is_keyframe:
             return (), (), []
         pose = self._as_memory_pose(current_pose or self.current_pose())
-        if pose is None:
+        if pose is None or (admission == ADMISSION_AUTOMATIC and pose.mixed_correction):
             return (), (), []
         context = self._semantic_builder.build(self.current_grid(), map_name=map_name)
         ray_history = (InstanceCacheRayHistoryProvider(self._record_map("instance").values())
@@ -219,8 +219,9 @@ class InstancesMixin:
                     return (), (), []
                 self._require_library(store, map_name)
             from dataclasses import replace
+            _, prepared = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, perception_context, image_bytes) if projected else ()
-            values = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in projected)
+            values = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in prepared)
             return self._associate_observations(store, values, admission=admission,
                                                 occupancy_grid=self.current_grid(), now=now)
         return self.write(ingest)

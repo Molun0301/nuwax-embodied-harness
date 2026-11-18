@@ -114,3 +114,40 @@ def test_multiple_detections_share_one_calibrated_projection():
     _, metadata = augmentor.augment_detections((detection,), image_frame=image,
                                                camera_info=cam, point_cloud=None)
     assert metadata['geometry_projection_degradation_reason'] == 'point_cloud_unavailable'
+
+
+def test_sample_detects_different_correction_used_by_lidar_batch():
+    from types import SimpleNamespace
+
+    from services.geometry.client import Transform
+    from services.geometry.state import Pose
+    from services.perception.observation_geometry import capture_geometry
+
+    stamp = 1_000_000_000
+    scan_stamp = stamp - 40_000_000
+    offsets = np.asarray([0, 80_000_000], dtype="<u8")
+    image = ImageFrame(camera_id="cam", frame_id="camera", width_px=4, height_px=4,
+        encoding="rgb8", data=b"x", metadata={"source_timestamp_ns": stamp})
+    cloud = PointCloudFrame(frame_id="lidar", point_count=2, points_xyz_array=np.ones((2, 3)),
+        metadata={"source_timestamp_ns": scan_stamp, "canonical_lidar_frame": SimpleNamespace(
+            timestamp_ns=scan_stamp, time_offset_ns_le=offsets.tobytes())})
+    transforms = (
+        Transform("map", "base_link", 0, 0, 0, 0, 0, 0, 1, stamp),
+        Transform("base_link", "camera", 0, 0, 0, 0, 0, 0, 1, 0),
+        Transform("base_link", "lidar", 0, 0, 0, 0, 0, 0, 1, 0),
+    )
+
+    def capture(last_seq):
+        frames = [SimpleNamespace(topic="localization.pose", metadata={}, payload=Pose(
+            0, 0, 0, 0, 0, 0, 1, "map", time, 17, seq))
+            for time, seq in ((scan_stamp, 1), (stamp, 1), (stamp + 40_000_000, last_seq))]
+        frames.append(SimpleNamespace(topic="pointcloud.frame", metadata={}, payload=cloud))
+        return capture_geometry(SimpleNamespace(replay=lambda topics: frames), image, transforms=transforms)
+
+    same = capture(1)
+    assert same.point_cloud.point_count == 2
+    assert (same.pose.session_id, same.pose.correction_seq) == (17, 1)
+    assert not same.pose.mixed_correction
+    mixed = capture(2)
+    assert mixed.point_cloud.point_count == 2
+    assert mixed.pose.mixed_correction

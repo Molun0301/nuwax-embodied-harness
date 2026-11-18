@@ -16,6 +16,8 @@ from services.memory.instance_evidence import (accumulate_support_voxels, suppor
     cooccurrence_evidence, merge_cooccurrence_metadata, remember_coobserved_instances,
     observation_source_index, historical_coobserved_ids, same_frame_distinct_same_label)
 from services.memory.object_extent import resolve_object_extent
+from services.memory.correction_buckets import merge_buckets
+from services.memory.map_correction import SESSION_KEY
 from services.memory.spatial_candidate_index import SpatialCandidateIndex
 import math
 import numpy as np
@@ -166,6 +168,11 @@ class InstanceConsolidator:
                     source=next(r for r in records if resolve_object_extent(r)==detector)
                     extent=dict(detector,center_offset_m={k:detector["center_offset_m"][k]+getattr(source.pose.position,k)-getattr(pose.position,k) for k in "xyz"})
                 metadata["object_extent"]=extent
+            if any(record.correction_buckets for record in records):
+                dynamic = latest.dynamic_state in (InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC)
+                updates["correction_buckets"] = merge_buckets(records, self._config,
+                    position_record=latest if dynamic else None)
+                metadata[SESSION_KEY] = max(record.metadata.get(SESSION_KEY, 0) for record in records)
             result[merge.survivor_id]=current.model_copy(update=updates)
             for key in merge.merged_ids:
                 result.pop(key)

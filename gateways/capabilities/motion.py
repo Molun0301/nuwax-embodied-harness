@@ -1,6 +1,6 @@
 """运动能力只通过运动守卫输出命令。"""
-import time
 
+from core import clock
 from core.capability import Capability
 from contracts.go2_sport import build_go2_sport_command_input_schema
 from gateways.capabilities.common import rpc_errors, schema
@@ -13,11 +13,11 @@ def relative_move(platform, ctx, args):
     duration = args["duration_sec"]
     command_limits = platform.motion.status().command_limits
     limited = False
-    start = time.monotonic()
+    start = clock.monotonic()
     with platform.motion.lease(MotionSource.GATEWAY_RELATIVE, args["motion_generation"]) as lease:
         while True:
             ctx.check()
-            elapsed = time.monotonic() - start
+            elapsed = clock.monotonic() - start
             if elapsed >= duration:
                 break
             limited_now, _ = lease.velocity(vx, vy, wz)

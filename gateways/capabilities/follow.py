@@ -1,7 +1,7 @@
 """跟随能力：统一感知给目标，原生跟随进程给速度，守卫执行。"""
 from dataclasses import asdict
-import time
 
+from core import clock
 from core.capability import Capability
 from core.errors import GatewayError
 from core.target_query import normalize_query
@@ -41,7 +41,7 @@ def _run_follow_target(platform, ctx, args):
     runtime, bridge = platform.perception.video_runtime, platform.follow
     reason = "follow:" + ctx.task_id
     bridge.start()
-    started = time.monotonic()
+    started = clock.monotonic()
     last_stamp = None
     last_detection = last_target = calibration = last_command = None
     lost_since = None
@@ -59,7 +59,7 @@ def _run_follow_target(platform, ctx, args):
                     last_command = bridge.latest_command(ctx.task_id)
                     if last_command is not None and last_command.state == PERSON_FOLLOW_TRACKING:
                         tracking_started = True
-                    now = time.monotonic()
+                    now = clock.monotonic()
                     elapsed = now - started
                     if elapsed >= duration:
                         if last_detection is not None and not tracking_started:

@@ -9,6 +9,7 @@ import time
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import PerceptionRuntimeStatus
 from core import StateNamespace
+from core import clock
 from core.errors import GatewayError
 from services.perception.keyframe import PerceptionKeyframeSelector
 from services.perception.image_utils import encode_image_frame_bytes
@@ -158,7 +159,8 @@ class PerceptionVideoRuntime:
                 group = groups.setdefault((camera, backend), {"reasons": set(), "classes": set()})
                 group["reasons"].add(reason)
                 group["classes"].update(classes)
-            started = time.monotonic()
+            started = clock.monotonic()
+            real_started = time.monotonic()
             failed = False
             for (camera, backend), group in groups.items():
                 try:
@@ -172,10 +174,12 @@ class PerceptionVideoRuntime:
                         self._last_error = str(error)
                     LOGGER.exception("连续感知处理失败")
             self._write_status()
-            delay = self._failure_backoff_sec if failed else interval
             with self._condition:
                 if settings == self._reasons and not self._closed:
-                    self._condition.wait(max(0.0, delay - (time.monotonic() - started)))
+                    if failed:
+                        self._condition.wait(max(0.0, self._failure_backoff_sec - (time.monotonic() - real_started)))
+                    else:
+                        clock.wait_until(started + interval, self._condition.wait)
 
     def _process(self, camera, backend, group):
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()

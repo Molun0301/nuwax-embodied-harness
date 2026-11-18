@@ -11,6 +11,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from contracts.events import RuntimeEventCategory
+from core import clock
 from core.capability import Capability
 from core.errors import GatewayError
 
@@ -48,6 +49,18 @@ class Cancelled(Exception):
     """任务取消或期限已到。"""
 
 
+class _TaskTimer(threading.Timer):
+    def __init__(self, deadline, callback, args):
+        super().__init__(0, callback, args=args)
+        self.deadline = deadline
+
+    def run(self):
+        clock.wait_until(self.deadline, self.finished.wait)
+        if not self.finished.is_set():
+            self.function(*self.args, **self.kwargs)
+        self.finished.set()
+
+
 class TaskContext:
     def __init__(self, task_id: str, cancelled: threading.Event, deadline: Optional[float], runner: TaskRunner):
         self.task_id = task_id
@@ -57,19 +70,21 @@ class TaskContext:
         self._last_progress: Optional[str] = None
 
     def check(self) -> None:
-        if self.deadline is not None and time.monotonic() >= self.deadline:
+        if self.deadline is not None and clock.monotonic() >= self.deadline:
             self._runner.cancel(self.task_id, "期限")
         if self.cancelled.is_set():
             raise Cancelled()
 
     def wait(self, seconds: float) -> None:
         self.check()
-        remaining = self.remaining()
-        self.cancelled.wait(seconds if remaining is None else min(seconds, remaining))
+        deadline = clock.monotonic() + seconds
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        clock.wait_until(deadline, self.cancelled.wait)
         self.check()
 
     def remaining(self) -> Optional[float]:
-        return None if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+        return None if self.deadline is None else max(0.0, self.deadline - clock.monotonic())
 
     def progress(self, value: float, stage: str, message: str, **data: Any) -> None:
         self.check()
@@ -134,7 +149,7 @@ class TaskRunner:
             task_id = "task_" + uuid4().hex
             duration = args.get("timeout_sec", cap.timeout_sec)
             ctx = TaskContext(task_id, threading.Event(),
-                              None if duration is None else time.monotonic() + duration, self)
+                              None if duration is None else clock.monotonic() + duration, self)
             status = TaskStatus(task_id, cap.name, caller, TaskState.RUNNING, cap.motion, 0.0,
                                 "running", "任务正在执行。", {}, None, None, None, time.time(), None)
             self._statuses[task_id] = status
@@ -154,7 +169,7 @@ class TaskRunner:
     def _run(self, cap: Capability, args: dict, ctx: TaskContext) -> None:
         timer = None
         if ctx.deadline is not None:
-            timer = threading.Timer(ctx.remaining(), self.cancel, args=(ctx.task_id, "期限"))
+            timer = _TaskTimer(ctx.deadline, self.cancel, args=(ctx.task_id, "期限"))
             timer.daemon = True
             timer.start()
         result, error = None, None

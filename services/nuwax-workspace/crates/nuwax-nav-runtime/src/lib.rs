@@ -19,11 +19,11 @@ use nuwax_motion_safety_guard::{
 };
 use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig, StopMessage};
 use nuwax_nav_astar::navigation_map::CostMap2D;
-use nuwax_nav_types_messages::{GoalKey, Path2D, Path3D, PoseStamped, Twist2};
+use nuwax_nav_types_messages::{clock, GoalKey, Path2D, Path3D, PoseStamped, Twist2};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{interval_at, Instant, MissedTickBehavior};
+use tokio::time::Instant;
 
 pub use nuwax_motion_safety_guard::{motion_guard_socket_path, MeasuredMotion};
 /// 保留来源时点的实测运动边界转换。
@@ -662,7 +662,7 @@ pub struct NavScheduler<M, P> {
 
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
-    path_wait_started_at: Option<Instant>,
+    path_wait_started_at: Option<clock::Instant>,
     latest_pose: Option<PoseStamped>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_source_max_age: Option<Duration>,
@@ -720,11 +720,7 @@ where
         mut urgent_rx: mpsc::Receiver<UrgentCommand>,
         status_tx: watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-        let mut tick = interval_at(
-            Instant::now() + self.config.tick_interval,
-            self.config.tick_interval,
-        );
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut tick = clock::interval(self.config.tick_interval, true);
         let mut input_open = true;
         let mut urgent_open = true;
         loop {
@@ -959,7 +955,7 @@ where
         self.current_execution_identity = None;
         self.current_route_kind = RouteKind::Complete;
         self.current_path_revision = 0;
-        self.path_wait_started_at = Some(Instant::now());
+        self.path_wait_started_at = Some(clock::Instant::now());
         self.status.session_id = Some(session.session_id.clone());
         self.session = Some(session);
         self.status.path_revision = 0;
@@ -1210,7 +1206,7 @@ where
         self.status.applied_commands+=1;self.status.last_applied_twist=Some(twist);
         self.planner.observe_measured_motion(self.motion.measured_motion());self.planner.observe_applied_command(twist);
         if twist!=Twist2::ZERO{self.path_wait_started_at=None;}
-        else{self.path_wait_started_at.get_or_insert_with(Instant::now);}
+        else{self.path_wait_started_at.get_or_insert_with(clock::Instant::now);}
         if let Some(feedback)=&mut self.status.surface_replan_feedback{
             if feedback.current_context.as_ref().is_some_and(|c|c.applied!=twist){feedback.current_context=None;}
         }
@@ -1329,7 +1325,7 @@ where
     ) -> Result<(), RuntimeError> {
         let Some(started_at)=self.path_wait_started_at else{return Ok(())};
         if self.config.path_wait_timeout.is_zero()
-            || Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
+            || clock::Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
             return Ok(());
         }
         let timeout_message = format!(
@@ -1768,8 +1764,16 @@ enum SchedulerEvent{Input(Option<InputCommand>),Tick}
 fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeError> {
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
         .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
-    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|v|v.as_nanos().min(u128::from(u64::MAX)) as u64)).map_err(RuntimeError::StaleInput)?;
+    let now = clock::source_now_ns();
+    let (tolerance, future_reason) = if clock::uses_device_clock() {
+        (1000, "数据源时间超前当前来源时钟")
+    } else {
+        (50_000_000, "位姿源时间超前当前墙钟超过50毫秒")
+    };
+    if source > now.saturating_add(tolerance) {
+        return Err(RuntimeError::StaleInput(future_reason.into()));
+    }
+    let age = now.saturating_sub(source);
     if u128::from(age) >= maximum.as_nanos() {
         return Err(RuntimeError::StaleInput(format!(
             "pose source deadline elapsed (source_timestamp_ns={source_ns}, source_age_ms={})", age / 1_000_000)));
@@ -2461,7 +2465,7 @@ mod tests {
             assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
             assert_eq!(scheduler.path_wait_started_at, wait_started);
         }
-        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.path_wait_started_at = Some(clock::Instant::now() - Duration::from_secs(31));
         scheduler.session_tick(&status).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains(reason), "{}", scheduler.status.message);
@@ -2489,25 +2493,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_pose_age_uses_slow_clock_and_rejects_stopped_source_clock() {
+    async fn source_pose_age_uses_device_clock() {
         const CHILD: &str = "NEH_TEST_POSE_DATA_TIME";
         let Some(path) = std::env::var_os(CHILD) else {
             let path = std::env::temp_dir().join(format!("neh-nav-data-clock-{}", std::process::id()));
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::source_pose_age_uses_slow_clock_and_rejects_stopped_source_clock"])
-                .env(CHILD, &path).env("NUWAX_SOURCE_TIME_FILE", &path).status().unwrap();
+                .args(["--exact", "tests::source_pose_age_uses_device_clock"])
+                .env(CHILD, &path).env("NUWAX_DEVICE_CLOCK", &path).status().unwrap();
             std::fs::remove_file(path).unwrap();
             assert!(status.success());
             return;
         };
         let source = 1_000_000_000_000_u64;
-        let write_clock = |current: u64, live: bool| {
-            let mono = if live { nuwax_motion_safety_guard::measured_motion::monotonic_ns() } else { 0 };
-            let mut bytes = b"NEHTIME1".to_vec();
-            for value in [1_u64, 1, current, 0, mono] { bytes.extend_from_slice(&value.to_le_bytes()); }
-            std::fs::write(&path, bytes).unwrap();
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::options().read(true).write(true).create_new(true)
+            .open(&path).unwrap();
+        file.set_len(40).unwrap();
+        file.write_all_at(b"USIMCLK1", 0).unwrap();
+        file.write_all_at(&0.35_f64.to_le_bytes(), 24).unwrap();
+        let write_clock = |sequence: u64, current: u64, paused: bool| {
+            file.write_all_at(&(sequence - 1).to_le_bytes(), 8).unwrap();
+            file.write_all_at(&current.to_le_bytes(), 16).unwrap();
+            file.write_all_at(&u64::from(paused).to_le_bytes(), 32).unwrap();
+            file.write_all_at(&sequence.to_le_bytes(), 8).unwrap();
         };
-        write_clock(source + 200_000_000, true);
+        write_clock(2, source + 200_000_000, false);
         let mut scheduler = NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
             FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
         let (tx, _) = watch::channel(scheduler.status.clone());
@@ -2519,12 +2529,12 @@ mod tests {
         scheduler.pose_receipt.as_mut().unwrap().received_at = Instant::now() - Duration::from_secs(6);
         scheduler.session_tick(&tx).await.unwrap();
         assert!(scheduler.status.planner_inputs_fresh, "来源钟仍新鲜时，不再附加收据年龄门");
-        write_clock(source + 600_000_000, true);
+        write_clock(4, source + 600_000_000, false);
         scheduler.session_tick(&tx).await.unwrap();
         assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("pose source deadline elapsed"));
-        write_clock(source + 200_000_000, false);
+        write_clock(6, source + 600_000_000, true);
         scheduler.session_tick(&tx).await.unwrap();
-        assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("停止推进"));
+        assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("pose source deadline elapsed"));
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
@@ -2714,7 +2724,7 @@ mod tests {
         assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
         assert!(scheduler.status.last_terminal.is_none());
         // 只设置已经流逝的等待起点，原30秒配置及输入期限保持原值。
-        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(30));
+        scheduler.path_wait_started_at = Some(clock::Instant::now() - Duration::from_secs(30));
         scheduler.session_tick(&status).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains("pose source deadline"));
@@ -3366,7 +3376,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(3));
+        scheduler.path_wait_started_at = Some(clock::Instant::now() - Duration::from_secs(3));
         scheduler.session_tick(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
 
@@ -3448,7 +3458,7 @@ mod tests {
                     state.step = PlannerStep::Command(Twist2 { linear: Point2::new(0.2, 0.0), angular_z: 0.0 });
                     state.wait_reason = None;
                 }
-                scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+                scheduler.path_wait_started_at = Some(clock::Instant::now() - Duration::from_secs(31));
                 scheduler.session_tick(&sender).await.unwrap();
                 assert!(scheduler.path_wait_started_at.is_none());
                 if recover {
@@ -3471,7 +3481,7 @@ mod tests {
         scheduler.observe_odometry(&sender, map_pose(), None).unwrap();
         scheduler.observe_costmap(&sender, costmap_at(1_000_000_000), Instant::now()).unwrap();
         scheduler.start_session(&sender, session()).await.unwrap();
-        scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+        scheduler.path_wait_started_at = Some(clock::Instant::now() - Duration::from_secs(31));
         scheduler.check_path_wait_timeout(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
 
@@ -3488,7 +3498,7 @@ mod tests {
             }).unwrap();
             scheduler.session = Some(session());
             scheduler.lease_active = true;
-            scheduler.path_wait_started_at = Some(Instant::now() - scheduler.config.path_wait_timeout);
+            scheduler.path_wait_started_at = Some(clock::Instant::now() - scheduler.config.path_wait_timeout);
             scheduler.status.message = cause.into();
             let (sender, observed) = watch::channel(scheduler.status.clone());
             scheduler.check_path_wait_timeout(&sender).await.unwrap();

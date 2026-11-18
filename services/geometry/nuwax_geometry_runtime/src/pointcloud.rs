@@ -46,7 +46,9 @@ type VoxelIndex = ahash::AHashSet<VoxelKey>;
 
 // 基础层的排除半径为三个精细体素（0.15 米，约为跟踪误差 95 分位的两倍）。
 const BASE_RADIUS_VOXELS: i32 = 3;
-// 至少五个不同帧命中，避免一帧中的密集回波重复计票。
+// 远处回波在相邻精细体素间变动，按 0.20 米粗格累计命中帧。
+const NEW_STRUCTURE_CELL_VOXELS: i32 = (0.20 / VOXEL_SIZE) as i32;
+// 至少五个不同帧命中，同一帧每个粗格只计一次。
 const NEW_STRUCTURE_FRAMES: usize = 5;
 // 从首次命中到确认至少一秒，使用帧的源时间。
 const NEW_STRUCTURE_SPAN_NS: u64 = 1_000_000_000;
@@ -84,11 +86,8 @@ struct StructureCandidate {
 }
 
 impl LoadedMapUpdates {
-    fn confirm(&mut self, key: VoxelKey, stamp: u64) -> bool {
-        if self.confirmed.contains(&key) {
-            return true;
-        }
-        if BASE_NEIGHBORS.iter().any(|&(x, y, z)| {
+    fn outside_base(&self, key: VoxelKey) -> bool {
+        !BASE_NEIGHBORS.iter().any(|&(x, y, z)| {
             let neighbor = || {
                 Some((
                     key.0.checked_add(x)?,
@@ -97,10 +96,14 @@ impl LoadedMapUpdates {
                 ))
             };
             neighbor().is_some_and(|nearby| self.base.contains(&nearby))
-        }) {
-            return false;
+        })
+    }
+
+    fn confirm(&mut self, cell: VoxelKey, stamp: u64) -> bool {
+        if self.confirmed.contains(&cell) {
+            return true;
         }
-        let candidate = self.candidates.entry(key).or_insert(StructureCandidate {
+        let candidate = self.candidates.entry(cell).or_insert(StructureCandidate {
             first_stamp: stamp,
             frames: 0,
         });
@@ -110,8 +113,8 @@ impl LoadedMapUpdates {
         {
             return false;
         }
-        self.candidates.remove(&key);
-        self.confirmed.insert(key);
+        self.candidates.remove(&cell);
+        self.confirmed.insert(cell);
         true
     }
 }
@@ -289,15 +292,25 @@ impl CloudMap {
         if !updates.allowed {
             return Ok(None);
         }
-        let mut decisions = AHashMap::new();
+        let mut fine_decisions = AHashMap::new();
+        let mut coarse_decisions = AHashMap::new();
         let mut confirmed = Vec::new();
         for &index in static_indices {
             let point = points[index as usize];
             let key = voxel_key(point.into(), VOXEL_SIZE).expect("只读分类已验证精细体素坐标");
-            if *decisions
-                .entry(key)
-                .or_insert_with(|| updates.confirm(key, stamp))
-            {
+            if *fine_decisions.entry(key).or_insert_with(|| {
+                // 粗格确认后，该格内每个精细体素仍须通过基础层距离判定。
+                updates.outside_base(key) && {
+                    let cell = (
+                        key.0.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
+                        key.1.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
+                        key.2.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
+                    );
+                    *coarse_decisions
+                        .entry(cell)
+                        .or_insert_with(|| updates.confirm(cell, stamp))
+                }
+            }) {
                 confirmed.push(point);
             }
         }

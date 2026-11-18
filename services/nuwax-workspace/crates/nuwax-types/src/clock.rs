@@ -1,5 +1,5 @@
 //! 行为时间与样本来源时间。进程启动时由环境决定时钟来源。
-use memmap2::Mmap;
+use memmap2::MmapRaw;
 use std::{
     fs::File,
     future::Future,
@@ -18,7 +18,7 @@ const FILE_POLL: Duration = Duration::from_millis(10);
 
 static DEVICE_PATH: LazyLock<Option<std::ffi::OsString>> =
     LazyLock::new(|| std::env::var_os("NUWAX_DEVICE_CLOCK").filter(|path| !path.is_empty()));
-static DEVICE: LazyLock<Mmap> = LazyLock::new(|| {
+static DEVICE: LazyLock<MmapRaw> = LazyLock::new(|| {
     let path = DEVICE_PATH.as_ref().unwrap();
     let file = loop {
         match File::open(path) {
@@ -28,7 +28,10 @@ static DEVICE: LazyLock<Mmap> = LazyLock::new(|| {
         }
     };
     // 同一会话的时钟文件保持长度与映射，平台按序号协议更新。
-    unsafe { memmap2::MmapOptions::new().len(CLOCK_LEN).map(&file) }.expect("映射设备时钟失败")
+    memmap2::MmapOptions::new()
+        .len(CLOCK_LEN)
+        .map_raw_read_only(&file)
+        .expect("映射设备时钟失败")
 });
 
 struct Sample {
@@ -37,20 +40,21 @@ struct Sample {
     paused: bool,
 }
 
-fn read_sample(map: &Mmap) -> Sample {
+fn read_sample(map: &MmapRaw) -> Sample {
     let field = |offset: usize| {
-        // 映射起点按页对齐，各字段为对齐的八字节小端值。
-        unsafe { AtomicU64::from_ptr(map.as_ptr().add(offset).cast_mut().cast::<u64>()) }
+        // 八字节字段对齐。只读页只做松弛原子读，屏障将字段读取夹在两次序号读取之间。
+        let value = unsafe { &*map.as_ptr().add(offset).cast::<AtomicU64>() };
+        u64::from_le(value.load(Ordering::Relaxed))
     };
-    let sequence = field(8);
     loop {
-        let before = u64::from_le(sequence.load(Ordering::Acquire));
+        let before = field(8);
         if before & 1 == 0 {
-            let source_ns = u64::from_le(field(16).load(Ordering::Relaxed));
-            let rate = f64::from_bits(u64::from_le(field(24).load(Ordering::Relaxed)));
-            let paused = u64::from_le(field(32).load(Ordering::Relaxed)) == 1;
             fence(Ordering::Acquire);
-            if u64::from_le(sequence.load(Ordering::Relaxed)) == before {
+            let source_ns = field(16);
+            let rate = f64::from_bits(field(24));
+            let paused = field(32) == 1;
+            fence(Ordering::Acquire);
+            if field(8) == before {
                 return Sample {
                     source_ns,
                     rate,

@@ -1,6 +1,7 @@
 //! Session 独有的探索对象，复用原前沿选择、失败反馈与返航路线算法。
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use nuwax_nav_types_messages::clock::{self, Instant};
 
 use nuwax_exploration::mission::{MissionPose, MissionProgress, ReturnPolicy, SourceCheckpoint};
 use nuwax_exploration::surface_adapter::{SurfaceGoalSourceAdapter, SurfaceInputReceiver};
@@ -874,8 +875,19 @@ fn unix_ns() -> u64 {
 }
 
 pub(crate) fn fresh(timestamp: u64, limit: u64) -> Result<(), String> {
-    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(timestamp, unix_ns())
-        .map_err(|reason| format!("来源年龄不可用：{reason}；源时间={timestamp}"))?;
+    if timestamp == 0 {
+        return Err(format!("来源年龄不可用：数据来源时间必须为正；源时间={timestamp}"));
+    }
+    let now = clock::source_now_ns();
+    let (tolerance, future_reason) = if clock::uses_device_clock() {
+        (1000, "数据源时间超前当前来源时钟")
+    } else {
+        (50_000_000, "位姿源时间超前当前墙钟超过50毫秒")
+    };
+    if timestamp > now.saturating_add(tolerance) {
+        return Err(format!("来源年龄不可用：{future_reason}；源时间={timestamp}"));
+    }
+    let age = now.saturating_sub(timestamp);
     if age > limit {
         return Err(format!("来源年龄={}毫秒，超过{}毫秒；源时间={timestamp}", age / 1_000_000, limit / 1_000_000));
     }

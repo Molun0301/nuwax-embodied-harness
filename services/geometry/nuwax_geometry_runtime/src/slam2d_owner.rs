@@ -1,4 +1,5 @@
 //! 二维工作进程由一个拥有方保留；控制与快照直接交给会话。
+use nuwax_nav_types_messages::clock;
 use crate::{proto, session::FrameRouter};
 use nuwax_slam_2d_runtime::{
     protocol::{Operation, Response, Session, Snapshot},
@@ -438,11 +439,8 @@ impl Owner {
             )
             .await?;
         let mut state = self.state.clone();
-        let armed_unix_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos() as u64;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let armed_unix_ns = clock::source_now_ns();
+        let deadline = clock::Instant::now() + Duration::from_secs(2);
         let mut accepted = 0;
         let mut previous = response
             .status
@@ -451,7 +449,7 @@ impl Owner {
             .map(|estimate| estimate.source_sequence);
         let mut frames = 0;
         loop {
-            match tokio::time::timeout_at(deadline, state.changed()).await {
+            match clock::timeout(deadline, state.changed()).await {
                 Err(_) => {
                     return Ok(proto::RelocalizationResult {
                         frames_used: frames,
@@ -469,10 +467,7 @@ impl Owner {
             previous = Some(estimate.source_sequence);
             frames += 1;
             let stamp = self.settings.unix_stamp(estimate.source_timestamp_ns)?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos() as u64;
+            let now = clock::source_now_ns();
             if estimate.disposition == "accepted"
                 && estimate.matching_response >= 0.3
                 && stamp >= armed_unix_ns

@@ -7,6 +7,7 @@ use nalgebra::{
 use nuwax_mapping::relocalization::{
     score_relocalization, NearestPointIndex, RelocalizationScore, SourceCloud, TargetCache,
 };
+use nuwax_nav_types_messages::clock;
 use std::{
     sync::{mpsc as sync_channel, Arc},
     thread,
@@ -32,14 +33,14 @@ impl Localizer {
         let runtime = tokio::runtime::Handle::current();
         let worker = thread::spawn(move || {
             let mut bad_rounds = 0;
-            let mut next = Instant::now() + Duration::from_secs(1);
+            let mut next = clock::Instant::now() + Duration::from_secs(1);
             loop {
-                match stopped.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                match clock::recv_timeout(&stopped, next) {
                     Ok(()) | Err(sync_channel::RecvTimeoutError::Disconnected) => break,
                     Err(sync_channel::RecvTimeoutError::Timeout) => {}
                 }
                 // 每轮最多使用最近两秒的已有帧；没有帧不产生质量采样。
-                next = Instant::now() + Duration::from_secs(1);
+                next = clock::Instant::now() + Duration::from_secs(1);
                 let Some(round) =
                     compute_round(&router.recent_frames(), mapper.map_from_odom(), &target)
                 else {

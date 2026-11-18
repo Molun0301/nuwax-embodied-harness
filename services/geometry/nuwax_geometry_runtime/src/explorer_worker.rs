@@ -2,6 +2,7 @@
 use super::*;
 use crate::explorer::{apply_forbidden, SurfaceInputBuilder, ExplorerTick};
 use std::sync::mpsc as channel;
+use nuwax_nav_types_messages::clock;
 
 enum Work {
     Feedback(NavigationStatus),
@@ -31,17 +32,20 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let file = std::env::temp_dir().join(format!("e4b-surface-source-{}", std::process::id()));
-            std::env::set_var("NUWAX_SOURCE_TIME_FILE", &file);
+            use std::os::unix::fs::FileExt;
+            std::env::set_var("NUWAX_DEVICE_CLOCK", &file);
             let stamp = now_ns() - 3_600_000_000_000;
-            let write_clock = |source| {
-                let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-                assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) }, 0);
-                let monotonic = time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64;
-                let mut bytes = b"NEHTIME1".to_vec();
-                for value in [1_u64, 1, source, now_ns(), monotonic] { bytes.extend_from_slice(&value.to_le_bytes()); }
-                std::fs::write(&file, bytes).unwrap();
+            let writer = std::fs::File::options().read(true).write(true).create_new(true)
+                .open(&file).unwrap();
+            writer.set_len(40).unwrap();
+            writer.write_all_at(b"USIMCLK1", 0).unwrap();
+            writer.write_all_at(&1.0_f64.to_le_bytes(), 24).unwrap();
+            let write_clock = |sequence: u64, source: u64| {
+                writer.write_all_at(&(sequence - 1).to_le_bytes(), 8).unwrap();
+                writer.write_all_at(&source.to_le_bytes(), 16).unwrap();
+                writer.write_all_at(&sequence.to_le_bytes(), 8).unwrap();
             };
-            write_clock(stamp + 100_000_000);
+            write_clock(2, stamp + 100_000_000);
             let mapper = Mapper::start(983, crate::mapper::MapperConfig::default()).unwrap();
             mapper.feed(crate::mapper::tests::room_frame(983, stamp));
             mapper.snapshot().await.unwrap();
@@ -57,7 +61,7 @@ mod tests {
             let (_, pose) = watch::channel(None);
             worker.tick(&mapper, &pose).await.unwrap();
             assert!(worker.surface_cache.is_some(), "来源年龄100毫秒的曲面不能因墙钟差一小时丢弃");
-            write_clock(stamp + 3_000_000_000);
+            write_clock(4, stamp + 3_000_000_000);
             assert!(crate::explorer::fresh(stamp, 2_000_000_000).unwrap_err().contains("超过2000毫秒"));
             mapper.shutdown().await.unwrap();
             std::fs::remove_file(file).unwrap();
@@ -87,12 +91,10 @@ impl ExplorerWorker {
                 masked_surface_cache: None,
             };
             let mut active = true;
-            let mut next_tick = std::time::Instant::now();
+            let mut next_tick = clock::Instant::now();
             loop {
                 let work = if active {
-                    match receiver.recv_timeout(
-                        next_tick.saturating_duration_since(std::time::Instant::now()),
-                    ) {
+                    match clock::recv_timeout(&receiver, next_tick) {
                         Ok(work) => Some(work),
                         Err(channel::RecvTimeoutError::Timeout) => None,
                         Err(channel::RecvTimeoutError::Disconnected) => break,
@@ -133,7 +135,7 @@ impl ExplorerWorker {
                             update.status.phase == ExplorationPhase::Running as i32
                         });
                         let _ = updates_tx.send(result);
-                        next_tick = std::time::Instant::now() + Duration::from_millis(200);
+                        next_tick = clock::Instant::now() + Duration::from_millis(200);
                     }
                 }
             }

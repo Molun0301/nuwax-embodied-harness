@@ -62,7 +62,7 @@ fn three_dimensional_occupancy_is_sent_at_most_once_per_second_keeping_the_lates
         meta: Some(proto::OccupancyGridMeta { timestamp_ns: stamp, ..Default::default() }),
         ..Default::default()
     };
-    let start = tokio::time::Instant::now();
+    let start = clock::Instant::now();
     let at = |ms| start + std::time::Duration::from_millis(ms);
     let mut rate = OccupancyRate { limited: true, sent_at: None, pending: None };
     assert_eq!(rate.offer(map(1), at(0)), Some(map(1)));

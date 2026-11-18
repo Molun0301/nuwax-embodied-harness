@@ -1,4 +1,5 @@
 //! 对外旁路输出：坐标树、导航地图与按配置发布的人物跟随点云。
+use nuwax_nav_types_messages::clock;
 use crate::{proto, session::SessionHandle};
 use nuwax_codec::lcm::schema;
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
@@ -28,13 +29,13 @@ const OCCUPANCY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// 三维链下 `/map/occupancy` 每秒至多发一次，间隔内只留最新一张，到点补发；二维链每次都发。
 struct OccupancyRate {
     limited: bool,
-    sent_at: Option<tokio::time::Instant>,
+    sent_at: Option<clock::Instant>,
     pending: Option<proto::MapUpdate>,
 }
 
 impl OccupancyRate {
     /// 返回现在要发的一张；间隔未到时替换待发的一张。
-    fn offer(&mut self, map: proto::MapUpdate, now: tokio::time::Instant) -> Option<proto::MapUpdate> {
+    fn offer(&mut self, map: proto::MapUpdate, now: clock::Instant) -> Option<proto::MapUpdate> {
         if self.limited && self.sent_at.is_some_and(|sent| now < sent + OCCUPANCY_INTERVAL) {
             self.pending = Some(map);
             return None;
@@ -43,10 +44,10 @@ impl OccupancyRate {
         self.sent_at = Some(now);
         Some(map)
     }
-    fn due_at(&self) -> Option<tokio::time::Instant> {
+    fn due_at(&self) -> Option<clock::Instant> {
         self.pending.as_ref().map(|_| self.sent_at.unwrap() + OCCUPANCY_INTERVAL)
     }
-    fn take_due(&mut self, now: tokio::time::Instant) -> Option<proto::MapUpdate> {
+    fn take_due(&mut self, now: clock::Instant) -> Option<proto::MapUpdate> {
         self.sent_at = Some(now);
         self.pending.take()
     }
@@ -168,9 +169,9 @@ impl Outputs {
                 let due = occupancy.due_at();
                 let (id, result) = tokio::select! {
                     _=&mut stopped=>break,
-                    _=tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some()=>{
+                    _=async { clock::sleep_until(due.unwrap()).await }, if due.is_some()=>{
                         let id = routes.borrow().as_ref().map_or(0, |route| route.id);
-                        let map = occupancy.take_due(tokio::time::Instant::now()).unwrap();
+                        let map = occupancy.take_due(clock::Instant::now()).unwrap();
                         (id, publish_occupancy(&transport, &map).await)
                     },
                     changed=maps.changed()=>{
@@ -235,7 +236,7 @@ async fn publish_map(
         return Ok(None);
     };
     let frame_id = map.meta.as_ref().ok_or("栅格缺少元数据")?.frame_id.clone();
-    if let Some(map) = occupancy.offer(map, tokio::time::Instant::now()) {
+    if let Some(map) = occupancy.offer(map, clock::Instant::now()) {
         publish_occupancy(transport, &map).await?;
     }
     let Some(sealed) = publication.fine else {

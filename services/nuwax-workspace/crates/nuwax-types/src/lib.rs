@@ -134,8 +134,6 @@ pub mod navigation;
 /// Shared legacy layered-ground geometry, without sensor or planner dependencies.
 pub mod ground_layer;
 
-pub mod source_time;
-
 pub mod fixed_collision;
 pub use fixed_collision::{FixedCollisionGeometry, FixedCollisionPrimitive, FixedCollisionShape};
 

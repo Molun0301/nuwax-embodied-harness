@@ -89,10 +89,7 @@ impl Owner {
             return Ok(None);
         };
         let stamp = settings.unix_stamp(scan.timestamp_ns as u64)? as i64;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos() as i64;
+        let now = nuwax_nav_types_messages::clock::source_now_ns() as i64;
         if stamp > now + 50_000_000
             || now.saturating_sub(stamp) > planar_navigation::MAX_SOURCE_AGE_NS
         {

@@ -8,6 +8,7 @@ use crate::{
     nav_bridge::NavBridge,
     proto::*,
 };
+use nuwax_nav_types_messages::clock;
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
@@ -26,7 +27,13 @@ mod localizer;
 
 fn trim_recent(recent: &mut VecDeque<(Instant, MappingFrame)>) {
     while recent.len() > 8
-        || recent.front().is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))
+        || recent.front().is_some_and(|(time, frame)| {
+            if clock::uses_device_clock() {
+                clock::source_now_ns().saturating_sub(frame.odom_pose.timestamp_ns) > 2_000_000_000
+            } else {
+                time.elapsed() > Duration::from_secs(2)
+            }
+        })
     {
         recent.pop_front();
     }
@@ -301,17 +308,17 @@ impl SessionHandle {
     /// 三维重定位前等近期主雷达帧不少于 5 帧：每 100 毫秒看一次，最多等 `limit`；
     /// 到时仍不足也返回，由会话照常给出原因。只读输入缓冲，不经会话命令循环。
     pub async fn wait_recent_frames(&self, limit: Duration) {
-        let deadline = tokio::time::Instant::now() + limit;
+        let deadline = clock::Instant::now() + limit;
         loop {
             let count = {
                 let mut recent = self.recent.lock();
                 trim_recent(&mut recent);
                 recent.len()
             };
-            if count >= 5 || tokio::time::Instant::now() >= deadline {
+            if count >= 5 || clock::Instant::now() >= deadline {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            clock::sleep_async(Duration::from_millis(100)).await;
         }
     }
     pub async fn set_goal(&self, request: NavigationGoal) -> Result<SetGoalResponse, Status> {

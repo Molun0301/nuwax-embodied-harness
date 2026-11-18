@@ -1,7 +1,7 @@
 //! 实测运动与地图姿态分开保留；这里只做轴系表达，不由命令制造观测。
 use crate::MeasuredMotion;
 /// 与生产反馈同宿主的原单调时钟，供既有物理模拟快照标注接收时刻。
-pub use nuwax_motion_safety_guard::measured_motion::monotonic_ns;
+pub use nuwax_nav_types_messages::clock::monotonic_ns;
 use nuwax_nav_types_messages::PoseStamped;
 
 /// SCAN 可选边界；缺失交给原 SCAN 历史轨迹机制，不伪造测速。
@@ -73,7 +73,7 @@ pub(crate) mod tests {
     use super::*;
     use nuwax_nav_types_messages::{NavFrameId, Point3, Pose3, Quaternion, Timestamp};
     pub(crate) fn measured(v: [f64; 3], w: [f64; 3]) -> MeasuredMotion {
-        let now = nuwax_motion_safety_guard::measured_motion::monotonic_ns();
+        let now = nuwax_nav_types_messages::clock::monotonic_ns();
         MeasuredMotion {
             source_id: "test:actual-state".into(),
             source_timestamp_ns: 123,

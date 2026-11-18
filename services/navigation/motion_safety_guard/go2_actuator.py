@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from core import clock
 from core.config import value
 
 from dataclasses import dataclass
@@ -277,7 +278,7 @@ class Go2Actuator:
 
     def _observe_motion_state(self, message: Any) -> None:
         """使用设备采样时间；里程计速度经姿态旋转到受控机体坐标。"""
-        received_monotonic_ns = time.monotonic_ns()
+        received_monotonic_ns = clock.monotonic_ns()
         try:
             sec, nanos = int(message.stamp.sec), int(message.stamp.nanosec)
             stamp = sec * 1_000_000_000 + nanos
@@ -543,7 +544,7 @@ class Go2Actuator:
                 feedback = self._motion_feedback
                 inactive = (self._feedback_mode in _NONWALKING_MODES and feedback is not None
                     and feedback.received_monotonic_ns is not None
-                    and 0 <= time.monotonic_ns()-feedback.received_monotonic_ns <= 250_000_000)
+                    and 0 <= clock.monotonic_ns()-feedback.received_monotonic_ns <= 250_000_000)
             if (inactive and self.supports_motion_feedback and self._low_level_controller is None
                     and not self._obstacle_remote_enabled
                     and all(isinstance(error, ActuatorError) and error.code == "STOP_REJECTED" for error in errors)):

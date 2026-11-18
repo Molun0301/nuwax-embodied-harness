@@ -261,7 +261,7 @@ mod guard_protocol {
     #[tokio::test]
     async fn b3_reconnect_does_not_replay_requests_or_keep_prior_guard_measurement() {
         fn feedback(stamp: u64) -> MeasuredMotionFeedback {
-            let now = nuwax_motion_safety_guard::measured_motion::monotonic_ns();
+            let now = nuwax_nav_types_messages::clock::monotonic_ns();
             MeasuredMotionFeedback {
                 source_id: "同一设备".into(), source_timestamp_ns: stamp,
                 received_monotonic_ns: now, valid_until_monotonic_ns: now + 2_000_000_000,

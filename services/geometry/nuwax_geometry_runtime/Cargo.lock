@@ -1701,8 +1701,8 @@ name = "nuwax-motion-safety-guard"
 version = "0.1.0"
 dependencies = [
  "nuwax-config",
+ "nuwax-types",
  "prost",
- "rustix",
  "thiserror 1.0.69",
  "tokio",
  "tonic-build",
@@ -2033,10 +2033,12 @@ dependencies = [
  "chrono",
  "indexmap 2.14.0",
  "libc",
+ "memmap2",
  "once_cell",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 

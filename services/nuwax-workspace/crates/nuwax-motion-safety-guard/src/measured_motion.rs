@@ -1,5 +1,6 @@
 //! 独立于命令回执的实测运动快照；只沿用来源截止，不在读取时续期。
 use crate::wire::MeasuredMotionFeedback;
+use nuwax_types::clock;
 
 /// 沿用设备既有受控参考点约定、机体轴系的真实测速，位姿是另一条独立采样流。
 #[derive(Clone, Debug, PartialEq)]
@@ -40,9 +41,9 @@ impl MeasuredMotion {
                     && (0.9..=1.1).contains(&q.iter().map(|v| v * v).sum::<f64>().sqrt())
             })
     }
-    /// 使用同宿主 CLOCK_MONOTONIC 检查；与设备 Unix 采样时间分开。
+    /// 用反馈的行为时域检查绝对有效期。
     pub fn is_current(&self) -> bool {
-        self.valid_at(monotonic_ns())
+        self.valid_at(clock::monotonic_ns())
     }
     pub(crate) fn from_wire(value: MeasuredMotionFeedback, now: u64) -> Option<Self> {
         let orientation_wxyz = if value.orientation_wxyz.is_empty() {
@@ -62,20 +63,6 @@ impl MeasuredMotion {
         };
         value.valid_at(now).then_some(value)
     }
-}
-
-/// 同宿主真实单调时钟；异常值为0，不能产生有效测量。
-pub fn monotonic_ns() -> u64 {
-    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    u64::try_from(now.tv_sec)
-        .ok()
-        .and_then(|s| s.checked_mul(1_000_000_000))
-        .and_then(|s| {
-            u64::try_from(now.tv_nsec)
-                .ok()
-                .and_then(|n| s.checked_add(n))
-        })
-        .unwrap_or(0)
 }
 
 #[derive(Default)]

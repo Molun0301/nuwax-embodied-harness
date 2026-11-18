@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
+from core import clock
 from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from services.navigation.motion_safety_guard.core import MotionGuardCore
@@ -51,7 +52,7 @@ class Device:
 
 class MeasuredMotionFeedbackTests(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict(os.environ, {'NUWAX_SOURCE_TIME_FILE': ''})
+        self.environment = patch.dict(os.environ, {'NUWAX_DEVICE_CLOCK': ''})
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.clock = Clock()
@@ -228,16 +229,21 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertLess(original.measured_motion.source_timestamp_ns,
                         latest.measured_motion.source_timestamp_ns)
 
-    def test_acquisition_mapping_bounds_deadline(self):
+    def test_device_source_time_bounds_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'times.bin'
-            path.write_bytes(b'NEHTIME1' + struct.pack('<Q', 1) + struct.pack('<QQQQ', 1, self.clock.unix,
-                             self.clock.unix - 100_000_000, self.clock.mono - 100_000_000))
-            self.device.feedback = self.sample()
-            with patch.dict(os.environ, {'NUWAX_SOURCE_TIME_FILE': str(path)}):
+            path = Path(directory) / 'clock.bin'
+            source = self.clock.unix - 100_000_000
+            path.write_bytes(struct.pack('<8sQQdQ', b'USIMCLK1', 2, self.clock.unix, 1.0, 0))
+            self.device.feedback = self.sample(source_timestamp_ns=source,
+                                               received_monotonic_ns=self.clock.unix)
+            with patch.dict(os.environ, {'NUWAX_DEVICE_CLOCK': str(path)}), patch.object(clock, '_mapping', None):
+                self.core._feedback = ExecutionFeedback()
+                self.core._monotonic_ns = clock.monotonic_ns
                 self.assertEqual(self.query().measured_motion.valid_until_monotonic_ns,
-                                 self.clock.mono + 150_000_000)
-                self.clock.step(150_000_001)
+                                 source + 250_000_000)
+                with path.open('r+b') as stream:
+                    stream.seek(8)
+                    stream.write(struct.pack('<QQdQ', 4, source + 250_000_001, 1.0, 0))
                 self.assertFalse(self.query().HasField('measured_motion'))
 
     def test_invalid_finite_frame_and_orientation(self):

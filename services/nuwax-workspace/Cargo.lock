@@ -1801,8 +1801,8 @@ name = "nuwax-motion-safety-guard"
 version = "0.1.0"
 dependencies = [
  "nuwax-config",
+ "nuwax-types",
  "prost",
- "rustix",
  "thiserror 1.0.69",
  "tokio",
  "tonic-build",

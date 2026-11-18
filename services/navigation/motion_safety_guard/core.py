@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
-import time
 
+from core import clock
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 from .constants import MAX_UINT64, OWNER_TIMEOUT_NS
@@ -23,7 +23,7 @@ class GuardFailure(Exception):
 
 
 class MotionGuardCore:
-    def __init__(self, *, actuator: ActuatorBackend, monotonic_ns=time.monotonic_ns) -> None:
+    def __init__(self, *, actuator: ActuatorBackend, monotonic_ns=clock.monotonic_ns) -> None:
         self._actuator = actuator
         self._monotonic_ns = monotonic_ns
         self._feedback = ExecutionFeedback.from_environment()

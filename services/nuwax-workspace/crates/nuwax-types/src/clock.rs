@@ -79,6 +79,37 @@ pub fn source_now_ns() -> u64 {
     }
 }
 
+/// 可跨同一宿主机的进程传递的行为纳秒。
+pub fn monotonic_ns() -> u64 {
+    if uses_device_clock() {
+        read_sample(&DEVICE).source_ns
+    } else {
+        let mut sample = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut sample) } == 0 {
+            sample.tv_sec as u64 * 1_000_000_000 + sample.tv_nsec as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// 等待消息或行为期限，通道关闭会立即返回。
+pub fn recv_timeout<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    deadline: Instant,
+) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match receiver.recv_timeout(next_wait(deadline).unwrap_or_default()) {
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Time {
     System(SystemInstant),

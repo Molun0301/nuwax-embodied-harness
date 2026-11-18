@@ -175,7 +175,7 @@ impl MotionGuardClient {
         self.stream = Some(stream);
         self.measured_motion.update(
             response.measured_motion,
-            crate::measured_motion::monotonic_ns(),
+            nuwax_types::clock::monotonic_ns(),
         );
         if let Some(error) = response.error {
             let code = ErrorCode::try_from(error.code).map_err(|_| protocol("未知错误码"))?;

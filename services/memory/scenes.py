@@ -99,43 +99,41 @@ class ScenesMixin:
             None if context is not None else self._observation_service.get_latest_observation(camera_id))
         if context is None and observation is None:
             raise GatewayError('当前没有可写入记忆的观察或感知结果', error_code='observation_unavailable', http_status=409)
-        automatic = (metadata or {}).get("source") == "perception_video_runtime"
-        sample_pose = (self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
-                       if automatic else None)
-        if sample_pose is not None and sample_pose.mixed_correction:
+        pose = self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
+        if (metadata or {}).get("source") == "perception_video_runtime" and pose is not None and pose.mixed_correction:
             return None
         source = context if context is not None else observation
         headline = context.scene_summary.headline if context is not None else observation.observation.summary
         title = title if title is not None else (headline if context is not None else "观察记录：%s" % source.camera_id)
+        locations = self._record_map("location")
+        linked_location = locations.get(linked_location_id) if linked_location_id else None
+        if linked_location_id and linked_location is None:
+            raise GatewayError("未找到地点记忆：%s" % linked_location_id)
+        if linked_location_id is None and context is not None:
+            matches = [record for record in locations.values() if record.map_name == map_name
+                and record.observation_id == context.observation.observation_id
+                and (pose is None or record.pose.frame_id == pose.frame_id)]
+            linked_location = matches[0] if len(matches) == 1 else None
+            linked_location_id = linked_location.location_id if linked_location is not None else None
+        linked_tags = ([linked_location.name, *linked_location.aliases, *linked_location.semantic_labels]
+                       if linked_location is not None else [])
+        labels = self._collect_scene_visual_labels(context.scene_summary) if context is not None else []
+        vision = self._collect_scene_vision_tags(context.scene_summary) if context is not None else []
+        captured = self._semantic_builder.build(self.current_grid(), map_name=map_name)
+        projected = self._projector.project(context, current_pose=pose, map_context=captured, frame_tree=frame_tree) if context is not None and pose is not None else ()
+        entry = SemanticMemoryEntry(memory_id=build_memory_id('scene'),
+            kind=MemoryRecordKind.NOTE if linked_location is not None else MemoryRecordKind.SCENE,
+            title=title, summary=summary_override or headline or title,
+            tags=self._normalize_tags([*(tags or []), *linked_tags, *labels, *vision]), linked_location_id=linked_location_id,
+            pose=pose, map_name=map_name, observation_id=source.observation.observation_id,
+            perception_headline=headline, artifact_ids=list(source.observation.artifact_ids),
+            metadata={**(self._build_scene_memory_metadata(context) if context is not None else {}),
+                'camera_id': source.camera_id, 'visual_labels': labels, 'vision_tags': vision, **dict(metadata or {})})
 
         def save(store):
-            if (store is None or store.name != map_name) and automatic:
+            if (store is None or store.name != map_name) and entry.metadata.get("source") == "perception_video_runtime":
                 return None
             self._require_library(store, map_name)
-            pose = sample_pose if automatic else self._explicit_memory_pose(observation_pose)
-            locations = store.model_map("location")
-            linked_location = locations.get(linked_location_id) if linked_location_id else None
-            if linked_location_id and linked_location is None:
-                raise GatewayError("未找到地点记忆：%s" % linked_location_id)
-            if linked_location_id is None and context is not None:
-                matches = [record for record in locations.values() if record.map_name == map_name
-                    and record.observation_id == context.observation.observation_id
-                    and (pose is None or record.pose.frame_id == pose.frame_id)]
-                linked_location = matches[0] if len(matches) == 1 else None
-            linked_tags = ([linked_location.name, *linked_location.aliases, *linked_location.semantic_labels]
-                           if linked_location is not None else [])
-            labels = self._collect_scene_visual_labels(context.scene_summary) if context is not None else []
-            vision = self._collect_scene_vision_tags(context.scene_summary) if context is not None else []
-            captured = self._semantic_builder.build(self.current_grid(), map_name=map_name)
-            projected = self._projector.project(context, current_pose=pose, map_context=captured, frame_tree=frame_tree) if context is not None and pose is not None else ()
-            entry = SemanticMemoryEntry(memory_id=build_memory_id('scene'),
-                kind=MemoryRecordKind.NOTE if linked_location is not None else MemoryRecordKind.SCENE,
-                title=title, summary=summary_override or headline or title,
-                tags=self._normalize_tags([*(tags or []), *linked_tags, *labels, *vision]), linked_location_id=linked_location.location_id if linked_location is not None else None,
-                pose=pose, map_name=map_name, observation_id=source.observation.observation_id,
-                perception_headline=headline, artifact_ids=list(source.observation.artifact_ids),
-                metadata={**(self._build_scene_memory_metadata(context) if context is not None else {}),
-                    'camera_id': source.camera_id, 'visual_labels': labels, 'vision_tags': vision, **dict(metadata or {})})
             corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, source, image_bytes)
             value = entry.model_copy(update={'pose': corrected, 'artifact_ids': photos, 'metadata': {**entry.metadata, 'photo_refs': [self.photo_ref(identity, library_name=map_name).model_dump(mode='json') for identity in photos]}})

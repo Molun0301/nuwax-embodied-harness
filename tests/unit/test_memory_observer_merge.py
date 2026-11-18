@@ -284,16 +284,17 @@ def test_map_correction_reopens_advances_and_rebases_in_flight_observations(tmp_
 
         remember(service, '第二次之后', source(2, stamp_first, 2.6))
         remember(service, '在途', source(0, stamp_first, 2.0))
-        mixed = _interpolate_pose([(stamp_first, source(1, stamp_first)),
-            (stamp_first + 2, source(2, stamp_first + 2))], stamp_first + 1)
+        mixed = _interpolate_pose([(stamp_first, source(1, stamp_first, 3.0)),
+            (stamp_first + 2, source(2, stamp_first + 2, 3.0))], stamp_first + 1)
         assert mixed.mixed_correction
         assert remember(service, '混合关键帧', mixed) is None
         explicit = remember(service, '显式写入', mixed, automatic=False)
-        assert explicit.pose.position.x == pytest.approx(42.0)
+        assert explicit.pose.position.x == pytest.approx(3.5)
+        assert explicit.pose.correction_seq == 2
         locations = {entry.title: entry.pose.position.x for entry in service.records("memory")}
         assert locations == pytest.approx({'校正前': 2.6, '两次之间': 2.6, '第二次之后': 2.6,
-            '在途': 2.6, '他会话': 9.0, '里程计': 8.0, '显式写入': 42.0})
-        assert calls == [2, 1, 2]
+            '在途': 2.6, '他会话': 9.0, '里程计': 8.0, '显式写入': 3.5})
+        assert calls == [2, 1, 2, 2]
 
     calls.clear()
     with integration.memory_at(tmp_path) as (service, geometry):
@@ -303,6 +304,34 @@ def test_map_correction_reopens_advances_and_rebases_in_flight_observations(tmp_
         assert calls == []
         assert service.records("instance")[0].pose == after.pose
         assert service.records("instance")[0].metadata[SESSION_KEY] == session
+
+
+def test_map_correction_explicit_writes_use_the_supplied_observation_pose(tmp_path):
+    from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+
+    session_id = 37
+    stamp = 1_000_000_000
+    correction = pb.MapCorrection(keyframes=[pb.MapCorrectionKeyframe(
+        timestamp_ns=stamp, translation=pb.Vec3(x=5), rotation=pb.Quat(w=1))])
+    observed_pose = Pose(frame_id="map", position=Vector3(x=2), source_timestamp_ns=stamp,
+                         session_id=session_id)
+    corrected_pose = observed_pose.model_copy(update={"position": Vector3(x=7), "correction_seq": 1})
+    with integration.memory_at(tmp_path) as (service, geometry):
+        geometry.get_map_correction = lambda owner, seq: {(session_id, 1): correction}[owner, seq]
+        geometry.value = replace(geometry.value, session_id=session_id, correction_seq=1,
+            pose=replace(geometry.value.pose, x=42, session_id=session_id, correction_seq=1))
+        geometry.change("house")
+        service.flush_observations()
+
+        scene = service.remember_current_scene(map_name="house", perception_context=integration.observed(),
+                                               observation_pose=observed_pose)
+        location, note = service.tag_location("观察点", map_name="house", observation_pose=observed_pose,
+                                              attach_latest_observation=False, attach_latest_perception=False)
+
+        assert service.current_pose().x == 42
+        assert service.get_record("memory", scene.memory_id).pose == corrected_pose
+        assert service.get_record("location", location.location_id).pose == corrected_pose
+        assert service.get_record("memory", note.memory_id).pose == corrected_pose
 
 
 def test_find_target_navigates_to_a_written_door_observation(tmp_path):

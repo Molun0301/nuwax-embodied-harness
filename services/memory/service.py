@@ -19,7 +19,7 @@ from services.memory.embeddings import Embeddings
 from services.memory.instances import InstancesMixin
 from services.memory.library import LibraryWriter
 from services.memory.navigation import NavigationMixin
-from services.memory.places import CURRENT_POSE, PlacesMixin
+from services.memory.places import PlacesMixin
 from services.memory.query import QueryMixin
 from services.memory.scenes import ScenesMixin
 from services.memory.store import MemorySnapshot, MemoryStore, MODELS
@@ -143,12 +143,6 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
             pose = event.pose(pose)
             projected = tuple(event.projected(item) for item in projected)
         return pose, projected
-
-    def _explicit_memory_pose(self, observation_pose):
-        current = self.current_pose()
-        if observation_pose is CURRENT_POSE or (current is not None and current.session_id):
-            return self._as_memory_pose(current)
-        return self._as_memory_pose(observation_pose)
 
     def snapshot(self):
         with self._condition:

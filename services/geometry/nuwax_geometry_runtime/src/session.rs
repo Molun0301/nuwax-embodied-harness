@@ -581,22 +581,15 @@ impl Session {
     fn start_localizer(&mut self, mapper: Arc<Mapper>) {
         if self.state.info.as_ref().unwrap().pipeline == "lio_3d" {
             let target = self.relocalization_target.as_ref().unwrap().clone();
-            // 重定位成功进入已定位：建图线程开始把帧写进地图。
-            mapper.set_writing(true);
             self.localizer = Some(localizer::Localizer::start(self.router.clone(), mapper, target));
         }
     }
     async fn stop_localizer(&mut self) {
         if let Some(localizer) = self.localizer.take() {
             localizer.stop().await;
-            // 离开已定位（重新定位、故障、结束会话）：建图线程回到只读。
-            self.mapper().expect("跟踪器运行期间路由上有地图").set_writing(false);
         }
     }
     fn localization_update(&mut self, update: localizer::TrackingUpdate) {
-        // 最近一轮吻合且修正未被限幅截断才写入；吻合差或尚未追上时只读。
-        self.mapper().expect("跟踪器运行期间路由上有地图")
-            .set_writing(update.bad_rounds == 0 && !update.limited);
         if update.bad_rounds >= 10 {
             self.state.reason = LOCALIZATION_DEGRADED.into();
         } else if update.bad_rounds == 0 && self.state.reason == LOCALIZATION_DEGRADED {
@@ -800,15 +793,10 @@ impl Session {
         Ok(())
     }
     async fn save(&mut self, request: SaveMapRequest) -> Result<SaveMapResponse, Status> {
-        // 三维链已定位时地图随环境更新，允许覆盖原图或另存。
-        let localized_3d = self.phase() == SessionPhase::Localized
-            && self.state.info.as_ref().unwrap().pipeline == "lio_3d";
-        if !localized_3d
-            && !matches!(
-                self.phase(),
-                SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
-            )
-        {
+        if !matches!(
+            self.phase(),
+            SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
+        ) {
             return Err(Status::failed_precondition("当前没有正在建的地图"));
         }
         let name = if request.map_name.is_empty() {

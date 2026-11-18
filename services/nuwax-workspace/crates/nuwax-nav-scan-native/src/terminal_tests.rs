@@ -159,3 +159,38 @@ fn terminal_translation_alone_uses_the_escape_reverse_limit() {
         assert_eq!(c.max_reverse_velocity, reverse, "阶段限值不修改原设备配置");
     }
 }
+
+#[test]
+fn n4_terminal_stop_includes_legal_circle_grid_intersections_and_keeps_open_goals() {
+    for swap in [false, true] {
+        let mut c = config();
+        c.resolution = 0.05;
+        c.body_length = if swap { 0.32 } else { 0.604 };
+        c.body_width = if swap { 0.604 } else { 0.32 };
+        let goal = [0., 0., 0.35];
+        let obstacle = if swap { [0.025, 0.225, 0.35] } else { [0.225, 0.025, 0.35] };
+        let mut map = MapOwner::new(&c).unwrap();
+        map.seed_occupied(&[], goal);
+        map.update_surface(&[obstacle], &[], &[], &[]).unwrap();
+        let snapshot = map.snapshot();
+        // 原网格的合法位置全部占据；原净空排序选中相邻网格线上的圆交点。
+        for x in -4..=4 {
+            for y in -4..=4 {
+                let point = [x as f64 * 0.025, y as f64 * 0.025, goal[2]];
+                if point[0].hypot(point[1]) <= 0.12 {
+                    assert_eq!(snapshot.pose_clearance(point, 0.).occupied, 1);
+                }
+            }
+        }
+        let selected = snapshot.terminal_points(&c, goal, 0., 0.15).stop;
+        assert_eq!(snapshot.pose_clearance(selected, 0.).occupied, 0);
+        assert!((selected[0].hypot(selected[1]) - 0.12).abs() < 1e-12);
+        let expected = -(0.12_f64.powi(2) - 0.025_f64.powi(2)).sqrt();
+        assert!((selected[usize::from(swap)] - expected).abs() < 1e-12);
+        assert!((selected[usize::from(!swap)] - 0.025).abs() < 1e-12);
+        assert_eq!(selected[2], goal[2]);
+        let open_goal = [-2., -2., goal[2]];
+        assert_eq!(snapshot.terminal_points(&c, open_goal, 0., 0.15).stop, open_goal,
+            "远离障碍且满足原首选净空的目标保持逐坐标相同");
+    }
+}

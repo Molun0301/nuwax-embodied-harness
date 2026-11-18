@@ -155,7 +155,6 @@ pub struct SurfaceFollower {
     early_requested: bool,
     plans: u64,
     execution_cycle_complete: bool,
-    untrackable_since_ns: Option<i64>,
     last_local_failure: Option<String>,
     correction_replan_pending: bool,
     terminal_phase: TerminalPhase,
@@ -209,7 +208,6 @@ impl SurfaceFollower {
             early_requested: false,
             plans: 0,
             execution_cycle_complete: false,
-            untrackable_since_ns: None,
             last_local_failure: None,
             correction_replan_pending: false,
             terminal_phase: TerminalPhase::Travel,
@@ -428,7 +426,6 @@ impl SurfaceFollower {
         self.local_path.clear();
         self.local_body_path = None;
         self.execution_cycle_complete = false;
-        self.untrackable_since_ns = None;
         self.last_local_failure = None;
         self.wait_reason = None;
         self.motion_sample_time = None;
@@ -722,9 +719,6 @@ impl SurfaceFollower {
     }
 }
 impl NavPlanner for SurfaceFollower {
-    fn set_control_pose_age(&mut self, age: std::time::Duration) {
-        self.tracker.set_pose_age(age);
-    }
     fn set_control_period(&mut self, period: std::time::Duration) {
         self.config.controller.control_frequency = 1. / period.as_secs_f64();
     }
@@ -844,7 +838,11 @@ impl NavPlanner for SurfaceFollower {
         }))
     }
     fn execution_wait_reason(&self) -> Option<String> {
-        self.wait_reason.clone()
+        match (&self.wait_reason, &self.last_local_failure) {
+            (Some(wait), Some(failure)) if failure.starts_with("原参考路线未被接纳") =>
+                Some(format!("{wait}；{failure}")),
+            _ => self.wait_reason.clone(),
+        }
     }
     fn terminal_phase(&self) -> TerminalPhase {
         self.terminal_phase
@@ -871,20 +869,7 @@ impl NavPlanner for SurfaceFollower {
         if std::mem::take(&mut self.correction_replan_pending) {
             return PlannerStep::ReplanRequired("地图已校正，重新规划路线".into());
         }
-        let previous_plans = self.plans;
-        let computed = self.compute();
-        if self.terminal_phase == TerminalPhase::Travel && !self.tracker.recovery_active()
-            && self.active.is_none() && self.plans == previous_plans {
-            let stamp = self.odometry.as_ref().unwrap().stamp.nanos;
-            let began = *self.untrackable_since_ns.get_or_insert(stamp);
-            if stamp - began >= 2_000_000_000 {
-                return PlannerStep::ReplanRequired(format!("连续2秒没有可跟踪曲线，重新规划路线：{}",
-                    self.last_local_failure.as_deref().or(self.wait_reason.as_deref()).unwrap_or("等待局部规划结果")));
-            }
-        } else {
-            self.untrackable_since_ns = None;
-        }
-        match computed {
+        match self.compute() {
             Ok(_) if self.reached() => PlannerStep::Succeeded,
             Ok(command) => PlannerStep::Command(command),
             Err(reason) => {
@@ -1158,6 +1143,22 @@ mod native_execution_tests {
             (1_000_000_000. / follower.config.controller.control_frequency) as i64;
         follower.update_odometry(current.clone());
         current
+    }
+
+    #[test]
+    fn n4_unaccepted_reference_cause_is_kept_in_public_wait_diagnostics() {
+        let (config, _) = crate::native_test_helpers::fixture();
+        let mut follower = SurfaceFollower::new(config).unwrap();
+        let rejected = "原参考路线未被接纳：Original final target is occupied";
+        follower.last_local_failure = Some(rejected.into());
+        follower.wait_reason = Some("等待局部轨迹".into());
+        assert_eq!(follower.execution_wait_reason(), Some(format!("等待局部轨迹；{rejected}")));
+        follower.wait_reason = None;
+        assert_eq!(follower.execution_wait_reason(), None, "正常执行不显示等待原因");
+        follower.configure_goal(&pose(3., 1., 0.), GoalOptions::default()).unwrap();
+        follower.wait_reason = Some("等待局部轨迹".into());
+        assert_eq!(follower.execution_wait_reason(), Some("等待局部轨迹".into()),
+            "新目标不附带上一参考的拒绝原因");
     }
 
     #[test]

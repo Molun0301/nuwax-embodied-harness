@@ -100,12 +100,13 @@ struct PlannerSession {
   std::shared_ptr<GridMap> map=std::make_shared<GridMap>();
   std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
   std::vector<double> reference;
+  std::string reference_rejection;
   Curve produced;
   ScanConfig config{};
   void initialize(const ScanConfig& c) {
     auto p=scan_planner::authorParameters(c);fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(p,map);
     fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s);produced->heading=fsm->manager().local_data_.heading;});
-    config=c;reference.clear();
+    config=c;reference.clear();reference_rejection.clear();
   }
 };
 struct TrackerSession {
@@ -116,7 +117,7 @@ struct TrackerSession {
   geometry_msgs::Twist raw;
   double phase=0.,reference_time=0.;
   std::optional<int64_t> reference_stamp;
-  bool install_pending=false,recovery_context=false;
+  bool install_pending=false;
   TrackerSession() {controller.cmd_vel_pub.sink=[this](const std::any& v){raw=std::any_cast<geometry_msgs::Twist>(v);};}
 };
 void errorText(char* out,size_t capacity,const std::exception& e) {if(capacity){std::strncpy(out,e.what(),capacity-1);out[capacity-1]=0;}}
@@ -207,8 +208,12 @@ extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void*
     if(incoming!=s.reference) {
       auto path=std::make_shared<nav_msgs::Path>();for(size_t i=0;i<count;++i){geometry_msgs::PoseStamped point;point.pose.position.x=reference[3*i];point.pose.position.y=reference[3*i+1];point.pose.position.z=reference[3*i+2]-c->body_to_ground;path->poses.push_back(point);}
       s.fsm->onReferencePath(path);s.reference=std::move(incoming);
+      // 只保存本次参考首次被拒的原文；后续相同参考不增加接纳或重试。
+      s.reference_rejection=s.fsm->hasTarget()?std::string{}:scan_native_diagnostic;
     }
-    if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()?"原参考路线未被接纳":scan_native_diagnostic);
+    if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()
+        ?"原参考路线未被接纳"+(s.reference_rejection.empty()?std::string{}:"："+s.reference_rejection)
+        :scan_native_diagnostic);
     if(active) {
       auto curve=*static_cast<const Curve*>(active);auto& local=s.fsm->manager().local_data_;
       local.position_traj_=curve->position;local.velocity_traj_=curve->velocity;local.acceleration_traj_=curve->acceleration;
@@ -243,17 +248,15 @@ extern "C" int nuwax_scan_motion_stopped(const ScanState* state,const ScanConfig
       &&std::abs(state->yaw_rate)<config->stopped_yaw_rps;
 }
 extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
-extern "C" int nuwax_scan_tracker_recovery_active(const void* p){return static_cast<const TrackerSession*>(p)->recovery_context;}
 extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;s.reference_time=0.;s.reference_stamp.reset();}
-extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};static_cast<TrackerSession*>(p)->recovery_context=false;}
+extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
-extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,const ScanState* tracking,
+extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
     const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
   *out={};*recovery={};scan_native_diagnostic.clear();try {
     auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
-    const Vector3d sampled_position=Eigen::Map<const Vector3d>(state->position);
-    const double sampled_yaw=state->yaw;
-    const Vector3d position=Eigen::Map<const Vector3d>(tracking->position);const double yaw=tracking->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
+    s.escape.observeSource(state->timestamp_ns);
+    const Vector3d position=Eigen::Map<const Vector3d>(state->position);const double yaw=state->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
     std::pair<double,double> installed_projection;
     if(s.pending){
       const auto projected=s.pending->projectStart(position,std::max(MINIMUM_DEVIATION_M,2.*c->resolution));
@@ -264,28 +267,23 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
     const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
     const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
-    s.recovery_context=s.escape.active();
     if(s.escape.hasDecision(state->timestamp_ns)) {
-      s.recovery_context=true;
-      s.escape.plan(s.map,*c,sampled_position,sampled_yaw,state->measured_velocity?state->velocity:nullptr,
+      s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,
           state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
       s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
       out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
     }
-    const int occupied=s.map.getInflateOccupancy(sampled_position,sampled_yaw);
+    const int occupied=s.map.getInflateOccupancy(position,yaw);
     if(occupied!=0) {
       s.escape.observeOverlap();
-      if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(sampled_position,sampled_yaw))) {
-        s.recovery_context=true;
-        s.escape.plan(s.map,*c,sampled_position,sampled_yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
+      if(occupied==1 && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
+        s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,previous,*recovery);
         s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
       }
       throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
     }
-    s.escape.observeClear(sampled_position,state->timestamp_ns);
-    s.recovery_context=s.escape.active();
-    ros::host_time_seconds=tracking->timestamp_ns*1e-9;
+    s.escape.observeClear(position,state->timestamp_ns);
     ScanConfig terminal_config;
     if(std::isfinite(terminal_yaw)&&terminal_position&&c->max_reverse_velocity==0.) {
       terminal_config=*c;terminal_config.max_reverse_velocity=std::max(.04,c->min_executable_linear_mps);c=&terminal_config;
@@ -300,8 +298,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
         Eigen::Vector2d velocity=(target-position).head<2>();
         const double distance=velocity.norm();
         const double cap=std::min(.10,scan_planner::deviceSpeedMagnitude(*c));
-        if((target-sampled_position).head<2>().norm()>c->terminal_translation_done_m && distance>0.)
-          velocity*=std::min(cap,std::clamp(s.controller.kp_pos*distance,.03,.10))/distance;
+        if(distance>c->terminal_translation_done_m)velocity*=std::min(cap,std::clamp(s.controller.kp_pos*distance,.03,.10))/distance;
         else velocity.setZero();
         s.raw.linear.x=cs*velocity.x()+sn*velocity.y();s.raw.linear.y=-sn*velocity.x()+cs*velocity.y();
       }
@@ -326,17 +323,17 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       // 实际投影用于进度；期望参考按控制周期推进，超出原偏离距离时停表。
       const double next_reference=std::min(s.curve->duration(),std::max(s.phase,s.reference_time+c->sample_dt));
       double reference_time=std::max(s.reference_time,s.phase);
-      // 有实测运动时外推时间戳随控制拍推进；没有外推的重复来源样本仍只算一拍。
-      if(s.reference_stamp!=tracking->timestamp_ns) {
+      // 同一来源采样的重复计算仍只算一拍，保留既有控制时钟语义。
+      if(s.reference_stamp!=state->timestamp_ns) {
         if((s.curve->position.evaluateDeBoorT(next_reference)-position).norm()<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution))
           reference_time=next_reference;
-        s.reference_stamp=tracking->timestamp_ns;
+        s.reference_stamp=state->timestamp_ns;
       }
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       // 完整参考末段继续位置反馈；局部窗口仍保留原末端减速，不把期望走完当作实际到达。
       s.controller.finish_dist=0.;
       // 本拍已推进并检查参考，回调不再额外推进一拍。
-      s.controller.odomCallback(odometry(*tracking));
+      s.controller.odomCallback(odometry(*state));
       const bool turning=s.curve->heading.turn_first
           &&std::abs(scan_planner::headingDifference(s.curve->headingAt(s.reference_time),yaw))>.3;
       if(!turning)s.reference_time=reference_time;

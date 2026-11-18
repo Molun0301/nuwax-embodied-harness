@@ -125,11 +125,20 @@ impl FrameRouter {
         }
     }
     pub async fn publish_map_from_odom(&self, session_id: u64, pose: Pose) {
+        self.publish_transform(session_id, Some(pose_isometry(&pose)), None)
+            .await;
+    }
+    async fn publish_transform(
+        &self,
+        session_id: u64,
+        correction: Option<nalgebra::Isometry3<f64>>,
+        loaded_writing: Option<bool>,
+    ) {
         let route = self.route.borrow().clone();
         if let Some(route) = route.filter(|route| route.id == session_id) {
-            if let Err(reason) = route.mapper.set_map_from_odom(pose_isometry(&pose)).await {
+            if let Err(reason) = route.mapper.update_transform(correction, loaded_writing).await {
                 let _ = self.faults.send((session_id, SessionIssue::Fault(reason)));
-            } else {
+            } else if correction.is_some() {
                 self.refresh_transform();
             }
         }
@@ -796,7 +805,9 @@ impl Session {
         if !matches!(
             self.phase(),
             SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
-        ) {
+        ) && !(self.phase() == SessionPhase::Localized
+            && self.state.info.as_ref().unwrap().pipeline == "lio_3d")
+        {
             return Err(Status::failed_precondition("当前没有正在建的地图"));
         }
         let name = if request.map_name.is_empty() {

@@ -981,3 +981,14 @@ async fn relocalize_entry_waits_for_five_recent_frames_or_the_limit() {
     feeder.await.unwrap();
     mapper.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn planar_localized_session_still_rejects_save() {
+    let (mut session, root, _) = load_fault_saved_planar_map().await;
+    session.state.phase = SessionPhase::Localized as i32;
+    let error = session.save(SaveMapRequest::default()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}

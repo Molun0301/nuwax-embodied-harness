@@ -1,6 +1,6 @@
 //! 已加载三维地图的逐秒跟踪；会话停止并等待线程后交还变换写入权。
 use super::FrameRouter;
-use crate::mapper::{pose_from_isometry, pose_isometry, Mapper, MappingFrame};
+use crate::mapper::{pose_isometry, Mapper, MappingFrame};
 use nalgebra::{
     Isometry3, Matrix3, Point3, SMatrix, SVector, Translation3, UnitQuaternion, Vector3,
 };
@@ -45,11 +45,8 @@ impl Localizer {
                 else {
                     continue;
                 };
-                if let Some(transform) = round.correction {
-                    runtime.block_on(router.publish_map_from_odom(
-                        mapper.session_id(),
-                        pose_from_isometry(transform, mapper.map_frame_id(), super::now_ns()),
-                    ));
+                runtime.block_on(round.apply(&router, mapper.session_id()));
+                if round.correction.is_some() {
                     bad_rounds = 0;
                 } else {
                     bad_rounds += 1;
@@ -60,6 +57,7 @@ impl Localizer {
                     timestamp_ns: super::now_ns(),
                 });
             }
+            runtime.block_on(router.publish_transform(mapper.session_id(), None, Some(false)));
         });
         Self {
             stop,
@@ -80,11 +78,21 @@ impl Localizer {
 
 pub(super) struct TrackingRound {
     pub correction: Option<Isometry3<f64>>,
+    pub limited: bool,
     pub score: RelocalizationScore,
     pub source_points: usize,
     pub target_points: usize,
     pub registration_ms: f64,
     pub scoring_ms: f64,
+}
+impl TrackingRound {
+    async fn apply(&self, router: &FrameRouter, session_id: u64) {
+        let allowed = self.correction.is_some() && !self.limited;
+        // 许可与本轮变换在同一建图命令内采用，帧不会读到一半的跟踪结果。
+        router
+            .publish_transform(session_id, self.correction, Some(allowed))
+            .await;
+    }
 }
 
 pub(super) fn compute_round(
@@ -118,11 +126,15 @@ pub(super) fn compute_round(
     let started = Instant::now();
     let score = score_relocalization(&source, candidate, target);
     let scoring_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let correction = score
-        .accepts(&candidate)
-        .then(|| constrained_step(&source, target, initial, candidate, odom));
+    let (correction, limited) = if score.accepts(&candidate) {
+        let (transform, limited) = constrained_step(&source, target, initial, candidate, odom);
+        (Some(transform), limited)
+    } else {
+        (None, false)
+    };
     Some(TrackingRound {
         correction,
+        limited,
         score,
         source_points: source.points.len(),
         target_points: local.len(),
@@ -186,7 +198,7 @@ fn constrained_step(
     initial: Isometry3<f64>,
     candidate: Isometry3<f64>,
     odom: Isometry3<f64>,
-) -> Isometry3<f64> {
+) -> (Isometry3<f64>, bool) {
     let mut information = Matrix3::zeros();
     let mut inliers = 0;
     for (point, normal) in source.points.iter().zip(&source.normals) {
@@ -211,12 +223,15 @@ fn constrained_step(
             constrained += direction * direction.dot(&delta);
         }
     }
-    let translation = p0.translation.vector + constrained * (0.02 / constrained.norm()).min(1.0);
+    let translation_scale = (0.02 / constrained.norm()).min(1.0);
+    let translation = p0.translation.vector + constrained * translation_scale;
     let angle = (p0.rotation.inverse() * p1.rotation).angle();
-    let rotation = p0
-        .rotation
-        .slerp(&p1.rotation, (0.2_f64.to_radians() / angle).min(1.0));
-    Isometry3::from_parts(Translation3::from(translation), rotation) * odom.inverse()
+    let rotation_scale = (0.2_f64.to_radians() / angle).min(1.0);
+    let rotation = p0.rotation.slerp(&p1.rotation, rotation_scale);
+    (
+        Isometry3::from_parts(Translation3::from(translation), rotation) * odom.inverse(),
+        translation_scale < 1.0 || rotation_scale < 1.0,
+    )
 }
 
 #[cfg(test)]

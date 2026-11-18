@@ -530,7 +530,7 @@ async fn run_surface_planner_with_computer(
     let generation = saturating_i64(runtime_generation());
     let mut path_revision = 0_i64;
     let mut last_path: Option<Path3D> = None;
-    let mut retry_after = Instant::now();
+    let mut retry_after = nuwax_nav_types_messages::clock::Instant::now();
     let mut needs_plan = false;
     let mut execution_admitted = false;
     let mut diagnostics = InputDiagnosticLimiter::default();
@@ -686,11 +686,11 @@ async fn run_surface_planner_with_computer(
                                     }
                                     successful.clear();needs_plan=true;
                                 } else {needs_plan=false;}
-                                retry_after=Instant::now()+Duration::from_secs(1);
+                                retry_after = nuwax_nav_types_messages::clock::Instant::now()+Duration::from_secs(1);
                                 continue;
                             }
                             state.endpoint=end;state.best_distance=end.distance(target);state.stagnant=0;
-                            retry_after=Instant::now()+Duration::from_secs(1);
+                            retry_after = nuwax_nav_types_messages::clock::Instant::now()+Duration::from_secs(1);
                         } else { approach=None; }
                         path_revision += 1;
                         publish_surface_path(&transport, &node.outputs[0], &planned_goal, generation, path_revision, &plan.path, plan.kind).await?;
@@ -700,11 +700,11 @@ async fn run_surface_planner_with_computer(
                         // 全局有路不代表局部可执行。真实位姿和感知每拍变化时，
                         // 精确输入复用不能抑制重复局部拒绝，统一留出一秒重试间隔。
                         // 期限只在本次结果交付后建立，后续输入不能不断顺延它。
-                        retry_after=Instant::now()+Duration::from_secs(1);
+                        retry_after = nuwax_nav_types_messages::clock::Instant::now()+Duration::from_secs(1);
                     }
                     Err(error) => {
                         diagnostics.reject("PCT原生全局规划", &error.to_string());
-                        retry_after = Instant::now() + Duration::from_secs(1);
+                        retry_after = nuwax_nav_types_messages::clock::Instant::now() + Duration::from_secs(1);
                         failed_input = Some(input);
                         hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(),
                             format!("PCT原生全局规划：{error}"),false,matches!(error, NavStackError::Planning(_)))));
@@ -768,7 +768,7 @@ async fn run_surface_planner_with_computer(
                 failed_input = None;
                 goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
-                retry_after = Instant::now(); geometry_retired = false;
+                retry_after = nuwax_nav_types_messages::clock::Instant::now(); geometry_retired = false;
             }
             frame = poses.next() => {
                 let Some(input)=drain_guarded_pose_input(frame,&mut poses,&mut diagnostics)? else {continue;};
@@ -781,7 +781,7 @@ async fn run_surface_planner_with_computer(
                     }
                 }
                 if approach_failure_pending || !path_computations.is_empty() || (!needs_plan && last_path.is_some())
-                    || Instant::now() < retry_after { continue; }
+                    || nuwax_nav_types_messages::clock::Instant::now() < retry_after { continue; }
                 let (Some(map), Some(pose), Some(active_goal)) = (latest_map.as_ref(), pose.as_ref(), goal.as_ref()) else { continue; };
                 if !execution_admitted || !map.authority.permits_goal(active_goal) { continue; }
                 let Ok(surface) = map.snapshot.as_ref() else { continue; };

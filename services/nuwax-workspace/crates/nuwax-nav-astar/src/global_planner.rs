@@ -140,7 +140,7 @@ pub struct GlobalPlanner {
     position_tracker: PositionTracker,
     replan_limiter: ReplanLimiter,
     last_state_unique_id: (LocalPlannerState, u32),
-    last_stuck_check: std::time::Instant,
+    last_stuck_check: nuwax_nav_types_messages::clock::Instant,
     last_published_path: Option<Path2D>,
     pending_event: Option<GlobalPlannerEvent>,
     /// 地图变化后先重新核对全局可达性，不能依赖局部把未知伪装成障碍。
@@ -188,7 +188,7 @@ impl GlobalPlanner {
             replanning_enabled: true,
             cfg,
             last_state_unique_id: (LocalPlannerState::Idle, 0),
-            last_stuck_check: std::time::Instant::now(),
+            last_stuck_check: nuwax_nav_types_messages::clock::Instant::now(),
             last_published_path: None,
             pending_event: None,
             map_update_pending: false,
@@ -425,7 +425,7 @@ impl GlobalPlanner {
         let state = self.local_planner.unique_state();
         if state != self.last_state_unique_id {
             self.last_state_unique_id = state;
-            self.last_stuck_check = std::time::Instant::now();
+            self.last_stuck_check = nuwax_nav_types_messages::clock::Instant::now();
         } else if self.status == NavigationStatus::Moving {
             let elapsed = self.last_stuck_check.elapsed().as_secs_f64();
             if elapsed > self.cfg.stuck_time_window && self.position_tracker.is_stuck() {
@@ -936,7 +936,7 @@ mod tests {
         planner.tick(&map);
         planner.tick(&map);
         let path = planner.last_published_path.clone();
-        let clock = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let clock = nuwax_nav_types_messages::clock::Instant::now() - std::time::Duration::from_secs(1);
         planner.last_stuck_check = clock;
         map.set(5, 5, UNKNOWN);
         map.set(40, 40, OCCUPIED);

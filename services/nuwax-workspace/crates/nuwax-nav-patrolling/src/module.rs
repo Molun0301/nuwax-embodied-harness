@@ -11,7 +11,7 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use nuwax_nav_types_messages::{
-    GridSnapshot, NavFrameId, Point2, Pose2, Pose3, PoseStamped, Twist2,
+    clock, GridSnapshot, NavFrameId, Point2, Pose2, Pose3, PoseStamped, Twist2,
 };
 use tokio::sync::broadcast;
 
@@ -254,7 +254,7 @@ impl Module for PatrollingModule {
             .name("patrolling-module".to_string())
             .spawn(move || loop {
                 tick_and_publish(&state, &goal_out);
-                match shutdown_rx.recv_timeout(period) {
+                match clock::recv_timeout(&shutdown_rx, clock::Instant::now() + period) {
                     Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std_mpsc::RecvTimeoutError::Timeout) => {}
                 }

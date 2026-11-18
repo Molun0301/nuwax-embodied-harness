@@ -244,8 +244,7 @@ impl Module for BasicPathFollowerModule {
         let goal_reached_tx = self.goal_reached_tx.clone();
 
         self.lifecycle_handle = Some(runtime.spawn(async move {
-            let mut ticker = tokio::time::interval(period);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticker = nuwax_nav_types_messages::clock::interval(period, false);
             ticker.tick().await;
 
             loop {

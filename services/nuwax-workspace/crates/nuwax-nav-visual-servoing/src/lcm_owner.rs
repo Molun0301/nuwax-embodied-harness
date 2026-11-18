@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use nuwax_nav_types_messages::clock::{self, Instant};
 
 use futures::StreamExt;
 use nuwax_codec::lcm::{person_follow, person_follow_command, schema};
@@ -184,8 +184,7 @@ impl PersonFollowLcmOwner {
         F: Future<Output = ()> + Send,
     {
         let started = Instant::now();
-        let mut control_tick = tokio::time::interval(controller.control_period());
-        control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut control_tick = clock::interval(controller.control_period(), false);
         tokio::pin!(shutdown);
 
         loop {

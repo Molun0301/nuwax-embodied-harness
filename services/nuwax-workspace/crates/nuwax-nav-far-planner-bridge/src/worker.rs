@@ -750,16 +750,16 @@ fn spawn_plan(
     let config = options.planner;
     let timeout = options.plan_timeout;
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = nuwax_nav_types_messages::clock::Instant::now() + timeout;
         tokio::task::yield_now().await;
-        let outcome = if tokio::time::Instant::now() >= deadline {
+        let outcome = if nuwax_nav_types_messages::clock::Instant::now() >= deadline {
             PlanOutcome::Timeout
         } else {
             let planning_goal = goal.clone();
             let task = tokio::task::spawn_blocking(move || {
                 plan_goal(&planning_goal, start, &obstacles, config)
             });
-            match tokio::time::timeout_at(deadline, task).await {
+            match nuwax_nav_types_messages::clock::timeout(deadline, task).await {
                 Err(_) => PlanOutcome::Timeout,
                 Ok(Err(error)) => PlanOutcome::Crashed(error.to_string()),
                 Ok(Ok(Ok(path))) => PlanOutcome::Path(path),

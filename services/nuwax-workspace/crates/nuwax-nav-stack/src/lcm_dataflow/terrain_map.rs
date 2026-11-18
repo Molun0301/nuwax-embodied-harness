@@ -19,8 +19,7 @@ pub(super) async fn run_terrain_map_ext(
     Module::start(&mut module).map_err(|error| module_error("terrain_map_ext.start", error))?;
     let mut has_odometry = false;
     let mut scan_before_odometry = None;
-    let mut ticker = tokio::time::interval(Duration::from_millis(TICK_PERIOD_MS));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = nuwax_nav_types_messages::clock::interval(Duration::from_millis(TICK_PERIOD_MS), false);
     signal_ready(ready)?;
 
     loop {

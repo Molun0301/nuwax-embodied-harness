@@ -162,7 +162,7 @@ pub struct LocalPlanner {
     costmap: Option<CostMap2D>,
     robot_geometry: nuwax_nav_types_messages::RobotGeometry,
     /// 上次 navigation_costmap 发布时间
-    last_navigation_costmap_at: Option<std::time::Instant>,
+    last_navigation_costmap_at: Option<nuwax_nav_types_messages::clock::Instant>,
     /// navigation_costmap 订阅者列表(sync stub;见 type alias 注释)
     navigation_costmap_subs: Vec<NavCostmapSubscriber>,
     /// 最近一次 typed goal reached 状态(H-20)
@@ -818,7 +818,7 @@ impl LocalPlanner {
         if interval <= 0.0 || self.navigation_costmap_subs.is_empty() {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = nuwax_nav_types_messages::clock::Instant::now();
         let due = match self.last_navigation_costmap_at {
             None => true,
             Some(last) => now.duration_since(last).as_secs_f64() >= interval,

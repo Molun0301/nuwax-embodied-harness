@@ -5,7 +5,7 @@
 //! - `is_stuck()`：当所有最近点到质心的距离 < threshold 时返回 true。
 //! - 用于 `GlobalPlanner` 在 `stuck_time_window` 之后触发 replan。
 
-use std::time::Instant;
+use nuwax_nav_types_messages::clock::Instant;
 
 use crate::helpers::{pose_to_point2, Point2, PoseStamped};
 
@@ -203,7 +203,7 @@ mod tests {
         // 第一个点已过期；窗内只剩一个点 (5,5)，size 报告仍为 2 但 is_stuck 用时间窗过滤
         // 单点距质心 0 < threshold 会 stuck；所以此处应验证时间窗过滤逻辑本身
         // 用第二个 point_tracker 验证过期过滤：size=2 但 is_stuck() 中 count=1
-        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs_f64(0.001);
+        let cutoff = nuwax_nav_types_messages::clock::Instant::now() - std::time::Duration::from_secs_f64(0.001);
         let mut fresh_count = 0;
         for i in 0..pt2.size {
             if pt2.timestamps[i] >= cutoff {

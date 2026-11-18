@@ -219,10 +219,9 @@ pub(super) async fn run_simple_planner(
     let mut path_revision = 0;
     let mut diagnostics = InputDiagnosticLimiter::default();
     Module::start(&mut module).map_err(|e| module_error("simple_planner", e))?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(
-        nuwax_nav_simple_planner::module::TICK_PERIOD_MS,
-    ));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = nuwax_nav_types_messages::clock::interval(
+        Duration::from_millis(nuwax_nav_simple_planner::module::TICK_PERIOD_MS), false,
+    );
     signal_ready(ready)?;
     loop {
         tokio::select! {
@@ -477,8 +476,7 @@ pub(super) async fn run_astar_planner_with_transport(
     let mut active_map_resolution = 0.05;
     let mut path_revision = 0_i64;
     let mut diagnostics = InputDiagnosticLimiter::default();
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = nuwax_nav_types_messages::clock::interval(Duration::from_millis(100), false);
     signal_ready(ready)?;
     loop {
         tokio::select! {

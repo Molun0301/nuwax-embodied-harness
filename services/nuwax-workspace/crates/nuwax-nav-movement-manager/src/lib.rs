@@ -11,7 +11,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use nuwax_nav_types_messages::clock::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

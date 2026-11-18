@@ -591,7 +591,8 @@ pub(super) async fn publish_versioned_path(
     channel: &str,
     publication: VersionedPathPublication<'_>,
 ) -> NavStackResult<bool> {
-    let source_timestamp_ns = current_unix_timestamp_ns()?;
+    let source_timestamp_ns = i64::try_from(nuwax_nav_types_messages::clock::source_now_ns())
+        .map_err(|_| NavStackError::Internal("Unix timestamp exceeds int64 nanoseconds".into()))?;
     let Some(envelope) = build_versioned_path_envelope(publication, source_timestamp_ns)? else {
         return Ok(false);
     };

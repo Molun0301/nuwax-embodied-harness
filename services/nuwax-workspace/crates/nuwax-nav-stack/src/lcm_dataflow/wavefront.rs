@@ -32,8 +32,7 @@ pub(super) async fn run_wavefront(
         .map_err(|error| module_error("wavefront.begin", format!("{error:?}")))?;
     let mut latest_map = None;
     let mut latest_odometry = None;
-    let mut ticker = tokio::time::interval(nuwax_explore_wavefront::runtime::NO_INPUT_TICK);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = nuwax_nav_types_messages::clock::interval(nuwax_explore_wavefront::runtime::NO_INPUT_TICK, false);
     signal_ready(ready)?;
 
     loop {
@@ -210,11 +209,6 @@ pub(super) fn decode_wavefront_grid(body: &[u8]) -> NavStackResult<OccupancyGrid
 
 #[cfg(feature = "explore")]
 pub(super) fn unix_timestamp() -> Timestamp {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    Timestamp::from_unix(
-        elapsed.as_secs().min(i64::MAX as u64) as i64,
-        elapsed.subsec_nanos(),
-    )
+    let now = nuwax_nav_types_messages::clock::source_now_ns();
+    Timestamp::from_unix((now / 1_000_000_000) as i64, (now % 1_000_000_000) as u32)
 }

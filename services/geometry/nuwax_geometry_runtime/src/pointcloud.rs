@@ -5,6 +5,7 @@ use crate::{
     mapper::{isometry_matrix, matrix_isometry, pose_from_isometry, pose_isometry, MappingFrame},
     proto,
 };
+use ahash::AHashMap;
 use memmap2::MmapMut;
 use nalgebra::{Isometry3, Point3};
 use std::{
@@ -12,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{fence, AtomicU64, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
 };
 #[path = "dynamic_cloud.rs"]
@@ -42,6 +43,79 @@ const CM_PAYLOAD: usize = (CM_HEADER + CM_CHUNKS * 8).div_ceil(4096) * 4096;
 const CM_TOTAL: usize = CM_PAYLOAD + CM_MAX_POINTS * 12;
 type VoxelKey = (i32, i32, i32);
 type VoxelIndex = ahash::AHashSet<VoxelKey>;
+
+// 基础层的排除半径为三个精细体素（0.15 米，约为跟踪误差 95 分位的两倍）。
+const BASE_RADIUS_VOXELS: i32 = 3;
+// 至少五个不同帧命中，避免一帧中的密集回波重复计票。
+const NEW_STRUCTURE_FRAMES: usize = 5;
+// 从首次命中到确认至少一秒，使用帧的源时间。
+const NEW_STRUCTURE_SPAN_NS: u64 = 1_000_000_000;
+// 未确认候选从首次命中起最多保留十秒。
+const NEW_STRUCTURE_TIMEOUT_NS: u64 = 10_000_000_000;
+
+static BASE_NEIGHBORS: LazyLock<Vec<VoxelKey>> = LazyLock::new(|| {
+    let radius = BASE_RADIUS_VOXELS;
+    let mut offsets = Vec::new();
+    for x in -radius..=radius {
+        for y in -radius..=radius {
+            for z in -radius..=radius {
+                let distance_squared = x * x + y * y + z * z;
+                if distance_squared <= radius * radius {
+                    offsets.push((distance_squared, (x, y, z)));
+                }
+            }
+        }
+    }
+    offsets.sort_unstable();
+    offsets.into_iter().map(|(_, offset)| offset).collect()
+});
+
+#[derive(Default)]
+struct LoadedMapUpdates {
+    base: VoxelIndex,
+    candidates: AHashMap<VoxelKey, StructureCandidate>,
+    confirmed: VoxelIndex,
+    allowed: bool,
+}
+
+struct StructureCandidate {
+    first_stamp: u64,
+    frames: usize,
+}
+
+impl LoadedMapUpdates {
+    fn confirm(&mut self, key: VoxelKey, stamp: u64) -> bool {
+        if self.confirmed.contains(&key) {
+            return true;
+        }
+        if BASE_NEIGHBORS.iter().any(|&(x, y, z)| {
+            let neighbor = || {
+                Some((
+                    key.0.checked_add(x)?,
+                    key.1.checked_add(y)?,
+                    key.2.checked_add(z)?,
+                ))
+            };
+            neighbor().is_some_and(|nearby| self.base.contains(&nearby))
+        }) {
+            return false;
+        }
+        let candidate = self.candidates.entry(key).or_insert(StructureCandidate {
+            first_stamp: stamp,
+            frames: 0,
+        });
+        candidate.frames += 1;
+        if candidate.frames < NEW_STRUCTURE_FRAMES
+            || stamp.saturating_sub(candidate.first_stamp) < NEW_STRUCTURE_SPAN_NS
+        {
+            return false;
+        }
+        self.candidates.remove(&key);
+        self.confirmed.insert(key);
+        true
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CloudSnapshot {
     pub fine: Option<Arc<nuwax_map_chunks::SealedMap>>,
@@ -73,6 +147,7 @@ pub(crate) struct CloudMap {
     recording_limit_reached: bool,
     raw_directory: Option<PathBuf>,
     readonly_classifier: Option<FineCloud>,
+    loaded_updates: Option<LoadedMapUpdates>,
     history_scans: Vec<(PathBuf, u64)>,
     dirty: bool,
 }
@@ -172,11 +247,77 @@ impl CloudMap {
             recording_limit_reached: false,
             raw_directory: None,
             readonly_classifier: None,
+            loaded_updates: None,
             history_scans: Vec::new(),
             dirty: false,
         };
         value.publish()?;
         Ok(value)
+    }
+    pub(crate) fn prepare_loaded_updates(&mut self) -> Result<(), String> {
+        let mut updates = LoadedMapUpdates::default();
+        if let Some(root) = &self.surface {
+            let mut reader = root.reader();
+            for reference in &root.manifest().blocks {
+                for &local in reader.block(reference)?.keys() {
+                    let [x, y, z] = nuwax_map_chunks::global_key(reference.key, local)?;
+                    updates.base.insert((x, y, z));
+                }
+            }
+        }
+        self.loaded_updates = Some(updates);
+        Ok(())
+    }
+
+    pub(crate) fn set_loaded_writing(&mut self, allowed: bool) {
+        self.loaded_updates.as_mut().unwrap().allowed = allowed;
+    }
+
+    pub(crate) fn accumulate_loaded(
+        &mut self,
+        sequence: u64,
+        frame: &MappingFrame,
+        points: &[Point3<f64>],
+        static_indices: &[u32],
+        origin: [f64; 3],
+    ) -> Result<Option<(Vec<Point3<f64>>, MappedFrame)>, String> {
+        let stamp = frame.odom_pose.timestamp_ns;
+        let updates = self.loaded_updates.as_mut().unwrap();
+        updates.candidates.retain(|_, candidate| {
+            stamp.saturating_sub(candidate.first_stamp) <= NEW_STRUCTURE_TIMEOUT_NS
+        });
+        if !updates.allowed {
+            return Ok(None);
+        }
+        let mut decisions = AHashMap::new();
+        let mut confirmed = Vec::new();
+        for &index in static_indices {
+            let point = points[index as usize];
+            let key = voxel_key(point.into(), VOXEL_SIZE).expect("只读分类已验证精细体素坐标");
+            if *decisions
+                .entry(key)
+                .or_insert_with(|| updates.confirm(key, stamp))
+            {
+                confirmed.push(point);
+            }
+        }
+        if confirmed.is_empty() {
+            return Ok(None);
+        }
+        // 这些点已做过完整帧的动静判定。零时间的空查询交付无撤销的分类结果，
+        // 让精细层和建图内核复用同一路径，加载图不接收空域撤销。
+        let (classified, _) = self.dufo.observe(&[], origin, 0, Isometry3::identity())?;
+        self.fine.accumulate(
+            self.session_id,
+            &frame.sensor_id,
+            sequence,
+            &confirmed,
+            origin,
+            stamp,
+            Some(classified.clone()),
+        )?;
+        self.accumulate_display(&confirmed, stamp)?;
+        Ok(Some((confirmed, classified)))
     }
     pub fn attach_shared(&mut self, path: &Path) -> Result<(), String> {
         self.shm = Some(CloudMapShmWriter::new(path).map_err(|e| e.to_string())?);
@@ -242,7 +383,15 @@ impl CloudMap {
             self.voxels.remove(&key);
             self.pages.removed(key, CM_MAX_POINTS);
         }
-        for p in &retained {
+        self.accumulate_display(&retained, frame.odom_pose.timestamp_ns)?;
+        self.poses
+            .push((self.stamp, isometry_matrix(&(map_from_odom * odom))));
+        self.record(sequence, frame, map_from_odom)?;
+        Ok((dynamic, indices, ground))
+    }
+
+    fn accumulate_display(&mut self, points: &[Point3<f64>], stamp: u64) -> Result<(), String> {
+        for p in points {
             let key = voxel_key([p.x, p.y, p.z], self.voxel_size).ok_or("点云坐标无效")?;
             if self.voxels.insert(key) {
                 self.pages.inserted(key, CM_MAX_POINTS);
@@ -263,11 +412,8 @@ impl CloudMap {
             self.pages.invalidate();
         }
         self.dirty = true;
-        self.stamp = frame.odom_pose.timestamp_ns;
-        self.poses
-            .push((self.stamp, isometry_matrix(&(map_from_odom * odom))));
-        self.record(sequence, frame, map_from_odom)?;
-        Ok((dynamic, indices, ground))
+        self.stamp = stamp;
+        Ok(())
     }
     fn record(
         &mut self,
@@ -387,7 +533,7 @@ impl CloudMap {
         points: &[Point3<f64>],
         origin: [f64; 3],
         map_from_odom: Isometry3<f64>,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
         if self.readonly_classifier.is_none() {
             let classifier = if let Some(root) = &self.surface {
                 let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository)?;
@@ -411,7 +557,7 @@ impl CloudMap {
             map_from_odom,
         )?;
         dynamic.bind_points(points, &indices);
-        self.readonly_classifier.as_mut().unwrap().accumulate(
+        let ground = self.readonly_classifier.as_mut().unwrap().accumulate(
             self.session_id,
             &frame.sensor_id,
             sequence,
@@ -419,7 +565,8 @@ impl CloudMap {
             origin,
             frame.odom_pose.timestamp_ns,
             Some(dynamic),
-        )
+        )?;
+        Ok((ground, indices))
     }
     pub fn disable_recording(&mut self) {
         self.recording = false;

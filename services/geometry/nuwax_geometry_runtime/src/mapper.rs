@@ -172,7 +172,11 @@ enum Command {
         proto::DenseCloudChunkRequest,
         oneshot::Sender<Result<proto::DenseCloudChunk, String>>,
     ),
-    Transform(Isometry3<f64>, oneshot::Sender<Result<(), String>>),
+    Transform {
+        correction: Option<Isometry3<f64>>,
+        loaded_writing: Option<bool>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Name(String),
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
@@ -380,9 +384,20 @@ impl Mapper {
         self.forbidden.borrow().clone()
     }
     pub async fn set_map_from_odom(&self, transform: Isometry3<f64>) -> Result<(), String> {
+        self.update_transform(Some(transform), None).await
+    }
+    pub(crate) async fn update_transform(
+        &self,
+        correction: Option<Isometry3<f64>>,
+        loaded_writing: Option<bool>,
+    ) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(Command::Transform(transform, tx))
+            .send(Command::Transform {
+                correction,
+                loaded_writing,
+                reply: tx,
+            })
             .map_err(|_| "建图任务已结束")?;
         rx.await.map_err(|_| "建图任务已结束")?
     }
@@ -534,6 +549,9 @@ impl Worker {
         if let Some(snapshot) = snapshot.as_ref() {
             cloud.load_history(snapshot.scans.clone(), snapshot.final_poses.clone());
         }
+        if read_only && kernel.is_some() {
+            cloud.prepare_loaded_updates().map_err(Status::unavailable)?;
+        }
         let map_from_odom = snapshot
             .as_ref()
             .map(|s| matrix_isometry(&s.map_from_odom))
@@ -655,10 +673,19 @@ impl Worker {
                 let _ = reply.send(self.cloud.dense_chunk(request, &self.config.map_frame_id));
                 Ok(())
             }
-            Command::Transform(transform, reply) => {
-                self.map_from_odom = transform;
-                self.transform.send_replace(transform);
-                self.publish_pose();
+            Command::Transform {
+                correction,
+                loaded_writing,
+                reply,
+            } => {
+                if let Some(allowed) = loaded_writing {
+                    self.cloud.set_loaded_writing(allowed);
+                }
+                if let Some(transform) = correction {
+                    self.map_from_odom = transform;
+                    self.transform.send_replace(transform);
+                    self.publish_pose();
+                }
                 let _ = reply.send(Ok(()));
                 Ok(())
             }
@@ -786,43 +813,39 @@ impl Worker {
             .map(|p| map_from_body * Point3::from(*p))
             .collect();
         let origin = map_from_body * Point3::from(frame.ray_origin_body);
-        if self.read_only {
-            let ground = self.cloud.classify_readonly(
+        let origin = [origin.x, origin.y, origin.z];
+        let (ground, integration) = if self.read_only {
+            let (ground, static_indices) = self.cloud.classify_readonly(
                 self.sequence,
                 &frame,
                 &points,
-                [origin.x, origin.y, origin.z],
+                origin,
                 self.map_from_odom,
             )?;
-            if !frame.mapping_only {
-                self.publish_recent(encode_recent_cloud(
-                    self.sequence,
-                    &frame,
-                    &points,
-                    &ground,
-                    map_from_body,
-                    [origin.x, origin.y, origin.z],
-                    &self.config,
-                )?);
+            let integration = self
+                .cloud
+                .accumulate_loaded(self.sequence, &frame, &points, &static_indices, origin)?
+                .map(|(confirmed, dynamic)| (Some(confirmed), dynamic, Vec::new()));
+            (ground, integration)
+        } else {
+            let (dynamic, pgo, ground) = self.cloud.accumulate(
+                self.sequence,
+                &frame,
+                &points,
+                origin,
+                self.map_from_odom,
+                self.evidence_from_odom,
+            )?;
+            if self.cloud.take_recording_limit() {
+                if self.corrector.is_some() {
+                    self.stop_correction("扫描记录已达上限，回环校正已停止".into());
+                } else {
+                    // 没有校正线程的会话只经同一通知通道写进会话原因。
+                    self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
+                }
             }
-            return Ok(());
-        }
-        let (dynamic, pgo, ground) = self.cloud.accumulate(
-            self.sequence,
-            &frame,
-            &points,
-            [origin.x, origin.y, origin.z],
-            self.map_from_odom,
-            self.evidence_from_odom,
-        )?;
-        if self.cloud.take_recording_limit() {
-            if self.corrector.is_some() {
-                self.stop_correction("扫描记录已达上限，回环校正已停止".into());
-            } else {
-                // 没有校正线程（加载的会话、不校正的配置）：只经同一通知通道写进会话原因。
-                self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
-            }
-        }
+            (ground, Some((None, dynamic, pgo)))
+        };
         if !frame.mapping_only {
             self.publish_recent(encode_recent_cloud(
                 self.sequence,
@@ -830,17 +853,20 @@ impl Worker {
                 &points,
                 &ground,
                 map_from_body,
-                [origin.x, origin.y, origin.z],
+                origin,
                 &self.config,
             )?);
         }
+        let Some((confirmed, dynamic, pgo)) = integration else {
+            return Ok(());
+        };
         let input = MappingBackendInput {
             source_timestamp_ns: stamp,
             received_at_ns: stamp,
             registered_frame_id: self.config.map_frame_id.clone(),
-            sensor_origin_map: [origin.x, origin.y, origin.z],
+            sensor_origin_map: origin,
             dynamic_frame: Some(dynamic),
-            registered_points_map: points,
+            registered_points_map: confirmed.unwrap_or(points),
         };
         let candidate = mapping_backend::compute_candidate_in_place(
             self.kernel.as_mut().unwrap(),
@@ -983,7 +1009,7 @@ impl Worker {
                 flushed = true;
             }
         }
-        if !self.read_only {
+        if !self.read_only || self.last_input.is_some() {
             self.cloud.commit(stamp)?;
             self.fine_root.send_replace(self.cloud.surface());
             if flushed {

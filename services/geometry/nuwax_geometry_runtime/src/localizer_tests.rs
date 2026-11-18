@@ -1,4 +1,5 @@
 use super::*;
+use crate::mapper::pose_from_isometry;
 
 fn room() -> Vec<Point3<f64>> {
     let mut points = Vec::new();
@@ -341,7 +342,9 @@ fn empty_input_skips_quality_and_step_limits_robot_pose_at_nonzero_odometry() {
     );
     let target_points: Vec<_> = points.iter().map(|p| candidate * p).collect();
     let target = TargetCache::new(&target_points, Default::default());
-    let result = constrained_step(&source, &target, Isometry3::identity(), candidate, odom);
+    let (result, limited) =
+        constrained_step(&source, &target, Isometry3::identity(), candidate, odom);
+    assert!(limited);
     let before = odom;
     let after = result * odom;
     assert!((after.translation.vector - before.translation.vector).norm() <= 0.02 + 1e-9);
@@ -351,6 +354,376 @@ fn empty_input_skips_quality_and_step_limits_robot_pose_at_nonzero_odometry() {
             .to_degrees()
             <= 0.2 + 1e-9
     );
+}
+
+#[test]
+fn l6_write_permission_uses_both_existing_limits() {
+    let points = room();
+    let source = SourceCloud::from_rays(points.iter().map(|p| (*p, Point3::origin())));
+    for (translation, angle, expected) in [
+        (0., 0., false),
+        (0.019, 0., false),
+        (0.021, 0., true),
+        (0., 0.19_f64, false),
+        (0., 0.21, true),
+        (0.021, 0.21, true),
+    ] {
+        let candidate = Isometry3::from_parts(
+            Translation3::new(translation, 0., 0.),
+            UnitQuaternion::from_euler_angles(0., 0., angle.to_radians()),
+        );
+        let target_points: Vec<_> = points.iter().map(|p| candidate * p).collect();
+        let target = TargetCache::new(&target_points, Default::default());
+        let (_, limited) = constrained_step(
+            &source,
+            &target,
+            Isometry3::identity(),
+            candidate,
+            Isometry3::identity(),
+        );
+        assert_eq!(limited, expected, "平移={translation}米，转角={angle}度");
+    }
+}
+
+// 沿用 G6 的两墙和地面，3,200 个采样点均落在精细体素中心。
+fn l6_surfaces() -> Vec<Point3<f64>> {
+    let mut points = Vec::new();
+    for i in 0..40 {
+        for j in 0..20 {
+            for y in [-2.025, 2.025] {
+                points.push(Point3::new(
+                    -1.975 + i as f64 * 0.1,
+                    y,
+                    0.125 + j as f64 * 0.1,
+                ));
+            }
+        }
+    }
+    for i in 0..40 {
+        for j in 0..40 {
+            points.push(Point3::new(
+                -1.975 + i as f64 * 0.1,
+                -1.975 + j as f64 * 0.1,
+                0.025,
+            ));
+        }
+    }
+    points
+}
+
+fn l6_frame(id: u64, stamp: u64, x: f64, bias: f64, yaw: f64, board: Option<f64>) -> MappingFrame {
+    let mut scan = l6_surfaces();
+    if let Some(distance) = board {
+        for i in 0..12 {
+            for j in 0..16 {
+                let point = Point3::new(
+                    -0.575 + i as f64 * 0.1,
+                    -2.025 + distance,
+                    0.325 + j as f64 * 0.1,
+                );
+                // 同一帧内即使有多次回波，每个体素也只有一票。
+                scan.extend([point; 4]);
+            }
+        }
+    }
+    let truth = Isometry3::translation(x, 0., 0.);
+    let odom = Isometry3::from_parts(
+        Translation3::new(x, bias, 0.),
+        UnitQuaternion::from_euler_angles(0., 0., yaw),
+    );
+    let mut input = frame(&scan, truth, odom, stamp);
+    input.session_id = id;
+    input.ray_origin_body = [0.025, 0.025, 0.65];
+    input
+}
+
+fn l6_keys(root: &nuwax_map_chunks::SealedMap) -> std::collections::BTreeSet<[i32; 3]> {
+    let mut reader = root.reader();
+    let mut keys = std::collections::BTreeSet::new();
+    for reference in &root.manifest().blocks {
+        for &local in reader.block(reference).unwrap().keys() {
+            keys.insert(nuwax_map_chunks::global_key(reference.key, local).unwrap());
+        }
+    }
+    keys
+}
+
+async fn l6_loaded_session(id: u64, root: std::path::PathBuf) -> super::super::Session {
+    use crate::mapper::MapperConfig;
+    use crate::proto::{LoadMapRequest, SaveMapRequest};
+    let mapper = Mapper::start(id, MapperConfig::default()).unwrap();
+    let mut session = super::super::tests::actor(mapper.clone(), root).await;
+    let input = l6_frame(id, super::super::now_ns(), 0., 0., 0., None);
+    session.router.publish_frame(input);
+    session
+        .save(SaveMapRequest {
+            map_name: "L6原图".into(),
+        })
+        .await
+        .unwrap();
+    session
+        .load(LoadMapRequest {
+            map_name: "L6原图".into(),
+        })
+        .await
+        .unwrap();
+    session
+}
+
+async fn l6_feed(session: &super::super::Session, mapper: &Mapper, frame: MappingFrame) {
+    session.router.publish_frame(frame);
+    mapper.surface_map().await.unwrap();
+    assert!(
+        mapper.error_rx().borrow().is_none(),
+        "{:?}",
+        *mapper.error_rx().borrow()
+    );
+}
+
+#[tokio::test]
+async fn l6_ten_minute_revisit_does_not_change_fine_or_display_map() {
+    use crate::proto::{PlanarSeed, RelocalizeRequest};
+    let root = std::env::temp_dir().join(format!("nuwax-l6-revisit-{}", uuid::Uuid::new_v4()));
+    let mut session = l6_loaded_session(1601, root.clone()).await;
+    let mapper = session.mapper().unwrap();
+    let base = super::super::now_ns();
+    l6_feed(
+        &session,
+        &mapper,
+        l6_frame(mapper.session_id(), base, 0., 0., 0., None),
+    )
+    .await;
+    let matched = session
+        .relocalize(RelocalizeRequest {
+            seed: Some(PlanarSeed::default()),
+        })
+        .await
+        .unwrap();
+    assert!(matched.succeeded, "{}", matched.message);
+    // 源时间加速回放，逐轮调用同一个生产配准和结果采用入口。
+    session.stop_localizer().await;
+    let target = session.relocalization_target.clone().unwrap();
+    let initial = mapper.snapshot().await.unwrap();
+    let initial_fine = initial.cloud.fine.as_ref().unwrap();
+    let mut limited_rounds = 0;
+    let mut writing_rounds = 0;
+    let mut recent = mapper.recent_cloud_rx();
+    let first_stamp = base + 200_000_000;
+    let input_at = |i: u64| {
+        let x = ((i % 400) as f64 / 200. - 1.).abs();
+        // 初始 5.5 厘米偏差经一次 2 厘米修正后仍余 3.5 厘米，再叠加 G6 原正弦扰动。
+        let bias = 0.055 + 0.035 * (i as f64 * 0.071).sin();
+        let yaw = 0.2_f64.to_radians() * (i as f64 * 0.053).sin();
+        l6_frame(
+            mapper.session_id(),
+            first_stamp + i * 200_000_000,
+            x,
+            bias,
+            yaw,
+            None,
+        )
+    };
+    for second in 0..600 {
+        let start = second * 5;
+        let input = input_at(start);
+        let round = compute_round(&[input], mapper.map_from_odom(), &target).unwrap();
+        assert!(
+            round.correction.is_some(),
+            "第{second}轮应吻合：{:?}",
+            round.score
+        );
+        if round.limited {
+            limited_rounds += 1;
+        } else {
+            writing_rounds += 1;
+        }
+        round.apply(&session.router, mapper.session_id()).await;
+        recent.borrow_and_update();
+        for index in start..start + 5 {
+            l6_feed(&session, &mapper, input_at(index)).await;
+        }
+        assert!(recent.has_changed().unwrap(), "近期点云应继续发布");
+    }
+    assert!(limited_rounds > 0 && writing_rounds > 0);
+    let after = mapper.snapshot().await.unwrap();
+    let final_fine = after.cloud.fine.as_ref().unwrap();
+    assert_eq!(l6_keys(initial_fine), l6_keys(final_fine));
+    assert_eq!(
+        initial_fine.manifest().revision,
+        final_fine.manifest().revision
+    );
+    assert_eq!(initial.cloud.display, after.cloud.display);
+    assert_eq!(initial.scans, after.scans);
+    assert!(Arc::ptr_eq(
+        session.relocalization_target.as_ref().unwrap(),
+        &target
+    ));
+    eprintln!(
+        "L6十分钟复走：3000帧，{limited_rounds}轮限幅，{writing_rounds}轮许可，精细体素 {}→{}，展示点 {}→{}",
+        initial_fine.manifest().points(), final_fine.manifest().points(),
+        initial.cloud.display.len() / 12, after.cloud.display.len() / 12
+    );
+    session.end_current().await.unwrap();
+    session.lio().unwrap().shutdown().await;
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn l6_only_persistent_structure_far_from_the_base_is_saved_and_reloaded() {
+    use crate::proto::{
+        LoadMapRequest, PlanarSeed, RelocalizeRequest, SaveMapRequest, SessionPhase,
+    };
+    let ns = 1_000_000_000;
+    for (name, distance, hits, accepted) in [
+        ("离墙半米", 0.5, vec![0, 2, 4, 6, 8, 10, 12, 14], true),
+        ("贴墙一分米", 0.1, vec![0, 2, 4, 6, 8, 10, 12, 14], false),
+        ("只出现三帧", 0.5, vec![0, 6, 12], false),
+        ("超过十秒的旧票", 0.5, vec![0, 2, 4, 6, 108, 110], false),
+    ] {
+        let root = std::env::temp_dir().join(format!("nuwax-l6-board-{}", uuid::Uuid::new_v4()));
+        let mut session = l6_loaded_session(1603, root.clone()).await;
+        let mapper = session.mapper().unwrap();
+        let id = mapper.session_id();
+        let start = super::super::now_ns();
+        let frame_at = |stamp| l6_frame(id, stamp, 0., 0., 0., Some(distance));
+        let initial = mapper.snapshot().await.unwrap();
+        let initial_fine = initial.cloud.fine.as_ref().unwrap();
+        let base = l6_keys(initial_fine);
+        let revision = initial_fine.manifest().revision;
+        l6_feed(&session, &mapper, frame_at(start)).await;
+        let result = session
+            .relocalize(RelocalizeRequest {
+                seed: Some(PlanarSeed::default()),
+            })
+            .await
+            .unwrap();
+        assert!(result.succeeded, "{name}：{}", result.message);
+        session.stop_localizer().await;
+        // 重定位本身不允许计票。即使带板的帧已经超过一秒，第一次好轮前仍只读。
+        for i in 1..=5 {
+            l6_feed(&session, &mapper, frame_at(start + i * ns / 4)).await;
+        }
+        assert_eq!(
+            mapper
+                .surface_map()
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .revision,
+            revision
+        );
+        let target = session.relocalization_target.clone().unwrap();
+        let round =
+            compute_round(&[frame_at(start + 2 * ns)], mapper.map_from_odom(), &target).unwrap();
+        assert!(
+            round.correction.is_some() && !round.limited,
+            "{name}：{:?}",
+            round.score
+        );
+        round.apply(&session.router, id).await;
+        for &tenth in &hits {
+            l6_feed(
+                &session,
+                &mapper,
+                frame_at(start + 2 * ns + tenth * (ns / 10)),
+            )
+            .await;
+            if !accepted || tenth < 10 {
+                assert_eq!(
+                    mapper
+                        .surface_map()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .manifest()
+                        .revision,
+                    revision,
+                    "{name}第{tenth}拍"
+                );
+            }
+        }
+        let after = mapper.snapshot().await.unwrap();
+        let after_keys = l6_keys(after.cloud.fine.as_ref().unwrap());
+        assert!(base.is_subset(&after_keys), "{name}：基础体素必须保留");
+        let new_voxels = after_keys.len() - base.len();
+        assert_eq!(new_voxels > 0, accepted, "{name}：新增 {new_voxels} 格");
+        assert_eq!(
+            after.cloud.display.len() > initial.cloud.display.len(),
+            accepted,
+            "{name}"
+        );
+        assert_eq!(initial.scans, after.scans, "{name}：历史扫描清单应相同");
+        assert_eq!(
+            initial.final_poses, after.final_poses,
+            "{name}：历史扫描位姿应相同"
+        );
+        assert!(Arc::ptr_eq(
+            session.relocalization_target.as_ref().unwrap(),
+            &target
+        ));
+        if accepted {
+            // 坏轮收回写入许可，近期点云仍然更新。
+            let mut wrong = frame_at(start + 4 * ns);
+            for p in &mut wrong.points_body {
+                p[0] *= 1.8;
+                p[1] *= 1.6;
+            }
+            let rejected = compute_round(&[wrong], mapper.map_from_odom(), &target).unwrap();
+            assert!(rejected.correction.is_none());
+            rejected.apply(&session.router, id).await;
+            let written = after.cloud.fine.as_ref().unwrap().manifest().revision;
+            let mut recent = mapper.recent_cloud_rx();
+            recent.borrow_and_update();
+            l6_feed(&session, &mapper, frame_at(start + 5 * ns)).await;
+            assert_eq!(
+                mapper
+                    .surface_map()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .manifest()
+                    .revision,
+                written
+            );
+            assert!(recent.has_changed().unwrap());
+            let overwritten = session.save(SaveMapRequest::default()).await.unwrap();
+            assert!(overwritten.replaced);
+            assert_eq!(overwritten.map_name, "L6原图");
+            assert_eq!(session.phase(), SessionPhase::Localized);
+            let renamed = session
+                .save(SaveMapRequest {
+                    map_name: "L6另存图".into(),
+                })
+                .await
+                .unwrap();
+            assert!(!renamed.replaced);
+            for name in ["L6原图", "L6另存图"] {
+                session
+                    .load(LoadMapRequest {
+                        map_name: name.into(),
+                    })
+                    .await
+                    .unwrap();
+                let loaded = session.mapper().unwrap().snapshot().await.unwrap();
+                assert_eq!(
+                    l6_keys(loaded.cloud.fine.as_ref().unwrap()),
+                    after_keys,
+                    "{name}"
+                );
+                assert_eq!(loaded.cloud.display, after.cloud.display);
+            }
+        }
+        eprintln!(
+            "L6{name}：已确认精细体素 {new_voxels}，展示点净增 {}",
+            (after.cloud.display.len() - initial.cloud.display.len()) / 12
+        );
+        session.end_current().await.unwrap();
+        session.lio().unwrap().shutdown().await;
+        session.nav.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

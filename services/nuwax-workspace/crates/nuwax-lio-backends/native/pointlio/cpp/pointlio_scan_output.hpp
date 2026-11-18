@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "pointlio_time.hpp"
+
 namespace nuwax_lio {
 
 // 逐点估计的扫描内轨迹只用于对外密集点云，不参与滤波或内核地图更新。
@@ -12,7 +14,7 @@ class PointLioScanOutput {
 public:
     struct Pose {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        double timestamp = 0;
+        SourceTimeNs timestamp_ns = 0;
         Eigen::Vector3d position = Eigen::Vector3d::Zero();
         Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();
         Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
@@ -25,24 +27,23 @@ public:
     void begin_scan() { trajectory_.clear(); }
 
     void record(const Pose& pose) {
-        if (!trajectory_.empty() && trajectory_.back().timestamp == pose.timestamp) {
+        if (!trajectory_.empty() && trajectory_.back().timestamp_ns == pose.timestamp_ns) {
             trajectory_.back() = pose;
         } else {
             trajectory_.push_back(pose);
         }
     }
 
-    bool finish_scan(const PointCloudXYZI::Ptr& raw, double scan_start,
+    bool finish_scan(const PointCloudXYZI::Ptr& raw, SourceTimeNs scan_start_ns,
                      const Eigen::Isometry3d& world_from_reference_sensor) {
         if (!raw || raw->empty() || trajectory_.empty()) return false;
         auto cloud = PointCloudXYZI::Ptr(new PointCloudXYZI(*raw));
         const Eigen::Isometry3d reference_from_world = world_from_reference_sensor.inverse();
         for (auto& point : cloud->points) {
-            // curvature沿内核原约定为真实扫描内毫秒偏移；保留所有点及其他字段。
-            const double timestamp = scan_start + static_cast<double>(point.curvature) / 1000.0;
+            const SourceTimeNs timestamp_ns = scan_start_ns + point.offset_ns;
             const Eigen::Vector3d value(point.x, point.y, point.z);
             const Eigen::Vector3d compensated = reference_from_world
-                * sensor_pose_at(timestamp) * value;
+                * sensor_pose_at(timestamp_ns) * value;
             point.x = static_cast<float>(compensated.x());
             point.y = static_cast<float>(compensated.y());
             point.z = static_cast<float>(compensated.z());
@@ -85,18 +86,19 @@ private:
         return result;
     }
 
-    Eigen::Isometry3d sensor_pose_at(double timestamp) const {
-        const auto upper = std::upper_bound(trajectory_.begin(), trajectory_.end(), timestamp,
-            [](double value, const Pose& pose) { return value < pose.timestamp; });
+    Eigen::Isometry3d sensor_pose_at(SourceTimeNs timestamp_ns) const {
+        const auto upper = std::upper_bound(trajectory_.begin(), trajectory_.end(), timestamp_ns,
+            [](SourceTimeNs value, const Pose& pose) { return value < pose.timestamp_ns; });
         // 原始密集点可能早于首个或晚于末个体素代表点，只延拓该帧边缘的估计运动。
         if (upper == trajectory_.begin()) {
-            return sensor_pose(*upper, timestamp - upper->timestamp);
+            return sensor_pose(*upper, elapsed_seconds(timestamp_ns, upper->timestamp_ns));
         }
         const auto& lower = *(upper - 1);
         if (upper == trajectory_.end()) {
-            return sensor_pose(lower, timestamp - lower.timestamp);
+            return sensor_pose(lower, elapsed_seconds(timestamp_ns, lower.timestamp_ns));
         }
-        const double alpha = (timestamp - lower.timestamp) / (upper->timestamp - lower.timestamp);
+        const double alpha = static_cast<double>(timestamp_ns - lower.timestamp_ns)
+            / (upper->timestamp_ns - lower.timestamp_ns);
         Pose pose;
         pose.position = (1 - alpha) * lower.position + alpha * upper->position;
         pose.rotation = lower.rotation.slerp(alpha, upper->rotation);

@@ -1,0 +1,263 @@
+--- a/src/Estimator.cpp
++++ b/src/Estimator.cpp
+@@ -12,6 +12,7 @@
+ bool   point_selected_surf[100000] = {0};
+ std::vector<M3D> crossmat_list;
+ int effct_feat_num = 0;
++Eigen::Vector3d batch_lidar_translation_information = Eigen::Vector3d::Zero();
+ double total_residual = 0.0; // 本帧有效匹配点的点到平面距离之和
+ int k = 0;
+ int idx = -1;
+@@ -217,6 +218,8 @@
+ 			m++;
+ 		}
+ 	}
++	// 位移雅可比的前三列给出本批三个轴的未加权信息对角线。
++	batch_lidar_translation_information = ekfom_data.h_x.leftCols<3>().colwise().squaredNorm().transpose();
+ 	effct_feat_num += effect_num_k;
+ }
+ 
+@@ -327,6 +330,8 @@
+ 			m++;
+ 		}
+ 	}
++	// 位移雅可比的前三列给出本批三个轴的未加权信息对角线。
++	batch_lidar_translation_information = ekfom_data.h_x.leftCols<3>().colwise().squaredNorm().transpose();
+ 	effct_feat_num += effect_num_k;
+ }
+ 
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -46,6 +46,9 @@
+     bool gravity_align_ = false;
+ 
+     // 只读取得同一初始化窗口累计的陀螺均值。
++    std::size_t initialization_sample_count() const { return init_iter_num - 1; }
++    nuwax_lio::SourceTimeNs initialization_first_ns() const { return init_first_ns; }
++    nuwax_lio::SourceTimeNs initialization_last_ns() const { return init_last_ns; }
+     const V3D& mean_gyro() const { return mean_gyr; }
+ 
+ private:
+@@ -53,6 +56,8 @@
+ 
+     V3D mean_gyr;
+     int init_iter_num = 1;
++    nuwax_lio::SourceTimeNs init_first_ns = 0;
++    nuwax_lio::SourceTimeNs init_last_ns = 0;
+ };
+ 
+ ImuProcess::ImuProcess()
+@@ -66,7 +71,7 @@
+ ImuProcess::~ImuProcess() {}
+ 
+ void ImuProcess::Reset() {
+-    printf("Reset ImuProcess");
++    printf("Reset ImuProcess\n");
+     mean_acc = V3D(0, 0, -1.0);
+     mean_gyr = V3D(0, 0, 0);
+     imu_need_init_ = true;
+@@ -76,7 +81,7 @@
+ void ImuProcess::IMU_init(const MeasureGroup &meas, int &N) {
+     /** 1. initializing the gravity, gyro bias, acc and gyro covariance
+      ** 2. normalize the acceleration measurenments to unit gravity **/
+-    printf("IMU Initializing: %.1f %%", double(N) / MAX_INI_COUNT * 100);
++    printf("IMU Initializing: %.1f %%\n", double(N) / MAX_INI_COUNT * 100);
+     V3D cur_acc, cur_gyr;
+ 
+     if (b_first_frame_) {
+@@ -88,6 +93,9 @@
+         mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+         mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+     }
++
++    if (N == 1) init_first_ns = nuwax_lio::source_time_ns(meas.imu.front()->header.stamp);
++    init_last_ns = nuwax_lio::source_time_ns(meas.imu.back()->header.stamp);
+ 
+     for (const auto &imu: meas.imu) {
+         const auto &imu_acc = imu->linear_acceleration;
+@@ -114,7 +122,7 @@
+             imu_need_init_ = true;
+ 
+             if (init_iter_num > MAX_INI_COUNT) {
+-                printf("IMU Initializing: %.1f %%", 100.0);
++                printf("IMU Initializing: %.1f %%\n", 100.0);
+                 imu_need_init_ = false;
+                 *cur_pcl_un_ = *(meas.lidar);
+             }
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -1,4 +1,5 @@
+ #include <functional>
++#include <optional>
+ #include <omp.h>
+ #include <mutex>
+ #include <cmath>
+@@ -22,6 +23,7 @@
+ #include "parameters.h"
+ #include "Estimator.h"
+ extern double total_residual;
++extern Eigen::Vector3d batch_lidar_translation_information;
+ #include "native_lio_arguments.hpp"
+ #include "pointlio_scan_output.hpp"
+ 
+@@ -83,6 +85,11 @@
+     std::function<void(const custom_messages::Odometry&)> odometry_callback_;
+     void record_output_pose(SourceTimeNs timestamp_ns);
+     bool finish_output_scan(const custom_messages::Odometry& odometry);
++    void report_drift(bool imu_stationary, std::size_t passed_batches, std::size_t rejected_batches,
++                      const V3D& translation_information);
++    std::size_t frames_since_imu_init_ = 0;
++    std::optional<SourceTimeNs> drift_begin_ns_;
++    bool drift_reported_ = false;
+ };
+ 
+ 
+@@ -549,6 +556,60 @@
+ 
+ }
+ 
++// 速度超过此值且惯性量测保持静止，才开始累计告警时长。
++constexpr double kDriftSpeedMps = 0.3;
++// 静止时角速度模长和加速度模长的偏差上限。
++constexpr double kStationaryAngularSpeedRadPerSec = 0.02;
++constexpr double kStationaryAccelerationErrorMps2 = 0.1;
++// 连续一秒以设备源时间计。
++constexpr SourceTimeNs kDriftDurationNs = nuwax_lio::kNanosecondsPerSecond;
++
++static bool imu_is_stationary(const custom_messages::Imu& imu) {
++    const auto& angular = imu.angular_velocity;
++    const auto& linear = imu.linear_acceleration;
++    return V3D(angular.x, angular.y, angular.z).norm() < kStationaryAngularSpeedRadPerSec
++        && std::abs(V3D(linear.x, linear.y, linear.z).norm() - 1.0) * G_m_s2
++            < kStationaryAccelerationErrorMps2;
++}
++
++static bool imu_stationary_through(SourceTimeNs end_ns) {
++    if (!imu_en) return false;
++    std::lock_guard<std::mutex> lock(mtx_buffer);
++    // 覆盖保留的惯性边界和本次扫描内的新样本，忽略扫描之后的右侧覆盖样本。
++    if (!imu_is_stationary(imu_last)) return false;
++    if (imu_time_ns(imu_next) > end_ns) return true;
++    if (!imu_is_stationary(imu_next)) return false;
++    for (const auto& imu : imu_deque) {
++        if (imu_time_ns(*imu) > end_ns) break;
++        if (!imu_is_stationary(*imu)) return false;
++    }
++    return true;
++}
++
++void LaserMapping::report_drift(bool imu_stationary, std::size_t passed_batches,
++                                std::size_t rejected_batches, const V3D& translation_information) {
++    const V3D& velocity = use_imu_as_input ? kf_input.x_.vel : kf_output.x_.vel;
++    const double speed = velocity.norm();
++    if (!(imu_stationary && speed > kDriftSpeedMps)) {
++        drift_begin_ns_.reset();
++        drift_reported_ = false;
++        return;
++    }
++    if (!drift_begin_ns_) drift_begin_ns_ = lidar_end_time_ns;
++    if (drift_reported_ || lidar_end_time_ns - *drift_begin_ns_ < kDriftDurationNs) return;
++
++    const double mean_residual = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.0;
++    fprintf(stderr, "[pointlio] WARNING startup_drift source_ns=%lld speed_mps=%.9g "
++        "velocity_mps=[%.9g,%.9g,%.9g] lidar_passed=%zu lidar_rejected=%zu "
++        "mean_residual_m=%.9g lidar_translation_information_diag=[%.9g,%.9g,%.9g] "
++        "frames_since_imu_init=%zu\n",
++        static_cast<long long>(lidar_end_time_ns), speed, velocity.x(), velocity.y(), velocity.z(),
++        passed_batches, rejected_batches, mean_residual,
++        translation_information.x(), translation_information.y(), translation_information.z(),
++        frames_since_imu_init_);
++    drift_reported_ = true;
++}
++
+ bool LaserMapping::run_once(custom_messages::Odometry& odom_out) {
+     if (!sync_packages(Measures)) return false;
+             if (flg_first_scan) {
+@@ -560,6 +621,9 @@
+             if (flg_reset) {
+                 printf("reset when rosbag play back");
+                 p_imu->Reset();
++                frames_since_imu_init_ = 0;
++                drift_begin_ns_.reset();
++                drift_reported_ = false;
+                 flg_reset = false;
+                 return false;
+             }
+@@ -570,6 +634,7 @@
+             update_time = 0;
+             t0 = omp_get_wtime();
+ 
++            if (imu_en && !p_imu->imu_need_init_) ++frames_since_imu_init_;
+             p_imu->Process(Measures, feats_undistort);
+ 
+             if (feats_undistort->empty() || feats_undistort == nullptr) {
+@@ -625,6 +690,18 @@
+                     }
+                     kf_input.change_x(state_in);
+                     kf_output.change_x(state_out);
++                    const V3D& gravity_estimate = use_imu_as_input ? state_in.gravity : state_out.gravity;
++                    const V3D& acceleration_bias = use_imu_as_input
++                        ? static_cast<const V3D&>(state_in.ba) : static_cast<const V3D&>(state_out.ba);
++                    const V3D& angular_velocity_bias = use_imu_as_input
++                        ? static_cast<const V3D&>(state_in.bg) : static_cast<const V3D&>(state_out.bg);
++                    std::cout << "[pointlio] imu_initialized samples=" << p_imu->initialization_sample_count()
++                        << " imu_first_source_ns=" << p_imu->initialization_first_ns()
++                        << " imu_last_source_ns=" << p_imu->initialization_last_ns()
++                        << " gravity_mps2=[" << gravity_estimate.transpose() << "]"
++                        << " accel_bias_mps2=[" << acceleration_bias.transpose() << "]"
++                        << " gyro_bias_radps=[" << angular_velocity_bias.transpose() << "]"
++                        << " first_scan_source_ns=" << first_lidar_time_ns << std::endl;
+                 }
+             } else {
+                 if (!p_imu->gravity_align_) {
+@@ -702,6 +779,10 @@
+             }
+ 
+             scan_output_.begin_scan();
++            const bool imu_stationary = imu_stationary_through(lidar_end_time_ns);
++            std::size_t passed_batches = 0;
++            std::size_t rejected_batches = 0;
++            V3D translation_information = V3D::Zero();
+             if (!use_imu_as_input) {
+                 bool imu_upda_cov = false;
+                 effct_feat_num = 0;
+@@ -801,6 +882,7 @@
+                     // 匹配不足时仍保留真实预测状态，不能跳过这段扫描运动。
+                     record_output_pose(time_current_ns);
+                     if (!measurement_updated) {
++                        ++rejected_batches;
+                         idx = idx + time_seq[k];
+                         continue;
+                     }
+@@ -816,6 +898,8 @@
+                         }
+                     }
+ 
++                    ++passed_batches;
++                    translation_information += batch_lidar_translation_information;
+                     solve_start = omp_get_wtime();
+ 
+                     if (publish_odometry_without_downsample) {
+@@ -955,10 +1039,13 @@
+                     // 匹配不足时仍保留真实预测状态，不能跳过这段扫描运动。
+                     record_output_pose(time_current_ns);
+                     if (!measurement_updated) {
++                        ++rejected_batches;
+                         idx = idx + time_seq[k];
+                         continue;
+                     }
+ 
++                    ++passed_batches;
++                    translation_information += batch_lidar_translation_information;
+                     solve_start = omp_get_wtime();
+ 
+                     // if(prop_at_freq_of_imu)
+@@ -999,6 +1086,8 @@
+                     idx = idx + time_seq[k];
+                 }
+             }
++
++            report_drift(imu_stationary, passed_batches, rejected_batches, translation_information);
+ 
+             /******* Publish odometry downsample *******/
+             // 每帧末态始终与最终点云对应，包括末尾只有预测而没有有效匹配的情况。

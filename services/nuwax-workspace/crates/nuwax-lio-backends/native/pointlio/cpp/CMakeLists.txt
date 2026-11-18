@@ -79,9 +79,22 @@ set(POINTLIO_PATCHES
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-scan-output-deskew.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-voxel-membership.patch"
   "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-parameter-wiring.patch"
-  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-quality-output.patch")
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-quality-output.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-integer-time.patch"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pointlio-startup-diagnostics.patch")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POINTLIO_PATCHES})
-foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp parameters.cpp)
+if(NOT LIVOX_COMMON_DIR)
+  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+endif()
+include("${LIVOX_COMMON_DIR}/native_plane_fit.cmake")
+# 先生成共享平面拟合头，再在同一准备目录发布 Point-LIO 的时间类型。
+set(POINTLIO_PLANE_FIT_DIR "${POINTLIO_PREPARE_DIR}/plane-fit")
+nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${POINTLIO_PLANE_FIT_DIR}")
+configure_file("${POINTLIO_PLANE_FIT_DIR}/src/common_lib.h"
+  "${POINTLIO_PREPARE_DIR}/src/common_lib.h" COPYONLY)
+set(POINTLIO_CORE_SOURCES pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp Estimator.h
+  parameters.cpp parameters.h preprocess.cpp preprocess.h)
+foreach(PATCHED_SOURCE IN LISTS POINTLIO_CORE_SOURCES)
   configure_file("${FASTLIO_SOURCE_DIR}/src/${PATCHED_SOURCE}"
     "${POINTLIO_PREPARE_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
@@ -129,16 +142,12 @@ endforeach()
 
 # Publish only after all patches succeed; equal bytes retain consumer mtimes.
 # Keep prepare inputs: configure_file registers them as configure dependencies.
-foreach(PATCHED_SOURCE pointlio.hpp laserMapping.hpp IMU_Processing.hpp Estimator.cpp parameters.cpp)
+foreach(PATCHED_SOURCE IN LISTS POINTLIO_CORE_SOURCES ITEMS common_lib.h)
   configure_file("${POINTLIO_PREPARE_DIR}/src/${PATCHED_SOURCE}"
     "${POINTLIO_PATCHED_DIR}/src/${PATCHED_SOURCE}" COPYONLY)
 endforeach()
-
-if(NOT LIVOX_COMMON_DIR)
-  set(LIVOX_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
-endif()
-include("${LIVOX_COMMON_DIR}/native_plane_fit.cmake")
-nuwax_prepare_native_plane_fit("${FASTLIO_SOURCE_DIR}" "${POINTLIO_PATCHED_DIR}")
+configure_file("${POINTLIO_PLANE_FIT_DIR}/src/stable_plane_fit.hpp"
+  "${POINTLIO_PATCHED_DIR}/src/stable_plane_fit.hpp" COPYONLY)
 
 FetchContent_Declare(dimos_lcm
   GIT_REPOSITORY https://github.com/dimensionalOS/dimos-lcm.git
@@ -187,7 +196,7 @@ set(LIVOX_SDK_INCLUDE_DIR ${LIVOX_SDK_PREFIX}/include)
 
 add_executable(pointlio_native
   main.cpp
-  ${FASTLIO_SOURCE_DIR}/src/preprocess.cpp
+  ${POINTLIO_PATCHED_DIR}/src/preprocess.cpp
   ${POINTLIO_PATCHED_DIR}/src/Estimator.cpp
   ${POINTLIO_PATCHED_DIR}/src/parameters.cpp
 )

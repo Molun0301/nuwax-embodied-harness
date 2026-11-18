@@ -39,6 +39,7 @@
 #include "native_lio_arguments.hpp"
 #include "native_imu_reference.hpp"
 #include "pointlio_options.hpp"
+#include "pointlio_time.hpp"
 #include "ordered_odometry_output.hpp"
 
 #include "dimos_native_module.hpp"
@@ -604,7 +605,6 @@ static void on_imu_data(const uint32_t /*handle*/, const uint8_t /*dev_type*/, L
     if (!g_running.load() || data == nullptr || !g_point_lio) { return; }
 
     uint64_t pkt_ts_ns = get_timestamp_ns(data);
-    double ts = static_cast<double>(pkt_ts_ns) / 1e9;
     auto* imu_pts = reinterpret_cast<const LivoxLidarImuRawPoint*>(data->data);
     uint16_t dot_num = data->dot_num;
 
@@ -613,7 +613,7 @@ static void on_imu_data(const uint32_t /*handle*/, const uint8_t /*dev_type*/, L
     std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
     for (uint16_t point_idx = 0; point_idx < dot_num; ++point_idx) {
         auto imu_msg = boost::make_shared<custom_messages::Imu>();
-        imu_msg->header.stamp = custom_messages::Time().fromSec(ts);
+        imu_msg->header.stamp = nuwax_lio::source_stamp(pkt_ts_ns);
         imu_msg->header.seq = 0;
         imu_msg->header.frame_id = "livox_frame";
 
@@ -934,7 +934,7 @@ static int run_pointlio(int argc, char** argv) {
                 const size_t num_points = points.size();
                 auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
                 lidar_msg->header.seq = 0;
-                lidar_msg->header.stamp = custom_messages::Time().fromSec( static_cast<double>(frame_start) / 1e9);
+                lidar_msg->header.stamp = nuwax_lio::source_stamp(frame_start);
                 lidar_msg->header.frame_id = "livox_frame";
                 lidar_msg->timebase = frame_start;
                 lidar_msg->lidar_id = 0;
@@ -1082,6 +1082,8 @@ static int run_pointlio(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // 日志通过管道交给拥有方，仍按行及时刷新。
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     try { return run_pointlio(argc, argv); }
     catch (const std::exception& error) {
         g_lcm = nullptr;

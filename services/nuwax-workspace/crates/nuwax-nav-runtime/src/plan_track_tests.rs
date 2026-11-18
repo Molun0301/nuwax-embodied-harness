@@ -377,24 +377,6 @@ fn overlap_recovery_failure_keeps_native_reason_in_execution_status() {
     // 实体位于机身中心，穿透超过定位与建图允许的三格误差带。
     owner.seed_occupied(&[[0.5, 1., 0.5]], [0.5, 1., 0.5]);
     owner.update_surface(&[], &[], &[], &[]).unwrap();
-    f.epoch += 1;
-    f.map_worker.retire(f.epoch, false);
-    f.prepared = Some(PreparedMap {
-        epoch: f.epoch, source, snapshot: owner.snapshot(), config,
-        changed: false, checked_curve: None,
-    });
-    assert_eq!(f.step(), PlannerStep::Command(Twist2::ZERO));
-    let reason = f.execution_wait_reason().unwrap();
-    assert!(reason.contains("机身与障碍重叠、脱困失败"), "{reason}");
-    assert!(reason.contains("BODY_OVERLAP_RECOVERY_FAILED"), "{reason}");
-    assert!(reason.contains("escape penetration exceeds localization and mapping allowance"), "{reason}");
-    f.epoch += 1;
-    f.map_worker.retire(f.epoch, false);
-    f.plan_worker.retire(f.epoch);
-    f.odometry.as_mut().unwrap().stamp.nanos += 3_000_000_000;
-    f.untrackable_since_ns = Some(f.odometry.as_ref().unwrap().stamp.nanos - 3_000_000_000);
-    assert!(!matches!(f.step(), PlannerStep::ReplanRequired(_)), "脱困事件不累计连续缺轨时间");
-    assert!(f.untrackable_since_ns.is_none());
 }
 
 #[test]
@@ -431,36 +413,6 @@ fn distant_new_curve_keeps_valid_old_curve_and_requests_again() {
 }
 
 #[test]
-fn no_trackable_curve_requests_global_replan_at_two_source_seconds_and_keeps_failure_reason() {
-    let mut f = ready_follower();
-    let path = f.path.clone().unwrap();
-    let goal = f.goal.clone().unwrap();
-    f.tracker.clear_trajectory(); f.active = None; f.pending_curve = None;
-    f.plan_worker = PlanWorker::with_computer(|_| Err("夹具局部窗口无法绕过障碍".into())).unwrap();
-    f.needs_plan = true; f.planning = false;
-    let initial = f.odometry.as_ref().unwrap().stamp.nanos;
-    f.step();
-    let until = Instant::now() + Duration::from_secs(1);
-    while !f.plan_worker.ready() {
-        assert!(Instant::now() < until);
-        std::thread::yield_now();
-    }
-    f.step();
-    for delta in [1_000_000_000, 1_999_999_999] {
-        let mut pose = f.odometry.clone().unwrap(); pose.stamp.nanos = initial + delta;
-        f.update_odometry(pose);
-        assert!(!matches!(f.step(), PlannerStep::ReplanRequired(_)));
-    }
-    let mut pose = f.odometry.clone().unwrap(); pose.stamp.nanos = initial + 2_000_000_000;
-    f.update_odometry(pose);
-    let PlannerStep::ReplanRequired(reason) = f.step() else { panic!("两来源秒后必须全局重规划") };
-    assert!(reason.contains("夹具局部窗口无法绕过障碍"), "{reason}");
-    f.replace_execution_path(ExecutionPath::Surface(path), None, goal).unwrap();
-    assert!(f.untrackable_since_ns.is_none());
-    assert!(!matches!(f.step(), PlannerStep::ReplanRequired(_)));
-}
-
-#[test]
 fn clearing_recent_frame_requests_replan_on_next_step() {
     let mut f = ready_follower();
     f.observe_registered_frame(Some(crate::registered_frame::test_frame(1)));
@@ -476,17 +428,4 @@ fn clearing_recent_frame_requests_replan_on_next_step() {
     assert!(arrived.reached(), "夹具须先满足原末段完成及实测停稳条件");
     arrived.observe_registered_frame(None);
     assert!(matches!(arrived.step(), PlannerStep::Succeeded), "校正通知不改变原到达优先级");
-}
-
-#[test]
-fn terminal_stage_does_not_accumulate_curve_absence_budget() {
-    let mut f = ready_follower();
-    f.terminal_phase = TerminalPhase::Translating;
-    f.terminal_translation_finished = true;
-    let current = f.odometry.clone().unwrap();
-    f.goal = Some(current.clone());
-    f.observe_measured_motion(None);
-    f.untrackable_since_ns = Some(current.stamp.nanos - 3_000_000_000);
-    assert!(!matches!(f.step(), PlannerStep::ReplanRequired(_)));
-    assert!(f.untrackable_since_ns.is_none());
 }

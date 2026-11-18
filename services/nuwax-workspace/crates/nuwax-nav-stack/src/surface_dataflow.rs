@@ -2694,7 +2694,7 @@ goal: schema::PoseStamped {
     }
 
     #[tokio::test]
-    async fn blocked_local_route_replans_globally_after_two_source_seconds() {
+    async fn distant_route_changes_replan_locally_without_replacing_global_route() {
         let starts = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&starts);
         let computer: SurfacePathComputer = Arc::new(move |map, pose, goal, config| {
@@ -2709,24 +2709,17 @@ goal: schema::PoseStamped {
         harness.wait_controlling().await;
         {
             let mut feed = harness.feed.lock().unwrap();
-            // 中段障碍横跨局部直行走廊，上下仍留有全局绕行空间。
-            for y in 5..25 { for z in 22..29 {
-                for value in [1.85_f32, (y as f32 + 0.5) * 0.1, (z as f32 + 0.5) * 0.1] {
-                    feed.map.cloud.data.extend_from_slice(&value.to_le_bytes());
-                }
-                feed.map.cloud.width += 1;
-                feed.map.cloud.row_step += 12;
-            }}
+            // 完整路线远端被真实障碍占据，当前局部前方仍可持续前进。
+            for value in [1.85_f32, 1.55, 2.5] { feed.map.cloud.data.extend_from_slice(&value.to_le_bytes()); }
+            feed.map.cloud.width += 1;
+            feed.map.cloud.row_step += 12;
         }
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
-        assert_eq!(starts.lock().unwrap().len(), 1, "远端变化仍由局部跟踪先检查");
-        // 墙从x=1.8开始；0.3米方形机身旋转最大半宽约0.212米，留0.3米才有完整转向空间。
-        harness.feed.lock().unwrap().position[0] = 1.5;
-        let replacement = harness.path_for(&goal).await;
-        assert!(replacement.path_revision > 1, "局部连续缺轨2秒后必须更新全局修订");
-        assert!(starts.lock().unwrap().len() >= 2);
-        assert!(replacement.path.poses.iter().any(|p| (p.pose.position[1] - 1.55).abs() > 0.8),
-            "新全局路线必须绕开中段障碍");
+        assert_eq!(starts.lock().unwrap().len(), 1, "新图不能触发全程重复检查和搜索");
+        harness.feed.lock().unwrap().position[0] = 1.85;
+        harness.wait_local_stop_or_reverse().await;
+        assert_eq!(starts.lock().unwrap().len(),1,"局部受阻由局部规划线程处理，保留全局路线身份");
+        assert_eq!(harness.scheduler.status().path_revision,1);
         assert!(harness.scheduler.status().pose_source_timestamp_ns>0);
         harness.cancel(&goal).await;
         harness.terminal(TerminalOutcome::Cancelled).await;

@@ -73,7 +73,6 @@ void nuwax_scan_trajectory_samples(const void *trajectory,double from,double dt,
 void *nuwax_scan_tracker_create(void);
 void nuwax_scan_tracker_destroy(void *tracker);
 void nuwax_scan_tracker_clear(void *tracker);
-int nuwax_scan_tracker_recovery_active(const void* tracker);
 void nuwax_scan_tracker_clear_trajectory(void *tracker);
 void nuwax_scan_tracker_install(void *tracker,const void *trajectory);
 void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void *snapshot,

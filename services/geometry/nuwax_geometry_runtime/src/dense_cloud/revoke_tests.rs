@@ -23,16 +23,25 @@ fn voxel_revoke_only_reads_related_key_and_coordinate_pages_at_archive_scale() {
         for page in 0..page_count {
             let mut points = (0..PAGE_POINTS)
                 .map(|local| {
+                    let voxel = (page * PAGE_POINTS + local) / 8;
+                    let half = |axis: usize| {
+                        if local & (1 << axis) == 0 {
+                            0.0125
+                        } else {
+                            0.0375
+                        }
+                    };
                     Point3::new(
-                        (if local % 2 == 0 { 1.0 } else { -1.0 }) * (1000.025 + page as f64),
-                        0.025,
-                        1.025,
+                        (if voxel % 2 == 0 { 1.0 } else { -1.0 })
+                            * (1000.0 + voxel as f64 * 0.05 + half(0)),
+                        half(1),
+                        1.0 + half(2),
                     )
                 })
                 .collect::<Vec<_>>();
             if page + 1 == page_count {
-                points[PAGE_POINTS - 1] = Point3::new(0.025, 0.025, 1.025);
-                points[PAGE_POINTS - 2] = points[PAGE_POINTS - 1];
+                points[PAGE_POINTS - 2] = Point3::new(0.0125, 0.025, 1.025);
+                points[PAGE_POINTS - 1] = Point3::new(0.0375, 0.025, 1.025);
             }
             cloud.append(&points).unwrap();
         }
@@ -70,9 +79,9 @@ fn voxel_revoke_only_reads_related_key_and_coordinate_pages_at_archive_scale() {
 fn same_block_unrelated_keys_are_rejected_by_existing_filters_without_disk_reads() {
     for page_count in [4, 256, 1024] {
         let mut cloud = DenseCloud::new().unwrap();
-        let points = vec![Point3::new(0.025, 0.025, 0.325); PAGE_POINTS];
+        let legacy_points = vec![Point3::new(0.025, 0.025, 0.325); PAGE_POINTS];
         for _ in 0..page_count {
-            cloud.append(&points).unwrap();
+            cloud.append_points(&legacy_points, false).unwrap();
         }
         let absent = key(&Point3::new(0.175, 0.025, 0.325));
         assert_eq!(cloud.remove_voxels(&[absent], 0.05).unwrap(), 0);
@@ -120,7 +129,7 @@ fn original_directory_budget_compacts_conservatively_and_keeps_remote_queries_lo
 }
 
 #[test]
-fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots() {
+fn voxel_follow_preserves_original_bits_order_and_restored_snapshots() {
     let transform = Isometry3::new(
         nalgebra::Vector3::new(-4.2, 3.1, -0.7),
         nalgebra::Vector3::new(0.2, -0.4, 0.8),
@@ -138,8 +147,8 @@ fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots(
                 })
             })
         })
-        .flat_map(|point| [point, point])
         .collect();
+    let batch: Vec<_> = points.iter().flat_map(|point| [*point, *point]).collect();
     let removed: HashSet<_> = points.iter().step_by(7).map(key).collect();
     let expected_points: Vec<_> = points
         .iter()
@@ -147,7 +156,7 @@ fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots(
         .copied()
         .collect();
     let mut cloud = DenseCloud::new().unwrap();
-    cloud.append(&points).unwrap();
+    cloud.append(&batch).unwrap();
     let before = cloud.snapshot((1) * 100, 1, "体素跟随").unwrap();
     assert_eq!(
         cloud

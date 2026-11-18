@@ -1,6 +1,128 @@
 use super::*;
 
 #[test]
+fn dense_cloud_ten_minute_surface_jitter() {
+    let voxel_size = f64::from(crate::pointcloud::VOXEL_SIZE);
+    let center = |key: i32| (f64::from(key) + 0.5) * voxel_size;
+    let mut surface = Vec::new();
+    for column in -20..20 {
+        for row in -20..20 {
+            surface.push(Point3::new(center(2 * column), center(2 * row), center(0)));
+        }
+        for height in 1..=20 {
+            for wall in [-42, 42] {
+                surface.push(Point3::new(
+                    center(2 * column),
+                    center(wall),
+                    center(2 * height),
+                ));
+            }
+        }
+    }
+    let scans: [Vec<_>; 8] = std::array::from_fn(|phase| {
+        let jitter = |axis: usize| {
+            if phase & (1 << axis) == 0 {
+                -0.005
+            } else {
+                0.005
+            }
+        };
+        surface
+            .iter()
+            .map(|point| {
+                Point3::new(
+                    point.x + jitter(0),
+                    point.y + jitter(1),
+                    point.z + jitter(2),
+                )
+            })
+            .collect()
+    });
+    let mut cloud = DenseCloud::new().unwrap();
+    for frame in 0..6_000 {
+        cloud.append(&scans[frame % scans.len()]).unwrap();
+        assert_eq!(
+            cloud.point_count,
+            ((frame + 1).min(scans.len()) * surface.len()) as u64
+        );
+        if matches!(frame, 0 | 7 | 5_999) {
+            println!(
+                "D1 frame={} points={} memory_bytes={} memory_parts={:?} disk_bytes={:?}",
+                frame + 1,
+                cloud.point_count,
+                cloud.revoke_index_memory_bytes(),
+                cloud.storage_memory_bytes(),
+                cloud.storage_disk_bytes(),
+            );
+        }
+    }
+    let count = cloud.point_count;
+    let revoked = 32;
+    let keys = scans[0][..revoked]
+        .iter()
+        .map(|point| {
+            crate::pointcloud::voxel_key([point.x, point.y, point.z], crate::pointcloud::VOXEL_SIZE)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cloud
+            .remove_voxels(&keys, crate::pointcloud::VOXEL_SIZE)
+            .unwrap(),
+        revoked * scans.len(),
+    );
+    let snapshot = cloud.snapshot(600, 1, "十分钟合成撤销").unwrap();
+    let (archive, _) = snapshot.archive("map").unwrap();
+    let mut restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
+    for scan in &scans {
+        restored.append(&scan[revoked..]).unwrap();
+    }
+    assert_eq!(restored.point_count, count - (revoked * scans.len()) as u64);
+    for scan in &scans {
+        cloud.append(scan).unwrap();
+        restored.append(scan).unwrap();
+    }
+    assert_eq!(cloud.point_count, count);
+    assert_eq!(restored.point_count, count);
+}
+
+#[test]
+fn legacy_archive_keeps_all_visible_points_and_blocks_repeated_subcells() {
+    let first = Point3::new(0.009, -0.021, 1.012);
+    let same_cell = Point3::new(0.013, -0.023, 1.013);
+    let other_cell = Point3::new(0.04, -0.021, 1.012);
+    let mut cloud = DenseCloud::new().unwrap();
+    cloud.append(&[first, same_cell, other_cell]).unwrap();
+    let snapshot = cloud.snapshot(100, 1, "同帧去重").unwrap();
+    let originals = [first, other_cell]
+        .into_iter()
+        .flat_map(|point| {
+            [point.x, point.y, point.z]
+                .map(|value| value as f32)
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot.point_count, 2);
+    assert_eq!(snapshot.read(0, 2).unwrap(), originals);
+    assert_eq!(snapshot.bounds_min[1], first.y as f32);
+
+    let legacy_points = [first, same_cell, other_cell, first];
+    let mut legacy = DenseCloud::new().unwrap();
+    legacy.append_points(&legacy_points, false).unwrap();
+    let snapshot = legacy.snapshot(200, 2, "历史存档").unwrap();
+    let (archive, _) = snapshot.archive("map").unwrap();
+    let mut restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
+    restored.append(&legacy_points).unwrap();
+    let reloaded = restored.snapshot(300, 3, "历史存档重载").unwrap();
+    assert_eq!(reloaded.point_count, snapshot.point_count);
+    assert_eq!(
+        reloaded.read(0, CHUNK_POINTS).unwrap(),
+        snapshot.read(0, CHUNK_POINTS).unwrap()
+    );
+}
+
+#[test]
 #[ignore = "release-mode dense append timing; run alone with --nocapture"]
 fn benchmark_dense_append_static_mix_and_retained_snapshots() {
     for n in [1_000, 30_000, 100_000] {
@@ -73,7 +195,7 @@ fn append_spans_partial_pages_preserving_keys_bounds_and_snapshots() {
                 Point3::new(
                     x,
                     if i % 3 == 0 { -0.025 } else { 0.025 },
-                    (i % 11) as f64 * 0.05,
+                    (i / 2) as f64 * f64::from(crate::pointcloud::VOXEL_SIZE) + 0.0125,
                 )
             })
             .collect::<Vec<_>>();
@@ -87,7 +209,11 @@ fn append_spans_partial_pages_preserving_keys_bounds_and_snapshots() {
             PAGE_POINTS + 1,
             points.len(),
         ] {
-            cloud.append(&points[start..end]).unwrap();
+            let batch = points[start..end]
+                .iter()
+                .flat_map(|point| [*point, *point])
+                .collect::<Vec<_>>();
+            cloud.append(&batch).unwrap();
             expected.extend(points[start..end].iter().flat_map(|p| {
                 [p.x, p.y, p.z]
                     .into_iter()
@@ -169,13 +295,15 @@ fn append_failure_keeps_published_state_and_retry_overwrites_unpublished_tail() 
     let before_live = cloud.live_keys.clone();
     let before_entries = cloud.block_directory.entries();
     let size = cloud.file.metadata().unwrap().len();
+    let before_invalid = Point3::new(1.0, 2.0, 3.0);
     assert!(cloud
-        .append(&[Point3::new(1.0, 2.0, 3.0), Point3::new(f64::NAN, 0.0, 0.0)])
+        .append(&[before_invalid, Point3::new(f64::NAN, 0.0, 0.0)])
         .is_err());
     assert_eq!(cloud.file.metadata().unwrap().len(), size);
     // 坐标文件写入成功而键文件失败，未发布的尾部不进入任何快照。
     let writable_keys = std::mem::replace(&mut cloud.keys_file, File::open("/dev/null").unwrap());
-    assert!(cloud.append(&[Point3::new(9.0, 8.0, 7.0)]).is_err());
+    let unpublished = Point3::new(9.0, 8.0, 7.0);
+    assert!(cloud.append(&[unpublished]).is_err());
     assert_eq!(cloud.file.metadata().unwrap().len(), size + 12);
     assert_eq!(cloud.point_count, 1);
     assert_eq!(cloud.stored_count, 1);
@@ -193,16 +321,15 @@ fn append_failure_keeps_published_state_and_retry_overwrites_unpublished_tail() 
         before_bytes
     );
     cloud.keys_file = writable_keys;
-    let next = Point3::new(1.025, -2.025, 3.025);
-    cloud.append(&[next]).unwrap();
+    cloud.append(&[before_invalid, unpublished]).unwrap();
     let expected: Vec<_> = before_bytes
         .iter()
         .copied()
-        .chain(
-            [next.x, next.y, next.z]
+        .chain([before_invalid, unpublished].into_iter().flat_map(|point| {
+            [point.x, point.y, point.z]
                 .into_iter()
-                .flat_map(|v| (v as f32).to_le_bytes()),
-        )
+                .flat_map(|value| (value as f32).to_le_bytes())
+        }))
         .collect();
     let after = cloud.snapshot((3) * 100, 3, "失败重试").unwrap();
     assert_eq!(after.read(0, CHUNK_POINTS).unwrap(), expected);
@@ -261,15 +388,25 @@ fn delta_keeps_surviving_prefix_and_unread_points_through_multiple_removals() {
 }
 
 #[test]
-fn dense_cloud_preserves_over_a_million_sub_voxel_points_and_frozen_prefixes() {
+fn dense_cloud_preserves_over_a_million_distinct_subcells_and_frozen_prefixes() {
     let mut cloud = DenseCloud::new().unwrap();
-    let scan = vec![Point3::new(0.011, -0.023, 1.037); 100_001];
-    for _ in 0..11 {
+    for frame in 0..11 {
+        let scan = (0..100_001)
+            .map(|index| {
+                Point3::new(
+                    0.011 + (frame * 100_001 + index) as f64 * 0.026,
+                    -0.023,
+                    1.037,
+                )
+            })
+            .collect::<Vec<_>>();
         cloud.append(&scan).unwrap();
     }
     let frozen = cloud.snapshot((1) * 100, 1, "密集验证").unwrap();
     assert_eq!(frozen.point_count, 1_100_011);
     cloud.append(&[Point3::new(0.012, -0.024, 1.038)]).unwrap();
+    assert_eq!(cloud.point_count, frozen.point_count);
+    cloud.append(&[Point3::new(0.011, 0.007, 1.037)]).unwrap();
     assert!(frozen.read(frozen.point_count, 1).unwrap().is_empty());
     let latest = cloud.snapshot((2) * 100, 2, "密集验证").unwrap();
     assert_eq!(latest.point_count, frozen.point_count + 1);

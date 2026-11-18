@@ -10,7 +10,7 @@ mod revoke_tests;
 use block_directory::BlockDirectory;
 use page_table::PageTable;
 
-use ahash::AHashSet as HashSet;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +27,8 @@ const MAX_HEADER_BYTES: usize = 65_536;
 const PAGE_POINTS: usize = 4096;
 const INDEX_BLOCK_M: f64 = 1.6;
 const MAX_INDEX_ENTRIES: usize = 1_000_000;
+/// 撤销体素的半边（0.025 米）。Mid-360 在 10 米处的测距噪声约 2 厘米，更细的格子多存的是噪声。
+const SUBCELL_SIZE_M: f64 = crate::pointcloud::VOXEL_SIZE as f64 / 2.0;
 /// 每页可见点体素键的布隆过滤器：32768 位、7 个哈希位置（一页约 3500 个不同体素时单键
 /// 假阳性约 1%）。只为前 16384 页建，约 6700 万点，每页 4 KiB，共 64 MiB；之后的候选页直接读原键。
 const FILTER_WORDS: usize = 512;
@@ -100,6 +102,7 @@ pub(crate) struct DenseCloud {
     #[cfg(test)]
     last_revoke: RevokeStats,
     live_keys: Option<HashSet<Key>>,
+    subcells: HashMap<Key, u8>,
     // 前 MAX_FILTER_PAGES 页中可见点的体素键（追加时登记，删除改动后重建）；
     // 只供删除时跳过必不含可见删除键的页。
     filters: Vec<Box<[u64; FILTER_WORDS]>>,
@@ -175,6 +178,7 @@ impl DenseCloud {
             #[cfg(test)]
             last_revoke: RevokeStats::default(),
             live_keys: Some(HashSet::new()),
+            subcells: HashMap::new(),
             filters: Vec::new(),
             readers: Default::default(),
             bounds_min: [f32::INFINITY; 3],
@@ -183,34 +187,59 @@ impl DenseCloud {
     }
 
     pub fn append(&mut self, points: &[Point3<f64>]) -> Result<(), String> {
+        self.append_points(points, true)
+    }
+
+    fn append_points(&mut self, points: &[Point3<f64>], deduplicate: bool) -> Result<(), String> {
+        let subcell_size = f64::from(self.voxel_size)
+            * (SUBCELL_SIZE_M / f64::from(crate::pointcloud::VOXEL_SIZE));
+        let mut pending = HashMap::<Key, u8>::new();
+        let mut bytes = Vec::with_capacity(points.len() * 12);
+        let mut keys = Vec::with_capacity(points.len() * 12);
+        let mut blocks = Vec::new();
+        let (mut low, mut high) = (self.bounds_min, self.bounds_max);
+        for point in points {
+            let coordinates = [point.x, point.y, point.z];
+            // 在降为单精度之前保存与精细地图完全相同的体素键，避免边界舍入导致漏删/误删。
+            let key = crate::pointcloud::voxel_key(coordinates, self.voxel_size)
+                .ok_or("完整点云索引坐标越界")?;
+            let stored = coordinates.map(|coordinate| coordinate as f32);
+            if stored.iter().any(|value| !value.is_finite()) {
+                return Err("完整点云包含无效坐标".into());
+            }
+            let [x_half, y_half, z_half] =
+                coordinates.map(|coordinate| (coordinate / subcell_size).floor() as i64 & 1);
+            let bit = 1_u8 << (x_half | (y_half << 1) | (z_half << 2));
+            if deduplicate && self.subcells.get(&key).is_some_and(|mask| mask & bit != 0) {
+                continue;
+            }
+            let mask = pending.entry(key).or_default();
+            if deduplicate && *mask & bit != 0 {
+                continue;
+            }
+            *mask |= bit;
+            blocks.push(index_block(coordinates));
+            for value in [key.0, key.1, key.2] {
+                keys.extend_from_slice(&value.to_le_bytes());
+            }
+            for (axis, value) in stored.into_iter().enumerate() {
+                low[axis] = low[axis].min(value);
+                high[axis] = high[axis].max(value);
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let accepted = blocks.len();
+        if accepted == 0 {
+            return Ok(());
+        }
         let count = self
             .stored_count
-            .checked_add(points.len() as u64)
+            .checked_add(accepted as u64)
             .ok_or("完整点云计数溢出")?;
         if count > (MAX_ARCHIVE_BYTES - MAX_HEADER_BYTES as u64 - 12) / 12 {
             return Err(
                 "完整点云存储达到8GiB容量，无法继续保留全部扫描；请保存后开始新地图".into(),
             );
-        }
-        let mut bytes = Vec::with_capacity(points.len() * 12);
-        let mut keys = Vec::with_capacity(points.len() * 12);
-        let (mut low, mut high) = (self.bounds_min, self.bounds_max);
-        for point in points {
-            // 在降为单精度之前保存与精细地图完全相同的体素键，避免边界舍入导致漏删/误删。
-            let key = crate::pointcloud::voxel_key([point.x, point.y, point.z], self.voxel_size)
-                .ok_or("完整点云索引坐标越界")?;
-            for value in [key.0, key.1, key.2] {
-                keys.extend_from_slice(&value.to_le_bytes());
-            }
-            for (axis, coordinate) in [point.x, point.y, point.z].into_iter().enumerate() {
-                let value = coordinate as f32;
-                if !value.is_finite() {
-                    return Err("完整点云包含无效坐标".into());
-                }
-                low[axis] = low[axis].min(value);
-                high[axis] = high[axis].max(value);
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
         }
         // 使用显式偏移；读者持有旧前缀，追加不能改变其内容或共享文件游标。
         self.file
@@ -219,11 +248,14 @@ impl DenseCloud {
         self.keys_file
             .write_all_at(&keys, self.stored_count * 12)
             .map_err(|e| e.to_string())?;
+        for (key, mask) in pending {
+            *self.subcells.entry(key).or_default() |= mask;
+        }
         self.block_directory.begin_append();
         let pages = Arc::make_mut(&mut self.pages);
         // 每页只复制固定页表路径；旧快照仍持有追加前的可见性。
         let mut index = 0;
-        while index < points.len() {
+        while index < accepted {
             let position = self.stored_count as usize + index;
             let page_index = position / PAGE_POINTS;
             if page_index == pages.len() {
@@ -233,9 +265,7 @@ impl DenseCloud {
                 }
             }
             let mut page = (**pages.get(page_index).unwrap()).clone();
-            let end = points
-                .len()
-                .min(index + PAGE_POINTS - position % PAGE_POINTS);
+            let end = accepted.min(index + PAGE_POINTS - position % PAGE_POINTS);
             for index in index..end {
                 let local = (self.stored_count as usize + index) % PAGE_POINTS;
                 let bytes = &bytes[index * 12..index * 12 + 12];
@@ -247,9 +277,7 @@ impl DenseCloud {
                     page.low[axis] = page.low[axis].min(point[axis]);
                     page.high[axis] = page.high[axis].max(point[axis]);
                 }
-                let source = points[index];
-                self.block_directory
-                    .insert(index_block([source.x, source.y, source.z]), page_index);
+                self.block_directory.insert(blocks[index], page_index);
                 // 复用降精度前已验证并写入的键，不重复计算或从单精度坐标推导。
                 let offset = index * 12;
                 let key: [i32; 3] = std::array::from_fn(|axis| {
@@ -272,7 +300,7 @@ impl DenseCloud {
             pages.set(page_index, Arc::new(page));
             index = end;
         }
-        self.point_count += points.len() as u64;
+        self.point_count += accepted as u64;
         self.stored_count = count;
         self.bounds_min = low;
         self.bounds_max = high;
@@ -426,6 +454,9 @@ impl DenseCloud {
                 live.remove(key);
             }
         }
+        for key in &removed {
+            self.subcells.remove(key);
+        }
         if count > 0 {
             let pages = Arc::make_mut(&mut self.pages);
             for (index, page, filter) in changes {
@@ -443,7 +474,7 @@ impl DenseCloud {
     }
 
     #[cfg(test)]
-    pub(crate) fn storage_memory_bytes(&self) -> [usize; 5] {
+    pub(crate) fn storage_memory_bytes(&self) -> [usize; 6] {
         let live = self.live_keys.as_ref().map_or(0, |keys| {
             block_directory::allocation(keys.capacity(), std::mem::size_of::<Key>())
         });
@@ -454,6 +485,7 @@ impl DenseCloud {
                 + self.filters.capacity() * std::mem::size_of::<Box<[u64; FILTER_WORDS]>>(),
             self.block_directory.memory_bytes(),
             live,
+            block_directory::allocation(self.subcells.capacity(), std::mem::size_of::<(Key, u8)>()),
         ]
     }
     #[cfg(test)]
@@ -614,7 +646,7 @@ impl DenseCloud {
                     )
                 })
                 .collect::<Vec<_>>();
-            cloud.append(&points)?;
+            cloud.append_points(&points, false)?;
             remaining -= count as u64;
         }
         if cloud.bounds_min != metadata.bounds_min || cloud.bounds_max != metadata.bounds_max {

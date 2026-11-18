@@ -95,6 +95,16 @@ class InstanceObservationWindowSample(TimestampedContract):
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
 
+class InstanceCorrectionBucket(ContractModel):
+    """同一会话和时间桶内的实例几何贡献。"""
+
+    session_id: int
+    start_ns: int
+    mean_offset_ns: float
+    pose: Pose
+    support: InstanceSupportEvidence
+
+
 class DeferredProjectionInput(ContractModel):
     """延迟投影(射线三角化 / 点云重投影)所需的单次观测输入缓存。
 
@@ -363,6 +373,7 @@ class SemanticInstance(TimestampedContract):
         default_factory=list,
         description="延迟投影(射线三角化/点云重投影)输入缓存，独立于 observation_window，不被 8 样本上限驱逐。",
     )
+    correction_buckets: List[InstanceCorrectionBucket] = Field(default_factory=list)
     lifecycle_state: InstanceLifecycleState = Field(
         default=InstanceLifecycleState.ACTIVE,
         description="生命周期状态。",
@@ -414,7 +425,7 @@ class SemanticInstance(TimestampedContract):
 
 
 class ObservationEvent(TimestampedContract):
-    """一次带空间锚定的观察事件，代表不可回写的事实层记录。"""
+    """一次带空间锚定的观察事件；识别内容不改，地图坐标随回环校正。"""
 
     event_id: str = Field(description="观察事件标识。")
     title: str = Field(description="事件标题。")

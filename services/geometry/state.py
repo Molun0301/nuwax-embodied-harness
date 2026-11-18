@@ -63,6 +63,8 @@ class Pose:
     qw: float
     frame_id: str
     timestamp_ns: int
+    session_id: int = 0
+    correction_seq: int = 0
 
     @property
     def yaw(self) -> float:
@@ -147,6 +149,8 @@ class GeometrySnapshot:
     view_only: bool = False
     localization_quality: Optional[LocalizationQuality] = None
     odometry_quality: Optional[OdometryQuality] = None
+    session_id: int = 0
+    correction_seq: int = 0
 
     @property
     def can_navigate(self) -> bool:
@@ -243,6 +247,9 @@ class GeometryStateView:
     def latest_map(self) -> Optional[MapUpdate]:
         with self._condition:
             return self._map
+
+    def get_map_correction(self, session_id: int, seq: int):
+        return self._client.get_map_correction(session_id, seq)
 
     def _subscribe(self, kind, callback):
         with self._condition:

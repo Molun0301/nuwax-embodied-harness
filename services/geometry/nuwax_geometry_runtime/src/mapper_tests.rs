@@ -34,7 +34,7 @@ fn g3_commit_timing(observation_size: u32, observation_origin: f64) -> serde_jso
     let mut worker = Worker::new(
         960, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let mut whole = nuwax_mapping::OccupancyGrid::with_frame(2000, 2000, 0.05, "map");
@@ -92,7 +92,7 @@ fn g2_replay_latency_benchmark() {
     let mut worker = Worker::new(
         957, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     for i in 1..=1000 { worker.frame(benchmark_frame(i * 1_000_000_000)).unwrap(); }
@@ -140,7 +140,7 @@ fn rejected_native_correction_stops_once_and_mapping_continues() {
     let mut worker = Worker::new(
         937, MapperConfig { correction_backend: "native_pgo".into(), ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let mut stopped = worker.correction_stopped.subscribe();
@@ -163,7 +163,7 @@ fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
     let mut worker = Worker::new(
         942, MapperConfig { correction_backend: "library_pgo".into(), ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.frame(room_frame(942, 1_000_000_000)).unwrap();
@@ -191,7 +191,7 @@ fn failed_replay_preserves_the_current_map() {
     let mut worker = Worker::new(
         938, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.frame(room_frame(938, 1_000_000_000)).unwrap();
@@ -224,7 +224,7 @@ fn forbidden_publication_failure_warns_after_replay_and_keeps_grid_updates() {
     let mut worker = Worker::new(
         948, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
@@ -262,7 +262,7 @@ fn small_pgo_updates_compare_against_the_corrections_that_built_the_current_map(
     let mut worker = Worker::new(
         945, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
@@ -299,7 +299,7 @@ fn replayed_timeline_keeps_centimeter_updates_small_after_robot_motion() {
     let mut worker = Worker::new(
         947, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let first = 1_000_000_000;
@@ -343,7 +343,7 @@ fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_be
     let mut worker = Worker::new(
         949, config(), None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     assert_eq!(worker.built_corrections, vec![(0, Isometry3::identity())]);
@@ -378,7 +378,7 @@ fn correction_adoption_changes_map_and_transform_together_and_publishes_clear_be
     let loaded = Worker::new(
         950, config(), Some(snapshot), true,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     assert_eq!(loaded.built_corrections, vec![(0, loaded.map_from_odom)]);
@@ -391,7 +391,7 @@ fn pgo_replay_threshold_combines_rotation_and_translation_and_checks_every_keyfr
         let mut worker = Worker::new(
             946, config(), None, false,
             watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
             watch::channel(None).0, watch::channel(Ok(())).0, false,
         ).unwrap();
         let first = 1_000_000_000;
@@ -417,7 +417,7 @@ pub(crate) fn frames_without_candidate_keep_session_healthy(
     let mut worker = Worker::new(
         frame.session_id, MapperConfig { backend, ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     worker.corrector = Some(CorrectionWorker::start(worker.session_id, worker.config.clone(), corrector).unwrap());
@@ -464,7 +464,7 @@ fn pgo_rebuild_keeps_root_and_block_versions_accepted_by_navigation() {
         let mut worker = Worker::new(
             session, MapperConfig { backend, ..config() }, None, false,
             watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-            watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+            watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
             watch::channel(None).0, watch::channel(Ok(())).0, false,
         ).unwrap();
         let mut receiver = Receiver::new(Repository::temporary().unwrap());
@@ -952,7 +952,7 @@ fn forbidden_mask_is_rasterized_again_only_when_zones_or_grid_layout_change() {
     let mut worker = Worker::new(
         949, MapperConfig { backend: MappingBackendSpec::SlamToolbox, ..config() }, None, false,
         watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
-        watch::channel(Isometry3::identity()).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
         watch::channel(None).0, watch::channel(Ok(())).0, false,
     ).unwrap();
     let mut mask = worker.forbidden.subscribe();
@@ -1216,5 +1216,13 @@ impl Worker {
         }
         self.corrector.take();
         Ok(())
+    }
+}
+
+impl Mapper {
+    pub(crate) async fn apply_test_correction(&self, update: PgoUpdate) {
+        let (send, receive) = oneshot::channel();
+        self.sender.send(Command::TestCorrection(update, send)).unwrap();
+        receive.await.unwrap().unwrap();
     }
 }

@@ -93,10 +93,10 @@ class Transform:
     timestamp_ns: int
 
 
-def _pose(value) -> Pose:
+def _pose(value, *, session_id=0, correction_seq=0) -> Pose:
     return Pose(value.position.x, value.position.y, value.position.z,
                 value.orientation.x, value.orientation.y, value.orientation.z, value.orientation.w,
-                value.frame_id, value.timestamp_ns)
+                value.frame_id, value.timestamp_ns, session_id, correction_seq)
 
 
 def _pose_message(value: Pose):
@@ -150,6 +150,7 @@ def _snapshot(value) -> GeometrySnapshot:
                           value.odometry_quality.mean_residual_m,
                           value.odometry_quality.timestamp_ns)
                           if value.HasField("odometry_quality") else None),
+        session_id=value.session_id, correction_seq=value.correction_seq,
     )
 
 
@@ -293,7 +294,11 @@ class GeometryClient:
         return _Subscription(self._stub.SubscribeState(pb.Empty()), _snapshot)
 
     def subscribe_pose(self) -> Iterator[Pose]:
-        return _Subscription(self._stub.SubscribePose(pb.Empty()), _pose)
+        return _Subscription(self._stub.SubscribePose(pb.Empty()), lambda pose: _pose(
+            pose, session_id=pose.session_id, correction_seq=pose.correction_seq))
+
+    def get_map_correction(self, session_id: int, seq: int):
+        return self._call("GetMapCorrection", pb.MapCorrectionRequest(session_id=session_id, seq=seq), None)
 
     def subscribe_map(self) -> Iterator[MapUpdate]:
         return _Subscription(self._stub.SubscribeMap(pb.Empty()), _map_update)

@@ -32,6 +32,10 @@ class Pose(TimestampedContract):
     frame_id: str = Field(description="位姿所属坐标系。")
     position: Vector3 = Field(default_factory=Vector3, description="位置，单位米。")
     orientation: Quaternion = Field(default_factory=Quaternion, description="朝向四元数。")
+    source_timestamp_ns: Optional[int] = None
+    session_id: int = 0
+    correction_seq: int = 0
+    mixed_correction: bool = False
 
     @field_validator("frame_id")
     @classmethod

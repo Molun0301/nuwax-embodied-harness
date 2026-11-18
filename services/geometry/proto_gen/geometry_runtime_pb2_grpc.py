@@ -141,7 +141,12 @@ class GeometryRuntimeStub(object):
         self.SubscribePose = channel.unary_stream(
                 '/nuwax.geometry.v3.GeometryRuntime/SubscribePose',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
-                response_deserializer=geometry__runtime__pb2.Pose.FromString,
+                response_deserializer=geometry__runtime__pb2.PoseUpdate.FromString,
+                _registered_method=True)
+        self.GetMapCorrection = channel.unary_unary(
+                '/nuwax.geometry.v3.GeometryRuntime/GetMapCorrection',
+                request_serializer=geometry__runtime__pb2.MapCorrectionRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.MapCorrection.FromString,
                 _registered_method=True)
         self.SubscribeMap = channel.unary_stream(
                 '/nuwax.geometry.v3.GeometryRuntime/SubscribeMap',
@@ -350,6 +355,13 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetMapCorrection(self, request, context):
+        """读取当前会话指定序号的回环事件；会话或事件不存在时返回 NOT_FOUND。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SubscribeMap(self, request, context):
         """地图流：占据栅格每次更新推一条，只推最新，订阅者慢时丢弃中间值。
         首条为当前栅格（尚无栅格时等第一次更新）。会话切换后推送新会话的第一张栅格。
@@ -475,7 +487,12 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
             'SubscribePose': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribePose,
                     request_deserializer=geometry__runtime__pb2.Empty.FromString,
-                    response_serializer=geometry__runtime__pb2.Pose.SerializeToString,
+                    response_serializer=geometry__runtime__pb2.PoseUpdate.SerializeToString,
+            ),
+            'GetMapCorrection': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMapCorrection,
+                    request_deserializer=geometry__runtime__pb2.MapCorrectionRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.MapCorrection.SerializeToString,
             ),
             'SubscribeMap': grpc.unary_stream_rpc_method_handler(
                     servicer.SubscribeMap,
@@ -908,7 +925,34 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.v3.GeometryRuntime/SubscribePose',
             geometry__runtime__pb2.Empty.SerializeToString,
-            geometry__runtime__pb2.Pose.FromString,
+            geometry__runtime__pb2.PoseUpdate.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMapCorrection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.v3.GeometryRuntime/GetMapCorrection',
+            geometry__runtime__pb2.MapCorrectionRequest.SerializeToString,
+            geometry__runtime__pb2.MapCorrection.FromString,
             options,
             channel_credentials,
             insecure,

@@ -1,6 +1,83 @@
 use super::*;
 
 #[tokio::test]
+async fn map_correction_versions_pose_state_and_history_until_session_ends() {
+    use crate::api::GeometryApi;
+    use crate::proto::geometry_runtime_server::GeometryRuntime;
+    use futures::StreamExt;
+    use nalgebra::Isometry3;
+
+    let id = 959;
+    let stamp = 1_000_000_000;
+    let mapper = Mapper::start(id, MapperConfig::default()).unwrap();
+    let session = actor(mapper.clone(), PathBuf::new()).await;
+    let mut handle = test_block_session(mapper.clone());
+    let (commands, receive_commands) = mpsc::unbounded_channel();
+    let (fault_tx, faults) = mpsc::unbounded_channel();
+    let (maps, _) = watch::channel(None);
+    let (_, navigation) = mpsc::unbounded_channel();
+    let router = session.router.clone();
+    handle.commands = commands;
+    handle.route = session.route.subscribe();
+    handle.state = session.publisher.subscribe();
+    handle.pose_update = router.pose_update.subscribe();
+    let forwarding = tokio::spawn(forward_maps(handle.route_rx(), maps, fault_tx, router.clone()));
+    let running = tokio::spawn(session.run(receive_commands, faults, navigation));
+    let api = GeometryApi::new(handle.clone());
+    let mut states = api.subscribe_state(tonic::Request::new(Empty {})).await.unwrap().into_inner();
+    let mut poses = api.subscribe_pose(tonic::Request::new(Empty {})).await.unwrap().into_inner();
+    let frame = crate::mapper::tests::room_frame(id, stamp);
+    router.publish_pose(id, frame.odom_pose.clone());
+    mapper.feed(frame);
+    mapper.snapshot().await.unwrap();
+    assert_eq!(poses.next().await.unwrap().unwrap().correction_seq, 0);
+    let first = Isometry3::translation(0.2, 0., 0.);
+    let second = Isometry3::new(nalgebra::Vector3::new(0.4, 0.2, 0.),
+        nalgebra::Vector3::new(0., 0., 0.2));
+    for (seq, transform) in [(1, first), (2, second)] {
+        mapper.apply_test_correction(corrector::PgoUpdate::constant_for_test(stamp, transform)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pose = poses.next().await.unwrap().unwrap();
+                if pose.correction_seq == seq {
+                    assert_eq!((pose.session_id, pose.timestamp_ns), (id, stamp));
+                    break;
+                }
+            }
+            loop {
+                let state = states.next().await.unwrap().unwrap();
+                if state.correction_seq == seq {
+                    assert_eq!(state.session_id, id);
+                    break;
+                }
+            }
+        }).await.unwrap();
+    }
+    for (seq, delta) in [(1, first), (2, second * first.inverse())] {
+        let result = api.get_map_correction(tonic::Request::new(MapCorrectionRequest { session_id: id, seq }))
+            .await.unwrap().into_inner();
+        let keyframe = &result.keyframes[0];
+        assert_eq!(keyframe.timestamp_ns, stamp);
+        let pose = Pose { position: keyframe.translation, orientation: keyframe.rotation,
+            frame_id: "map".into(), timestamp_ns: stamp };
+        assert!((pose_isometry(&pose).translation.vector - delta.translation.vector).norm() < 1e-12);
+        assert!(pose_isometry(&pose).rotation.angle_to(&delta.rotation) < 1e-12);
+    }
+    let error = api.get_map_correction(tonic::Request::new(MapCorrectionRequest { session_id: id, seq: 3 }))
+        .await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    let stopped = handle.stop_session().await.unwrap();
+    assert_eq!((stopped.session_id, stopped.correction_seq), (0, 0));
+    assert!(mapper.map_correction(1).is_none());
+    let error = api.get_map_correction(tonic::Request::new(MapCorrectionRequest { session_id: id, seq: 1 }))
+        .await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    handle.shutdown().await;
+    running.await.unwrap();
+    forwarding.abort();
+}
+
+#[tokio::test]
 async fn correction_event_moves_target_with_nearest_old_body_pose_and_resubmits_same_id_once() {
     use crate::mapper::{CorrectedKeyframe, CorrectionEvent, pose_isometry};
     use nalgebra::Isometry3;

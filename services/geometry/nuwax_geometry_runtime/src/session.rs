@@ -46,6 +46,7 @@ pub(crate) struct Route {
 pub struct FrameRouter {
     route: watch::Receiver<Option<Route>>,
     pose: watch::Sender<Option<Pose>>,
+    pose_update: watch::Sender<Option<PoseUpdate>>,
     odom: watch::Sender<Option<Pose>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
     // 近期主雷达输入归持续输入拥有方，不随地图会话替换。
@@ -67,31 +68,47 @@ impl FrameRouter {
             return;
         }
         self.odom.send_replace(Some(pose.clone()));
-        let pose = route
-            .filter(|route| route.map_pose)
-            .map_or_else(|| pose.clone(), |route| route.mapper.transform_pose(&pose));
+        let (pose, update) = Self::project_pose(route.as_ref(), pose);
+        self.pose_update.send_replace(Some(update));
         self.pose.send_replace(Some(pose));
+    }
+    fn project_pose(route: Option<&Route>, odom: Pose) -> (Pose, PoseUpdate) {
+        let session_id = route.map_or(0, |route| route.id);
+        let (pose, correction_seq) = match route {
+            Some(route) if route.map_pose => route.mapper.versioned_pose(&odom),
+            Some(route) => (odom, route.mapper.correction_seq()),
+            None => (odom, 0),
+        };
+        let update = PoseUpdate {
+            position: pose.position,
+            orientation: pose.orientation,
+            frame_id: pose.frame_id.clone(),
+            timestamp_ns: pose.timestamp_ns,
+            session_id,
+            correction_seq,
+        };
+        (pose, update)
     }
     fn refresh_transform(&self) {
         let odom = self.odom.borrow().clone();
         let route = self.route.borrow().clone();
         if let Some(odom) = odom {
-            let projected = route
-                .filter(|route| route.map_pose)
-                .map_or_else(|| odom.clone(), |route| route.mapper.transform_pose(&odom));
-            self.pose.send_if_modified(|current| {
+            let (projected, update) = Self::project_pose(route.as_ref(), odom);
+            if self.pose_update.send_if_modified(|current| {
                 if current
                     .as_ref()
                     .is_some_and(|pose| pose.timestamp_ns > projected.timestamp_ns)
                 {
                     return false;
                 }
-                let changed = current.as_ref() != Some(&projected);
+                let changed = current.as_ref() != Some(&update);
                 if changed {
-                    *current = Some(projected);
+                    *current = Some(update);
                 }
                 changed
-            });
+            }) {
+                self.pose.send_replace(Some(projected));
+            }
         }
     }
     pub fn publish_frame(&self, frame: MappingFrame) {
@@ -165,6 +182,7 @@ pub struct SessionHandle {
     state: watch::Receiver<GeometryState>,
     route: watch::Receiver<Option<Route>>,
     pose: watch::Receiver<Option<Pose>>,
+    pose_update: watch::Receiver<Option<PoseUpdate>>,
     maps: watch::Receiver<Option<MapUpdate>>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
@@ -197,11 +215,13 @@ impl SessionHandle {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (route_tx, route) = watch::channel(None);
         let (pose_tx, pose) = watch::channel(None);
+        let (pose_update_tx, pose_update) = watch::channel(None);
         let (odom, _) = watch::channel(None);
         let (faults, fault_rx) = mpsc::unbounded_channel();
         let router = FrameRouter {
             route: route.clone(),
             pose: pose_tx,
+            pose_update: pose_update_tx,
             odom,
             faults: faults.clone(),
             recent: Default::default(),
@@ -264,6 +284,7 @@ impl SessionHandle {
             state,
             route,
             pose,
+            pose_update,
             maps,
             lio: lio_rx,
             faults,
@@ -354,6 +375,15 @@ impl SessionHandle {
     }
     pub fn pose_rx(&self) -> watch::Receiver<Option<Pose>> {
         self.pose.clone()
+    }
+    pub(crate) fn pose_update_rx(&self) -> watch::Receiver<Option<PoseUpdate>> {
+        self.pose_update.clone()
+    }
+    pub(crate) fn map_correction(&self, request: MapCorrectionRequest) -> Result<MapCorrection, Status> {
+        self.route.borrow().as_ref()
+            .filter(|route| route.id == request.session_id)
+            .and_then(|route| route.mapper.map_correction(request.seq))
+            .ok_or_else(|| Status::not_found("当前会话没有该回环校正事件"))
     }
     pub fn map_rx(&self) -> watch::Receiver<Option<MapUpdate>> {
         self.maps.clone()
@@ -535,6 +565,9 @@ impl Session {
     }
     fn snapshot(&self) -> GeometryState {
         let mut state = self.state.clone();
+        let route = self.route.borrow();
+        state.session_id = route.as_ref().map_or(0, |route| route.id);
+        state.correction_seq = route.as_ref().map_or(0, |route| route.mapper.correction_seq());
         state.pose = self.router.pose.borrow().clone();
         state.odometry_quality = self.lio.borrow().as_ref().and_then(|lio| lio.odometry_quality());
         state
@@ -1328,6 +1361,7 @@ pub(crate) fn test_router(
         FrameRouter {
             route,
             pose,
+            pose_update: watch::channel(None).0,
             odom,
             faults,
             recent: Default::default(),
@@ -1348,10 +1382,11 @@ pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
     let (_, route) = watch::channel(Some(Route {id:mapper.session_id(), mapper,
         map_pose:true, accept_frames:true}));
     let (_, pose) = watch::channel(None);
+    let (_, pose_update) = watch::channel(None);
     let (_, maps) = watch::channel(None);
     let (_, lio) = watch::channel(None);
     let (faults, _) = mpsc::unbounded_channel();
-    SessionHandle { commands, state, route, pose, maps, lio, faults, recent: Default::default() }
+    SessionHandle { commands, state, route, pose, pose_update, maps, lio, faults, recent: Default::default() }
 }
 
 #[cfg(test)]

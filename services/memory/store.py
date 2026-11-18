@@ -16,6 +16,7 @@ from contracts.spatial_memory import (
     NavigationTrajectoryEvent, ObservationEvent, SceneSpace, SemanticGraphRelation,
     SemanticInstance, SemanticSummaryNode,
 )
+from services.memory.map_correction import SESSION_KEY
 
 MODELS = {
     "location": (TaggedLocation, "location_id", "tagged_locations"),
@@ -104,6 +105,8 @@ class MemoryStore:
 
     def _initialize(self):
         self.connection.execute("BEGIN")
+        self.connection.execute("CREATE TABLE IF NOT EXISTS map_correction_progress "
+                                "(id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, seq INTEGER NOT NULL)")
         rebuild = set()
         for kind, (_, _, table) in MODELS.items():
             extra = (", relation_kind TEXT, source_node_kind TEXT, source_node_id TEXT, target_node_kind TEXT, target_node_id TEXT"
@@ -175,6 +178,21 @@ class MemoryStore:
     def has(self, kind, identity):
         return self.connection.execute("SELECT 1 FROM "+MODELS[kind][2]+" WHERE id=?",(identity,)).fetchone() is not None
 
+    def correction_progress(self):
+        return self.connection.execute("SELECT session_id,seq FROM map_correction_progress").fetchone() or (0, 0)
+
+    def set_correction_progress(self, session_id, seq):
+        self.connection.execute("INSERT OR REPLACE INTO map_correction_progress VALUES (1,?,?)", (session_id, seq))
+
+    def _record_session(self, record):
+        pose = getattr(record, "pose", None)
+        if isinstance(record, SceneSpace) and record.boundary is not None:
+            pose = record.boundary.centroid
+        session_id = (pose.session_id if pose is not None else 0) or self.correction_progress()[0]
+        if session_id:
+            return record.model_copy(update={"metadata": {**record.metadata, SESSION_KEY: session_id}})
+        return record
+
     def put(self, kind, record):
         _,identity,table = MODELS[kind]
         fields = self._business_key_fields(kind,record)
@@ -185,6 +203,13 @@ class MemoryStore:
                 record = record.model_copy(update={identity:previous[0]})
         identifier = getattr(record,identity)
         old = self.get(kind,identifier)
+        if old is None and SESSION_KEY not in record.metadata:
+            record = self._record_session(record)
+        if kind == "scene_space" and record.metadata.get("source") == "room_segmentation":
+            session_id, _ = self.correction_progress()
+            if session_id and any(sample.pose is not None and sample.pose.session_id == session_id
+                                  for sample in record.observation_samples):
+                record = record.model_copy(update={"metadata": {**record.metadata, SESSION_KEY: session_id}})
         if old == record and self.connection.execute('SELECT 1 FROM '+table+' WHERE id=?',(identifier,)).fetchone():
             return record
         indexed = self._index(kind,record)
@@ -244,6 +269,8 @@ class MemoryStore:
     def put_live_instance(self, record, *, persist):
         if persist:
             return self.put('instance',record)
+        if SESSION_KEY not in record.metadata and self.get("instance", record.instance_id) is None:
+            record = self._record_session(record)
         self.connection.execute('DELETE FROM semantic_instances WHERE id=?',(record.instance_id,))
         self._pending['instance',record.instance_id] = record.model_copy(deep=True)
         self._pending_persistence[record.instance_id] = False

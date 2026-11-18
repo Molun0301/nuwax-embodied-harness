@@ -35,6 +35,7 @@ def contract_pose(value):
         return value
     return Pose(frame_id=value.frame_id,
         timestamp=datetime.fromtimestamp(value.timestamp_ns / 1e9, timezone.utc),
+        source_timestamp_ns=value.timestamp_ns, session_id=value.session_id, correction_seq=value.correction_seq,
         position=Vector3(x=value.x, y=value.y, z=value.z),
         orientation=Quaternion(x=value.qx, y=value.qy, z=value.qz, w=value.qw))
 
@@ -74,6 +75,8 @@ def _interpolate_pose(samples, stamp):
         rotation = (np.sin((1-weight)*angle)*first+np.sin(weight*angle)*second)/np.sin(angle)
     rotation /= np.linalg.norm(rotation)
     return Pose(frame_id=left.frame_id, timestamp=datetime.fromtimestamp(stamp/1e9, timezone.utc),
+                source_timestamp_ns=stamp, session_id=left.session_id, correction_seq=left.correction_seq,
+                mixed_correction=(left.session_id, left.correction_seq) != (right.session_id, right.correction_seq),
                 position=Vector3(x=position[0], y=position[1], z=position[2]),
                 orientation=Quaternion(**dict(zip("xyzw", rotation))))
 
@@ -157,6 +160,7 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
                    if sample is not None and sample.time_offset_ns_le is not None else np.zeros(len(points), dtype=np.int64))
         scan_stamp = int(sample.timestamp_ns) if sample is not None else key[1]
         mapped = np.empty((len(points), 3), dtype=np.float64)
+        mixed = pose.mixed_correction
         for offset in np.unique(offsets):
             batch_pose = _pose_at_source_time(pose_samples, scan_stamp+int(offset))
             if batch_pose is None:
@@ -167,8 +171,11 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
                 return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable")
             batch = offsets == offset
             mapped[batch] = np.asarray(points)[batch] @ transform.matrix[:3, :3].T+transform.matrix[:3, 3]
+            mixed |= batch_pose.mixed_correction or (
+                batch_pose.session_id, batch_pose.correction_seq) != (pose.session_id, pose.correction_seq)
             batch_count += 1
         points = mapped
+        pose = pose.model_copy(update={"mixed_correction": mixed})
     sources = ({"source_id": key[0], "frame_id": source_cloud.frame_id, "source_timestamp_ns": key[1],
                 "selected_point_count": len(points), "canonical_lidar": sample is not None,
                 "point_batch_count": batch_count, "image_delta_ns": key[1]-stamp},)

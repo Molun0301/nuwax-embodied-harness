@@ -182,14 +182,20 @@ impl GeometryRuntime for GeometryApi {
         }));
         Ok(Response::new(self.until_closed(stream)))
     }
-    type SubscribePoseStream = ResponseStream<Pose>;
+    type SubscribePoseStream = ResponseStream<PoseUpdate>;
     async fn subscribe_pose(
         &self,
         _: Request<Empty>,
     ) -> Result<Response<Self::SubscribePoseStream>, Status> {
         Ok(Response::new(
-            self.until_closed(present(self.session.pose_rx())),
+            self.until_closed(present(self.session.pose_update_rx())),
         ))
+    }
+    async fn get_map_correction(
+        &self,
+        request: Request<MapCorrectionRequest>,
+    ) -> Result<Response<MapCorrection>, Status> {
+        Ok(Response::new(self.session.map_correction(request.into_inner())?))
     }
     type SubscribeMapStream = ResponseStream<MapUpdate>;
     async fn subscribe_map(

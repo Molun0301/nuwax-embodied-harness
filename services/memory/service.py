@@ -19,7 +19,7 @@ from services.memory.embeddings import Embeddings
 from services.memory.instances import InstancesMixin
 from services.memory.library import LibraryWriter
 from services.memory.navigation import NavigationMixin
-from services.memory.places import PlacesMixin
+from services.memory.places import CURRENT_POSE, PlacesMixin
 from services.memory.query import QueryMixin
 from services.memory.scenes import ScenesMixin
 from services.memory.store import MemorySnapshot, MemoryStore, MODELS
@@ -32,6 +32,7 @@ from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.vision_to_map_projection_service import VisionToMapProjectionService
 from services.memory.semantic_map.semantic_map_builder import SemanticMapBuilder
 from services.memory.semantic_map.inputs import algorithm_grid
+from services.memory.map_correction import MapCorrection
 
 
 class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, NavigationMixin):
@@ -85,7 +86,7 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
             self._unsubscribe = geometry_state.subscribe(self._geometry_changed)
             def initial(store):
                 snapshot = geometry_state.snapshot()
-                return self._writer.switch(snapshot.map_name or None) if snapshot is not None else False
+                return self._use_geometry_state(snapshot) if snapshot is not None else False
             try:
                 self._writer.call(initial, transaction=False)
             except Exception:
@@ -94,8 +95,60 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
     def _geometry_changed(self, snapshot):
         with self._condition:
             if not self._closed:
-                self._writer.call(lambda store: self._writer.switch(snapshot.map_name or None),
+                self._writer.call(lambda store: self._use_geometry_state(snapshot),
                                   wait=False, transaction=False)
+
+    def _use_geometry_state(self, snapshot):
+        switched = self._writer.switch(snapshot.map_name or None)
+        store = self._writer.store
+        if store is None or not snapshot.session_id:
+            return switched
+        current = self.geometry_state.snapshot()
+        if current.session_id != snapshot.session_id:
+            return switched
+        try:
+            with store.connection:
+                advanced = self._advance_corrections(store, snapshot.session_id, snapshot.correction_seq, snapshot.info.map_frame_id)
+        except BaseException:
+            store.rollback_cache()
+            raise
+        return switched or advanced
+
+    def _correction(self, session_id, seq, frame):
+        message = self.geometry_state.get_map_correction(session_id, seq)
+        return MapCorrection(session_id, seq, frame, message, self._association._association_config)
+
+    def _advance_corrections(self, store, session_id, seq, frame):
+        owner, applied = store.correction_progress()
+        if owner != session_id:
+            applied = 0
+            store.set_correction_progress(session_id, applied)
+        for event_seq in range(applied + 1, seq + 1):
+            self._correction(session_id, event_seq, frame).apply(store)
+            store.set_correction_progress(session_id, event_seq)
+        return seq > applied
+
+    def _prepare_map_sample(self, store, pose, projected=()):
+        state = self.geometry_state.snapshot() if self.geometry_state is not None else None
+        if state is None or state.map_name != store.name or pose is None or not state.session_id:
+            return pose, projected
+        frame = state.info.map_frame_id
+        session_id = state.session_id
+        if pose.session_id != session_id:
+            return pose, projected
+        self._advance_corrections(store, session_id, pose.correction_seq, frame)
+        _, applied = store.correction_progress()
+        for seq in range(pose.correction_seq + 1, applied + 1):
+            event = self._correction(session_id, seq, frame)
+            pose = event.pose(pose)
+            projected = tuple(event.projected(item) for item in projected)
+        return pose, projected
+
+    def _explicit_memory_pose(self, observation_pose):
+        current = self.current_pose()
+        if observation_pose is CURRENT_POSE or (current is not None and current.session_id):
+            return self._as_memory_pose(current)
+        return self._as_memory_pose(observation_pose)
 
     def snapshot(self):
         with self._condition:
@@ -265,7 +318,8 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
             return value
         return Pose(position=Vector3(x=value.x, y=value.y, z=value.z),
             orientation=Quaternion(x=value.qx, y=value.qy, z=value.qz, w=value.qw),
-            frame_id=value.frame_id, timestamp=datetime.fromtimestamp(value.timestamp_ns/1e9, timezone.utc))
+            frame_id=value.frame_id, timestamp=datetime.fromtimestamp(value.timestamp_ns/1e9, timezone.utc),
+            source_timestamp_ns=value.timestamp_ns, session_id=value.session_id, correction_seq=value.correction_seq)
 
     def _directory(self, name):
         return self.default_root if self.geometry_state is None and name == "default" else self.maps_root/name/"memory"

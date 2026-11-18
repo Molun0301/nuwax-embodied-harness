@@ -63,6 +63,18 @@ constexpr std::size_t kMaxGraphNodes =
 constexpr int kIcpIterationLimit = 50;
 // 关键帧按 0.1 米体素采样，对应距离取约三倍体素，避免非重叠几何拉偏配准。
 constexpr double kIcpMaxCorrespondenceDistanceM = 0.3;
+// 宽配准只为 0.3 米精配准提供独立初值。
+constexpr double kLoopReviewCoarseDistanceM = 0.6;
+// 比较两种配准作用到当前关键帧中心后的三维位置。
+constexpr double kLoopReviewWideAgreementM = 0.06;
+// 水平网格初值的间距。
+constexpr double kLoopReviewGridStepM = 0.20;
+// 搜索圆盘和比较解使用同一位移半径。
+constexpr double kLoopReviewGridRadiusM = 1.0;
+// 截断近邻距离，限制非重叠点对网格评分的影响。
+constexpr double kLoopReviewGridScoreDistanceM = 0.15;
+// 评分更好的网格解超出此距离才否决直接配准。
+constexpr double kLoopReviewGridAgreementM = 0.10;
 constexpr double kIcpStatisticsRangeM = 10.0;
 constexpr std::size_t kMinIcpInliers = 20;
 constexpr std::size_t kStatusFixedWireBytes = 337;
@@ -1205,28 +1217,19 @@ struct IcpResult {
     std::string error;
 };
 
-IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::ConstPtr& target,
-                       double score_threshold,
-                       const std::shared_ptr<std::atomic<bool>>& cancelled) {
-    if (source->size() > static_cast<std::size_t>(Result::MAX_LOOP_INLIERS) ||
-        target->size() > kMaxSubmapPoints) {
-        IcpResult result;
-        result.disposition = IcpDisposition::Failure;
-        result.error = "ICP cloud exceeds the frozen V3 proof limits";
-        return result;
-    }
-    if (source->size() < kMinIcpInliers || target->size() < kMinIcpInliers) {
-        return {};
-    }
+IcpResult fitLoop(const PointCloud::ConstPtr& source, const PointCloud::ConstPtr& target,
+                  double correspondence_distance_m, const Eigen::Matrix4f& initial,
+                  std::optional<double> score_threshold,
+                  const std::shared_ptr<std::atomic<bool>>& cancelled) {
     pcl::IterativeClosestPoint<Point, Point> icp;
     icp.setInputSource(source);
     icp.setInputTarget(target);
     icp.setMaximumIterations(1);
-    icp.setMaxCorrespondenceDistance(kIcpMaxCorrespondenceDistanceM);
+    icp.setMaxCorrespondenceDistance(correspondence_distance_m);
     icp.setTransformationEpsilon(1.0e-7);
     icp.setEuclideanFitnessEpsilon(1.0e-7);
     icp.setRANSACIterations(0);
-    Eigen::Matrix4f estimate = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f estimate = initial;
     bool converged = false;
     for (int iteration = 0; iteration < kIcpIterationLimit; ++iteration) {
         if (cancelled->load(std::memory_order_acquire)) {
@@ -1258,13 +1261,39 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
         result.disposition = IcpDisposition::Cancelled;
         return result;
     }
-    const double fitness = icp.getFitnessScore(kIcpStatisticsRangeM);
-    if ((!converged && !icp.hasConverged()) || !std::isfinite(fitness) ||
-        fitness > score_threshold) {
+    IcpResult result;
+    result.disposition = IcpDisposition::Correction;
+    result.source_correction = estimate;
+    // 粗配准只提供初值，沿用直接配准的条件筛选两种精配准结果。
+    if (score_threshold) {
+        const double fitness = icp.getFitnessScore(kIcpStatisticsRangeM);
+        if ((!converged && !icp.hasConverged()) || !std::isfinite(fitness) ||
+            fitness > *score_threshold) {
+            return {};
+        }
+        result.fitness_score = fitness;
+    }
+    return result;
+}
+
+IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::ConstPtr& target,
+                       double score_threshold,
+                       const std::shared_ptr<std::atomic<bool>>& cancelled) {
+    if (source->size() > static_cast<std::size_t>(Result::MAX_LOOP_INLIERS) ||
+        target->size() > kMaxSubmapPoints) {
+        IcpResult result;
+        result.disposition = IcpDisposition::Failure;
+        result.error = "ICP cloud exceeds the frozen V3 proof limits";
+        return result;
+    }
+    if (source->size() < kMinIcpInliers || target->size() < kMinIcpInliers) {
         return {};
     }
+    IcpResult result = fitLoop(source, target, kIcpMaxCorrespondenceDistanceM,
+                               Eigen::Matrix4f::Identity(), score_threshold, cancelled);
+    if (result.disposition != IcpDisposition::Correction) return result;
     PointCloud::Ptr transformed(new PointCloud);
-    pcl::transformPointCloud(*source, *transformed, estimate);
+    pcl::transformPointCloud(*source, *transformed, result.source_correction);
     pcl::KdTreeFLANN<Point> nearest;
     nearest.setInputCloud(target);
     long double squared_error = 0.0;
@@ -1299,13 +1328,86 @@ IcpResult registerLoop(const PointCloud::ConstPtr& source, const PointCloud::Con
         result.error = "ICP inlier proof is non-finite";
         return result;
     }
-    IcpResult result;
-    result.disposition = IcpDisposition::Correction;
-    result.source_correction = estimate;
-    result.fitness_score = fitness;
     result.inlier_rmse_m = rmse;
     result.inlier_count = inlier_count;
     return result;
+}
+
+Eigen::Vector3d correctedLoopCenter(const Eigen::Matrix4f& correction,
+                                    const Eigen::Vector3d& center) {
+    return correction.block<3, 3>(0, 0).cast<double>() * center +
+           correction.block<3, 1>(0, 3).cast<double>();
+}
+
+bool wideLoopAgrees(const PointCloud::ConstPtr& source, const PointCloud::ConstPtr& target,
+                    double score_threshold, const Eigen::Vector3d& center,
+                    const IcpResult& registration,
+                    const std::shared_ptr<std::atomic<bool>>& cancelled) {
+    const auto coarse = fitLoop(source, target, kLoopReviewCoarseDistanceM,
+                                Eigen::Matrix4f::Identity(), std::nullopt, cancelled);
+    if (coarse.disposition != IcpDisposition::Correction) return false;
+    const auto fine = fitLoop(source, target, kIcpMaxCorrespondenceDistanceM,
+                              coarse.source_correction, score_threshold, cancelled);
+    return fine.disposition == IcpDisposition::Correction &&
+           (correctedLoopCenter(fine.source_correction, center) -
+            correctedLoopCenter(registration.source_correction, center)).norm() <=
+               kLoopReviewWideAgreementM;
+}
+
+double truncatedLoopScore(const PointCloud& source, const pcl::KdTreeFLANN<Point>& nearest,
+                          const Eigen::Matrix4f& correction, std::size_t stride) {
+    constexpr double limit_squared =
+        kLoopReviewGridScoreDistanceM * kLoopReviewGridScoreDistanceM;
+    std::vector<int> indices(1);
+    std::vector<float> distances(1);
+    double sum = 0.0;
+    for (std::size_t index = 0; index < source.size(); index += stride) {
+        const auto& point = source[index];
+        const Eigen::Vector3f moved = correction.block<3, 3>(0, 0) * point.getVector3fMap() +
+                                      correction.block<3, 1>(0, 3);
+        nearest.nearestKSearch(Point(moved.x(), moved.y(), moved.z()), 1, indices, distances);
+        sum += std::min(static_cast<double>(distances[0]), limit_squared);
+    }
+    return sum / ((source.size() + stride - 1) / stride);
+}
+
+bool gridLoopAgrees(const PointCloud::ConstPtr& source, const PointCloud::ConstPtr& target,
+                    double score_threshold, const Eigen::Vector3d& center,
+                    const IcpResult& registration,
+                    const std::shared_ptr<std::atomic<bool>>& cancelled) {
+    constexpr int radius_steps = static_cast<int>(kLoopReviewGridRadiusM / kLoopReviewGridStepM);
+    pcl::KdTreeFLANN<Point> nearest;
+    nearest.setInputCloud(target);
+    auto best_score = std::numeric_limits<double>::infinity();
+    Eigen::Matrix4f seed = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f translation = Eigen::Matrix4f::Identity();
+    for (int x = -radius_steps; x <= radius_steps; ++x) {
+        for (int y = -radius_steps; y <= radius_steps; ++y) {
+            if ((x == 0 && y == 0) || x * x + y * y > radius_steps * radius_steps) continue;
+            if (cancelled->load(std::memory_order_acquire)) return false;
+            translation(0, 3) = x * kLoopReviewGridStepM;
+            translation(1, 3) = y * kLoopReviewGridStepM;
+            // 固定隔点取样，格点同分时保留第一个。
+            const double score = truncatedLoopScore(*source, nearest, translation, 2);
+            if (score < best_score) {
+                best_score = score;
+                seed = translation;
+            }
+        }
+    }
+    const auto alternate = fitLoop(source, target, kIcpMaxCorrespondenceDistanceM,
+                                   seed, score_threshold, cancelled);
+    const auto original_center = correctedLoopCenter(registration.source_correction, center);
+    const auto alternate_center = correctedLoopCenter(alternate.source_correction, center);
+    // 只在网格解合格且严格优于原解时，用它的分歧否决原解。
+    const bool better_alternate =
+        alternate.disposition == IcpDisposition::Correction &&
+        (alternate_center - center).norm() <= kLoopReviewGridRadiusM &&
+        ((original_center - center).norm() > kLoopReviewGridRadiusM ||
+         truncatedLoopScore(*source, nearest, alternate.source_correction, 1) <
+             truncatedLoopScore(*source, nearest, registration.source_correction, 1));
+    return !better_alternate ||
+           (alternate_center - original_center).norm() <= kLoopReviewGridAgreementM;
 }
 
 enum class TerminalKind { Succeeded, Rejected, Cancelled };
@@ -1429,7 +1531,7 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     PointCloud::Ptr target = loopTargetSubmap(
         trial, *loop_target, current_index, options.loop_submap_half_range,
         options.submap_resolution_m);
-    const IcpResult registration =
+    IcpResult registration =
         registerLoop(source, target, options.loop_score_threshold, cancelled);
     if (registration.disposition == IcpDisposition::Cancelled) {
         return cancelledRequest(request);
@@ -1440,6 +1542,17 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
                 TerminalKind::Rejected, Status::REASON_OPTIMIZATION_FAILED,
                 registration.error};
     }
+    const Eigen::Isometry3d current_global =
+        isometryFromRigidPose(trial.graph.keyPosesSe3()[current_index].global);
+    if (registration.disposition == IcpDisposition::Correction) {
+        const bool agreed =
+            wideLoopAgrees(source, target, options.loop_score_threshold,
+                           current_global.translation(), registration, cancelled) &&
+            gridLoopAgrees(source, target, options.loop_score_threshold,
+                           current_global.translation(), registration, cancelled);
+        if (cancelled->load()) return cancelledRequest(request);
+        if (!agreed) registration.disposition = IcpDisposition::NoCandidate;
+    }
     if (registration.disposition == IcpDisposition::NoCandidate) {
         ProcessedRequest completed{noCandidateResult(request), TerminalKind::Succeeded,
                                    Status::REASON_NONE, "ICP did not prove a loop"};
@@ -1447,10 +1560,6 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
         completed.proposed_state = std::move(trial);
         return completed;
     }
-    if (cancelled->load()) return cancelledRequest(request);
-
-    const Eigen::Isometry3d current_global =
-        isometryFromRigidPose(trial.graph.keyPosesSe3()[current_index].global);
     const Eigen::Isometry3d target_global =
         isometryFromRigidPose(trial.graph.keyPosesSe3()[*loop_target].global);
     Eigen::Isometry3d icp_correction = Eigen::Isometry3d::Identity();

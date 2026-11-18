@@ -879,13 +879,8 @@ pub(crate) fn fresh(timestamp: u64, limit: u64) -> Result<(), String> {
         return Err(format!("来源年龄不可用：数据来源时间必须为正；源时间={timestamp}"));
     }
     let now = clock::source_now_ns();
-    let (tolerance, future_reason) = if clock::uses_device_clock() {
-        (1000, "数据源时间超前当前来源时钟")
-    } else {
-        (50_000_000, "位姿源时间超前当前墙钟超过50毫秒")
-    };
-    if timestamp > now.saturating_add(tolerance) {
-        return Err(format!("来源年龄不可用：{future_reason}；源时间={timestamp}"));
+    if timestamp > now.saturating_add(50_000_000) {
+        return Err(format!("来源年龄不可用：数据源时间超前当前来源时钟超过50毫秒；源时间={timestamp}"));
     }
     let age = now.saturating_sub(timestamp);
     if age > limit {

@@ -1765,13 +1765,8 @@ fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeE
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
         .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
     let now = clock::source_now_ns();
-    let (tolerance, future_reason) = if clock::uses_device_clock() {
-        (1000, "数据源时间超前当前来源时钟")
-    } else {
-        (50_000_000, "位姿源时间超前当前墙钟超过50毫秒")
-    };
-    if source > now.saturating_add(tolerance) {
-        return Err(RuntimeError::StaleInput(future_reason.into()));
+    if source > now.saturating_add(50_000_000) {
+        return Err(RuntimeError::StaleInput("数据源时间超前当前来源时钟超过50毫秒".into()));
     }
     let age = now.saturating_sub(source);
     if u128::from(age) >= maximum.as_nanos() {

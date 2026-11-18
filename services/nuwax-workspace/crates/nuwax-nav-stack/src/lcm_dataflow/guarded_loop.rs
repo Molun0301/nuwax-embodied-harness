@@ -1132,17 +1132,12 @@ pub(super) fn build_guarded_navigation_status(
     let input_ready = status.motion_sink_ready && status.planner_inputs_fresh
         && !telemetry.map_frame.is_empty() && telemetry.map_frame == telemetry.pose_frame;
     let message = if !input_ready && !matches!(goal_status, schema::NAVIGATION_GOAL_STATUS_SUCCEEDED | schema::NAVIGATION_GOAL_STATUS_FAILED | schema::NAVIGATION_GOAL_STATUS_CANCELLED | schema::NAVIGATION_GOAL_STATUS_STOPPED) {
-        use nuwax_nav_types_messages::clock;
-        let (source_now, tolerance, future_reason) = if clock::uses_device_clock() {
-            (clock::source_now_ns(), 1000, "数据源时间超前当前来源时钟")
-        } else {
-            (now.as_nanos() as u64, 50_000_000, "位姿源时间超前当前墙钟超过50毫秒")
-        };
+        let source_now = nuwax_nav_types_messages::clock::source_now_ns();
         let age = |stamp: i64| {
             if stamp <= 0 { return "尚未收到，年龄未知".to_string(); }
             let stamp = stamp as u64;
-            if stamp > source_now.saturating_add(tolerance) {
-                format!("来源年龄不可用：{future_reason}")
+            if stamp > source_now.saturating_add(50_000_000) {
+                "来源年龄不可用：数据源时间超前当前来源时钟超过50毫秒".to_string()
             } else {
                 format!("来源年龄={}毫秒", source_now.saturating_sub(stamp) / 1_000_000)
             }

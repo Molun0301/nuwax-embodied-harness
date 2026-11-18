@@ -13,7 +13,7 @@ use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
@@ -25,15 +25,9 @@ use explorer_worker::ExplorerWorker;
 #[path = "localizer.rs"]
 mod localizer;
 
-fn trim_recent(recent: &mut VecDeque<(Instant, MappingFrame)>) {
+fn trim_recent(recent: &mut VecDeque<(clock::Instant, MappingFrame)>) {
     while recent.len() > 8
-        || recent.front().is_some_and(|(time, frame)| {
-            if clock::uses_device_clock() {
-                clock::source_now_ns().saturating_sub(frame.odom_pose.timestamp_ns) > 2_000_000_000
-            } else {
-                time.elapsed() > Duration::from_secs(2)
-            }
-        })
+        || recent.front().is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))
     {
         recent.pop_front();
     }
@@ -55,7 +49,7 @@ pub struct FrameRouter {
     odom: watch::Sender<Option<Pose>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
     // 近期主雷达输入归持续输入拥有方，不随地图会话替换。
-    recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
+    recent: Arc<parking_lot::Mutex<VecDeque<(clock::Instant, MappingFrame)>>>,
 }
 impl FrameRouter {
     pub(crate) fn mapper(&self) -> Option<Arc<Mapper>> {
@@ -103,7 +97,7 @@ impl FrameRouter {
     pub fn publish_frame(&self, frame: MappingFrame) {
         if !frame.mapping_only {
             let mut recent = self.recent.lock();
-            recent.push_back((Instant::now(), frame.clone()));
+            recent.push_back((clock::Instant::now(), frame.clone()));
             trim_recent(&mut recent);
         }
         let route = self.route.borrow().clone();
@@ -174,7 +168,7 @@ pub struct SessionHandle {
     maps: watch::Receiver<Option<MapUpdate>>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
-    recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
+    recent: Arc<parking_lot::Mutex<VecDeque<(clock::Instant, MappingFrame)>>>,
 }
 const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
 const PLANAR_VIEW_ONLY: &str = "缺少二维定位图，只能查看";

@@ -118,3 +118,55 @@ def test_driver_links_clock_before_feedback(tmp_path, monkeypatch):
         assert observed == [41]
     finally:
         simulation.close()
+
+
+def test_bind_running_status_builds_motion_feedback(device_clock, tmp_path, monkeypatch):
+    home = tmp_path / "neh"
+    monkeypatch.setenv("NUWAX_INSTALL_HOME", str(home))
+    monkeypatch.setenv("NUWAX_DEVICE_CLOCK", str(home / "run/device_clock"))
+
+    def respond(request):
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json={
+                "protocol": "unitree-sim/1",
+                "backend": {
+                    "robot": "g1",
+                    "command_limits": {"vx_mps": 1, "vy_mps": 1, "wz_rps": 1, "source": "test"},
+                },
+                "clock": {"shared_memory_path": str(device_clock)},
+            })
+        return httpx.Response(200, json={
+            "mode": "physics",
+            "session": "test",
+            "epoch": 1,
+            "sim_time_ns": 100,
+            "robot_status": {
+                "state": "running",
+                "source_clock_mapping": {
+                    "clock_id": "device-clock",
+                    "unix_anchor_ns": 999_999_950,
+                    "sim_anchor_ns": 50,
+                },
+                "velocity": {
+                    "reference_frame_id": "base",
+                    "reference_linear_mps": [0.25, 0.0, 0.0],
+                    "reference_angular_rps": [0.0, 0.0, 0.5],
+                    "reference_orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    "command_from_reference_rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                    "command_frame_id": "base",
+                },
+            },
+        })
+
+    client = httpx.Client
+    monkeypatch.setattr(device.httpx, "Client", lambda **kw: client(transport=httpx.MockTransport(respond), **kw))
+    simulation = device.Device("http://test", "g1", "base")
+    try:
+        simulation.bind()
+        feedback = simulation.get_motion_execution_feedback()
+        assert feedback is not None
+        assert feedback.source_id == "unitree-sim/test/1/device-clock"
+        assert feedback.source_timestamp_ns == feedback.received_monotonic_ns == 1_000_000_000
+        assert (feedback.linear_x_mps, feedback.angular_z_rps) == (0.25, 0.5)
+    finally:
+        simulation.close()

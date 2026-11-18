@@ -168,7 +168,8 @@ class Device:
                 received_monotonic_ns=clock.monotonic_ns(),
                 frame_id=self.frame_id, linear_x_mps=float(linear[0]), linear_y_mps=float(linear[1]),
                 linear_z_mps=float(linear[2]), angular_x_rps=float(angular[0]), angular_y_rps=float(angular[1]),
-                angular_z_rps=float(angular[2]), source_id='unitree-sim/%s/%s/%s' % (*self.scope, mapping['clock_id']),
+                angular_z_rps=float(angular[2]),
+                source_id='unitree-sim/%s/%s/%s' % (*self.scope, payload['source_clock_mapping']['clock_id']),
                 orientation_wxyz=tuple(float(x) for x in velocity['reference_orientation_wxyz']))
 
     def is_available(self):

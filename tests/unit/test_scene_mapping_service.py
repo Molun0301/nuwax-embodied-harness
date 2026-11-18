@@ -172,7 +172,7 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
 
     memory, backend, service = setup.memory, setup.backend, setup.service
     start = utc_now()
-    monkeypatch.setattr(mapping_module, 'utc_now', lambda: start)
+    monkeypatch.setattr(mapping_module.clock, 'source_now_ns', lambda: round(start.timestamp() * 1e9))
     backend.winner = 'kitchen'
     for x in (2, 3):
         remember(setup, x, timestamp=start)
@@ -181,7 +181,7 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
     before_revision = service.get_map()['regions'][0]['metadata']['scene_revision']
 
     later = start + timedelta(seconds=service.config.max_evidence_age_sec + 2)
-    monkeypatch.setattr(mapping_module, 'utc_now', lambda: later)
+    monkeypatch.setattr(mapping_module.clock, 'source_now_ns', lambda: round(later.timestamp() * 1e9))
     remember(setup, 2.2, timestamp=later)
     backend.winner = 'bedroom'
     result = service.run_once(apply_labels=True)

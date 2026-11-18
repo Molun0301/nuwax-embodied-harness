@@ -969,7 +969,7 @@ async fn relocalize_entry_waits_for_five_recent_frames_or_the_limit() {
     let feeder = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         for stamp in 1..=5 {
-            recent.lock().push_back((Instant::now(), crate::mapper::tests::room_frame(717, stamp)));
+            recent.lock().push_back((clock::Instant::now(), crate::mapper::tests::room_frame(717, stamp)));
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });

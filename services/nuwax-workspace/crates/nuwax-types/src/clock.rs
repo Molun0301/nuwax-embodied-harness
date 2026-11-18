@@ -92,11 +92,8 @@ pub fn monotonic_ns() -> u64 {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut sample) } == 0 {
-            sample.tv_sec as u64 * 1_000_000_000 + sample.tv_nsec as u64
-        } else {
-            0
-        }
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut sample) };
+        sample.tv_sec as u64 * 1_000_000_000 + sample.tv_nsec as u64
     }
 }
 

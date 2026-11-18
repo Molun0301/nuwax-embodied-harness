@@ -225,8 +225,7 @@ class SceneMappingService:
         return capture, written
 
     def _evidence(self, space, capture):
-        now_ns = (clock.source_now_ns() if clock.uses_device_clock()
-                  else round(utc_now().timestamp() * 1e9))
+        now_ns = clock.source_now_ns()
         selected, seen = [], set()
         for entry in capture["entries"]:
             if entry.map_name != space.map_name or entry.pose is None:

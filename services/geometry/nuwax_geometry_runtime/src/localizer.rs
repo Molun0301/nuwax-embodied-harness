@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 pub(super) struct TrackingUpdate {
     pub score: RelocalizationScore,
     pub bad_rounds: u32,
-    pub limited: bool,
     pub timestamp_ns: u64,
 }
 
@@ -58,7 +57,6 @@ impl Localizer {
                 let _ = sender.send(TrackingUpdate {
                     score: round.score,
                     bad_rounds,
-                    limited: round.limited,
                     timestamp_ns: super::now_ns(),
                 });
             }
@@ -82,7 +80,6 @@ impl Localizer {
 
 pub(super) struct TrackingRound {
     pub correction: Option<Isometry3<f64>>,
-    pub limited: bool,
     pub score: RelocalizationScore,
     pub source_points: usize,
     pub target_points: usize,
@@ -121,15 +118,11 @@ pub(super) fn compute_round(
     let started = Instant::now();
     let score = score_relocalization(&source, candidate, target);
     let scoring_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut limited = false;
-    let correction = score.accepts(&candidate).then(|| {
-        let (transform, truncated) = constrained_step(&source, target, initial, candidate, odom);
-        limited = truncated;
-        transform
-    });
+    let correction = score
+        .accepts(&candidate)
+        .then(|| constrained_step(&source, target, initial, candidate, odom));
     Some(TrackingRound {
         correction,
-        limited,
         score,
         source_points: source.points.len(),
         target_points: local.len(),
@@ -193,7 +186,7 @@ fn constrained_step(
     initial: Isometry3<f64>,
     candidate: Isometry3<f64>,
     odom: Isometry3<f64>,
-) -> (Isometry3<f64>, bool) {
+) -> Isometry3<f64> {
     let mut information = Matrix3::zeros();
     let mut inliers = 0;
     for (point, normal) in source.points.iter().zip(&source.normals) {
@@ -218,17 +211,12 @@ fn constrained_step(
             constrained += direction * direction.dot(&delta);
         }
     }
-    let translation_scale = (0.02 / constrained.norm()).min(1.0);
-    let translation = p0.translation.vector + constrained * translation_scale;
+    let translation = p0.translation.vector + constrained * (0.02 / constrained.norm()).min(1.0);
     let angle = (p0.rotation.inverse() * p1.rotation).angle();
-    let rotation_scale = (0.2_f64.to_radians() / angle).min(1.0);
     let rotation = p0
         .rotation
-        .slerp(&p1.rotation, rotation_scale);
-    (
-        Isometry3::from_parts(Translation3::from(translation), rotation) * odom.inverse(),
-        translation_scale < 1.0 || rotation_scale < 1.0,
-    )
+        .slerp(&p1.rotation, (0.2_f64.to_radians() / angle).min(1.0));
+    Isometry3::from_parts(Translation3::from(translation), rotation) * odom.inverse()
 }
 
 #[cfg(test)]

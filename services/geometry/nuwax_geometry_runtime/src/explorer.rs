@@ -213,11 +213,6 @@ impl Explorer {
             })
             .unwrap_or_default();
         return_policy.validate().map_err(Status::invalid_argument)?;
-        if self.surface_config.is_some() && stop.max_coverage_pct.is_some() {
-            return Err(Status::invalid_argument(
-                "三维探索不能用未知总体积计算覆盖率",
-            ));
-        }
         if !request.blacklist_radius_m.is_finite()
             || request.blacklist_radius_m < 0.0
             || stop

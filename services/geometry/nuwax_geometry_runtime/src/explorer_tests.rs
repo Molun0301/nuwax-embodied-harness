@@ -247,6 +247,22 @@ fn max_goals_does_not_count_failed_child_as_reached() {
     assert_ne!(next.status.phase, proto::ExplorationPhase::Succeeded as i32);
 }
 #[test]
+fn surface_exploration_accepts_coverage_stop_without_a_grid() {
+    let mut explorer = make_explorer("住宅".into(), "map".into(), true).unwrap();
+    let mut request = request();
+    request.stop_conditions = Some(proto::ExplorationStopConditions {
+        max_coverage_pct: Some(50.),
+        ..Default::default()
+    });
+    let started = explorer.start("三维探索".into(), request).unwrap();
+    assert_eq!(started.phase, proto::ExplorationPhase::Running as i32);
+    let update = explorer
+        .tick(Some(pose()), None, Err("曲面快照尚未生成".into()), Ok(()))
+        .unwrap();
+    assert_eq!(update.status.phase, proto::ExplorationPhase::Running as i32);
+}
+
+#[test]
 fn coverage_stop_counts_only_cells_inside_requested_boundary() {
     for inside_known in [false, true] {
         let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();

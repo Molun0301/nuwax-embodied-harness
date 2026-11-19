@@ -231,7 +231,8 @@ TEXT = {"type": "string"}
 TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
 CHECKPOINT = {"type": "string", "minLength": 1}
 POINT = schema({"x": NUMBER, "y": NUMBER}, ("x", "y"))
-CONDITIONS = schema({"max_coverage_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
+CONDITIONS = schema({"max_coverage_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100,
+    "description": "地图覆盖率停止条件（百分比），仅二维建图生效。"},
     "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
     "max_duration_ms": {"type": "integer", "minimum": 1},
     "max_goals": {"type": "integer", "minimum": 1}})

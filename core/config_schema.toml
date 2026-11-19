@@ -2434,6 +2434,7 @@ description = "日志轮转保留的历史文件数量。网关立即生效，�
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
+    "scripts/supervisor.py:Supervisor.start_component",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.backup_count",
 ]
 apply = "hot"
@@ -2593,6 +2594,7 @@ description = "单个日志文件的轮转容量（字节）。网关立即生�
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
+    "scripts/supervisor.py:Supervisor.start_component",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.max_bytes",
 ]
 apply = "hot"

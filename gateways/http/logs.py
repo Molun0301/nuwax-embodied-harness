@@ -27,6 +27,7 @@ from core.process_title import set_process_title
 _TEXT_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d[,.]\d+)\s+\[(?P<level>\w+)\]\s+\[(?P<component>[^]]+)\]\s*(?P<message>.*)$")
 _RUST_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\dT\S+)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<message>.*)$")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_RECENT_FILE_BYTES = 256 * 1024
 
 
 def _reverse_open_lines(handle, start: int, end: int):
@@ -49,13 +50,21 @@ def _reverse_open_lines(handle, start: int, end: int):
         yield start, pending.decode("utf-8", errors="replace"), start + len(pending) < end
 
 
-def _reverse_lines(path: Path) -> Iterator[tuple[int, str, os.stat_result]]:
+def _reverse_lines(path: Path, skipped_prefixes=None) -> Iterator[tuple[int, str, os.stat_result]]:
     """从文件尾部分块读取；历史大文件不会被一次读入内存。"""
     try:
         with path.open("rb") as handle:
             opened_stat = os.fstat(handle.fileno())
-            for offset, raw, _complete in _reverse_open_lines(handle, 0, opened_stat.st_size):
-                yield offset, raw, opened_stat
+            start = 0
+            starts_at_line = True
+            if skipped_prefixes is not None and opened_stat.st_size > _RECENT_FILE_BYTES:
+                skipped_prefixes.add(path)
+                start = opened_stat.st_size - _RECENT_FILE_BYTES
+                handle.seek(start - 1)
+                starts_at_line = handle.read(1) == b"\n"
+            for offset, raw, _complete in _reverse_open_lines(handle, start, opened_stat.st_size):
+                if offset != start or starts_at_line:
+                    yield offset, raw, opened_stat
     except FileNotFoundError:
         # 容量轮转恰好发生时，下一轮查询会从当前文件列表继续。
         return
@@ -155,11 +164,11 @@ def _entry_key(entry: dict) -> tuple[str, str]:
     return _time_key(entry["timestamp"]), str(entry["id"])
 
 
-def _component_entries(paths: list[Path], seen_files: set):
+def _component_entries(paths: list[Path], seen_files: set, skipped_prefixes=None):
     for path in paths:
         fallback_time = None
         continuation = []
-        for offset, raw, stat in _reverse_lines(path):
+        for offset, raw, stat in _reverse_lines(path, skipped_prefixes):
             if fallback_time is None:
                 identity = (stat.st_dev, stat.st_ino)
                 if identity in seen_files:
@@ -226,9 +235,11 @@ def _page_result(entries, sources, limit, *, cursor_expired=False, already_redac
 
 
 def _scan_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: str = "", level: str = "", source: str = "",
-               component: str = "", query: str = "", request_id: str = "", task_id: str = "") -> dict:
+               component: str = "", query: str = "", request_id: str = "", task_id: str = "",
+               recent: bool = False) -> dict:
     """按源时间和标识全局排序，仅保留页容量；线程写入造成的文件内乱序也不会漏页。"""
     sources = set()
+    skipped_prefixes = set() if recent else None
     matcher = _LogFilter(before, level, source, component, query, request_id, task_id)
     if not matcher.valid:
         return _page_result([], set(), limit, cursor_expired=True)
@@ -236,7 +247,7 @@ def _scan_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
     def candidates():
         seen_files = set()
         for paths in _log_paths(log_file, log_dir):
-            for entry in _component_entries(paths, seen_files):
+            for entry in _component_entries(paths, seen_files, skipped_prefixes):
                 key = _entry_key(entry)
                 if not matcher.before_key(key):
                     continue
@@ -246,7 +257,10 @@ def _scan_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
 
     # 不假定多线程写入的单个文件严格有序，选择最近一页而不把全量日志载入内存。
     entries = heapq.nlargest(limit + 1, candidates(), key=_entry_key)
-    return _page_result(entries, sources, limit)
+    result = _page_result(entries, sources, limit)
+    if skipped_prefixes and result["next_before"]:
+        result["has_more"] = True
+    return result
 
 
 _LOG_CACHE_MAX_QUERIES = 4
@@ -583,8 +597,13 @@ def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
     return result
 
 
-def _render_log_response(log_file, options, export_format, *, reader=None):
-    result = (query_logs if reader is None else reader)(log_file, **options)
+def _render_log_response(log_file, options, export_format, *, reader=None, recent_page=False):
+    if recent_page and export_format is None and not any(options.get(key) for key in
+            ("before", "level", "source", "component", "query", "request_id", "task_id")):
+        # 首屏只读各文件的末尾。历史翻页、筛选和导出仍走同一套持久索引。
+        result = _scan_logs(log_file, **options, recent=True)
+    else:
+        result = (query_logs if reader is None else reader)(log_file, **options)
     if export_format is None:
         return json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), {}
     rows = reversed(result["entries"])
@@ -612,7 +631,7 @@ def _log_query_process(connection):
             if request is None:
                 return
             try:
-                connection.send((True, _render_log_response(*request, reader=reader.query)))
+                connection.send((True, _render_log_response(*request, reader=reader.query, recent_page=True)))
             except Exception as error:
                 connection.send((False, f"{type(error).__name__}: {error}"))
     except (EOFError, BrokenPipeError):

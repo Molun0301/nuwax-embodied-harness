@@ -1,9 +1,11 @@
 """业务组件的唯一进程监督者：按需启动、状态查询和依序关闭。"""
 import asyncio
+from contextlib import suppress
 import ctypes
 from dataclasses import dataclass, field
 import fcntl
 import json
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import signal
@@ -74,12 +76,39 @@ class Component:
     enabled: bool = True
     process: object = None
     task: object = None
+    output_task: object = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     state: str = "stopped"
     exit_code: object = None
     error: object = None
     started_at: float = 0
     log_file: object = None
+
+
+class ComponentLog(RotatingFileHandler):
+    """按容量轮转组件的原始输出，保留字节和换行。"""
+
+    def __init__(self, path, max_bytes, backup_count):
+        super().__init__(path, maxBytes=max_bytes, backupCount=backup_count)
+        self.size = self.stream.tell()
+        self.line_start = True
+
+    def _open(self):
+        return open(self.baseFilename, "ab")
+
+    def append(self, chunk):
+        parts = (chunk.splitlines(keepends=True)
+                 if self.maxBytes and self.backupCount and self.size + len(chunk) > self.maxBytes
+                 else (chunk,))
+        for part in parts:
+            if (self.line_start and self.maxBytes and self.backupCount and self.size
+                    and self.size + len(part) > self.maxBytes):
+                self.doRollover()
+                self.size = 0
+            self.stream.write(part)
+            self.size += len(part)
+            self.line_start = part.endswith(b"\n")
+        self.stream.flush()
 
 
 def component_table(root, config):
@@ -142,20 +171,28 @@ class Supervisor:
     async def start_component(self, name, item):
         try:
             if item.process is None or item.process.returncode is not None:
+                if item.output_task is not None:
+                    await item.output_task
                 item.state, item.exit_code, item.error = "starting", None, None
                 if isinstance(item.ready, Path):
                     item.ready.parent.mkdir(parents=True, exist_ok=True)
                     item.ready.unlink(missing_ok=True)
-                from core.config import value
-                directory = Path(value("logging.dir"))
+                from core.config import read_config
+                settings = read_config(self.home)["logging"]
+                directory = Path(settings["dir"])
                 directory.mkdir(parents=True, exist_ok=True)
                 item.log_file = directory / (name + ".log")
-                with item.log_file.open("ab") as log:
+                log = ComponentLog(item.log_file, settings["max_bytes"], settings["backup_count"])
+                try:
                     item.process = await asyncio.create_subprocess_exec(*item.command, cwd=self.root,
                         env=dict(self.environment, **item.environment), stdin=subprocess.DEVNULL,
-                        stdout=log, stderr=log, start_new_session=True, preexec_fn=parent_death_signal)
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        start_new_session=True, preexec_fn=parent_death_signal)
+                except BaseException:
+                    log.close()
+                    raise
                 item.started_at = time.monotonic()
-                self.background_task(self.watch(item, item.process))
+                item.output_task = self.background_task(self.watch(item, item.process, log))
             deadline = time.monotonic() + READY_TIMEOUT
             while item.process.returncode is None and not self.stopping.is_set():
                 if item.ready is None or (item.ready.exists() if isinstance(item.ready, Path) else item.ready()):
@@ -171,7 +208,25 @@ class Supervisor:
                 item.state = "exited"
             return {"ok": False, "component": name, "error": item.error}
 
-    async def watch(self, item, process):
+    async def watch(self, item, process, log):
+        try:
+            while True:
+                chunk = await process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                if log is not None:
+                    try:
+                        log.append(chunk)
+                    except OSError as error:
+                        # 文件写失败后仍消费管道，避免组件因管道写满而停住。
+                        with suppress(OSError):
+                            log.close()
+                        log = None
+                        with suppress(OSError):
+                            print(f"组件日志写入失败：{item.log_file}：{error}", file=sys.stderr)
+        finally:
+            if log is not None:
+                log.close()
         code = await process.wait()
         if item.process is process:
             item.state, item.exit_code = "exited", code

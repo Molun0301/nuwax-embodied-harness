@@ -5060,6 +5060,7 @@
           updateOverviewForFrame = updateRobotStateFrame(frame);
         } else if (frame.topic === "geometry.state") {
           state.latestGeometryState = frame.payload;
+          window.dispatchEvent?.(new CustomEvent("stream:geometry.state", {detail: frame.payload}));
           if (frame.payload.phase === "idle") {
             updateMap({...envelopeFromFrame(frame, {}), status: "cleared"});
             hideMapPose();

@@ -390,6 +390,17 @@ button{font-family:inherit;cursor:pointer}
 #live-map .forbidden-zone-item-meta{color:var(--muted);font-size:var(--fs-xs)}
 #live-map .forbidden-zone-item button{height:22px;padding:0 8px;border:0;border-radius:var(--r-xs);background:var(--inset);color:var(--muted);font:inherit;font-size:var(--fs-sm);cursor:pointer}
 #live-map .forbidden-zone-item button:hover:not(:disabled){background:var(--bad-w);color:var(--bad)}
+/* 地图管理：当前地图醒目，列表每行一张地图，操作按钮靠右。 */
+#live-map .map-manager-current{font-size:var(--fs-md);font-weight:660;color:var(--ink);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#live-map .map-manager-list{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none;max-height:220px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+#live-map .map-manager-item{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:4px 6px 4px 10px;
+  border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface)}
+#live-map .map-manager-item[data-current="true"]{border-color:var(--info);background:var(--info-w);box-shadow:inset 3px 0 0 var(--info)}
+#live-map .map-manager-main{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;min-width:0}
+#live-map .map-manager-main strong{font-weight:600;color:var(--ink);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#live-map .map-manager-actions{flex:none;display:inline-flex;gap:6px}
+#live-map .map-manager-actions .msb-btn{min-height:26px;padding:0 9px}
+#live-map .map-manager-empty{padding:6px 2px;color:var(--muted);font-size:var(--fs)}
 /* 状态行：当前结果在前，说明文字随后；空项不占位。 */
 .msb-status{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 14px;margin:0;color:var(--strong);font-size:var(--fs-sm);line-height:1.55;min-width:0}
 .msb-status>*{min-width:0;overflow-wrap:anywhere}

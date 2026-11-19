@@ -56,6 +56,7 @@ pub struct Geometry {
     pub mapping_backend: String,
     pub mapping_confirmation_cell_m: f64,
     pub mapping_confirmation_frames: u32,
+    pub mapping_confirmation_ground_band_m: f64,
     pub mapping_confirmation_span_s: f64,
     pub mapping_confirmation_timeout_s: f64,
     pub mapping_dynamic_inflate_hits_dist_m: f32,

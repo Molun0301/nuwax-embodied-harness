@@ -223,7 +223,8 @@ def derived_values(values, code_root=CODE_ROOT):
             "min_executable_angular_rps": motion["MIN_EXECUTABLE_ANGULAR_RPS"],
             "actuator_max_linear_mps": float(linear),
             "actuator_max_yaw_rps": float(yaw), "actuator_motion_model": model if profile == "pct-scan-3d" else "",
-            "robot_geometry_json": geometry.to_runtime_json()}
+            "robot_geometry_json": geometry.to_runtime_json(),
+            "standing_ground_z_m": geometry.z_min_m + motion["STANDING_GROUND_OFFSET_M"]}
 
 
 def read_config(home=None, code_root=CODE_ROOT):

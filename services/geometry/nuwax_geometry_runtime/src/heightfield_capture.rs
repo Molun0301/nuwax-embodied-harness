@@ -767,7 +767,9 @@ pub(super) fn capture(
     }
     Ok(indices)
 }
-/// 本帧分类：返回待替换的列记录和归入地面的点索引，写入由 `capture` 完成。
+type GroundUpdates = BTreeMap<Xy, ColumnGroundRecords>;
+
+/// 本帧分类：返回待替换的列记录和归入地面的点索引。
 pub(super) fn classify(
     writer: &mut Writer,
     returns: &[Return],
@@ -775,7 +777,35 @@ pub(super) fn classify(
     sequence: u64,
     timestamp_ns: u64,
     source: Arc<LayerSource>,
-) -> Result<(BTreeMap<Xy, ColumnGroundRecords>, Vec<u32>), String> {
+) -> Result<(GroundUpdates, Vec<u32>), String> {
+    classify_frame(
+        writer, returns, removed, sequence, timestamp_ns, source,
+        None::<fn(&[u32]) -> Vec<u32>>,
+    ).map(|(updates, ground, _)| (updates, ground))
+}
+
+/// 完整帧决定本帧地面标签，地面记录只累积本次接纳的测量。
+pub(super) fn classify_building(
+    writer: &mut Writer,
+    returns: &[Return],
+    removed: &[Key],
+    sequence: u64,
+    timestamp_ns: u64,
+    source: Arc<LayerSource>,
+    select: impl FnOnce(&[u32]) -> Vec<u32>,
+) -> Result<(GroundUpdates, Vec<u32>, Vec<u32>), String> {
+    classify_frame(writer, returns, removed, sequence, timestamp_ns, source, Some(select))
+}
+
+fn classify_frame(
+    writer: &mut Writer,
+    returns: &[Return],
+    removed: &[Key],
+    sequence: u64,
+    timestamp_ns: u64,
+    source: Arc<LayerSource>,
+    select: Option<impl FnOnce(&[u32]) -> Vec<u32>>,
+) -> Result<(GroundUpdates, Vec<u32>, Vec<u32>), String> {
     let q = f64::from(writer.voxel_size_m());
     let touched: BTreeSet<_> = returns
         .iter()
@@ -805,6 +835,42 @@ pub(super) fn classify(
         sequence,
         timestamp_ns,
     };
+    if let Some(select) = select {
+        let classified: Vec<_> = columns.par_iter().with_min_len(256)
+            .map(|&(&xy, points)| frame.classify_column(xy, points))
+            .collect();
+        let mut indices = Vec::new();
+        for ((_, points), column) in columns.iter().zip(&classified) {
+            indices.extend(column.ground_indices(points));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let admitted = select(&indices);
+        let mut written = vec![false; returns.len()];
+        for &index in &admitted {
+            written[index as usize] = true;
+        }
+        let results: Vec<_> = columns.into_par_iter().zip(classified).with_min_len(256)
+            .map(|((&xy, points), mut column)| {
+                let selected: Vec<_> = points.iter().copied()
+                    .filter(|p| written[p.index as usize]).collect();
+                if selected.is_empty() {
+                    return Ok(None);
+                }
+                let heights: BTreeSet<_> = selected.iter().map(|p| p.key[2]).collect();
+                column.safe.retain(|z, _| heights.contains(z));
+                column.denied.retain(|z| heights.contains(z));
+                Ok(frame.record_column(xy, &selected, column)?.map(|record| (xy, record)))
+            })
+            .collect::<Vec<Result<_, String>>>();
+        let mut updates = BTreeMap::new();
+        for result in results {
+            if let Some((xy, record)) = result? {
+                updates.insert(xy, record);
+            }
+        }
+        return Ok((updates, indices, admitted));
+    }
     // 每个分片至少256列，减少细列任务的拆分与线程池窃取；结果仍按原列序合并。
     let results: Vec<_> = columns
         .par_iter()
@@ -822,7 +888,7 @@ pub(super) fn classify(
     }
     indices.sort_unstable();
     indices.dedup();
-    Ok((updates, indices))
+    Ok((updates, indices, Vec::new()))
 }
 /// 一帧分类的只读输入，供各列并行使用。
 struct Frame<'f, 'a> {
@@ -835,6 +901,19 @@ struct Frame<'f, 'a> {
     sequence: u64,
     timestamp_ns: u64,
 }
+struct ColumnClassification {
+    grouping: Vec<Group>,
+    safe: BTreeMap<i32, usize>,
+    denied: BTreeSet<i32>,
+    compatibility: BTreeMap<(usize, Bin), bool>,
+}
+
+impl ColumnClassification {
+    fn ground_indices<'a>(&'a self, points: &'a [&'a Return]) -> impl Iterator<Item = u32> + 'a {
+        points.iter().filter(|p| self.safe.contains_key(&p.key[2])).map(|p| p.index)
+    }
+}
+
 impl Frame<'_, '_> {
     /// 一个本帧回波列：返回变化后的列记录（无变化为 `None`）和归入地面的点索引。
     fn column(
@@ -842,17 +921,19 @@ impl Frame<'_, '_> {
         xy: Xy,
         points: &[&Return],
     ) -> Result<(Option<ColumnGroundRecords>, Vec<u32>), String> {
+        let classified = self.classify_column(xy, points);
+        let indices = classified.ground_indices(points).collect();
+        Ok((self.record_column(xy, points, classified)?, indices))
+    }
+
+    fn classify_column(&self, xy: Xy, points: &[&Return]) -> ColumnClassification {
         let Self {
             context,
             old,
             historical,
             q,
-            voxel,
-            source,
-            sequence,
-            timestamp_ns,
+            ..
         } = *self;
-        let mut indices = Vec::new();
         // Absence of a return is not counter-evidence. Original Writer::remove
         // already retracts removed occupancy. Halo participates in geometry only.
         let mut local = context.local(xy);
@@ -915,13 +996,25 @@ impl Frame<'_, '_> {
         // Ambiguous middle returns are still occupancy. They are not a reason
         // to retract an unseen old member, so never add these keys to denied.
         safe.retain(|_, g| !withheld.contains(g));
+        ColumnClassification { grouping, safe, denied, compatibility }
+    }
+
+    fn record_column(
+        &self,
+        xy: Xy,
+        points: &[&Return],
+        classified: ColumnClassification,
+    ) -> Result<Option<ColumnGroundRecords>, String> {
+        let ColumnClassification { grouping, safe, denied, compatibility } = classified;
+        let Self { old, q, voxel, source, sequence, timestamp_ns, .. } = *self;
+        let previous = old.get(&xy);
+        let olds: Vec<_> = previous.into_iter().flat_map(old_records).collect();
         let mut frames = BTreeMap::new();
         for (g, group) in grouping.iter().enumerate() {
             let mut counts: BTreeMap<i32, [u32; 8]> = BTreeMap::new();
             let mut samples = Vec::new();
             for p in points.iter().filter(|p| safe.get(&p.key[2]) == Some(&g)) {
                 counts.entry(p.key[2]).or_default()[p.bin.rem_euclid(8) as usize] += 1;
-                indices.push(p.index);
                 samples.push(LayerSample {
                     source: source.clone(),
                     point: p.point,
@@ -945,7 +1038,7 @@ impl Frame<'_, '_> {
                 .collect();
             let matching: Vec<_> = frames
                 .iter()
-                .filter(|(_, (g, _, _))| compatible(i, g.seed, &mut local, context))
+                .filter(|(_, (g, _, _))| compatibility[&(i, g.seed)])
                 .map(|(&g, _)| g)
                 .collect();
             if matching.len() == 1 {
@@ -1000,12 +1093,7 @@ impl Frame<'_, '_> {
         // This actual XY was classified, even when mixed/dynamic returns leave
         // no ground declaration. Preserve that distinction beside occupancy.
         next.classified_empty = next.heightfields.is_empty();
-        Ok((
-            previous
-                .is_none_or(|before| before != &next)
-                .then_some(next),
-            indices,
-        ))
+        Ok(previous.is_none_or(|before| before != &next).then_some(next))
     }
 }
 fn sample_member(sample: &LayerSample, q: f64) -> Option<i32> {

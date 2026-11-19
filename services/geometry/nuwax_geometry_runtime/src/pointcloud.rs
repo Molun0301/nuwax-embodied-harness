@@ -68,6 +68,8 @@ struct StructureUpdates {
     min_frames: u32,
     min_span_ns: u64,
     timeout_ns: u64,
+    ground_band_m: f64,
+    standing_ground_z_m: f64,
     base: VoxelIndex,
     candidates: AHashMap<VoxelKey, StructureCandidate>,
     confirmed: VoxelIndex,
@@ -81,12 +83,19 @@ struct StructureCandidate {
 
 impl StructureUpdates {
     fn from_runtime() -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct StandingGround {
+            standing_ground_z_m: f64,
+        }
         let geometry = nuwax_config::geometry()?;
+        let ground: StandingGround = nuwax_config::section("derived")?;
         Ok(Self {
             cell_voxels: (geometry.mapping_confirmation_cell_m / f64::from(VOXEL_SIZE)).round() as i32,
             min_frames: geometry.mapping_confirmation_frames,
             min_span_ns: (geometry.mapping_confirmation_span_s * 1e9) as u64,
             timeout_ns: (geometry.mapping_confirmation_timeout_s * 1e9) as u64,
+            ground_band_m: geometry.mapping_confirmation_ground_band_m,
+            standing_ground_z_m: ground.standing_ground_z_m,
             base: VoxelIndex::default(),
             candidates: AHashMap::new(),
             confirmed: VoxelIndex::default(),
@@ -132,22 +141,28 @@ impl StructureUpdates {
         confirmed
     }
 
-    /// 地面直接接纳，既不等待确认，也不为同粗格的非地面回波计票。
+    /// 只有站立地面薄层内的地面回波免确认，也不为其他回波计票。
     fn select_building(
         &mut self,
         points: &[Point3<f64>],
         static_indices: &[u32],
         ground: &[u32],
+        body_z: f64,
         stamp: u64,
     ) -> Vec<u32> {
-        let mut ground_mask = vec![false; points.len()];
+        let surface_z = body_z + self.standing_ground_z_m;
+        let mut exempt = vec![false; points.len()];
+        let mut immediate = Vec::new();
         for &index in ground {
-            ground_mask[index as usize] = true;
+            if (points[index as usize].z - surface_z).abs() <= self.ground_band_m {
+                exempt[index as usize] = true;
+                immediate.push(index);
+            }
         }
-        let non_ground = static_indices.iter().copied()
-            .filter(|&index| !ground_mask[index as usize]);
-        let mut admitted = self.select(points, non_ground, stamp);
-        admitted.extend_from_slice(ground);
+        let candidates = static_indices.iter().copied()
+            .filter(|&index| !exempt[index as usize]);
+        let mut admitted = self.select(points, candidates, stamp);
+        admitted.extend(immediate);
         admitted.sort_unstable();
         admitted
     }
@@ -413,6 +428,7 @@ impl CloudMap {
         )?;
         dynamic.bind_points(points, &indices);
         let stamp = frame.odom_pose.timestamp_ns;
+        let body_z = (map_from_odom * odom).translation.z;
         let updates = &mut self.structure_updates;
         let (ground_indices, admitted_indices) = self.fine.accumulate_building(
             self.session_id,
@@ -422,7 +438,7 @@ impl CloudMap {
             origin,
             stamp,
             dynamic.clone(),
-            |ground| updates.select_building(points, &indices, ground, stamp),
+            |ground| updates.select_building(points, &indices, ground, body_z, stamp),
         )?;
         self.dense.remove_cleared(&dynamic)?;
         let retained: Vec<_> = points

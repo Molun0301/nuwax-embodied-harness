@@ -748,6 +748,12 @@ async fn building_ground_and_recent_are_immediate_on_start_and_resume() {
     async fn feed(mapper: &Mapper, session: u64, stamp: u64, x: f64) {
         let mut frame = room_frame(session, stamp);
         frame.odom_pose.position.as_mut().unwrap().x += x;
+        let derived: serde_json::Value = nuwax_config::section("derived").unwrap();
+        let ground_z = derived["standing_ground_z_m"].as_f64().unwrap();
+        for point in &mut frame.points_body {
+            point[2] += ground_z;
+        }
+        frame.ray_origin_body[2] += ground_z;
         let raw_points = frame.points_body.len() as i32;
         mapper.feed(frame);
         let surface = mapper.surface_map().await.unwrap().unwrap();

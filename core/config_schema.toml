@@ -1676,6 +1676,14 @@ description = "同一粗格确认所需的最少命中帧数，每帧只计一�
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_frames"]
 apply = "restart"
 
+[geometry.mapping_confirmation_ground_band_m]
+type = "float"
+min = 0.0
+default = 0.05
+description = "建图时，已标为地面的回波距站立地面的最大免确认高度差（米）。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_ground_band_m"]
+apply = "restart"
+
 [geometry.mapping_confirmation_span_s]
 type = "float"
 min = 0.0

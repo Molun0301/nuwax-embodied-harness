@@ -1,44 +1,63 @@
 use super::*;
 
 #[test]
-fn building_ground_is_written_on_first_frame() {
+fn building_ground_band_writes_only_nearby_ground_on_first_frame() {
     let mut map = CloudMap::new(975, None, None).unwrap();
     let size = f64::from(VOXEL_SIZE);
-    let points: Vec<_> = (-4..=4).flat_map(|x| {
+    let mut points: Vec<_> = (-4..=4).flat_map(|x| {
         (-4..=4).map(move |y| Point3::new(
             (f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size, 0.02,
         ))
     }).collect();
+    let floor_count = points.len();
+    let upper: Vec<_> = points.iter().map(|p| p + nalgebra::Vector3::new(2., 0., 0.15)).collect();
+    points.extend(upper);
     let all: Vec<_> = (0..points.len() as u32).collect();
     let updates = &mut map.structure_updates;
+    let body_z = 0.02 - updates.standing_ground_z_m;
     let (ground, admitted) = map.fine.accumulate_building(
         975, "地面回波", 1, &points, [0., 0., 0.5], 1,
         crate::dynamic_backend::MappedFrame::unfiltered(),
-        |ground| updates.select_building(&points, &all, ground, 1),
+        |ground| updates.select_building(&points, &all, ground, body_z, 1),
     ).unwrap();
     assert_eq!(ground, all);
-    assert_eq!(admitted, all);
+    assert_eq!(admitted, all[..floor_count]);
 
     let sealed = map.fine.seal(domain(975), 1, 1).unwrap();
     let mut reader = nuwax_map_chunks::RegionReader::new(sealed.repository.clone(), 1024 * 1024);
     let occupied = reader.region(
-        sealed.manifest(), [-4, -4, 0], [4, 4, 0], points.len()
+        sealed.manifest(), [-4, -4, 0], [44, 4, 4], points.len()
     ).unwrap();
-    assert_eq!(occupied.len(), points.len());
+    assert_eq!(occupied.len(), floor_count);
+    assert!(occupied.iter().all(|(key, _)| key[2] == 0));
 }
 
 #[test]
-fn building_ground_does_not_confirm_non_ground_hits_in_same_cell() {
+fn building_ground_band_does_not_confirm_other_returns_in_same_cell() {
     let mut updates = StructureUpdates::from_runtime().unwrap();
-    let points = [Point3::new(0.025, 0.025, 0.02), Point3::new(0.025, 0.025, 0.12)];
+    let points = [
+        Point3::new(0.025, 0.025, 0.02),
+        Point3::new(0.025, 0.025, 0.12),
+        Point3::new(0.025, 0.025, -0.05),
+        Point3::new(0.025, 0.025, 0.06),
+    ];
+    let body_z = 0.02 - updates.standing_ground_z_m;
     for i in 0..5 {
-        assert_eq!(updates.select_building(&points, &[0], &[0], 1 + i * 250_000_000), vec![0]);
+        assert_eq!(
+            updates.select_building(&points, &[0], &[0], body_z, 1 + i * 250_000_000),
+            vec![0],
+        );
     }
     for i in 0..4 {
-        assert_eq!(updates.select_building(&points, &[0, 1], &[0], 2_000_000_000 + i * 250_000_000),
-            vec![0]);
+        assert_eq!(
+            updates.select_building(&points, &[0, 1, 2, 3], &[0, 1, 2], body_z, 2_000_000_000 + i * 250_000_000),
+            vec![0],
+        );
     }
-    assert_eq!(updates.select_building(&points, &[0, 1], &[0], 3_000_000_000), vec![0, 1]);
+    assert_eq!(
+        updates.select_building(&points, &[0, 1, 2, 3], &[0, 1, 2], body_z, 3_000_000_000),
+        vec![0, 1, 2, 3],
+    );
 }
 
 #[test]

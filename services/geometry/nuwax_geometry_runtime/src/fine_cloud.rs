@@ -216,15 +216,19 @@ impl FineCloud {
                 runtime_generation: 1,
                 session_generation: session_id,
             });
-            let (updates, ground) = heightfield_capture::classify(
-                &mut self.writer, &returns, &removed, sequence, stamp, source,
-            )?;
-            let mut admitted = Vec::new();
-            if let Some(select) = select {
-                admitted = select(&ground);
-                let occupied = admitted.iter().map(|&i| keys[i as usize]).collect();
+            let (updates, ground, admitted) = if let Some(select) = select {
+                let result = heightfield_capture::classify_building(
+                    &mut self.writer, &returns, &removed, sequence, stamp, source, select,
+                )?;
+                let occupied = result.2.iter().map(|&i| keys[i as usize]).collect();
                 self.write_occupancy(occupied, stamp)?;
-            }
+                result
+            } else {
+                let (updates, ground) = heightfield_capture::classify(
+                    &mut self.writer, &returns, &removed, sequence, stamp, source,
+                )?;
+                (updates, ground, Vec::new())
+            };
             if !updates.is_empty() {
                 self.writer.replace_ground_columns(updates.iter().map(|(xy, value)| (*xy, value)))?;
             }

@@ -1,7 +1,7 @@
 """网关的唯一装配根，进程启停交给业务监督者。"""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import logging
 import os
 from pathlib import Path
@@ -113,11 +113,11 @@ def build_platform(config) -> Platform:
     platform.events = EventBus()
     platform.robot = create_active_robot_assembly(config)
     platform.capabilities = CapabilityTable()
-    for cap in (system.CAPABILITIES + maps.CAPABILITIES + motion.CAPABILITIES + navigation.CAPABILITIES
-                + exploration.CAPABILITIES + building.CAPABILITIES + cleanup.CAPABILITIES
-                + memory.CAPABILITIES + perception_caps.CAPABILITIES + skills_caps.CAPABILITIES + follow.CAPABILITIES
-                + manipulation.CAPABILITIES):
-        platform.capabilities.register(cap)
+    for module, group in ((system, "系统与任务"), (maps, "地图"), (motion, "运动"), (navigation, "导航"),
+                          (exploration, "探索"), (building, "跨楼层"), (cleanup, "地图清理"), (memory, "记忆与语义"),
+                          (perception_caps, "感知"), (skills_caps, "找目标"), (follow, "跟随"), (manipulation, "操作")):
+        for cap in module.CAPABILITIES:
+            platform.capabilities.register(replace(cap, group=group))
     platform.tasks = TaskRunner(platform)
     home = os.environ.get("NUWAX_INSTALL_HOME", config.base_dir)
     platform.motion = MotionClient(motion_guard_socket(home))

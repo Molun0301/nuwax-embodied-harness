@@ -149,8 +149,9 @@
     captureClickFromMap();
     window.addEventListener('stream:tasks.state', event => applyTask(event.detail));
     window.addEventListener('stream:navigation.state', event => {
-      const value = event.detail;
-      if (state.active && value) state.detailEl.textContent = value.message || value.status || '';
+      // 三维地图转发的同名事件不带文字，只在有文字时更新，不清空已显示的详情。
+      const text = event.detail?.message || event.detail?.status;
+      if (state.active && text) state.detailEl.textContent = text;
     });
     setStatus(PICK_HINT, 'idle');
   }

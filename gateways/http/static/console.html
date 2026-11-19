@@ -21,9 +21,15 @@
       <div class="vstat"><div class="v mono" id="networkLatency">--</div><div class="l">CPU</div></div>
       <div class="vstat"><div class="v mono" id="resourceMetric">--</div><div class="l">内存</div></div>
       <div class="vstat" title="浏览器与网关实时连接的一次往返耗时；尚未收到回应时显示已等待的时间。"><div class="v mono" id="lastReceive">--</div><div class="l">连接往返</div></div>
+      <div class="vstat volume-stat" id="volumeStat" hidden><div class="v"><input id="volumeSlider" type="range" min="0" max="100" step="1" value="0" aria-label="设备音量"><span id="volumeValue" class="mono">--</span></div><div class="l" id="volumeLabel">音量</div></div>
+    </div>
+    <div class="estop-wrap">
+      <button id="emergencyStop" class="estop" type="button" title="立即停止所有运动、取消运动任务并停止导航与探索（stop_all_motion）">急停</button>
+      <span id="emergencyStopStatus" class="estop-status" role="status"></span>
     </div>
     <div class="seg">
       <button class="view-switch-btn active" id="viewSwitchMonitor" type="button" data-view-target="monitor-view">监控</button>
+      <button class="view-switch-btn" id="viewSwitchCapabilities" type="button" data-view-target="capabilities-view" title="智能体可用的全部能力，按参数填写后直接调用">能力</button>
       <button class="view-switch-btn" id="viewSwitchLogs" type="button" data-view-target="logs-view">日志</button>
       <button class="view-switch-btn" id="viewSwitchConfig" type="button" data-view-target="config-view">设置</button>
     </div>
@@ -49,6 +55,7 @@
 <button id="mapCleanupToggle" class="tool map-action-button" type="button" aria-label="清理已完成地图" aria-controls="mapCleanupPanel" aria-expanded="false"><span>清理</span></button>
 <span class="map-actions-divider"></span>
 <button id="mapNavToggle" class="tool map-action-button" type="button" aria-label="导航" title="导航" aria-expanded="false" aria-controls="navigation-container"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 11 16-7-7 16-2-7-7-2Z"/></svg><span>导航</span></button>
+<button id="mapMotionToggle" class="tool map-action-button" type="button" aria-label="运动" title="运动控制：移动、动作、姿态与设置" aria-expanded="false" aria-controls="motionPanel" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3m3-3 3 3M12 21l-3-3m3 3 3-3M3 12l3-3m-3 3 3 3M21 12l-3-3m3 3-3 3"/></svg><span>运动</span></button>
 <button id="mapBoundaryToggle" class="tool map-action-button" type="button" aria-label="禁行区" title="禁行区" aria-expanded="false" aria-controls="boundary-draw-container"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="m6 18 12-12"/></svg><span>禁行区</span></button></nav>
               <div class="map-header-actions">
               <div class="map-camera-dock map-tool-group" aria-label="地图镜头">
@@ -185,10 +192,53 @@
                   <button id="semanticMemoryClose" class="msb-close" type="button" aria-label="收起物品" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
 
+                <section id="motionPanel" class="map-drawer map-subpanel motion-panel" aria-label="运动控制" hidden>
+                  <div class="msb-body">
+                    <div class="msb-row" data-motion-capability="relative_move">
+                      <span class="msb-lead">移动</span>
+                      <label class="msb-field">速度（米/秒）<input id="motionSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.2"></label>
+                      <label class="msb-field">转速（弧度/秒）<input id="motionTurnSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.5"></label>
+                      <label class="msb-field">时长（秒）<input id="motionDuration" class="msb-input msb-num" type="number" min="0.1" step="0.1" value="1"></label>
+                      <div class="msb-group motion-pad" role="group" aria-label="移动方向">
+                        <button class="msb-btn" type="button" data-move="forward">前进</button>
+                        <button class="msb-btn" type="button" data-move="backward">后退</button>
+                        <button class="msb-btn" type="button" data-move="left">左移</button>
+                        <button class="msb-btn" type="button" data-move="right">右移</button>
+                        <button class="msb-btn" type="button" data-move="turn_left">左转</button>
+                        <button class="msb-btn" type="button" data-move="turn_right">右转</button>
+                      </div>
+                    </div>
+                    <div class="msb-row" data-motion-capability="execute_sport_command">
+                      <span class="msb-lead">动作</span>
+                      <select id="motionAction" class="msb-input" aria-label="机身动作"></select>
+                      <span id="motionActionParams" class="msb-group"></span>
+                      <button id="motionActionRun" class="msb-btn primary" type="button">执行动作</button>
+                    </div>
+                    <div class="msb-row" data-motion-capability="set_body_pose">
+                      <span class="msb-lead">姿态</span>
+                      <label class="msb-field">横滚<input id="motionPose-roll" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
+                      <label class="msb-field">俯仰<input id="motionPose-pitch" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
+                      <label class="msb-field">偏航<input id="motionPose-yaw" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
+                      <span class="msb-note">弧度</span>
+                      <button id="motionPoseApply" class="msb-btn" type="button">应用姿态</button>
+                    </div>
+                    <div class="msb-row motion-settings">
+                      <span class="msb-lead">设置</span>
+                      <span class="msb-group" data-motion-capability="set_speed_level"><label class="msb-field">速度档位<select id="motionSpeedLevel" class="msb-input"></select></label><button id="motionSpeedLevelApply" class="msb-btn" type="button">设置</button></span>
+                      <span class="msb-sep" aria-hidden="true"></span>
+                      <span class="msb-group" data-motion-capability="set_obstacle_avoidance"><label class="msb-field">实时避障<select id="motionAvoidance" class="msb-input"><option value="true">开启</option><option value="false">关闭</option></select></label><button id="motionAvoidanceApply" class="msb-btn" type="button">应用</button></span>
+                      <span class="msb-sep" aria-hidden="true"></span>
+                      <span class="msb-group" data-motion-capability="switch_control_mode"><label class="msb-field">控制模式<select id="motionMode" class="msb-input"></select></label><button id="motionModeApply" class="msb-btn" type="button">切换</button></span>
+                    </div>
+                    <p class="msb-status"><span id="motionStatus" role="status">按钮直接执行，机器人会按所选动作运动；需要立即停下时点页面顶部“急停”。</span></p>
+                  </div>
+                  <button class="msb-close" type="button" data-map-panel-close="motionPanel" aria-label="收起运动控制">×</button>
+                </section>
                 <section id="navigation-container" class="navigation-panel map-drawer map-subpanel" data-role="v2-navigation" aria-label="导航" hidden>
                   <div class="msb-body msb-tabbed">
                     <div class="msb-seg" role="tablist" aria-label="导航方式">
                       <button type="button" role="tab" data-nav-tab="goal" aria-selected="true">选点导航</button>
+                      <button type="button" role="tab" data-nav-tab="named" aria-selected="false">按名称</button>
                       <button type="button" role="tab" data-nav-tab="explore" aria-selected="false">自动探索</button>
                       <button type="button" role="tab" data-nav-tab="floor" aria-selected="false" hidden>跨楼层</button>
                     </div>
@@ -201,6 +251,19 @@
                         </div>
                       </div>
                       <p class="msb-status"><span data-role="nav-status" aria-live="polite">未选点</span><span data-role="nav-detail" class="msb-meta"></span><span class="msb-note">双击地图选点，双击后按住拖动设定朝向；单击拖动照常旋转平移地图。</span></p>
+                    </div>
+                    <div class="msb-pane" data-nav-pane="named" role="tabpanel">
+                      <div class="msb-row">
+                        <label class="msb-field">名称<input id="namedNavTarget" class="msb-input" list="namedNavNames" placeholder="地点、区域或物品名称" autocomplete="off"></label>
+                        <datalist id="namedNavNames"></datalist>
+                        <label class="msb-check" title="到达后连拍核对目标，失败会降权并报告原因"><input id="namedNavVerify" type="checkbox" checked>到达后核对</label>
+                        <div class="msb-group">
+                          <button id="namedNavSubmit" class="msb-btn primary" type="button">前往</button>
+                          <button id="namedNavCancel" class="msb-btn" type="button" disabled>取消</button>
+                          <button id="namedNavRefresh" class="msb-btn" type="button">刷新名称</button>
+                        </div>
+                      </div>
+                      <p class="msb-status"><span id="namedNavStatus" role="status">按当前地图记忆中的地点、区域或物品名称前往（navigate_to_named_location）。</span></p>
                     </div>
                     <details class="exploration-mission msb-pane" data-role="exploration-mission" data-nav-pane="explore" role="tabpanel">
                       <summary>自动探索与恢复</summary>
@@ -398,6 +461,29 @@
       </div></div>
       <div class="overview-hidden"><section id="overviewGrid" aria-hidden="true"></section></div>
     </div>
+    <div id="capabilities-view" class="view-pane">
+      <section class="card cfg capability-view rise" aria-label="全部能力">
+        <aside class="cfg-side" aria-label="能力列表">
+          <div class="capability-search"><input id="capabilitySearch" class="field" type="search" placeholder="搜索能力名、说明或分组" aria-label="搜索能力"></div>
+          <nav id="capabilityNav" class="cfg-nav capability-nav" aria-label="按分组的能力"></nav>
+        </aside>
+        <div class="cfg-main capability-main">
+          <header class="page-head">
+            <div class="capability-heading"><h2 id="capabilityTitle" class="mono">全部能力</h2><div id="capabilityMeta" class="capability-meta"></div></div>
+          </header>
+          <div class="capability-body">
+            <p id="capabilityDescription" class="capability-description">这里列出智能体可用的全部能力，按参数说明填写后直接调用，与智能体走同一调用接口。留空的可选参数不发送，由能力使用默认值。</p>
+            <form id="capabilityForm" class="capability-form" novalidate></form>
+            <div class="capability-actions">
+              <button id="capabilitySubmit" class="btn primary" type="button" hidden>执行</button>
+              <button id="capabilityCancel" class="btn" type="button" hidden>取消任务</button>
+              <span id="capabilityStatus" class="capability-status" role="status"></span>
+            </div>
+            <pre id="capabilityResult" class="capability-result" hidden></pre>
+          </div>
+        </div>
+      </section>
+    </div>
     <div id="logs-view" class="view-pane">
       <section class="card log-workspace rise" aria-label="结构化运行日志">
         <header class="page-head log-heading">
@@ -529,6 +615,8 @@
   </div>
 </div>
 
+  <!-- 网关渲染页面时替换为实际几何执行链（lio_3d 或 slam_2d），二维执行链据此不加载三维视图。 -->
+  <script>window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__";</script>
   <script src="/static/js/task-feedback.js"></script>
   <script src="/static/js/console-logs.js"></script>
   <script src="/static/js/console-updates.js"></script>
@@ -536,6 +624,8 @@
   <script src="/static/js/map-workspace.js"></script>
   <script src="/static/js/map-cleanup.js"></script>
   <script src="/static/js/map-manager.js"></script>
+  <script src="/static/js/capability-panel.js"></script>
+  <script src="/static/js/robot-controls.js"></script>
   <script src="/static/js/map-stream.js"></script>
   <script src="/static/js/console.js"></script>
   <script src="/static/js/semantic-map.js"></script>

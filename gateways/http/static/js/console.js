@@ -187,6 +187,9 @@
         semanticOverlayReturnFocus: null,
         showSemanticInstances: true,
         highlightTarget: null,
+        // 任务栏取消：已发出取消的任务号，以及取消失败时后端返回的原因。
+        taskCancelPending: new Set(),
+        taskCancelErrors: new Map(),
         clusterAnim: null,
         _prevClusters: null,
         semanticStreamVersion: 0,
@@ -319,6 +322,7 @@
         for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
         if (targetId === "config-view") window.nuwaxConsoleSettings?.open();
         if (targetId === "logs-view") window.nuwaxConsoleLogs?.open();
+        if (targetId === "capabilities-view") window.nuwaxCapabilityPanel?.open();
         if (targetId === "monitor-view") redrawMapAfterResize();
         updateMapStreamChip();
       }
@@ -1246,6 +1250,7 @@
           const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
           const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timed_out"].includes(taskState) ? " · 不建议原样重试" : "";
           meta.textContent = task.feedback?.message || task.summary || `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
+          if (state.taskCancelErrors.has(taskKey)) meta.textContent += ` · 取消失败：${state.taskCancelErrors.get(taskKey)}`;
           if (!heading.parentElement) left.prepend(heading);
           if (title.parentElement !== heading) heading.append(title);
           if (!meta.parentElement) left.append(meta);
@@ -1260,6 +1265,24 @@
           pill.title = taskState;
           if (!left.parentElement) row.append(left);
           if (pill.parentElement !== heading) heading.append(pill);
+          // 活动任务都可取消，调用与智能体相同的 cancel_task 能力。
+          let cancel = heading.querySelector(".task-cancel");
+          if (isTerminalTaskState(taskState)) {
+            cancel?.remove();
+            state.taskCancelPending.delete(taskKey);
+          } else {
+            if (!cancel) {
+              cancel = document.createElement("button");
+              cancel.type = "button";
+              cancel.className = "btn btn-sm task-cancel";
+              cancel.addEventListener("click", () => cancelTaskFromRail(cancel.dataset.taskId));
+              heading.append(cancel);
+            }
+            const pending = taskState === "cancelling" || state.taskCancelPending.has(taskKey);
+            cancel.dataset.taskId = taskKey;
+            cancel.disabled = pending;
+            cancel.textContent = pending ? "取消中" : "取消";
+          }
           wantedRows.push(row);
         }
         const wanted = new Set(wantedRows);
@@ -1268,6 +1291,21 @@
           if (els.taskSummary.children[index] !== row) els.taskSummary.insertBefore(row, els.taskSummary.children[index] || null);
         });
         renderServiceStatus();
+      }
+      async function cancelTaskFromRail(taskId) {
+        state.taskCancelPending.add(taskId);
+        state.taskCancelErrors.delete(taskId);
+        refreshTaskStore();
+        try {
+          const response = await fetch("/api/capabilities/cancel_task/invoke", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ arguments: { task_id: taskId } }) });
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error?.message || `服务返回 ${response.status}`);
+        } catch (error) {
+          state.taskCancelPending.delete(taskId);
+          state.taskCancelErrors.set(taskId, error.message);
+          refreshTaskStore();
+        }
       }
       async function loadInitialTasks() {
         if (state.taskLoadPromise) {
@@ -5091,8 +5129,9 @@
           state.navigationLocalPath = [];
           state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
             isPublic: navigationContextIsPublic(nav), status: nav?.status};
+          // 高亮环按平面点 {x, y} 读取，与物品导航写入的格式一致。
           state.highlightTarget = target && !["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav.status)
-            ? {target_pose: state.goalPose} : null;
+            ? {target_pose: {x: target.x, y: target.y, z: target.z}} : null;
           window.dispatchEvent(new CustomEvent("stream:navigation.state", {detail: nav}));
           requestMapDraw(false);
         } else if (frame.topic === "exploration.state") {

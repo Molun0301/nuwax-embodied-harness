@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import product
 import json
 import math
 from pathlib import Path
 import struct
 from typing import Dict, Mapping, Optional, Tuple
 import xml.etree.ElementTree as ET
+
+from core.config import schema_default
 
 _DIMENSION_KEYS = tuple(axis.lower() + "_m" for axis in ("LENGTH", "WIDTH", "HEIGHT"))
 _CENTER_KEYS = tuple("center_" + axis.lower() + "_m" for axis in "XYZ")
@@ -125,6 +128,7 @@ class ResolvedRobotGeometry:
     self_collision_primitives: Tuple[dict, ...] = ()
     self_collision_excluded_moving: int = 0
     self_collision_unsupported: int = 0
+    self_filter_swept_boxes: Tuple[dict, ...] = ()
 
     @property
     def length_m(self) -> float:
@@ -154,6 +158,7 @@ class ResolvedRobotGeometry:
             "excluded_moving_collision_count": self.self_collision_excluded_moving,
             "unsupported_collision_count": self.self_collision_unsupported,
         }
+        result["self_filter_swept_boxes"] = list(self.self_filter_swept_boxes)
         return result
 
     def to_runtime_json(self) -> str:
@@ -402,7 +407,52 @@ def _read_urdf_description(path: Path, base_link: str, *, urdf_data: Optional[by
     return links, joints, edges, root_link, selected
 
 
+def _swept_link_samples(chain, positions, limits, swing):
+    import numpy as np
+
+    edge_samples = []
+    for joint, forward in chain:
+        if joint.joint_type == "fixed":
+            transforms = (joint.origin,)
+        else:
+            reference = positions[joint.name]
+            lower, upper = limits.get(joint.name, (-math.inf, math.inf))
+            samples = dict.fromkeys(min(upper, max(lower, reference + offset))
+                                    for offset in (-swing, 0.0, swing))
+            transforms = tuple(joint.origin @ joint.motion(value) for value in samples)
+        edge_samples.append(transforms if forward else tuple(np.linalg.inv(t) for t in transforms))
+    for combination in product(*edge_samples):
+        transform = np.eye(4)
+        for edge in combination:
+            transform = transform @ edge
+        yield transform[:3, :3], transform[:3, 3]
+
+
+def _swept_box(primitive, samples, origin, margin, floor):
+    lower, upper = [math.inf] * 3, [-math.inf] * 3
+    for sample in samples:
+        rotation, center = _compose(sample, origin)
+        for axis, row in enumerate(rotation):
+            if primitive["shape"] == "box":
+                extent = sum(abs(value) * size / 2 for value, size in zip(row, primitive["size_m"]))
+            elif primitive["shape"] == "sphere":
+                extent = primitive["radius_m"]
+            else:
+                extent = (primitive["radius_m"] * math.hypot(row[0], row[1])
+                          + primitive["length_m"] / 2 * abs(row[2]))
+            lower[axis] = min(lower[axis], center[axis] - extent)
+            upper[axis] = max(upper[axis], center[axis] + extent)
+    lower = [float(value - margin) for value in lower]
+    upper = [float(value + margin) for value in upper]
+    lower[2] = max(lower[2], floor)
+    if upper[2] <= lower[2]:
+        return None
+    return {"center_m": [(lo + hi) / 2 for lo, hi in zip(lower, upper)],
+            "size_m": [hi - lo for lo, hi in zip(lower, upper)]}
+
+
 def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str,
+                joint_swing_rad: float, margin_m: float, ground_clearance_m: float,
                 resource_bytes: Optional[Mapping[Path, bytes]] = None):
     from core.robot_kinematics import load_robot_kinematic_model, RobotKinematicsError
     try:
@@ -420,7 +470,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
     unknown = set(positions) - set(joints)
     if unknown:
         raise RobotGeometryError("参考姿态包含未知关节：" + ",".join(sorted(unknown)))
-    values, warnings, resolving = {}, [], set()
+    values, warnings, resolving, limits = {}, [], set(), {}
     out_of_limit = []
     def joint_value(name):
         if name in values:
@@ -450,6 +500,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
             upper = _number(limit.get("upper", "inf"), "关节上限") if limit.get("upper") is not None else math.inf
             if lower > upper:
                 raise RobotGeometryError("关节上下限颠倒：" + name)
+            limits[name] = lower, upper
             if not lower <= value <= upper:
                 if name in positions:
                     raise RobotGeometryError("显式参考位置超出关节限位：" + name)
@@ -485,47 +536,60 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
             xy.extend(points); lows.append(lo); highs.append(hi)
     if not xy:
         raise RobotGeometryError("模型没有可读取的碰撞或显示外形。", "robot_geometry_missing")
-    # 自体实体只使用与 body 刚性连接的 collision，不能使用导航凸外包或关节零位。
-    fixed_edges = {name: [] for name in links}
-    for joint in joints.values():
-        if joint.get("type") == "fixed":
-            parent = joint.find("parent").get("link")
-            child = joint.find("child").get("link")
-            fixed_edges[parent].append(child)
-            fixed_edges[child].append(parent)
+    # 从机体基准出发遍历，基准在树中间时也沿反向关节取样。
+    edges = {name: [] for name in links}
+    for joint in model.joints:
+        edges[joint.parent_link].append((joint.child_link, joint, True))
+        edges[joint.child_link].append((joint.parent_link, joint, False))
+    chains = {selected: ()}
     fixed_links, pending = {selected}, [selected]
     while pending:
-        for neighbour in fixed_edges[pending.pop()]:
-            if neighbour not in fixed_links:
-                fixed_links.add(neighbour)
+        current = pending.pop()
+        for neighbour, joint, forward in edges[current]:
+            if neighbour not in chains:
+                chains[neighbour] = chains[current] + ((joint, forward),)
+                if current in fixed_links and joint.joint_type == "fixed":
+                    fixed_links.add(neighbour)
                 pending.append(neighbour)
+    floor = min(lows) + ground_clearance_m
     primitives, excluded_moving, unsupported = [], 0, 0
+    swept_boxes = []
     for name, link in links.items():
+        fixed = name in fixed_links
+        samples = None
         for item in link.findall("collision"):
-            if name not in fixed_links:
+            if not fixed:
                 excluded_moving += 1
-                continue
             geometry = item.find("geometry")
             shape = list(geometry)[0] if geometry is not None and len(geometry) == 1 else None
             if shape is None or shape.tag not in ("box", "sphere", "cylinder"):
-                unsupported += 1
+                if fixed:
+                    unsupported += 1
                 continue
-            rotation, translation = _compose(inverse, _compose(transforms[name], _origin(item)))
-            primitive = {"link_name": name, "shape": shape.tag,
-                         "translation_m": list(translation),
-                         "rotation_row_major": [v for row in rotation for v in row]}
+            primitive = {"link_name": name, "shape": shape.tag}
             if shape.tag == "box":
                 primitive["size_m"] = list(_vector(shape.get("size"), None, "盒尺寸"))
             else:
                 primitive["radius_m"] = _number(shape.get("radius"), "模型半径", positive=True)
                 if shape.tag == "cylinder":
                     primitive["length_m"] = _number(shape.get("length"), "圆柱长度", positive=True)
-            primitives.append(primitive)
+            origin = _origin(item)
+            if fixed:
+                rotation, translation = _compose(inverse, _compose(transforms[name], origin))
+                primitive["translation_m"] = list(translation)
+                primitive["rotation_row_major"] = [v for row in rotation for v in row]
+                primitives.append(primitive)
+            else:
+                if samples is None:
+                    samples = tuple(_swept_link_samples(chains[name], values, limits, joint_swing_rad))
+                box = _swept_box(primitive, samples, origin, margin_m, floor)
+                if box is not None:
+                    swept_boxes.append(box)
     if moving:
         warnings.append("活动关节按静态参考姿态计算，不跟随实时腿部姿态；未填写的关节取模型零位。")
     return ResolvedRobotGeometry(_hull(xy), min(lows), max(highs), source_prefix + "_" + kind,
                                  str(path), selected, tuple(sorted(values.items())), tuple(warnings),
-                                 tuple(primitives), excluded_moving, unsupported)
+                                 tuple(primitives), excluded_moving, unsupported, tuple(swept_boxes))
 
 
 def _box(length, width, height, center, source):
@@ -558,6 +622,9 @@ def resolve_robot_model_config(config: RobotGeometryConfig, *, robot_name: str, 
 
 
 def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base_dir,
+                           self_filter_joint_swing_rad: float = schema_default("geometry.self_filter_joint_swing_rad"),
+                           self_filter_margin_m: float = schema_default("geometry.self_filter_margin_m"),
+                           self_filter_ground_clearance_m: float = schema_default("geometry.self_filter_ground_clearance_m"),
                            resource_bytes: Optional[Mapping[Path, bytes]] = None) -> ResolvedRobotGeometry:
     """按完整手填、指定模型、驱动默认模型、通用兼容外包解析；不启动设备。"""
     dimensions = tuple(_optional_number(getattr(config, name), name, positive=True) for name in ("length_m","width_m","height_m"))
@@ -570,6 +637,8 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
         if model_config.model_path:
             result = _parse_urdf(Path(model_config.model_path), model_config.model_base_link,
                                  _joint_positions(model_config.model_joint_positions_json),
+                                 joint_swing_rad=self_filter_joint_swing_rad, margin_m=self_filter_margin_m,
+                                 ground_clearance_m=self_filter_ground_clearance_m,
                                  source_prefix="urdf" if explicit else "robot_default_urdf", resource_bytes=resource_bytes)
         else:
             # 通用回退沿原0.25米外包半宽与0.6米高度，来源明确，不伪称真实模型。

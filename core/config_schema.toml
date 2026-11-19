@@ -1888,6 +1888,27 @@ consumers = [
 ]
 apply = "restart"
 
+[geometry.self_filter_ground_clearance_m]
+type = "float"
+default = 0.04
+description = "腿足摆动盒底部与模型参考姿态地面之间的最小间距（米）。"
+consumers = ["core/config.py:derived_values"]
+apply = "restart"
+
+[geometry.self_filter_joint_swing_rad]
+type = "float"
+default = 0.6
+description = "点云自体过滤在各活动关节参考位置两侧的采样角偏移（弧度，移动关节为米）。"
+consumers = ["core/config.py:derived_values"]
+apply = "restart"
+
+[geometry.self_filter_margin_m]
+type = "float"
+default = 0.03
+description = "点云自体过滤的腿足摆动包围盒在每侧外扩的距离（米）。"
+consumers = ["core/config.py:derived_values"]
+apply = "restart"
+
 [geometry.slam2d_config]
 type = "string"
 default = ""

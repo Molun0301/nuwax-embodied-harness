@@ -6,8 +6,10 @@ use std::process::Command;
 
 
 fn check_case(case: &Value) {
-    let json = case["runtime_json"].as_str().unwrap();
-    let data: Value = serde_json::from_str(json).unwrap();
+    let mut data: Value = serde_json::from_str(case["runtime_json"].as_str().unwrap()).unwrap();
+    // 旧夹具继续独立验证固定实体与历史配置。
+    data.as_object_mut().unwrap().remove("self_filter_swept_boxes");
+    let json = &data.to_string();
     let collision = &data["self_collision"];
     let links: Vec<_> = collision["primitives"]
         .as_array()
@@ -98,6 +100,38 @@ fn check_case(case: &Value) {
         filter.retain_external(&mut registered, &pose);
         assert_eq!(registered, expected, "完整位姿下仍按实体分类");
     }
+}
+
+#[test]
+fn go2_swept_boxes_reach_point_filter_and_navigation() {
+    use nuwax_nav_types_messages::RobotGeometry;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3).unwrap();
+    let python = std::env::var_os("NEH_TEST_PYTHON").unwrap_or_else(|| "python3".into());
+    let output = Command::new(python)
+        .args(["-c", concat!(
+            "from core.config import defaults, derived_values\n",
+            "values = defaults()\n",
+            "values['robot']['driver'] = 'go2'\n",
+            "print(derived_values(values)['robot_geometry_json'])\n",
+        )])
+        .current_dir(root)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let json = std::str::from_utf8(&output.stdout).unwrap();
+    let filter = RobotSelfFilter::from_runtime_geometry("base_link", json).unwrap().unwrap();
+    assert_eq!((filter.fixed_count, filter.swept_count), (3, 24));
+    assert!(filter.contains_body(&Point3::new(0.15, -0.17, -0.20)));
+    assert!(!filter.contains_body(&Point3::new(0.15, -0.17, -0.36)));
+
+    let mut fixed_only: Value = serde_json::from_str(json).unwrap();
+    fixed_only.as_object_mut().unwrap().remove("self_filter_swept_boxes");
+    assert_eq!(
+        RobotGeometry::from_runtime_json(json).unwrap(),
+        RobotGeometry::from_runtime_json(&fixed_only.to_string()).unwrap(),
+    );
 }
 
 #[test]

@@ -34,6 +34,18 @@ class KinematicJoint:
     # (被模仿关节, 倍率, 偏移)；没有模仿约束时为 None。
     mimic: Optional[Tuple[str, float, float]] = None
 
+    def motion(self, position: float) -> np.ndarray:
+        motion = np.eye(4)
+        axis = np.asarray(self.axis)
+        if self.joint_type == "prismatic":
+            motion[:3, 3] = axis * position
+        elif self.joint_type in ("revolute", "continuous"):
+            x, y, z = axis
+            skew = np.array(((0, -z, y), (z, 0, -x), (-y, x, 0)))
+            c, sn = np.cos(position), np.sin(position)
+            motion[:3, :3] = c * np.eye(3) + (1-c) * np.outer(axis, axis) + sn * skew
+        return motion
+
 
 @dataclass(frozen=True)
 class LinkHull:
@@ -96,17 +108,7 @@ class RobotKinematicModel:
             return result
         transforms = {self.root_link: np.eye(4)}
         for joint in self.joints:
-            motion = np.eye(4)
-            angle = value(joint.name)
-            axis = np.asarray(joint.axis)
-            if joint.joint_type == "prismatic":
-                motion[:3, 3] = axis * angle
-            elif joint.joint_type in ("revolute", "continuous"):
-                x, y, z = axis
-                skew = np.array(((0, -z, y), (z, 0, -x), (-y, x, 0)))
-                c, sn = np.cos(angle), np.sin(angle)
-                motion[:3, :3] = c * np.eye(3) + (1-c) * np.outer(axis, axis) + sn * skew
-            transforms[joint.child_link] = transforms[joint.parent_link] @ joint.origin @ motion
+            transforms[joint.child_link] = transforms[joint.parent_link] @ joint.origin @ joint.motion(value(joint.name))
         base = transforms[self.base_link]
         inverse = np.eye(4)
         inverse[:3, :3] = base[:3, :3].T

@@ -1,4 +1,4 @@
-//! 规范注册之前只删除与机体刚性相连的碰撞实体，不把导航凸包当实心机器人。
+//! 规范注册之前过滤固定自体碰撞实体和腿足摆动盒。
 
 use nalgebra::{Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion};
 use serde::Deserialize;
@@ -34,7 +34,8 @@ pub(crate) struct RobotSelfFilter {
     primitives: Vec<Primitive>,
     body_bounds: ([f64; 3], [f64; 3]),
     model_base_link: String,
-    excluded_moving: usize,
+    fixed_count: usize,
+    swept_count: usize,
     unsupported: usize,
 }
 
@@ -52,10 +53,10 @@ impl RobotSelfFilter {
         let result = Self::from_config(Some(geometry))?;
         if let Some(filter) = &result {
             // 配置已声明选定模型连杆是机体基准；名称绑定不是物理标定验证。
-            eprintln!("固定自体过滤：模型基准 {} 按几何配置对应运行时 body {}，实体 {}，排除活动几何 {}，未支持 {}；动态腿足未覆盖",
-                            filter.model_base_link, runtime_body_frame, filter.primitives.len(), filter.excluded_moving, filter.unsupported);
+            eprintln!("自体点云过滤：模型基准 {} 按几何配置对应运行时 body {}，固定实体 {}，腿足摆动盒 {}，未支持 {}",
+                            filter.model_base_link, runtime_body_frame, filter.fixed_count, filter.swept_count, filter.unsupported);
         } else {
-            eprintln!("固定自体过滤未启用：配置没有可用固定碰撞实体；不使用导航外包替代");
+            eprintln!("自体点云过滤未启用：配置没有可用固定实体或腿足摆动盒");
         }
         Ok(result)
     }
@@ -64,27 +65,38 @@ impl RobotSelfFilter {
         #[derive(Deserialize)]
         struct GeometryConfig {
             self_collision: Option<SelfCollision>,
+            #[serde(default)]
+            self_filter_swept_boxes: Vec<SweptBox>,
         }
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         struct SelfCollision {
             primitives: Vec<PrimitiveConfig>,
             #[serde(default)]
             model_base_link: String,
             #[serde(default)]
-            excluded_moving_collision_count: usize,
-            #[serde(default)]
             unsupported_collision_count: usize,
+        }
+        #[derive(Deserialize)]
+        struct SweptBox {
+            center_m: [f64; 3],
+            size_m: [f64; 3],
         }
         let Some(geometry) = geometry.filter(|value| !value.trim().is_empty()) else {
             return Ok(None);
         };
         let config: GeometryConfig = serde_json::from_str(geometry).map_err(|e| e.to_string())?;
-        let Some(collision) = config.self_collision else {
-            return Ok(None);
-        };
-        let mut primitives = Vec::with_capacity(collision.primitives.len());
+        let collision = config.self_collision.unwrap_or_default();
+        let fixed_count = collision.primitives.len();
+        let swept_count = config.self_filter_swept_boxes.len();
+        let mut primitives = Vec::with_capacity(fixed_count + swept_count);
         let mut lower = [f64::INFINITY; 3];
         let mut upper = [f64::NEG_INFINITY; 3];
+        // 启动时计算保守联合边界，吸收浮点舍入但不膨胀实体。
+        let mut include_extent = |axis: usize, center: f64, extent: f64| {
+            let rounding = 1e-12 * (1.0 + center.abs() + extent);
+            lower[axis] = lower[axis].min(center - extent - rounding);
+            upper[axis] = upper[axis].max(center + extent + rounding);
+        };
         for item in collision.primitives {
             let dimensions_valid = match &item.shape {
                 Shape::Box { size_m } => size_m.iter().all(|v| v.is_finite() && *v > 0.0),
@@ -113,7 +125,6 @@ impl RobotSelfFilter {
                 ),
                 UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(rotation)),
             );
-            // 启动时计算保守联合边界；多数外部点不必逐实体做逆变换。
             let matrix = pose.rotation.to_rotation_matrix();
             for axis in 0..3 {
                 let extent = match &item.shape {
@@ -126,15 +137,20 @@ impl RobotSelfFilter {
                             + length_m / 2.0 * matrix[(axis, 2)].abs()
                     }
                 };
-                let center = pose.translation.vector[axis];
-                // 仅吸收边界表达的浮点舍入，不膨胀实际实体分类。
-                let rounding = 1e-12 * (1.0 + center.abs() + extent);
-                lower[axis] = lower[axis].min(center - extent - rounding);
-                upper[axis] = upper[axis].max(center + extent + rounding);
+                include_extent(axis, pose.translation.vector[axis], extent);
             }
             primitives.push(Primitive {
                 shape_from_body: pose.inverse(),
                 shape: item.shape,
+            });
+        }
+        for SweptBox { center_m, size_m } in config.self_filter_swept_boxes {
+            for axis in 0..3 {
+                include_extent(axis, center_m[axis], size_m[axis] / 2.0);
+            }
+            primitives.push(Primitive {
+                shape_from_body: Isometry3::translation(-center_m[0], -center_m[1], -center_m[2]),
+                shape: Shape::Box { size_m },
             });
         }
         Ok(if primitives.is_empty() {
@@ -144,7 +160,8 @@ impl RobotSelfFilter {
                 primitives,
                 body_bounds: (lower, upper),
                 model_base_link: collision.model_base_link,
-                excluded_moving: collision.excluded_moving_collision_count,
+                fixed_count,
+                swept_count,
                 unsupported: collision.unsupported_collision_count,
             })
         })

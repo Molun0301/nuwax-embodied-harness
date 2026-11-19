@@ -1934,7 +1934,7 @@ apply = "restart"
 [geometry.self_filter_ground_clearance_m]
 type = "float"
 default = 0.04
-description = "腿足摆动盒底部与模型参考姿态地面之间的最小间距（米）。"
+description = "腿足摆动盒底部与实际站立地面之间的最小间距（米）"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
 
@@ -2098,6 +2098,17 @@ default = 0.15
 description = "三维导航的共同台阶高度上限（米）。导航能力标定和上、下台阶独立设置按现行优先关系覆盖此值。"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_step_height_m",
+]
+apply = "restart"
+
+[navigation.terminal_stall_timeout_sec]
+type = "float"
+min = 0.0
+min_exclusive = true
+default = 5.0
+description = "终点转向或平移连续无进展时结束目标的时限（秒）。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.terminal_stall_timeout_sec",
 ]
 apply = "restart"
 
@@ -2423,6 +2434,7 @@ description = "日志轮转保留的历史文件数量。网关立即生效，�
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
+    "scripts/supervisor.py:Supervisor.start_component",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.backup_count",
 ]
 apply = "hot"
@@ -2582,6 +2594,7 @@ description = "单个日志文件的轮转容量（字节）。网关立即生�
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
+    "scripts/supervisor.py:Supervisor.start_component",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.max_bytes",
 ]
 apply = "hot"

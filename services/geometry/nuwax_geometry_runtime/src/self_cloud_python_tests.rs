@@ -124,7 +124,10 @@ fn go2_swept_boxes_reach_point_filter_and_navigation() {
     let filter = RobotSelfFilter::from_runtime_geometry("base_link", json).unwrap().unwrap();
     assert_eq!((filter.fixed_count, filter.swept_count), (3, 24));
     assert!(filter.contains_body(&Point3::new(0.15, -0.17, -0.20)));
-    assert!(!filter.contains_body(&Point3::new(0.15, -0.17, -0.36)));
+    // 同一腿区内检查摆动盒新下沿两侧，并保留实测站立地面。
+    assert!(filter.contains_body(&Point3::new(0.15, -0.17, -0.36)));
+    assert!(!filter.contains_body(&Point3::new(0.15, -0.17, -0.38)));
+    assert!(!filter.contains_body(&Point3::new(0.15, -0.17, -0.41)));
 
     let mut fixed_only: Value = serde_json::from_str(json).unwrap();
     fixed_only.as_object_mut().unwrap().remove("self_filter_swept_boxes");

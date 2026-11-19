@@ -87,7 +87,7 @@ fn terminal_heading_uses_the_existing_proportional_gain_while_turning_or_transla
     for position in [None, Some([0.1,0.,0.4])] {
         for error in [-0.04, 0.04] {
             let tracked = ScanTracker::default().track_terminal_position(
-                &c,&snapshot,&state,[0.;3],Some(error),position).unwrap();
+                &c,&snapshot,&state,[0.;3],Some(error),position,None).unwrap();
             assert!(!tracked.invalid(),"空图末段应有合法候选：{tracked:?}");
             assert!((tracked.command[2]-1.5*error).abs()<1e-12,
                 "小误差采用现有kp_yaw=1.5，避免偏航加速度平方根给出过大期望：{tracked:?}");
@@ -148,7 +148,7 @@ fn terminal_translation_alone_uses_the_escape_reverse_limit() {
         let snapshot = map.snapshot();
         let mut tracker = ScanTracker::default();
         let tracked = tracker.track_terminal_position(&c, &snapshot, &state, [0.; 3],
-            Some(0.), Some([-1., 0., 0.4])).unwrap();
+            Some(0.), Some([-1., 0., 0.4]), None).unwrap();
         assert!(!tracked.invalid(), "末段倒退仍须通过原命令与制动检查：{tracked:?}");
         assert!((tracked.command[0] + expected).abs() < 1e-12, "{tracked:?}");
         assert_eq!(&tracked.command[1..], &[0., 0.]);

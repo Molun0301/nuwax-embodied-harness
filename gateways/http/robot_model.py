@@ -103,7 +103,7 @@ class RobotModelView:
             if key != self._geometry_key:
                 try:
                     self._geometry = resolve_robot_geometry(
-                        config, robot_name=robot_name, base_dir=self.base_dir,
+                        config, robot_name=robot_name, base_dir=self.base_dir, standing_ground_offset_m=0.0,
                     ).to_runtime_dict()
                 except (RobotGeometryError, OSError) as exc:
                     self._geometry = {"error": str(exc)}

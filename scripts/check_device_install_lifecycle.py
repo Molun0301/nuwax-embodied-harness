@@ -268,12 +268,14 @@ class LegacyUpgradeChecks(Checks):
 class ComponentDiagnosticChecks(Checks):
     def test_health_timeout_uses_supervisor_reported_exited_component_log(self):
         import asyncio
-        from core.config import ConfigStore, config_snapshot
+        from core.config import ConfigStore
         from scripts.device_manager import runtime
         from scripts.supervisor import Component, Supervisor
 
         directory = self.engine.home / "独立组件日志"
-        config = ConfigStore(self.engine.home).install("诊断", {"logging.dir": str(directory)})
+        store = ConfigStore(self.engine.home)
+        store.install("诊断", {"logging.dir": str(directory)})
+        store.activate("诊断")
 
         async def exited_gateway():
             component = Component([sys.executable, "-c", "raise AttributeError('current gateway fixture failure')"])
@@ -283,8 +285,7 @@ class ComponentDiagnosticChecks(Checks):
             await asyncio.gather(*tuple(owner.background))
             return owner.status()
 
-        with config_snapshot(config):
-            report = asyncio.run(exited_gateway())
+        report = asyncio.run(exited_gateway())
         self.assertEqual(report["components"]["gateway"]["state"], "exited")
         self.assertEqual(report["components"]["gateway"]["exit_code"], 1)
         self.assertEqual(report["components"]["gateway"]["log_file"], str(directory / "gateway.log"))

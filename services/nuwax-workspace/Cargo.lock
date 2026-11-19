@@ -2007,6 +2007,7 @@ name = "nuwax-nav-pct-native"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "nuwax-core",
 ]
 
 [[package]]
@@ -2055,8 +2056,11 @@ name = "nuwax-nav-scan-native"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "nuwax-core",
  "nuwax-nav-pct-native",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -195,7 +195,9 @@ fn required_frame(
 }
 
 #[cfg(feature = "guard-runtime")]
-const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(1);
+use nuwax_core::logging::DiagnosticLimiter as InputDiagnosticLimiter;
+#[cfg(all(test, feature = "guard-runtime"))]
+use nuwax_core::logging::INPUT_DIAGNOSTIC_INTERVAL;
 
 #[cfg(feature = "guard-runtime")]
 #[derive(Debug, PartialEq)]
@@ -206,33 +208,6 @@ enum OwnerInput<T> {
 
 #[cfg(feature = "guard-runtime")]
 type OwnerInputResult<T> = NavStackResult<OwnerInput<T>>;
-
-#[cfg(feature = "guard-runtime")]
-#[derive(Default)]
-struct InputDiagnosticLimiter {
-    next_emit: Option<Instant>,
-    suppressed: u64,
-}
-
-#[cfg(feature = "guard-runtime")]
-impl InputDiagnosticLimiter {
-    fn reject(&mut self, component: &str, reason: &str) {
-        if let Some(suppressed) = self.record_at(Instant::now()) {
-            tracing::warn!(input=component, reason, suppressed, "导航输入被拒绝");
-        }
-    }
-
-    fn record_at(&mut self, now: Instant) -> Option<u64> {
-        if self.next_emit.is_none_or(|deadline| now >= deadline) {
-            let suppressed = std::mem::take(&mut self.suppressed);
-            self.next_emit = Some(now + INPUT_DIAGNOSTIC_INTERVAL);
-            Some(suppressed)
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
-            None
-        }
-    }
-}
 
 #[cfg(feature = "guard-runtime")]
 fn runtime_input_error<T>(

@@ -229,7 +229,7 @@ class RobotVisualAssetStore:
                         if size > _TOTAL_LIMIT:
                             raise RobotVisualError("机器人外观资源超过总读取预算。")
                 navigation = geometry.resolve_robot_geometry(config, robot_name="", base_dir=self.base_dir,
-                    resource_bytes=resources).to_runtime_dict()
+                    standing_ground_offset_m=0.0, resource_bytes=resources).to_runtime_dict()
                 navigation.pop("model_path", None)
             except (RobotVisualError, geometry.RobotGeometryError, OSError, ValueError, RuntimeError) as exc:
                 self._navigation = None
@@ -367,7 +367,7 @@ class RobotVisualAssetStore:
         navigation, navigation_error = None, None
         try:
             navigation = geometry.resolve_robot_geometry(config, robot_name="", base_dir=self.base_dir,
-                resource_bytes={path: model_data, **resources}).to_runtime_dict()
+                standing_ground_offset_m=0.0, resource_bytes={path: model_data, **resources}).to_runtime_dict()
             navigation.pop("model_path", None)
         except geometry.RobotGeometryError as exc:
             navigation_error = {"code": exc.code, "message": str(exc)}

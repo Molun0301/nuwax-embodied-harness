@@ -255,13 +255,14 @@ def test_safe_geometry_snapshot_matches_legacy_and_never_reopens_files(tmp_path)
     stl(mesh, [[0, 0, 0], [1, 0, 0], [0, 1, 1]])
     path = model(tmp_path, '<collision><geometry><mesh filename="part.stl"/></geometry></collision>')
     config = RobotGeometryConfig(model_path=str(path))
-    expected = resolve_robot_geometry(config, robot_name="test", base_dir=tmp_path).to_runtime_dict()
+    options = dict(robot_name="test", base_dir=tmp_path, standing_ground_offset_m=0.0)
+    expected = resolve_robot_geometry(config, **options).to_runtime_dict()
     resources = {path: path.read_bytes(), mesh: mesh.read_bytes()}
     with patch("core.robot_geometry._read_bounded", side_effect=AssertionError("快照路径禁止再读文件")):
-        actual = resolve_robot_geometry(config, robot_name="test", base_dir=tmp_path, resource_bytes=resources).to_runtime_dict()
+        actual = resolve_robot_geometry(config, resource_bytes=resources, **options).to_runtime_dict()
         assert actual == expected
         with pytest.raises(ValueError, match="快照缺少网格"):
-            resolve_robot_geometry(config, robot_name="test", base_dir=tmp_path, resource_bytes={path: resources[path]})
+            resolve_robot_geometry(config, resource_bytes={path: resources[path]}, **options)
 
 
 def test_asset_kinematics_and_navigation_use_the_same_urdf_snapshot(tmp_path):

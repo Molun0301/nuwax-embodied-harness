@@ -37,26 +37,25 @@ async fn zero_position_surface_scheduler() -> (
     scheduler.sample_input_status();
     assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
-    crate::native_test_helpers::prepare_terminal_map(&mut scheduler.planner);
     (scheduler, status, motion, goal)
 }
 #[tokio::test]
-async fn zero_position_real_surface_arrival_requires_measured_stop_before_release() {
-    let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
-    scheduler.session_tick(&status).await.unwrap();
-    assert!(scheduler.status.last_terminal.is_none(),"缺少测速不能宣告停稳");
-    motion.lock().unwrap().measured = Some(crate::motion_feedback::tests::measured([0.1,0.,0.],[0.;3]));
-    scheduler.session_tick(&status).await.unwrap();
-    assert!(scheduler.status.last_terminal.is_none(),"仍在移动不能提前成功");
-    motion.lock().unwrap().measured = Some(crate::motion_feedback::tests::measured([0.;3],[0.;3]));
-    scheduler.session_tick(&status).await.unwrap();
-    assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
-    assert!(!scheduler.lease_active);
-    assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
-
-    assert!(scheduler.session.is_none());
-    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("release:")).count(), 1);
-    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
+async fn zero_position_real_surface_arrival_immediately_releases_lease() {
+    for (route, measured) in [
+        (RouteKind::Complete, None),
+        (RouteKind::Approach, Some(crate::motion_feedback::tests::measured([0.1, 0., 0.], [0.; 3]))),
+    ] {
+        let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
+        scheduler.current_route_kind = route;
+        motion.lock().unwrap().measured = measured;
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
+        assert!(!scheduler.lease_active);
+        assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+        assert!(scheduler.session.is_none());
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("release:")).count(), 1);
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
+    }
 }
 #[tokio::test]
 async fn zero_position_real_surface_rejects_nearby_pose_before_arrival_event() {

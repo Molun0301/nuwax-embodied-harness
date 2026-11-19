@@ -34,7 +34,7 @@ GENERIC = '''<robot name="nonroot_fixed_test">
 
 def case(name, model, points, fixed_links, excluded_moving, **dimensions):
     config = geometry.RobotGeometryConfig(model_path=str(model), model_base_link="base", **dimensions)
-    result = geometry.resolve_robot_geometry(config, robot_name="generic", base_dir=ROOT)
+    result = geometry.resolve_robot_geometry(config, robot_name="generic", base_dir=ROOT, standing_ground_offset_m=0.0)
     return {
         "name": name,
         "runtime_json": result.to_runtime_json(),

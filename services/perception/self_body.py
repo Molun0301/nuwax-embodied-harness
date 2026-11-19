@@ -524,7 +524,9 @@ def build_self_body_filter(
         except RobotKinematicsError as exc:
             model_error = exc.code
             LOGGER.warning("自体过滤无法加载机器人模型 %s：%s", path, exc)
-    static_ground=resolve_robot_geometry(robot_geometry,robot_name=robot_name,base_dir=base_dir).z_min_m
+    static_ground = resolve_robot_geometry(
+        robot_geometry, robot_name=robot_name, base_dir=base_dir, standing_ground_offset_m=0.0,
+    ).z_min_m
     return KinematicSelfBodyFilter(
         model=model,
         model_error=model_error,

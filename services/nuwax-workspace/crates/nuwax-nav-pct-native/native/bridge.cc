@@ -1,5 +1,6 @@
 // PCT上游搜索的无ROS数据适配；只由有效地面层构建可搜索节点。
 #include "a_star/a_star_search.h"
+#include <collision_evidence.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -198,13 +199,19 @@ struct Planner {
     dirty_buckets.clear();
   }
   bool collision(double x, double y, double ground, double heading) const {
-    if (!inside(boundary,x,y)) return true;
     const double co=std::cos(heading),si=std::sin(heading),q=cfg.resolution;
+    if (!inside(boundary,x,y)) {
+      recordForbiddenPoint(x,y,q);
+      return true;
+    }
     std::vector<Point> shape;shape.reserve(footprint.size());
     double minx=INFINITY,miny=INFINITY,maxx=-INFINITY,maxy=-INFINITY;
     for (auto p:footprint) {
       Point v{x+co*p[0]-si*p[1],y+si*p[0]+co*p[1]};
-      if(!inside(boundary,v[0],v[1])) return true;
+      if(!inside(boundary,v[0],v[1])) {
+        recordForbiddenPoint(v[0],v[1],q);
+        return true;
+      }
       minx=std::min(minx,v[0]);maxx=std::max(maxx,v[0]);
       miny=std::min(miny,v[1]);maxy=std::max(maxy,v[1]);shape.push_back(v);
     }
@@ -229,7 +236,13 @@ struct Planner {
           }
         }
         // 真实薄地面带允许足端接触，较高实体和其它层仍检查原细列。
-        if(!support&&((maxx==minx&&maxy==miny)||intersects(shape,b.x*q,b.y*q,q)))return true;
+        if(!support&&((maxx==minx&&maxy==miny)||intersects(shape,b.x*q,b.y*q,q))) {
+          // PCT 原生层用无界高度带表达禁止通过的整列。
+          const bool forbidden=std::isinf(b.low)&&std::isinf(b.high);
+          recordCollision((b.x+.5)*q,(b.y+.5)*q,b.low,b.high,
+              forbidden ? BusinessForbidden : SurfaceContact);
+          return true;
+        }
       }
     }
     return false;
@@ -561,7 +574,9 @@ extern "C" void pct_replace_overlay(void* planner,const PctCell* cells,size_t nc
 extern "C" void pct_destroy(void* planner){delete static_cast<Planner*>(planner);}
 extern "C" void pct_result_free(PctResult* result){delete[] result->points;result->points=nullptr;}
 extern "C" int pct_plan(void* planner,const double* start,const double* goal,PctResult* result,
-                         CancelFn cancel,const void* user,bool progressive,char* err,size_t cap){
+                         CancelFn cancel,const void* user,bool progressive,char* err,size_t cap,
+                         CollisionEvidence* evidence){
+  const CollisionEvidenceScope capture(evidence);
   const auto begin=std::chrono::steady_clock::now();
   try {
     auto& p=*static_cast<Planner*>(planner);
@@ -816,7 +831,7 @@ extern "C" PctSearchStats pct_multi_goal_stats(const void* search){
   return static_cast<const MultiGoalSearch*>(search)->transitions.stats;
 }
 extern "C" int pct_multi_goal_cost(void* search,const double* start,const double* goal,PctCost* cost,
-                                    CancelFn cancel,const void* user,char* err,size_t cap) {
+                                    CancelFn cancel,const void* user,char* err,size_t cap,CollisionEvidence* evidence) {
   try {
   auto& s=*static_cast<MultiGoalSearch*>(search);
   // 缓存仅在本次同步查询绑定；普通导航与逐步逼近没有共享搜索状态。
@@ -826,7 +841,7 @@ extern "C" int pct_multi_goal_cost(void* search,const double* start,const double
   if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
   ++s.transitions.stats.exact_queries;
   const auto began=std::chrono::steady_clock::now();
-  const int status=pct_plan(&s.planner,start,goal,&route,cancel,user,false,err,cap);
+  const int status=pct_plan(&s.planner,start,goal,&route,cancel,user,false,err,cap,evidence);
   s.transitions.stats.exact_elapsed_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
   if(status==0) {
     cost->cost=0;cost->yaw=0;cost->elapsed_ms=route.elapsed_ms;cost->expanded=route.expanded;

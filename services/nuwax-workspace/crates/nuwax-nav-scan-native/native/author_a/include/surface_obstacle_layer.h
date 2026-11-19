@@ -95,6 +95,7 @@ class SurfaceObstacleLayer {
           if(!(band.low==band.high ? band.low>=low&&band.low<high : band.high>low&&band.low<high))continue;
           const BodyCollisionCell cell{ix,iy,0,true,band.low,band.high};
           if(initial&&initial->count(cell))continue;
+          recordCollision((ix+.5)*r,(iy+.5)*r,band.low,band.high,SurfaceContact);
           if(!output)return true;
           output->push_back(cell);hit=true;
           // 软净距只依赖平面列；恢复证明仍保留每一个真实高度带。

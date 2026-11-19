@@ -1125,8 +1125,7 @@ where
                     .is_some_and(|end|pose.pose.position.distance(end.pose.position)<=APPROACH_NEAR_END_M),
                 _ => false,
             };
-            if matches!(&step,PlannerStep::Succeeded) || near_endpoint
-                && matches!(&step,PlannerStep::Command(_) | PlannerStep::Pending(_)) {
+            if near_endpoint && matches!(&step,PlannerStep::Command(_) | PlannerStep::Pending(_)) {
                 step=PlannerStep::ReplanRequired("逼近路线已到近端，原目标仍活动，等待新观测地面与重规划".into());
             }
         }
@@ -2361,8 +2360,7 @@ mod tests {
             scheduler.start_session(&status, target).await.unwrap();
             scheduler.session_tick(&status).await.unwrap();
             if tolerance > 0.0336 {
-                assert_eq!(scheduler.status.last_terminal, None, "进入容差后仍须完成到停点的平移");
-                scheduler.cancel(&status, "goal-1").await.unwrap();
+                assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
             } else {
                 assert_eq!(scheduler.status.last_terminal, None, "选点位置超出原容差时不能判到达");
                 assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));

@@ -1,8 +1,10 @@
 //! 原生地图、慢规划与快跟踪的独立接口。
+use nuwax_core::logging::{CollisionEvidence, CollisionLogPose, DiagnosticLimiter};
 use std::{
     ffi::{c_char, c_void, CStr},
     ptr::NonNull,
     sync::Arc,
+    time::Instant,
 };
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -250,6 +252,7 @@ extern "C" {
         goal_yaw: f64,
         error: *mut c_char,
         capacity: usize,
+        evidence: *mut CollisionEvidence,
     ) -> *mut c_void;
     fn nuwax_scan_trajectory_destroy(trajectory: *mut c_void);
     fn nuwax_scan_trajectory_samples(
@@ -275,6 +278,7 @@ extern "C" {
         recovery: *mut SamplesRaw,
         error: *mut c_char,
         capacity: usize,
+        evidence: *mut CollisionEvidence,
     );
     fn nuwax_scan_free(out: *mut SamplesRaw);
 }
@@ -473,11 +477,11 @@ impl Trajectory {
     }
 }
 /// 独立慢规划会话，不持运动端或控制器。
-pub struct ScanPlanner(NonNull<c_void>);
+pub struct ScanPlanner(NonNull<c_void>, DiagnosticLimiter);
 unsafe impl Send for ScanPlanner {}
 impl Default for ScanPlanner {
     fn default() -> Self {
-        Self(NonNull::new(unsafe { nuwax_scan_planner_create() }).unwrap())
+        Self(NonNull::new(unsafe { nuwax_scan_planner_create() }).unwrap(), DiagnosticLimiter::default())
     }
 }
 impl ScanPlanner {
@@ -492,6 +496,9 @@ impl ScanPlanner {
         goal_yaw: Option<f64>,
     ) -> Result<Trajectory, String> {
         let mut error = [0 as c_char; 1024];
+        let now = Instant::now();
+        let mut evidence = CollisionEvidence::new(state.position, config.body_to_ground);
+        let output = if CollisionEvidence::capture(&self.1, now) { &mut evidence } else { std::ptr::null_mut() };
         let result = unsafe {
             nuwax_scan_planner_plan(
                 self.0.as_ptr(),
@@ -505,11 +512,18 @@ impl ScanPlanner {
                 goal_yaw.unwrap_or(f64::NAN),
                 error.as_mut_ptr(),
                 error.len(),
+                output,
             )
         };
         NonNull::new(result)
             .map(|p| Trajectory(Arc::new(TrajectoryHandle(p))))
-            .ok_or_else(|| error_message(&error))
+            .ok_or_else(|| {
+                let reason = error_message(&error);
+                evidence.log_failure(&mut self.1, now, "局部轨迹求解", &reason,
+                    CollisionLogPose::with_yaw(state.position, Some(state.yaw)),
+                    reference.last().map(|point| CollisionLogPose::with_yaw(*point, goal_yaw)));
+                reason
+            })
     }
 }
 impl Drop for ScanPlanner {
@@ -518,11 +532,11 @@ impl Drop for ScanPlanner {
     }
 }
 /// 快控制会话；这里只做相位、控制与原命令检查。
-pub struct ScanTracker(NonNull<c_void>);
+pub struct ScanTracker(NonNull<c_void>, DiagnosticLimiter);
 unsafe impl Send for ScanTracker {}
 impl Default for ScanTracker {
     fn default() -> Self {
-        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap())
+        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap(), DiagnosticLimiter::default())
     }
 }
 impl ScanTracker {
@@ -545,7 +559,7 @@ impl ScanTracker {
         previous: [f64; 3],
         terminal_yaw: Option<f64>,
     ) -> Result<TrackResult, TrackFailure> {
-        self.track_terminal_position(config, map, state, previous, terminal_yaw, None)
+        self.track_terminal_position(config, map, state, previous, terminal_yaw, None, None)
     }
     /// 末端位置只与末端朝向一起传入；其余跟踪、限速和命令扫掠共用同一条路径。
     pub fn track_terminal_position(
@@ -556,10 +570,14 @@ impl ScanTracker {
         previous: [f64; 3],
         terminal_yaw: Option<f64>,
         terminal_position: Option<[f64; 3]>,
+        goal: Option<([f64; 3], [f64; 4])>,
     ) -> Result<TrackResult, TrackFailure> {
         let mut result = TrackRaw::default();
         let mut recovery = SamplesRaw::default();
         let mut error = [0 as c_char; 1024];
+        let now = Instant::now();
+        let mut evidence = CollisionEvidence::new(state.position, config.body_to_ground);
+        let output = if CollisionEvidence::capture(&self.1, now) { &mut evidence } else { std::ptr::null_mut() };
         unsafe {
             nuwax_scan_tracker_track(
                 self.0.as_ptr(),
@@ -573,6 +591,7 @@ impl ScanTracker {
                 &mut recovery,
                 error.as_mut_ptr(),
                 error.len(),
+                output,
             )
         };
         let samples = if recovery.sample_count == 0 {
@@ -581,6 +600,12 @@ impl ScanTracker {
             unsafe { std::slice::from_raw_parts(recovery.samples, recovery.sample_count) }.to_vec()
         };
         unsafe { nuwax_scan_free(&mut recovery) };
+        if result.reason & track_reason::NO_CANDIDATE != 0 {
+            let detail = error_message(&error);
+            let reason = if detail.is_empty() { "命令检查没有合法候选" } else { &detail };
+            evidence.log_failure(&mut self.1, now, "局部命令检查", reason,
+                CollisionLogPose::with_yaw(state.position, Some(state.yaw)), goal.map(Into::into));
+        }
         if error[0] == 0 {
             Ok(TrackResult {
                 command: result.command,
@@ -622,6 +647,7 @@ mod tests {
     include!("gait_velocity_tests.rs");
     include!("terminal_tests.rs");
     include!("reference_rejection_tests.rs");
+    include!("collision_logging_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

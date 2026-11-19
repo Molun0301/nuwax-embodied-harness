@@ -4,12 +4,13 @@ use nalgebra::{Isometry3, Point3};
 use nuwax_dufomap_native::{DufoMap, Params};
 
 pub(crate) fn online_params() -> Params {
+    let geometry = nuwax_config::geometry().expect("启动已捕获 geometry 配置");
     Params {
-        resolution: 0.15,
-        inflate_unknown: 2,
+        resolution: geometry.mapping_dynamic_resolution_m,
+        inflate_unknown: geometry.mapping_dynamic_inflate_unknown,
         inflate_unknown_compensation: false,
-        inflate_hits_dist: 0.30,
-        sliding_window_size: 30,
+        inflate_hits_dist: geometry.mapping_dynamic_inflate_hits_dist_m,
+        sliding_window_size: geometry.mapping_dynamic_sliding_window_size,
         ..Params::default()
     }
 }

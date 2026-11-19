@@ -29,6 +29,20 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(nuwax_lio::PointLioPoint,
     (float, intensity, intensity)
 )
 
+namespace faster_lio {
+
+// 上游 iVox 头在点类型定义之后加载，先声明其转换模板。
+template <typename T, int dim, typename PointType>
+inline Eigen::Matrix<T, dim, 1> ToEigen(const PointType& pt);
+
+template <>
+inline Eigen::Matrix<float, 3, 1> ToEigen<float, 3, nuwax_lio::PointLioPoint>(
+    const nuwax_lio::PointLioPoint& pt) {
+    return pt.getVector3fMap();
+}
+
+}
+
 namespace pcl {
 
 // 体素坐标和强度继续用 PCL（点云库）的质心，时间用整数均值取最近纳秒。

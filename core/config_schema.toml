@@ -1934,8 +1934,8 @@ apply = "restart"
 [geometry.self_filter_ground_clearance_m]
 type = "float"
 default = 0.04
-description = "腿足摆动盒底部与模型参考姿态地面之间的最小间距（米）。"
-consumers = ["core/config.py:derived_values"]
+description = "腿足摆动盒底部与模型参考姿态地面之间的最小间距（米）。可为负值；Go2 安装时写入 −0.01，因实际站姿比模型参考姿态高约 4–5 厘米。"
+consumers = ["core/config.py:derived_values", "scripts/module_installer/runtime.py:write_runtime"]
 apply = "restart"
 
 [geometry.self_filter_joint_swing_rad]

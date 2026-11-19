@@ -157,6 +157,19 @@ button{font-family:inherit;cursor:pointer}
 .vstat .v.ok{color:var(--good)}.vstat .v.warn{color:var(--warn)}.vstat .v.bad{color:var(--bad)}
 .vstat .l{font-size:var(--fs-xs);color:var(--faint);margin-top:1px;white-space:nowrap}
 .vitals>.seg{flex:none}
+/* 急停：红底醒目，任何视图都在顶栏可点；下方一行显示最近一次结果。 */
+.estop-wrap{flex:none;display:flex;flex-direction:column;align-items:center;gap:2px;max-width:220px}
+.estop{height:var(--control-height);min-width:84px;padding:0 18px;border:0;border-radius:var(--r-sm);background:var(--bad);color:#fff;
+  font-size:var(--fs-md);font-weight:720;letter-spacing:.12em;box-shadow:0 2px 8px -3px var(--bad)}
+.estop:hover{filter:brightness(1.08)}
+.estop:active{filter:brightness(.92)}
+.estop-status{max-width:220px;font-size:var(--fs-xs);color:var(--good);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.estop-status:empty{display:none}
+.estop-status[data-level="warn"]{color:var(--warn)}
+.estop-status[data-level="error"]{color:var(--bad)}
+.volume-stat .v{display:flex;align-items:center;gap:6px}
+.volume-stat input[type="range"]{width:88px;height:16px;margin:0;accent-color:var(--ink)}
+.volume-stat.is-error .l{color:var(--bad)}
 #themeToggle{flex:0 0 var(--control-height);width:var(--control-height);height:var(--control-height);display:grid;place-items:center;padding:0;
   border:1px solid var(--line);border-radius:var(--r-sm);background:var(--inset);color:var(--strong);transition:background .15s,color .15s}
 #themeToggle:hover{background:var(--inset-2);color:var(--ink)}
@@ -239,6 +252,8 @@ button{font-family:inherit;cursor:pointer}
 .task-row-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 .task-row-heading>.mono{min-width:0;overflow-wrap:anywhere}
 .task-row-heading>.pill{flex-shrink:0}
+.task-row-heading>.task-cancel{flex-shrink:0;min-height:22px;padding:0 8px}
+.task-row-heading>.pill{margin-left:auto}
 .task-feedback-details{margin-top:8px;font-size:var(--fs);min-width:0}
 .task-feedback-details summary{cursor:pointer;line-height:1.7}
 .task-feedback-fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
@@ -401,6 +416,8 @@ button{font-family:inherit;cursor:pointer}
 #live-map .map-manager-actions{flex:none;display:inline-flex;gap:6px}
 #live-map .map-manager-actions .msb-btn{min-height:26px;padding:0 9px}
 #live-map .map-manager-empty{padding:6px 2px;color:var(--muted);font-size:var(--fs)}
+/* 运动面板：方向按钮成组，执行按钮一律显式点击。 */
+#live-map .motion-pad .msb-btn{min-width:52px}
 /* 状态行：当前结果在前，说明文字随后；空项不占位。 */
 .msb-status{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 14px;margin:0;color:var(--strong);font-size:var(--fs-sm);line-height:1.55;min-width:0}
 .msb-status>*{min-width:0;overflow-wrap:anywhere}
@@ -540,8 +557,9 @@ details.msb-pane>summary{display:none}
 .semantic-detail-actions{display:flex;flex-wrap:wrap;gap:8px;border-top:1px solid var(--line);padding-top:14px}
 .semantic-detail-actions .btn{flex:1}
 
-/* 视图、镜头与状态已有固定宽度，功能按钮在拥挤前独立换行，按内容宽度左对齐。 */
-@container (max-width:1200px){
+/* 视图、镜头与状态已有固定宽度，功能按钮在拥挤前独立换行，按内容宽度左对齐。
+   断点取工具栏单行所需宽度（约 1330 像素，含“地图”“运动”按钮）。 */
+@container (max-width:1340px){
   #live-map{--map-header-pad:8px}
   #live-map .map-header{flex-wrap:wrap;gap:6px 8px;padding:var(--map-header-pad) 12px}
   #live-map .map-tool-actions{order:3;flex:1 0 100%;border-left:0;border-top:1px solid var(--line-2);padding:6px 0 0;overflow-x:auto;scrollbar-width:thin}
@@ -869,4 +887,47 @@ details.msb-pane>summary{display:none}
 }
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
+
+/* ===== 全部能力 ===== */
+.capability-search{flex:none;padding:12px 10px 0}
+.capability-search .field{width:100%;font-weight:400}
+.capability-nav button{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-start;gap:1px;width:100%;min-height:34px;padding:6px 10px;border:0;border-radius:var(--r-sm);
+  background:transparent;color:var(--strong);text-align:left;font:inherit}
+.capability-nav button:hover{background:var(--inset);color:var(--ink)}
+.capability-nav button.on{background:var(--inset-2);color:var(--ink)}
+.capability-nav button .mono{font-size:var(--fs);font-weight:620}
+.capability-nav .cap-summary{max-width:100%;font-size:var(--fs-xs);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.capability-nav .hd{padding:10px 8px 4px}
+.capability-nav .hd:first-child{padding-top:0}
+.capability-heading{display:flex;flex-direction:column;gap:6px;min-width:0}
+.capability-meta{display:flex;flex-wrap:wrap;gap:6px}
+.capability-meta:empty{display:none}
+.capability-body{flex:1;min-height:0;overflow:auto;padding:16px 20px 24px}
+.capability-description{margin:0 0 14px;color:var(--strong);white-space:pre-wrap;line-height:1.6;max-width:880px}
+.capability-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px 16px;max-width:1100px}
+.cap-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.cap-field label{display:flex;align-items:baseline;gap:8px;min-width:0}
+.cap-field label .mono{font-size:var(--fs);font-weight:640;color:var(--ink);overflow-wrap:anywhere}
+.cap-type{font-size:var(--fs-xs);color:var(--faint);white-space:nowrap}
+.cap-field .field{width:100%;font:inherit;font-weight:400;padding:0 9px}
+.cap-field textarea.field{padding:6px 9px;font-family:var(--mono);font-size:var(--fs);resize:vertical}
+.cap-hint{font-size:var(--fs-xs);color:var(--muted);line-height:1.5;overflow-wrap:anywhere}
+.cap-schema summary{font-size:var(--fs-xs);color:var(--faint);cursor:pointer}
+.cap-schema pre{margin:4px 0 0;max-height:220px;overflow:auto;padding:8px;border-radius:var(--r-sm);background:var(--inset);font-size:var(--fs-xs)}
+.capability-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-top:16px}
+.capability-status{font-size:var(--fs-sm);color:var(--strong);overflow-wrap:anywhere}
+.capability-status[data-level="error"]{color:var(--bad)}
+.capability-result{margin:12px 0 0;max-width:1100px;max-height:480px;overflow:auto;padding:12px;border:1px solid var(--line);border-radius:var(--r);
+  background:var(--inset);font-family:var(--mono);font-size:var(--fs);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:900px){
+  .capability-search{padding:8px 0 8px 12px}
+  .capability-search .field{width:200px}
+  .capability-nav button{width:auto;flex-shrink:0;white-space:nowrap}
+  .capability-nav .cap-summary{display:none}
+  .capability-form{grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:760px){
+  .vitals>.estop-wrap{order:2}
+  .estop{min-width:64px;padding:0 12px}
 }

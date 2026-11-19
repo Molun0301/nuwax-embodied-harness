@@ -5427,10 +5427,12 @@
         if (state.map2dCameraMode === "free") event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
-        // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
-        state.semanticRegionPointerDown = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
-        if (!isMap3dVisible() && event.button === 0) {
+        // 禁行区绘制：把事件让给 SVG overlay，canvas 主循环不参与。
+        if (window.__nuwaxBoundaryActive) return;
+        // 导航选点期间单击按住拖动照常旋转平移，不做物品与区域点选；双击选点由导航模块处理。
+        const picking = Boolean(window.__nuwaxNavigationActive);
+        state.semanticRegionPointerDown = event.button === 0 && !picking ? { x: event.clientX, y: event.clientY } : null;
+        if (!isMap3dVisible() && event.button === 0 && !picking) {
           const pointer = canvasPointer(event);
           const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
           if (hit) {
@@ -5464,7 +5466,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointermove", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) {
           const pointer = canvasPointer(event);
           state.mapFreeView.yaw = state.mapRotateDrag.yawStart + (pointer.x - state.mapRotateDrag.pointerStart.x) * 0.006;
@@ -5487,7 +5489,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) state.mapRotateDrag = null;
         if (state.mapPanDrag) finishMapPan(event);
         const start = state.semanticRegionPointerDown;
@@ -5498,7 +5500,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) {
           state.mapRotateDrag = null;
           return;
@@ -5532,8 +5534,7 @@
       };
       window.__nuwaxResolveNavigationHeight = resolveNavigationHeight;
       window.__nuwaxResetMapInteraction = resetMapInteraction;
-      // V2 模块互斥开关：boundary_draw.js / navigation.js 在激活时会置 true，
-      // 主循环的 pointerdown/pointermove/pointerup 入口据此提前 return 让事件落到 SVG overlay。
+      // 地图工具互斥开关：禁行区绘制或导航选点激活时为真，物品定位与语义面板据此让位。
       window.__nuwaxMapToolV2 = {
         active: function () { return Boolean(window.__nuwaxBoundaryActive || window.__nuwaxNavigationActive); },
       };

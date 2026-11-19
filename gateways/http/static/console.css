@@ -194,11 +194,6 @@ button{font-family:inherit;cursor:pointer}
 .video .ov{position:absolute;z-index:1;left:9px;right:9px;bottom:9px;display:flex;justify-content:space-between;align-items:center;gap:4px;flex-wrap:wrap}
 .ovchip{padding:2px 8px;border-radius:var(--r-xs);font-size:var(--fs-xs);color:var(--strong);max-width:100%;overflow-wrap:anywhere}
 #visionModelStatus{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* 右栏较窄时互换按钮只留图标，标题与按钮保持单行。 */
-@container (max-width:350px){
-  #video-perception .media-swap{width:32px;padding:0}
-  #video-perception .media-swap [data-swap-label]{display:none}
-}
 /* 没有画面时只保留一行提示，把高度留给下方运行信息；放大模式仍保留画面区域。 */
 .workspace:not(.swapped) #video-perception:has(#videoFrame[hidden]) .video{display:none}
 .vision-status-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:var(--fs-sm)}

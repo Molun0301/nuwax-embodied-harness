@@ -325,7 +325,7 @@
               <div class="panel-bar-title"><h2>摄像头与识别</h2><span id="videoStatus" class="pill missing">缺失</span></div>
               <div class="panel-actions">
                 <label class="chip-toggle" title="在画面上叠加检测框"><input id="showDetections" type="checkbox" checked><span>检测框</span></label>
-                <button id="mediaSwapBtnVideo" class="btn btn-sm media-swap" type="button" title="地图 / 视频 互换位置与大小"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5"/></svg><span data-swap-label>放大</span></button>
+                <button id="perceptionRuntimeToggle" class="btn btn-sm" type="button" title="开启或关闭手动连续识别；探索、跟随和找目标使用时会继续识别" disabled>开启检测</button>
               </div>
             </div>
             <div class="vision-content">
@@ -344,10 +344,8 @@
                 <div class="vision-status-row">
                   <span id="perceptionRuntimeStatus" class="pill missing">连续识别状态未知</span>
                   <span id="perceptionRuntimeReasons" class="muted small">使用原因：未读取</span>
-                  <button id="perceptionRuntimeStart" class="btn btn-sm" type="button" disabled>开启手动识别</button>
-                  <button id="perceptionRuntimeStop" class="btn btn-sm" type="button" disabled>关闭手动识别</button>
                 </div>
-                <p id="perceptionRuntimeMessage" class="muted small" role="status">关闭手动识别只移除手动使用原因；探索、跟随和找目标仍在使用时会继续识别。</p>
+                <p id="perceptionRuntimeMessage" class="muted small" role="status">关闭检测只移除手动使用原因；探索、跟随和找目标仍在使用时会继续识别。</p>
                 <div class="vision-status-row">
                   <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
                 </div>

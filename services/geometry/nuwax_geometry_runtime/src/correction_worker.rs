@@ -167,7 +167,7 @@ impl Rebuilt {
                 source_timestamp_ns: self.stamp, received_at_ns: self.stamp,
                 registered_frame_id: self.config.map_frame_id.clone(),
                 sensor_origin_map: [origin.x, origin.y, origin.z], dynamic_frame: Some(observation.dynamic),
-                registered_points_map: observation.confirmed,
+                registered_points_map: observation.admitted,
             };
             if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
                 &mut self.kernel, &input, self.config.compute, 0)? {

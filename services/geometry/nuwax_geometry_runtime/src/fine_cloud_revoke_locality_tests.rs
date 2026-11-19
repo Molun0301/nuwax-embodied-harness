@@ -52,7 +52,7 @@ fn scattered_free_cells_revoke_over_two_million_voxels_by_two_blocks() {
             fine.voxel_size(),
         ))
     });
-    fine.accumulate_inner(&seed_points, Some([0.0; 3]), 0, None, None)
+    fine.accumulate_inner(&seed_points, Some([0.0; 3]), 0, None)
         .unwrap();
     assert_eq!(fine.last_revoke_read_blocks(), 0);
     assert_eq!(fine.last_revoke_block_lookups(), 0);
@@ -74,7 +74,7 @@ fn scattered_free_cells_revoke_over_two_million_voxels_by_two_blocks() {
         }
     );
 
-    fine.accumulate_inner(&[], Some([0.0; 3]), 2, Some(frame), None)
+    fine.accumulate_inner(&[], Some([0.0; 3]), 2, Some(frame))
         .unwrap();
     assert_eq!(
         fine.last_revoke_read_blocks(),
@@ -169,7 +169,7 @@ fn rotated_negative_free_cells_match_full_scan_and_read_only_intersections() {
         .collect();
     fine.writer.seed_unknown(keys.iter().copied()).unwrap();
     fine.writer.flush().unwrap();
-    fine.accumulate_inner(&[], Some([0.0; 3]), 1, Some(frame), None)
+    fine.accumulate_inner(&[], Some([0.0; 3]), 1, Some(frame))
         .unwrap();
     assert_eq!(fine.last_revoke_read_blocks(), expected_blocks.len());
     assert!(fine.last_revoke_read_blocks() < existing_blocks.len());
@@ -203,7 +203,6 @@ fn rotated_negative_free_cells_match_full_scan_and_read_only_intersections() {
         Some([0.0; 3]),
         2,
         Some(crate::dynamic_backend::MappedFrame::unfiltered()),
-        None,
     )
     .unwrap();
     assert_eq!(fine.last_revoke_read_blocks(), 0);

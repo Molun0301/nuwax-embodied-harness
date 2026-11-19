@@ -103,14 +103,14 @@ impl StructureUpdates {
     fn select(
         &mut self,
         points: &[Point3<f64>],
-        static_indices: &[u32],
+        static_indices: impl IntoIterator<Item = u32>,
         stamp: u64,
     ) -> Vec<u32> {
         self.expire(stamp);
         let mut fine_decisions = AHashMap::new();
         let mut coarse_decisions = AHashMap::new();
         let mut confirmed = Vec::new();
-        for &index in static_indices {
+        for index in static_indices {
             let point = points[index as usize];
             let key = voxel_key(point.into(), VOXEL_SIZE).expect("静态分类已验证精细体素坐标");
             if *fine_decisions.entry(key).or_insert_with(|| {
@@ -130,6 +130,26 @@ impl StructureUpdates {
             }
         }
         confirmed
+    }
+
+    /// 地面直接接纳，既不等待确认，也不为同粗格的非地面回波计票。
+    fn select_building(
+        &mut self,
+        points: &[Point3<f64>],
+        static_indices: &[u32],
+        ground: &[u32],
+        stamp: u64,
+    ) -> Vec<u32> {
+        let mut ground_mask = vec![false; points.len()];
+        for &index in ground {
+            ground_mask[index as usize] = true;
+        }
+        let non_ground = static_indices.iter().copied()
+            .filter(|&index| !ground_mask[index as usize]);
+        let mut admitted = self.select(points, non_ground, stamp);
+        admitted.extend_from_slice(ground);
+        admitted.sort_unstable();
+        admitted
     }
 
     fn outside_base(&self, key: VoxelKey) -> bool {
@@ -179,7 +199,7 @@ pub(crate) struct BuildingObservation {
     pub dynamic: MappedFrame,
     pub static_indices: Vec<u32>,
     pub ground_indices: Vec<u32>,
-    pub confirmed: Vec<Point3<f64>>,
+    pub admitted: Vec<Point3<f64>>,
 }
 
 pub(crate) struct CloudMap {
@@ -341,7 +361,7 @@ impl CloudMap {
             updates.expire(stamp);
             return Ok(None);
         }
-        let confirmed: Vec<_> = updates.select(points, static_indices, stamp)
+        let confirmed: Vec<_> = updates.select(points, static_indices.iter().copied(), stamp)
             .into_iter().map(|index| points[index as usize]).collect();
         if confirmed.is_empty() {
             return Ok(None);
@@ -393,16 +413,16 @@ impl CloudMap {
         )?;
         dynamic.bind_points(points, &indices);
         let stamp = frame.odom_pose.timestamp_ns;
-        let confirmed_indices = self.structure_updates.select(points, &indices, stamp);
-        let ground_indices = self.fine.accumulate_confirmed(
+        let updates = &mut self.structure_updates;
+        let (ground_indices, admitted_indices) = self.fine.accumulate_building(
             self.session_id,
             &frame.sensor_id,
             sequence,
             points,
-            &confirmed_indices,
             origin,
             stamp,
             dynamic.clone(),
+            |ground| updates.select_building(points, &indices, ground, stamp),
         )?;
         self.dense.remove_cleared(&dynamic)?;
         let retained: Vec<_> = points
@@ -411,7 +431,7 @@ impl CloudMap {
             .copied()
             .collect();
         self.dense.append(&retained)?;
-        let confirmed: Vec<_> = confirmed_indices.into_iter()
+        let admitted: Vec<_> = admitted_indices.into_iter()
             .map(|index| points[index as usize]).collect();
         let hits: ahash::AHashSet<_> = points
             .iter()
@@ -429,8 +449,8 @@ impl CloudMap {
             self.voxels.remove(&key);
             self.pages.removed(key, CM_MAX_POINTS);
         }
-        if !confirmed.is_empty() || !self.fine.removed_keys().is_empty() {
-            self.accumulate_display(&confirmed, stamp)?;
+        if !admitted.is_empty() || !self.fine.removed_keys().is_empty() {
+            self.accumulate_display(&admitted, stamp)?;
         }
         self.poses
             .push((stamp, isometry_matrix(&(map_from_odom * odom))));
@@ -439,7 +459,7 @@ impl CloudMap {
             dynamic,
             static_indices: indices,
             ground_indices,
-            confirmed,
+            admitted,
         })
     }
 

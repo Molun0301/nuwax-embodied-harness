@@ -870,7 +870,7 @@ impl Worker {
             }
             (
                 observation.ground_indices,
-                Some((observation.confirmed, observation.dynamic, observation.static_indices)),
+                Some((observation.admitted, observation.dynamic, observation.static_indices)),
             )
         };
         if !frame.mapping_only {

@@ -19,7 +19,8 @@ from services.navigation.exploration_checkpoint import ExplorationCheckpoint
 @dataclass
 class _ExplorationRun:
     task_id: str
-    exploration_id: str
+    # 探索真正启动前为空；任务进入处理器即登记，准备建图期间也能暂停或停止。
+    exploration_id: str = ""
     pause: threading.Event = field(default_factory=threading.Event)
 
 
@@ -39,11 +40,17 @@ class ExplorationControl:
             self._runs.pop(run.task_id, None)
 
     def find(self, exploration_id=""):
+        """已启动的探索；不带编号时取最近一次。"""
         with self._lock:
             for run in reversed(tuple(self._runs.values())):
-                if not exploration_id or run.exploration_id == exploration_id:
+                if run.exploration_id and (not exploration_id or run.exploration_id == exploration_id):
                     return run
         return None
+
+    def preparing(self):
+        """已进入探索处理器、正在启动建图会话或探索的运行。"""
+        with self._lock:
+            return next((run for run in reversed(tuple(self._runs.values())) if not run.exploration_id), None)
 
 
 class _PauseRequested(Exception):
@@ -90,12 +97,15 @@ def _request(args, progress_json="", *, remaining_sec=900.0):
 
 
 def _stop(platform, run, timeout_sec):
-    platform.geometry.stop_exploration(run.exploration_id, timeout_sec=timeout_sec)
+    if run.exploration_id:
+        platform.geometry.stop_exploration(run.exploration_id, timeout_sec=timeout_sec)
 
 
 def _pause_and_save(platform, ctx, args, run):
     _stop(platform, run, ctx.remaining())
-    progress = platform.geometry.get_exploration_progress(run.exploration_id, timeout_sec=ctx.remaining())
+    # 探索尚未启动时没有新进度，检查点沿用本次请求带来的进度。
+    progress = (platform.geometry.get_exploration_progress(run.exploration_id, timeout_sec=ctx.remaining())
+                if run.exploration_id else args.get("_resume_progress_json", ""))
     ctx.check()
     snapshot = platform.geometry_state.snapshot()
     pose = snapshot.pose
@@ -114,35 +124,41 @@ def _pause_and_save(platform, ctx, args, run):
 
 @rpc_errors
 def explore_area(platform, ctx, args):
-    if not platform.config.perception.yolo_world.enabled:
-        return _explore_area(platform, ctx, args)
-    reason = f"exploration:{ctx.task_id}"
-    runtime = platform.perception.video_runtime
-    runtime.acquire(reason)
+    run = _ExplorationRun(ctx.task_id)
+    platform.exploration_control.add(run)
     try:
-        return _explore_area(platform, ctx, args)
+        if not platform.config.perception.yolo_world.enabled:
+            return _explore_area(platform, ctx, args, run)
+        reason = f"exploration:{ctx.task_id}"
+        runtime = platform.perception.video_runtime
+        runtime.acquire(reason)
+        try:
+            return _explore_area(platform, ctx, args, run)
+        finally:
+            runtime.release(reason)
     finally:
-        runtime.release(reason)
+        platform.exploration_control.remove(run)
 
 
-def _explore_area(platform, ctx, args):
+def _explore_area(platform, ctx, args, run):
     ctx.check()
     snapshot = platform.geometry_state.snapshot()
     name = args.get("map_name") or (snapshot.map_name if snapshot is not None else "")
     args = {**args, "map_name": name}
     saved = platform.maps.get(name)
     continuing = args.get("continue_saved", saved is not None and saved.saved)
-    start_mapping_session(platform, name, continue_saved=continuing, timeout_sec=ctx.remaining())
-    ctx.check()
-    exploration_id = platform.geometry.start_exploration(
-        _request(args, args.get("_resume_progress_json", ""), remaining_sec=ctx.remaining()), timeout_sec=ctx.remaining())
-    run = _ExplorationRun(ctx.task_id, exploration_id)
-    platform.exploration_control.add(run)
+    following = _FollowingContext(ctx, run)
     terminal = False
     try:
-        ctx.progress(0.0, "exploring", "正在探索", exploration_id=exploration_id, map_name=name)
         try:
-            for status in platform.geometry_state.follow_exploration(exploration_id, _FollowingContext(ctx, run)):
+            start_mapping_session(platform, name, continue_saved=continuing, timeout_sec=ctx.remaining())
+            following.check()
+            run.exploration_id = platform.geometry.start_exploration(
+                _request(args, args.get("_resume_progress_json", ""), remaining_sec=ctx.remaining()),
+                timeout_sec=ctx.remaining())
+            exploration_id = run.exploration_id
+            ctx.progress(0.0, "exploring", "正在探索", exploration_id=exploration_id, map_name=name)
+            for status in platform.geometry_state.follow_exploration(exploration_id, following):
                 ctx.progress(0.0, "exploring", status.message,
                              exploration_id=exploration_id, map_name=name, exploration=asdict(status))
                 if status.phase.terminal:
@@ -173,17 +189,30 @@ def _explore_area(platform, ctx, args):
         except _PauseRequested:
             return _pause_and_save(platform, ctx, args, run)
     finally:
-        try:
-            if not terminal:
-                _stop(platform, run, None)
-        finally:
-            platform.exploration_control.remove(run)
+        if not terminal:
+            _stop(platform, run, None)
+
+
+def _preparing_task(platform):
+    """已提交但还在准备运行组件或加载地图、尚未进入探索处理器的探索任务。"""
+    return next((task.task_id for task in reversed(platform.tasks.active())
+                 if task.capability in {"explore_area_v2", "resume_exploration"}), None)
+
+
+def _find_run(platform, exploration_id):
+    # 不带编号时，探索尚未启动的运行同样可以暂停或停止。
+    control = platform.exploration_control
+    return control.find(exploration_id) or (None if exploration_id else control.preparing())
 
 
 @rpc_errors
 def stop_exploration(platform, args):
     exploration_id = args.get("exploration_id", "")
-    run = platform.exploration_control.find(exploration_id)
+    run = _find_run(platform, exploration_id)
+    task_id = _preparing_task(platform) if run is None and not exploration_id else None
+    if task_id is not None:
+        platform.tasks.cancel(task_id, "停止探索")
+        return {"exploration_id": "", "task_id": task_id, "stopped": True}
     try:
         if run is None:
             platform.geometry.stop_exploration(exploration_id)
@@ -196,9 +225,15 @@ def stop_exploration(platform, args):
 
 
 def pause_exploration(platform, args):
-    run = platform.exploration_control.find(args.get("exploration_id", ""))
+    exploration_id = args.get("exploration_id", "")
+    run = _find_run(platform, exploration_id)
     if run is None:
-        raise GatewayError("没有匹配的活动探索任务", error_code="exploration_not_running", http_status=409)
+        task_id = None if exploration_id else _preparing_task(platform)
+        if task_id is None:
+            raise GatewayError("没有匹配的活动探索任务", error_code="exploration_not_running", http_status=409)
+        # 建图会话尚未开始，没有可保存的地图和进度，直接结束任务。
+        platform.tasks.cancel(task_id, "暂停探索：探索尚未开始，没有可保存的地图和进度")
+        return {"task_id": task_id, "exploration_id": "", "checkpoint_pending": False}
     run.pause.set()
     return {"task_id": run.task_id, "exploration_id": run.exploration_id,
             "checkpoint_id": run.task_id, "checkpoint_pending": True}

@@ -1616,6 +1616,49 @@ consumers = [
 ]
 apply = "restart"
 
+[geometry.mapping_dynamic_inflate_hits_dist_m]
+type = "float"
+min = 0.0
+default = 0.30
+description = "在线建图去动态时沿射线保护命中点前方的距离（米）。距离越大，越少将命中点附近判为空闲。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_inflate_hits_dist_m",
+]
+apply = "restart"
+
+[geometry.mapping_dynamic_inflate_unknown]
+type = "integer"
+min = 0
+max = 4
+default = 1
+description = "在线建图去动态的未知区外扩格数。格数越大，判定空闲所需的邻域射线覆盖越完整。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_inflate_unknown",
+]
+apply = "restart"
+
+[geometry.mapping_dynamic_resolution_m]
+type = "float"
+min = 0.0
+min_exclusive = true
+default = 0.12
+description = "在线去动态判定空闲和动态回波的体素边长（米）。精细地图另用自身的体素边长。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_resolution_m",
+]
+apply = "restart"
+
+[geometry.mapping_dynamic_sliding_window_size]
+type = "integer"
+min = 0
+max = 2147483647
+default = 1
+description = "在线去动态合并射线证据的最近帧数。0 或 1 表示只用当前帧。较长窗口增加覆盖，也会保留更久的历史命中。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_sliding_window_size",
+]
+apply = "restart"
+
 [geometry.mapping_initial_safe_radius_meters]
 type = "float"
 min = 0.0

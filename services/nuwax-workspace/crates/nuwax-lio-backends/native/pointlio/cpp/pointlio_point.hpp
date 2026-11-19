@@ -36,7 +36,10 @@ template <>
 class CentroidPoint<nuwax_lio::PointLioPoint> {
 public:
     void add(const nuwax_lio::PointLioPoint& point) {
-        centroid_.add(PointXYZI(point.x, point.y, point.z, point.intensity));
+        // PCL 1.10 没有同时接收坐标和强度的构造函数。
+        PointXYZI sample(point.intensity);
+        sample.getVector3fMap() = point.getVector3fMap();
+        centroid_.add(sample);
         offset_sum_ns_ += point.offset_ns;
     }
 

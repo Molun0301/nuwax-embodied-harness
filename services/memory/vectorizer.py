@@ -516,8 +516,16 @@ def build_text_embedder(
             timeout_sec=timeout_sec,
         )
     if spec.provider_name == "sentence_transformers":
-        return SentenceTransformerTextEmbedder(model_name=spec.model_name, dimension=dimension)
+        return SentenceTransformerTextEmbedder(model_name=spec.model_name, dimension=dimension, device="cpu")
     raise ValueError(f"不支持的文本向量化模型：{model_name}")
+
+
+def embedding_model_identity(spec, dimension):
+    """已有向量按将要使用的模型名和维度匹配，无需加载模型。"""
+    if spec.provider_name == "dashscope":
+        return (_normalize_dashscope_model_name(spec.model_name),
+                _resolve_dashscope_dimension(spec.model_name, dimension))
+    return spec.model_name, dimension
 
 
 def build_vision_language_embedder(

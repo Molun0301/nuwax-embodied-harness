@@ -64,6 +64,7 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
         self._grounding_query_planner = GroundingQueryPlanner()
         self._planner = InspectionPosePlanner()
         self._association = InstanceAssociationService(text_embedder=text_embedder,
+            load_text_embedder=lambda: self._embeddings.load("text"),
             inspection_pose_planner=self._planner, association_config=association_config)
         self._instance_association_service = self._association
         self._semantic_builder = SemanticMapBuilder(inspection_pose_planner=self._planner)
@@ -226,11 +227,6 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
         with self._condition:
             self._library_error = None
             self._condition.notify_all()
-        if store is not None:
-            try:
-                self._embeddings.initialize()
-            except Exception:
-                LOGGER.exception('嵌入模型初始化失败，继续使用词法检索')
 
     def _library_failed(self, error):
         with self._condition:

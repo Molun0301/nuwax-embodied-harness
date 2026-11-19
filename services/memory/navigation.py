@@ -391,14 +391,15 @@ class NavigationMixin:
         segmentation_evidence = self._collect_arrival_segmentation_evidence(perception_context.observation.detections_2d, query=effective_query, target_labels=target_labels)
         image_score = 0.0
         target_point = self._vector_point_for_record(record_id) if record_id else None
-        if self._embeddings.image is not None and perception_context.image_artifact is not None:
+        image = self._embeddings.load("image") if perception_context.image_artifact is not None else None
+        if image is not None:
             current_image_bytes = self._load_image_bytes(perception_context.image_artifact.artifact_id)
             if current_image_bytes is not None:
-                current_image_vector = self._embeddings.image.embed_image_bytes(current_image_bytes)
-                query_image_vector = self._embeddings.image.embed_text(effective_query)
-                image_score = max(image_score, max(0.0, self._embeddings.image.cosine_similarity(query_image_vector, current_image_vector)))
+                current_image_vector = image.embed_image_bytes(current_image_bytes)
+                query_image_vector = image.embed_text(effective_query)
+                image_score = max(image_score, max(0.0, image.cosine_similarity(query_image_vector, current_image_vector)))
                 if target_point is not None and IMAGE_VECTOR_NAME in target_point.vectors:
-                    image_score = max(image_score, max(0.0, self._embeddings.image.cosine_similarity(current_image_vector, target_point.vectors[IMAGE_VECTOR_NAME].array())))
+                    image_score = max(image_score, max(0.0, image.cosine_similarity(current_image_vector, target_point.vectors[IMAGE_VECTOR_NAME].array())))
         score = self._clamp_score(0.45 * lexical_score + (0.55 * image_score if image_score > 0.0 else 0.0) + (0.35 * lexical_score if image_score <= 0.0 else 0.0))
         segmentation_match_score = self._coerce_optional_float(segmentation_evidence.get('segmentation_match_score')) or 0.0
         segmentation_quality = str(segmentation_evidence.get('segmentation_quality') or 'unknown')

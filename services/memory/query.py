@@ -484,7 +484,7 @@ class QueryMixin:
         query_scope = str((grounding_plan.metadata if grounding_plan is not None else {}).get('query_scope') or query_scope)
         snapshot = self.snapshot()
         current_pose = self._as_memory_pose(self.current_pose())
-        vectors = self._embeddings.query(query)
+        vectors = self._embeddings.query(query, snapshot)
         scalar, scored = {}, {}
         vector_recall, lexical = {name:[] for name in vectors}, set()
         from services.memory.reader import read_connection, filter_sql
@@ -632,13 +632,14 @@ class QueryMixin:
         from services.model_providers import (resolve_text_embedding_provider_spec,
             resolve_vision_language_provider_spec, resolve_grounding_provider_spec)
         text, image = self._embeddings.text, self._embeddings.image
+        initialization_error = self._embeddings.initialization_error
         text_provider = resolve_text_embedding_provider_spec(self._embedding_model).to_metadata()
         image_provider = resolve_vision_language_provider_spec(self._image_embedding_model).to_metadata()
         return {"library_name": library, "query_text_preview": self._preview_text(query),
             "query_scope": scope, "match_limit": max(1, int(limit)),
             "candidate_count": candidate_count, "returned_candidate_count": returned_count,
-            "query_embedding_errors": ({"initialization": self._embeddings.error}
-                if self._embeddings._initialization_error is not None else {}),
+            "query_embedding_errors": ({"initialization": initialization_error}
+                if initialization_error is not None else {}),
             "fallback_used": not vectors and bool(text_provider.get("fallback_used")),
             "fallback_reason": str(text_provider.get("fallback_reason") or "") if not vectors else "",
             "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank" if vectors else "lexical_only",

@@ -7,7 +7,7 @@ import inspect
 import math
 import re
 import numpy as np
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from contracts.base import utc_now
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
@@ -57,13 +57,15 @@ class InstanceAssociationService:
     _SEMANTIC_ATTRIBUTE_KEYS = ('color', 'colour', 'material', 'shape', 'category', 'object_type', 'brand', 'model', 'pattern', 'text', 'ocr_text', 'description', 'display_name_zh')
     _POSE_EVIDENCE_KEYS = ('projection_method', 'projection_confidence', 'support_point_count', 'projection_degradation_reason', 'pose_quality_level', 'observation_only', 'coverage', 'depth_coverage', 'map_projection_coverage', 'reprojection_error', 'geometry_projection_method', 'geometry_projection_status', 'segmentation_projection_status', 'support_points_2d', 'support_points_3d', 'support_points_map', 'centroid_map', 'bbox_3d_map', 'object_3d_bbox', 'object_extent', 'position_support_radius_m', 'navigable', 'non_navigable_reason', 'has_structured_segmentation', 'segmentation_score', 'predicted_iou', 'stability_score', 'segmentation_quality_score', 'segmentation_support_point_count', 'segmentation_bbox_xyxy', 'centroid_uv', 'mask_center_px', 'segmentation_area_ratio', 'segmentation_occlusion_flags', 'segmentation_truncation_flags')
 
-    def __init__(self, *, text_embedder: Optional[TextEmbedder], inspection_pose_planner: Optional[InspectionPosePlanner]=None, association_config=None) -> None:
+    def __init__(self, *, text_embedder: Optional[TextEmbedder], inspection_pose_planner: Optional[InspectionPosePlanner]=None, association_config=None,
+                 load_text_embedder: Optional[Callable[[], Optional[TextEmbedder]]] = None) -> None:
         if association_config is None:
             from core.settings import MemoryInstanceAssociationConfig
             association_config = MemoryInstanceAssociationConfig()
         self._association_config = association_config
         self._consolidator = InstanceConsolidator(config=association_config)
         self._text_embedder = text_embedder
+        self._load_text_embedder = load_text_embedder
         self._text_embedder_cache_identity = self._embedder_cache_identity(text_embedder)
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
         self._label_similarity_cache: OrderedDict[frozenset[str], float] = OrderedDict()
@@ -96,6 +98,13 @@ class InstanceAssociationService:
         self._label_similarity_cache.clear()
         self._embedding_cache.clear()
 
+    def _text_embedder_for_similarity(self) -> Optional[TextEmbedder]:
+        if self._text_embedder is None and self._load_text_embedder is not None:
+            embedder = self._load_text_embedder()
+            if embedder is not None:
+                self.set_text_embedder(embedder)
+        return self._text_embedder
+
     def _label_similarity(self, label_a: str, label_b: str) -> float:
         """计算两个标签的语义相似度，返回 [0.0, 1.0]。
 
@@ -112,9 +121,10 @@ class InstanceAssociationService:
         if cache_key in self._label_similarity_cache:
             self._label_similarity_cache.move_to_end(cache_key)
             return self._label_similarity_cache[cache_key]
-        if self._text_embedder is not None:
+        embedder = self._text_embedder_for_similarity()
+        if embedder is not None:
             try:
-                similarity = self._text_embedder.cosine_similarity(self._embed_text_cached(a), self._embed_text_cached(b))
+                similarity = embedder.cosine_similarity(self._embed_text_cached(a), self._embed_text_cached(b))
                 result = min(1.0, similarity) if math.isfinite(similarity) and similarity >= 0.75 else 0.0
             except Exception:
                 return 0.0
@@ -1073,9 +1083,10 @@ class InstanceAssociationService:
             return 0.0
         if left_text == right_text:
             return 1.0
-        if self._text_embedder is not None:
+        embedder = self._text_embedder_for_similarity()
+        if embedder is not None:
             try:
-                similarity = self._text_embedder.cosine_similarity(self._embed_text_cached(left_text), self._embed_text_cached(right_text))
+                similarity = embedder.cosine_similarity(self._embed_text_cached(left_text), self._embed_text_cached(right_text))
                 return max(0.0, min(1.0, similarity)) if math.isfinite(similarity) else 0.0
             except Exception:
                 pass

@@ -19,6 +19,8 @@ class Capability:
     robots: Optional[FrozenSet[str]] = None
     normalize_names: Tuple[str, ...] = ()
     before_submit: Optional[Callable] = None
+    # 能力所属功能分组的中文名，由登记处按定义模块填写，网页能力面板据此分组。
+    group: str = ""
 
 
 class CapabilityTable:

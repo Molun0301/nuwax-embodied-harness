@@ -29,7 +29,7 @@ def list_capabilities(platform, args):
     robot = platform.robot.manifest.robot_name
     return {"capabilities": [{"name": cap.name, "description": cap.description,
                               "input_schema": cap.input_schema, "kind": cap.kind,
-                              "motion": cap.motion, "agent_tool": cap.agent_tool}
+                              "motion": cap.motion, "agent_tool": cap.agent_tool, "group": cap.group}
                              for cap in platform.capabilities.for_robot(robot)]}
 
 

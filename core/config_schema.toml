@@ -2101,6 +2101,17 @@ consumers = [
 ]
 apply = "restart"
 
+[navigation.terminal_stall_timeout_sec]
+type = "float"
+min = 0.0
+min_exclusive = true
+default = 5.0
+description = "终点转向或平移连续无进展时结束目标的时限（秒）。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.terminal_stall_timeout_sec",
+]
+apply = "restart"
+
 [navigation.wavefront_goal_timeout_ms]
 type = "integer"
 min = 1

@@ -88,19 +88,20 @@ fn terminal_reference_cuts_before_the_first_point_within_half_body_width() {
 }
 
 #[test]
-fn business_tolerance_keeps_the_current_curve_running() {
+fn unaligned_goal_keeps_the_current_curve_running_while_moving() {
     let mut f=ready_follower();
     f.options.position_tolerance_m=0.15;
     next_pose(&mut f,[4.88,1.,0.5]);
+    f.odometry.as_mut().unwrap().pose.orientation = Quaternion::from_yaw(1.);
     f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.2,0.,0.],[0.;3])));
     assert!(f.position_reached());
     let step=f.step();
-    assert_ne!(step,PlannerStep::Succeeded,"进入业务容差不得跳过仍可执行的曲线");
+    assert_ne!(step,PlannerStep::Succeeded,"朝向不在容差内，目标仍在执行");
     assert_eq!(f.terminal_phase(),TerminalPhase::Travel,"实测未停稳时不能提前进入末段");
 }
 
 #[test]
-fn eighth_round_saved_arrivals_wait_for_measured_stop() {
+fn eighth_round_saved_arrivals_succeed_inside_both_tolerances() {
     // 第八轮保存图点1—3宣告成功所用的原位姿与原目标；原公开距离约0.11—0.13米。
     let cases=[
         ([3.425000377371905,-0.9749997835606372,-0.006618790235110528],-0.7809150981891009,
@@ -124,12 +125,9 @@ fn eighth_round_saved_arrivals_wait_for_measured_stop() {
         // 原来源时刻的平台实测运动；配对误差分别为77、172、77纳秒。
         f.observe_measured_motion(Some(crate::motion_feedback::tests::measured(velocity,[0.,0.,yaw_rate])));
         assert!(f.position_reached());
-        assert!(!f.reached(),"进入容差时仍在运动，不能提前成功");
         assert!(f.active.is_some());
-        f.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
-        assert!(!f.reached(),"停稳后仍须完成到停点的平移");
-        f.terminal_translation_finished=true;
-        assert!(f.reached(),"平移结束且原位置、朝向、实测停稳条件满足后完成");
+        assert_eq!(f.step(), PlannerStep::Succeeded);
+        assert_eq!(f.terminal_phase(), TerminalPhase::Travel);
     }
 }
 
@@ -149,7 +147,7 @@ fn ninth_round_stopped_arrival_succeeds_with_unfinished_curve() {
         [0.,0.,-5.7431892283567847e-05])));
     assert!(f.active.is_some());
     assert_eq!(f.step_at_goal(),Some(PlannerStep::Succeeded));
-    assert!(f.terminal_translation_finished,"检查后平移为零时，结束平移后按原位置、朝向和停稳条件完成");
+    assert_eq!(f.terminal_phase(), TerminalPhase::Travel);
     assert_eq!(f.step(),PlannerStep::Succeeded);
 }
 fn delayed_planner(
@@ -423,9 +421,7 @@ fn clearing_recent_frame_requests_replan_on_next_step() {
     let mut arrived = ready_follower();
     arrived.odometry = arrived.goal.clone();
     arrived.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3], [0.;3])));
-    arrived.terminal_phase = TerminalPhase::Translating;
-    arrived.terminal_translation_finished = true;
-    assert!(arrived.reached(), "夹具须先满足原末段完成及实测停稳条件");
+    assert!(arrived.reached(), "夹具须先满足位置与朝向容差");
     arrived.observe_registered_frame(None);
     assert!(matches!(arrived.step(), PlannerStep::Succeeded), "校正通知不改变原到达优先级");
 }

@@ -49,6 +49,8 @@ pub struct SurfaceFollowerConfig {
     pub controller: LocalPlannerConfig,
     /// 实际角速度上限。
     pub max_angular_speed_rps: f64,
+    /// 终点转向或平移允许的连续无进展时间。
+    pub terminal_stall_timeout_sec: f64,
 }
 impl SurfaceFollowerConfig {
     /// 创建物理标定明确的三维执行配置。
@@ -90,6 +92,7 @@ impl SurfaceFollowerConfig {
             max_observation_age_sec: None,
             controller: LocalPlannerConfig::default_config(),
             max_angular_speed_rps: 0.55,
+            terminal_stall_timeout_sec: 5.,
         }
     }
     /// SCAN直接保留实际运动声明，不套用旧二维后端的前向策略。
@@ -160,8 +163,7 @@ pub struct SurfaceFollower {
     terminal_phase: TerminalPhase,
     terminal_approach: Option<TerminalApproach>,
     terminal_heading: f64,
-    terminal_translation_finished: bool,
-    terminal_translation_progress: Option<(f64, i64)>,
+    terminal_progress: Option<(f64, i64)>,
 }
 impl SurfaceFollower {
     /// 生产地图只接受注册原帧；地图维护线程独占概率图。
@@ -213,8 +215,7 @@ impl SurfaceFollower {
             terminal_phase: TerminalPhase::Travel,
             terminal_approach: None,
             terminal_heading: 0.,
-            terminal_translation_finished: false,
-            terminal_translation_progress: None,
+            terminal_progress: None,
         })
     }
     /// 在创建工作线程和连接运动端之前核对物理配置。
@@ -305,11 +306,11 @@ impl SurfaceFollower {
         position_within_tolerance(Self::position(pose), Self::position(goal),
             self.options.position_tolerance_m, map)
     }
-    fn reached(&self) -> bool {
+    fn orientation_reached(&self) -> bool {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
             return false;
         };
-        let yaw = if !self.options.requires_orientation() {
+        if !self.options.requires_orientation() {
             true
         } else if self.options.yaw_tolerance_rad == 0. {
             nuwax_nav_types_messages::same_finite_yaw(
@@ -323,16 +324,10 @@ impl SurfaceFollower {
             )
             .abs()
                 < self.options.yaw_tolerance_rad
-        };
-        let boundary = crate::motion_feedback::boundary_for_pose(pose, self.measured_motion.as_ref());
-        let state = MotionState {
-            velocity: boundary.velocity.unwrap_or([0.; 3]),
-            yaw_rate: boundary.yaw_rate.unwrap_or(0.),
-            measured_velocity: u32::from(boundary.velocity.is_some()),
-            measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
-            ..Default::default()
-        };
-        self.terminal_translation_finished && self.position_reached() && yaw && state.stopped()
+        }
+    }
+    fn reached(&self) -> bool {
+        self.position_reached() && self.orientation_reached()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
         let mut config = self.config.scan;
@@ -433,8 +428,7 @@ impl SurfaceFollower {
         self.terminal_phase = TerminalPhase::Travel;
         self.terminal_approach = None;
         self.terminal_heading = 0.;
-        self.terminal_translation_finished = false;
-        self.terminal_translation_progress = None;
+        self.terminal_progress = None;
     }
     fn reference_to_stop(reference: &[[f64; 3]], stop: [f64; 3], half_width: f64) -> Vec<[f64; 3]> {
         let keep = reference.iter().position(|point|
@@ -478,8 +472,7 @@ impl SurfaceFollower {
         self.phase = 0.;
         self.local_path.clear();
         self.local_body_path = None;
-        self.terminal_translation_finished = false;
-        self.terminal_translation_progress = None;
+        self.terminal_progress = None;
         self.terminal_heading = if self.options.requires_orientation() {
             self.goal.as_ref().unwrap().pose.orientation.yaw()
         } else {
@@ -521,7 +514,7 @@ impl SurfaceFollower {
         self.motion_boundary = Some(boundary);
         state
     }
-    fn compute(&mut self) -> Result<Twist2, String> {
+    fn compute(&mut self) -> Result<Twist2, PlannerStep> {
         let state = self.state();
         if let Some(result) = self.map_worker.take() {
             match result {
@@ -565,7 +558,9 @@ impl SurfaceFollower {
                 ))
         {
             self.execution_cycle_complete = true;
-            return Err("全局参考已结束，原业务目标未到，等待后续路线".into());
+            let reason = "全局参考已结束，原业务目标未到，等待后续路线".to_owned();
+            self.wait_reason = Some(reason.clone());
+            return Err(PlannerStep::ReplanRequired(reason));
         }
         let Some(map) = self.prepared.clone() else {
             self.submit_map();
@@ -576,33 +571,37 @@ impl SurfaceFollower {
         let at_terminal_stop = self.at_terminal_stop(&state);
         if self.terminal_phase == TerminalPhase::Turning && !at_terminal_stop {
             self.terminal_phase = TerminalPhase::Travel;
+            self.terminal_progress = None;
             self.needs_plan = true;
         } else if self.terminal_phase == TerminalPhase::Travel
             && at_terminal_stop && ((self.active.is_none() && self.pending_curve.is_none()) || state.stopped()) {
             self.begin_terminal_turn();
         }
-        if self.terminal_phase == TerminalPhase::Turning {
-            let goal_yaw = self.goal.as_ref().unwrap().pose.orientation.yaw();
-            let aligned = if self.options.yaw_tolerance_rad == 0. {
-                nuwax_nav_types_messages::same_finite_yaw(state.yaw, goal_yaw)
-            } else {
-                nuwax_nav_astar::controllers::angle_diff(goal_yaw, state.yaw).abs() < self.options.yaw_tolerance_rad
-            };
-            if aligned { self.terminal_phase = TerminalPhase::Translating; }
+        if self.terminal_phase == TerminalPhase::Turning && self.orientation_reached() {
+            self.terminal_phase = TerminalPhase::Translating;
+            self.terminal_progress = None;
         }
         let terminal_yaw = (self.terminal_phase != TerminalPhase::Travel)
             .then_some(self.terminal_heading);
         let stop = self.terminal_approach.as_ref().map_or_else(
             || Self::position(self.goal.as_ref().unwrap()), |a| a.points.stop);
-        if self.terminal_phase == TerminalPhase::Translating && !self.terminal_translation_finished {
-            let distance = (state.position[0] - stop[0]).hypot(state.position[1] - stop[1]);
-            let progress = self.terminal_translation_progress.get_or_insert((distance, state.timestamp_ns));
-            if distance < progress.0 { *progress = (distance, state.timestamp_ns); }
-            self.terminal_translation_finished = distance <= nuwax_nav_scan_native::TERMINAL_TRANSLATION_DONE_M
-                || state.timestamp_ns - progress.1 >= 1_000_000_000;
+        let terminal_position = (self.terminal_phase == TerminalPhase::Translating).then_some(stop);
+        if terminal_yaw.is_some() {
+            let (error, reason) = if self.terminal_phase == TerminalPhase::Turning {
+                (nuwax_nav_astar::controllers::angle_diff(self.terminal_heading, state.yaw).abs(),
+                    "终点转向受阻")
+            } else {
+                ((state.position[0] - stop[0]).hypot(state.position[1] - stop[1]), "终点平移受阻")
+            };
+            // 用实测位姿的来源时间计时，只有误差刷新最小值才算有进展。
+            let progress = self.terminal_progress.get_or_insert((error, state.timestamp_ns));
+            if error < progress.0 {
+                *progress = (error, state.timestamp_ns);
+            }
+            if (state.timestamp_ns - progress.1) as f64 * 1e-9 >= self.config.terminal_stall_timeout_sec {
+                return Err(PlannerStep::Failed(reason.into()));
+            }
         }
-        let terminal_position = (self.terminal_phase == TerminalPhase::Translating
-            && !self.terminal_translation_finished).then_some(stop);
         let mut tracking_failure = None;
         let checked = match self.tracker.track_terminal_position(
             &config,
@@ -663,18 +662,6 @@ impl SurfaceFollower {
             self.active = None;
             self.active_snapshot = None;
             self.needs_plan = true;
-        }
-        if self.terminal_phase == TerminalPhase::Translating {
-            self.terminal_translation_finished |= (checked.no_candidate() || !checked.invalid())
-                && checked.command[0] == 0. && checked.command[1] == 0.;
-            if self.terminal_translation_finished && !self.position_reached() {
-                self.terminal_phase = TerminalPhase::Travel;
-                self.terminal_translation_finished = false;
-                self.terminal_translation_progress = None;
-                self.needs_plan = true;
-            }
-        } else if checked.no_candidate() {
-            self.terminal_phase = TerminalPhase::Travel;
         }
         // 已有计算时合并请求；这次计算交付后只由后续新事件再次请求。
         if self.needs_plan {
@@ -870,17 +857,8 @@ impl NavPlanner for SurfaceFollower {
             return PlannerStep::ReplanRequired("地图已校正，重新规划路线".into());
         }
         match self.compute() {
-            Ok(_) if self.reached() => PlannerStep::Succeeded,
             Ok(command) => PlannerStep::Command(command),
-            Err(reason) => {
-                self.wait_reason = Some(reason.clone());
-                if self.execution_cycle_complete {
-                    PlannerStep::ReplanRequired(reason)
-                } else {
-                    self.needs_plan = true;
-                    PlannerStep::Command(Twist2::ZERO)
-                }
-            }
+            Err(step) => step,
         }
     }
     fn stop(&mut self) {
@@ -979,120 +957,86 @@ mod native_execution_tests {
     }
 
     #[test]
-    fn tolerance_edge_finishes_translation_before_success_with_or_without_goal_yaw() {
-        for requires_yaw in [true, false] {
-            let (mut config, source) = crate::native_test_helpers::fixture();
-            config.motion_limits.as_mut().unwrap().model = nuwax_nav_types_messages::MotionModel::Omnidirectional;
-            config.motion_limits.as_mut().unwrap().max_lateral_mps = 0.3;
-            let dt = 1. / config.controller.control_frequency;
+    fn go2_frontier_succeeds_in_tolerance_without_terminal_motion() {
+        for (yaw, yaw_tolerance_rad) in [(-40_f64.to_radians(), std::f64::consts::PI), (2.82, 0.1)] {
+            let (config, source) = crate::native_test_helpers::fixture();
             let mut follower = crate::native_test_helpers::author_static_map_follower(config);
-            let start = pose(1., 1., 0.);
-            let goal = pose(1.14, 1., 1.);
-            follower.configure_goal(&goal, GoalOptions {position_tolerance_m: 0.15,
-                yaw_tolerance_rad: if requires_yaw { 0.1 } else { std::f64::consts::PI },
-                ..Default::default()}).unwrap();
+            let start = pose(-0.404, -0.324, yaw);
+            let goal = pose(-0.35, -0.25, 2.82);
+            follower.configure_goal(&goal, GoalOptions {
+                position_tolerance_m: 0.15,
+                yaw_tolerance_rad,
+                ..Default::default()
+            }).unwrap();
             follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
             follower.update_odometry(start.clone());
-            follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3], [0.;3])));
-            follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start, goal.clone()]}), None, goal.clone()).unwrap();
-            let mut moving = false;
-            let mut succeeded = false;
-            for _ in 0..1000 {
-                let step = follower.step();
-                if matches!(step, PlannerStep::Succeeded) {
-                    let p = follower.odometry.as_ref().unwrap().pose.position;
-                    assert!((p.x-goal.pose.position.x).hypot(p.y-goal.pose.position.y) <= 0.02);
-                    assert!(moving, "不能在容差边缘提前成功");
-                    if !requires_yaw {
-                        assert!(follower.odometry.as_ref().unwrap().pose.orientation.yaw().abs() < 1e-8,
-                            "无朝向要求的平移保持进入时朝向");
-                    }
-                    succeeded = true; break;
-                }
-                let command = match step {PlannerStep::Command(v) => v, _ => Twist2::ZERO};
-                moving |= command.linear.x.hypot(command.linear.y) > 0.;
-                let mut p = follower.odometry.as_ref().unwrap().clone();
-                let yaw = p.pose.orientation.yaw();
-                p.pose.position.x += (yaw.cos()*command.linear.x-yaw.sin()*command.linear.y)*dt;
-                p.pose.position.y += (yaw.sin()*command.linear.x+yaw.cos()*command.linear.y)*dt;
-                p.pose.orientation = Quaternion::from_yaw(yaw+command.angular_z*dt);
-                p.stamp.nanos += (dt*1e9) as i64;
-                follower.update_odometry(p);
-                follower.observe_applied_command(command);
-                follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured(
-                    [command.linear.x, command.linear.y, 0.], [0.,0.,command.angular_z])));
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            assert!(succeeded, "末段应完成平移与实测停车，朝向要求={requires_yaw}");
+            follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                poses: vec![start, goal.clone()],
+            }), None, goal).unwrap();
+
+            assert_eq!(follower.step(), PlannerStep::Succeeded);
+            assert_eq!(follower.terminal_phase(), TerminalPhase::Travel);
         }
     }
 
     #[test]
-    fn terminal_translation_finishes_after_one_source_second_without_a_new_minimum() {
-        let (config, source) = crate::native_test_helpers::fixture();
+    fn terminal_translation_times_out_from_last_distance_progress() {
+        let (mut config, source) = crate::native_test_helpers::fixture();
+        config.terminal_stall_timeout_sec = 2.;
         let mut follower = crate::native_test_helpers::author_static_map_follower(config);
         let start = pose(1., 1., 0.);
-        let goal = pose(1.1, 1., 0.);
-        follower.configure_goal(&goal, GoalOptions {position_tolerance_m: 0.15,
-            yaw_tolerance_rad: std::f64::consts::PI, ..Default::default()}).unwrap();
+        let mut goal = pose(1.1, 1., 0.);
+        goal.pose.position.z += 0.3;
+        follower.configure_goal(&goal, GoalOptions { position_tolerance_m: 0.15,
+            yaw_tolerance_rad: std::f64::consts::PI, ..Default::default() }).unwrap();
         follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
         follower.update_odometry(start.clone());
-        follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3], [0.;3])));
-        follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses: vec![start.clone(),goal.clone()]}), None, goal.clone()).unwrap();
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: vec![start.clone(), goal.clone()],
+        }), None, goal.clone()).unwrap();
         crate::native_test_helpers::prepare_terminal_map(&mut follower);
-        assert!(!follower.terminal_translation_finished);
-        // 刷新最小距离重置来源计时；同源调用不能积成1秒。
+        assert_eq!(follower.terminal_phase(), TerminalPhase::Translating);
+
         let mut closer = start;
         closer.pose.position.x += 0.02;
         closer.stamp.nanos += 500_000_000;
         follower.update_odometry(closer.clone());
         for _ in 0..30 {
-            assert_ne!(follower.step(), PlannerStep::Succeeded);
-            assert!(!follower.terminal_translation_finished);
+            assert!(matches!(follower.step(), PlannerStep::Command(_)));
         }
-        closer.stamp.nanos += 999_999_999;
+        closer.stamp.nanos += 1_999_999_999;
         follower.update_odometry(closer.clone());
-        assert_ne!(follower.step(), PlannerStep::Succeeded);
-        assert!(!follower.terminal_translation_finished);
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         closer.stamp.nanos += 1;
         follower.update_odometry(closer);
-        assert_eq!(follower.step(), PlannerStep::Succeeded, "距S仍8厘米但1来源秒无新最小值、在原容差内并实测停稳，应结束平移后完成");
-        assert!(follower.terminal_translation_finished);
+        assert_eq!(follower.step(), PlannerStep::Failed("终点平移受阻".into()));
+
         follower.configure_goal(&goal, GoalOptions::default()).unwrap();
-        assert!(follower.terminal_translation_progress.is_none());
+        assert!(follower.terminal_progress.is_none());
     }
 
     #[test]
-    fn blocked_terminal_translation_succeeds_in_tolerance_or_returns_to_travel() {
-        for within in [true, false] {
-            let (config, source) = crate::native_test_helpers::fixture();
-            let mut follower = crate::native_test_helpers::author_static_map_follower(config);
-            // 设备不能横移，保持零朝向时侧向目标的检查输出为零。
-            let start = pose(1.,1.,0.);
-            let goal = pose(1., if within {1.1} else {1.3}, 0.);
-            follower.configure_goal(&goal, GoalOptions {position_tolerance_m:0.15,
-                yaw_tolerance_rad:std::f64::consts::PI,..Default::default()}).unwrap();
-            follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
-            follower.update_odometry(start.clone());
-            follower.observe_measured_motion(Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
-            follower.replace_execution_path(ExecutionPath::Surface(Path3D {poses:vec![start,goal.clone()]}),None,goal).unwrap();
-            for _ in 0..1000 {
-                follower.compute().unwrap();
-                if follower.prepared.is_some() {break;}
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            // 容差外变体模拟进入平移后发生位置漂移，规则只在平移结束时回查位置。
-            follower.begin_terminal_turn();
-            follower.compute().unwrap();
-            if within {
-                assert!(follower.terminal_translation_finished);
-                assert!(matches!(follower.step(),PlannerStep::Succeeded));
-            } else {
-                assert_eq!(follower.terminal_phase(),TerminalPhase::Travel);
-                assert!(!follower.terminal_translation_finished);
-                assert!(follower.planning, "容差外受阻须请求行进规划");
-            }
-        }
+    fn terminal_turn_times_out_without_yaw_progress() {
+        let (config, source) = crate::native_test_helpers::fixture();
+        let mut follower = crate::native_test_helpers::author_static_map_follower(config);
+        let mut start = pose(1., 1., 0.);
+        let goal = pose(1.1, 1., 1.);
+        follower.configure_goal(&goal, GoalOptions { position_tolerance_m: 0.15,
+            yaw_tolerance_rad: 0.1, ..Default::default() }).unwrap();
+        follower.update_execution_map(ExecutionMap::Surface(source)).unwrap();
+        follower.update_odometry(start.clone());
+        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+            poses: vec![start.clone(), goal.clone()],
+        }), None, goal).unwrap();
+        crate::native_test_helpers::prepare_terminal_map(&mut follower);
+        assert_eq!(follower.terminal_phase(), TerminalPhase::Turning);
+
+        start.stamp.nanos += 4_999_999_999;
+        follower.update_odometry(start.clone());
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
+        start.stamp.nanos += 1;
+        follower.update_odometry(start);
+        assert_eq!(follower.step(), PlannerStep::Failed("终点转向受阻".into()));
     }
 
     fn pose(x: f64, y: f64, yaw: f64) -> PoseStamped {

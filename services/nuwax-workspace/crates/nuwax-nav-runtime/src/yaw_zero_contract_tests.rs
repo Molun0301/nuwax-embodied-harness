@@ -1,4 +1,4 @@
-// 零容差到达使用当拍实际位姿；停稳由明确的实测输入证明。
+// 零容差到达使用当拍实际位姿。
 fn yaw_zero_pi_goal() -> nuwax_nav_types_messages::Quaternion {
     nuwax_nav_types_messages::Quaternion { x: 0.0, y: 0.0, z: 1.0, w: 0.0 }
 }
@@ -61,7 +61,6 @@ async fn yaw_zero_surface_scheduler(
     scheduler.sample_input_status();
     assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
-    crate::native_test_helpers::prepare_terminal_map(&mut scheduler.planner);
     (scheduler, status, motion, actual)
 }
 async fn yaw_zero_observe_release(
@@ -101,6 +100,7 @@ async fn zero_yaw_real_surface_rejects_nonzero_residual_before_arrival_event() {
     let delta = actual.yaw() - goal.yaw();
     assert!(delta.sin().atan2(delta.cos()).abs() > 0.0);
     let (mut scheduler, status, _motion, _pose) = yaw_zero_surface_scheduler(goal, actual).await;
+    crate::native_test_helpers::prepare_terminal_map(&mut scheduler.planner);
     scheduler.session_tick(&status).await.unwrap();
     assert!(scheduler.status.last_terminal.is_none());
 }

@@ -102,6 +102,7 @@ pub struct Navigation {
     pub min_stair_tread_m: f64,
     pub pct_terrain_source: String,
     pub surface_voxel_size_m: f64,
+    pub terminal_stall_timeout_sec: f64,
     pub traversability_max_slope_deg: f64,
     pub traversability_max_step_height_m: f64,
     pub wavefront_goal_timeout_ms: i64,

@@ -2283,6 +2283,7 @@
         drawTrajectory(ctx, anchor, scale);
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
+        drawNavigationPick(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
         drawSemanticInstances(ctx, anchor, scale);
         drawRobot(ctx, anchor);
@@ -2352,8 +2353,14 @@
       }
       function drawGoal(ctx, anchor, scale) {
         const point = pointFromPose(state.goalPose);
-        if (!point) return;
-        const yaw = yawFromPose(state.goalPose);
+        if (point) drawGoalMarker(ctx, anchor, scale, point, yawFromPose(state.goalPose));
+      }
+      // 导航面板正在选的点：有朝向画箭头，没有朝向画圆点，与提交后的目标显示一致。
+      function drawNavigationPick(ctx, anchor, scale) {
+        const pick = window.__nuwaxNavigationModule?.getState().pendingPose;
+        if (pick) drawGoalMarker(ctx, anchor, scale, pick, pick.yaw);
+      }
+      function drawGoalMarker(ctx, anchor, scale, point, yaw) {
         if (Number.isFinite(yaw)) {
           drawOrientedGoal(
             ctx,
@@ -5078,8 +5085,10 @@
           const nav = frame.payload;
           const terminal = ["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav?.status);
           const target = terminal ? null : nav?.target;
+          // 后端目标总带四元数（未指定朝向时为 0）；本页提交时未定朝向的目标按不带方向显示。
+          const unoriented = target && window.__nuwaxNavigationModule?.goalOrientationUnset(nav.goal_id);
           state.goalPose = target ? {position: {x: target.x, y: target.y, z: target.z},
-            orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}} : null;
+            ...(unoriented ? {} : {orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}})} : null;
           state.navigationPath = (terminal ? [] : nav?.planned_path || []).map(([x, y, z]) => ({x, y, z}));
           state.navigationLocalPath = [];
           state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
@@ -5278,6 +5287,11 @@
         }
         refreshTaskStore();
       }
+      // 选点导航得知自己提交的目标号时，该目标的状态可能已先到达；按提交时的朝向选择重画一次。
+      window.addEventListener("navigation:submitted-goal", (event) => {
+        const frame = state.latestStreamFrames["navigation.state"];
+        if (frame?.payload?.goal_id === event.detail.goal_id) processStreamFrame(frame);
+      });
       function updateStreamOverview(frame) {
         const keyByTopic = {
           "robot.state": "state",

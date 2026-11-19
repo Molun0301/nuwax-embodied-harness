@@ -106,25 +106,6 @@ class Checks(unittest.TestCase):
 
 
 class LegacyUpgradeChecks(Checks):
-    def test_go2_install_uses_swept_box_default_only_when_missing_from_profile(self):
-        from core.config import ConfigStore
-
-        candidate = self.engine.home / "releases/candidate"
-        self.source_tree(candidate / "source")
-        (candidate / "source/adapters").symlink_to(ROOT / "adapters", target_is_directory=True)
-        (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
-        job = self.job("install")
-        store = ConfigStore(self.engine.home)
-        key = "geometry.self_filter_ground_clearance_m"
-        plan = {"modules": ["core", "geometry", "pointlio"], "robot": "go2"}
-
-        for profile, expected in [({}, -0.01), ({"logging.level": "DEBUG"}, -0.01), ({key: 0.02}, 0.02)]:
-            if profile:
-                store.install("原方案", profile)
-            existing = self.engine._existing(candidate, job)
-            values = self.engine._configure_candidate(candidate, plan, existing)
-            self.assertEqual(values[key], expected)
-
     def test_candidate_install_computes_geometry_without_writing_runtime_file(self):
         from core.config import ConfigStore
         from core.robot_geometry import RobotGeometryError

@@ -41,8 +41,9 @@ class FixedSelfGeometryChecks(unittest.TestCase):
         self.path.write_text(MODEL)
 
     def resolve(self, module=geometry, **kwargs):
+        calibration = {"standing_ground_offset_m": 0.0} if module is geometry else {}
         return module.resolve_robot_geometry(module.RobotGeometryConfig(model_path=str(self.path),
-                 model_base_link='body', **kwargs), robot_name='generic', base_dir=self.root)
+                 model_base_link='body', **kwargs), robot_name='generic', base_dir=self.root, **calibration)
 
     def test_fixed_component_includes_parent_excludes_moving_descendants(self):
         data = self.resolve().to_runtime_dict()['self_collision']
@@ -64,7 +65,7 @@ class FixedSelfGeometryChecks(unittest.TestCase):
 
     def test_manual_envelope_is_not_a_solid_self_model(self):
         result = geometry.resolve_robot_geometry(geometry.RobotGeometryConfig(length_m=1,width_m=1,height_m=1),
-                    robot_name='generic', base_dir=self.root)
+                    robot_name='generic', base_dir=self.root, standing_ground_offset_m=0.0)
         self.assertEqual(result.to_runtime_dict()['self_collision']['primitives'], [])
 
     def test_full_manual_dimensions_keep_existing_model_precedence(self):
@@ -111,7 +112,7 @@ class FixedSelfGeometryChecks(unittest.TestCase):
         for model in (ROOT / 'drivers').glob('*/robot_geometry.urdf'):
             with self.subTest(model=str(model)):
                 config = geometry.RobotGeometryConfig(model_path=str(model))
-                result = geometry.resolve_robot_geometry(config, robot_name='generic', base_dir=ROOT)
+                result = geometry.resolve_robot_geometry(config, robot_name='generic', base_dir=ROOT, standing_ground_offset_m=0.0)
                 encoded = json.loads(result.to_runtime_json())
                 self.assertIn('self_collision', encoded)
                 if baseline:

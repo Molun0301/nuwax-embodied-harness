@@ -452,7 +452,7 @@ def _swept_box(primitive, samples, origin, margin, floor):
 
 
 def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str,
-                joint_swing_rad: float, margin_m: float, ground_clearance_m: float,
+                joint_swing_rad: float, margin_m: float, standing_ground_offset_m: float, ground_clearance_m: float,
                 resource_bytes: Optional[Mapping[Path, bytes]] = None):
     from core.robot_kinematics import load_robot_kinematic_model, RobotKinematicsError
     try:
@@ -551,7 +551,7 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
                 if current in fixed_links and joint.joint_type == "fixed":
                     fixed_links.add(neighbour)
                 pending.append(neighbour)
-    floor = min(lows) + ground_clearance_m
+    floor = min(lows) + standing_ground_offset_m + ground_clearance_m
     primitives, excluded_moving, unsupported = [], 0, 0
     swept_boxes = []
     for name, link in links.items():
@@ -622,6 +622,7 @@ def resolve_robot_model_config(config: RobotGeometryConfig, *, robot_name: str, 
 
 
 def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base_dir,
+                           standing_ground_offset_m: float,
                            self_filter_joint_swing_rad: float = schema_default("geometry.self_filter_joint_swing_rad"),
                            self_filter_margin_m: float = schema_default("geometry.self_filter_margin_m"),
                            self_filter_ground_clearance_m: float = schema_default("geometry.self_filter_ground_clearance_m"),
@@ -638,6 +639,7 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
             result = _parse_urdf(Path(model_config.model_path), model_config.model_base_link,
                                  _joint_positions(model_config.model_joint_positions_json),
                                  joint_swing_rad=self_filter_joint_swing_rad, margin_m=self_filter_margin_m,
+                                 standing_ground_offset_m=standing_ground_offset_m,
                                  ground_clearance_m=self_filter_ground_clearance_m,
                                  source_prefix="urdf" if explicit else "robot_default_urdf", resource_bytes=resource_bytes)
         else:

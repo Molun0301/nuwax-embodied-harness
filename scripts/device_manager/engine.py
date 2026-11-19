@@ -851,12 +851,8 @@ class Engine:
         configuration = plan.get("_request", {}).get("configuration", {})
         if not isinstance(configuration, dict):
             raise ManagerError("invalid_config", "预配置必须是键值对象。")
-        profile_values = dict(existing, **configuration)
-        existing = probe(candidate, "prepare", values=profile_values)
-        clearance = "geometry.self_filter_ground_clearance_m"
-        # 准备配置会补全全局默认值；安装器需要保留 Go2 方案中该键的原始缺省。
-        if plan["robot"] == "go2" and clearance not in profile_values:
-            existing.pop(clearance, None)
+        existing = dict(existing, **configuration)
+        existing = probe(candidate, "prepare", values=existing)
         model_settings = []
         if "perception" in plan["modules"]:
             model_settings.append(("perception.yolo_world_model", "yolov8s-worldv2.pt"))

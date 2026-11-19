@@ -71,8 +71,6 @@ def write_runtime(root, prefix, modules, robot, existing):
         values["motion_guard.backend"] = "unitree_sdk2py"
         if geometry and "go2.direct_dds_point_cloud_enabled" not in existing:
             values["go2.direct_dds_point_cloud_enabled"] = True
-        if "geometry.self_filter_ground_clearance_m" not in existing:
-            values["geometry.self_filter_ground_clearance_m"] = -0.01
         from adapters.sensors.go2_calibration import GO2_CALIBRATION_PROFILE
         calibration = GO2_CALIBRATION_PROFILE
         for key, translation, rotation in (

@@ -249,8 +249,7 @@
         visionLabels: document.getElementById("visionLabels"),
         perceptionRuntimeStatus: document.getElementById("perceptionRuntimeStatus"),
         perceptionRuntimeReasons: document.getElementById("perceptionRuntimeReasons"),
-        perceptionRuntimeStart: document.getElementById("perceptionRuntimeStart"),
-        perceptionRuntimeStop: document.getElementById("perceptionRuntimeStop"),
+        perceptionRuntimeToggle: document.getElementById("perceptionRuntimeToggle"),
         perceptionRuntimeMessage: document.getElementById("perceptionRuntimeMessage"),
         showSemanticInstances: document.getElementById("showSemanticInstances"),
         semanticInstancesRefresh: document.getElementById("semanticInstancesRefresh"),
@@ -334,20 +333,17 @@
         const workspace = document.querySelector(".workspace");
         const video = document.getElementById("video-perception");
         const btnMap = document.getElementById("mediaSwapBtn");
-        const btnVideo = document.getElementById("mediaSwapBtnVideo");
         if (!workspace) return;
         function toggle() {
           const swapped = workspace.classList.toggle("swapped");
           // 只改文字，保留按钮内的图标。
           setText(btnMap?.querySelector("[data-swap-label]"), swapped ? "地图" : "视频");
-          setText(btnVideo?.querySelector("[data-swap-label]"), swapped ? "缩小" : "放大");
           if (video) video.classList.toggle("rise", false);
           // 槽位尺寸变化后重排地图画布并重绘（视频靠 CSS 自适应，无需干预）
           setTimeout(redrawMapAfterResize, 60);
           setTimeout(redrawMapAfterResize, 320);
         }
         if (btnMap) btnMap.addEventListener("click", toggle);
-        if (btnVideo) btnVideo.addEventListener("click", toggle);
       }
       initMediaSwap();
 
@@ -1327,8 +1323,10 @@
         setText(els.perceptionRuntimeReasons, `使用原因：${reasons.length
           ? reasons.map(reason => labels[reason.split(":")[0]] || reason).join("、") : "无"}`);
         els.perceptionRuntimeReasons.title = reasons.join("、");
-        els.perceptionRuntimeStart.disabled = state.perceptionRuntimeBusy || manual;
-        els.perceptionRuntimeStop.disabled = state.perceptionRuntimeBusy || !manual;
+        // 一个按钮按当前是否有手动原因切换开启与关闭。
+        setText(els.perceptionRuntimeToggle, manual ? "关闭检测" : "开启检测");
+        els.perceptionRuntimeToggle.setAttribute("aria-pressed", String(manual));
+        els.perceptionRuntimeToggle.disabled = state.perceptionRuntimeBusy;
       }
       function loadPerceptionRuntimeStatus() {
         if (state.perceptionRuntimeBusy) return Promise.resolve();
@@ -1339,7 +1337,7 @@
             if (!response.ok) throw new Error(result.message || `服务返回 ${response.status}`);
             renderPerceptionRuntime(result.perception_runtime);
             setText(els.perceptionRuntimeMessage, result.perception_runtime.running
-              ? "识别由上述使用原因保持运行；手动关闭只移除手动原因。" : "当前没有使用原因，可开启手动识别。");
+              ? "识别由上述使用原因保持运行；关闭检测只移除手动原因。" : "当前没有使用原因，可开启检测。");
           })
           .catch(error => setText(els.perceptionRuntimeMessage, `读取连续识别状态失败：${error.message}`))
           .finally(() => { state.perceptionRuntimeLoadPromise = null; });
@@ -1347,8 +1345,7 @@
       }
       async function setManualPerception(enabled) {
         state.perceptionRuntimeBusy = true;
-        els.perceptionRuntimeStart.disabled = true;
-        els.perceptionRuntimeStop.disabled = true;
+        els.perceptionRuntimeToggle.disabled = true;
         try {
           // 先完成在途读取，避免旧查询响应覆盖动作返回的真实原因集合。
           await state.perceptionRuntimeLoadPromise;
@@ -1357,11 +1354,11 @@
           const result = await response.json();
           if (!response.ok) throw new Error(result.message || `服务返回 ${response.status}`);
           renderPerceptionRuntime(result.perception_runtime);
-          setText(els.perceptionRuntimeMessage, enabled ? "已开启手动识别。"
-            : result.perception_runtime.running ? "已关闭手动识别；其它任务仍在使用连续识别。"
-            : "已关闭手动识别，当前没有其它使用原因。");
+          setText(els.perceptionRuntimeMessage, enabled ? "已开启检测。"
+            : result.perception_runtime.running ? "已关闭检测；其它任务仍在使用连续识别。"
+            : "已关闭检测，当前没有其它使用原因。");
         } catch (error) {
-          setText(els.perceptionRuntimeMessage, `手动识别操作失败：${error.message}`);
+          setText(els.perceptionRuntimeMessage, `${enabled ? "开启" : "关闭"}检测失败：${error.message}`);
         } finally {
           state.perceptionRuntimeBusy = false;
           if (state.perceptionRuntime) renderPerceptionRuntime(state.perceptionRuntime);
@@ -5063,6 +5060,7 @@
           updateOverviewForFrame = updateRobotStateFrame(frame);
         } else if (frame.topic === "geometry.state") {
           state.latestGeometryState = frame.payload;
+          window.dispatchEvent?.(new CustomEvent("stream:geometry.state", {detail: frame.payload}));
           if (frame.payload.phase === "idle") {
             updateMap({...envelopeFromFrame(frame, {}), status: "cleared"});
             hideMapPose();
@@ -5348,8 +5346,8 @@
       loadInitialHealth();
       loadInitialTasks();
       loadPerceptionRuntimeStatus();
-      els.perceptionRuntimeStart.addEventListener("click", () => setManualPerception(true));
-      els.perceptionRuntimeStop.addEventListener("click", () => setManualPerception(false));
+      els.perceptionRuntimeToggle.addEventListener("click",
+        () => setManualPerception(!state.perceptionRuntime.reasons.includes("manual")));
       window.setInterval(() => {
         if (videoPanelVisible()) void loadPerceptionRuntimeStatus();
       }, 3000);
@@ -5427,10 +5425,12 @@
         if (state.map2dCameraMode === "free") event.preventDefault();
       });
       els.mapCanvas.addEventListener("pointerdown", (event) => {
-        // V2 boundary/navigation 模式：把事件让给 SVG overlay，canvas 主循环不参与。
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
-        state.semanticRegionPointerDown = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
-        if (!isMap3dVisible() && event.button === 0) {
+        // 禁行区绘制：把事件让给 SVG overlay，canvas 主循环不参与。
+        if (window.__nuwaxBoundaryActive) return;
+        // 导航选点期间单击按住拖动照常旋转平移，不做物品与区域点选；双击选点由导航模块处理。
+        const picking = Boolean(window.__nuwaxNavigationActive);
+        state.semanticRegionPointerDown = event.button === 0 && !picking ? { x: event.clientX, y: event.clientY } : null;
+        if (!isMap3dVisible() && event.button === 0 && !picking) {
           const pointer = canvasPointer(event);
           const hit = hitTestSemanticMarkers(pointer.x, pointer.y);
           if (hit) {
@@ -5464,7 +5464,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointermove", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) {
           const pointer = canvasPointer(event);
           state.mapFreeView.yaw = state.mapRotateDrag.yawStart + (pointer.x - state.mapRotateDrag.pointerStart.x) * 0.006;
@@ -5487,7 +5487,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointerup", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) state.mapRotateDrag = null;
         if (state.mapPanDrag) finishMapPan(event);
         const start = state.semanticRegionPointerDown;
@@ -5498,7 +5498,7 @@
         }
       });
       els.mapCanvas.addEventListener("pointercancel", (event) => {
-        if (window.__nuwaxMapToolV2 && window.__nuwaxMapToolV2.active()) return;
+        if (window.__nuwaxBoundaryActive) return;
         if (state.mapRotateDrag) {
           state.mapRotateDrag = null;
           return;
@@ -5532,8 +5532,7 @@
       };
       window.__nuwaxResolveNavigationHeight = resolveNavigationHeight;
       window.__nuwaxResetMapInteraction = resetMapInteraction;
-      // V2 模块互斥开关：boundary_draw.js / navigation.js 在激活时会置 true，
-      // 主循环的 pointerdown/pointermove/pointerup 入口据此提前 return 让事件落到 SVG overlay。
+      // 地图工具互斥开关：禁行区绘制或导航选点激活时为真，物品定位与语义面板据此让位。
       window.__nuwaxMapToolV2 = {
         active: function () { return Boolean(window.__nuwaxBoundaryActive || window.__nuwaxNavigationActive); },
       };

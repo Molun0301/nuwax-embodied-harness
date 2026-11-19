@@ -13,7 +13,8 @@
   function status(message, failed = false) { el.status.textContent = message; el.status.dataset.level = failed ? 'error' : ''; }
   function buttons() {
     el.start.disabled = busy || active;
-    el.pause.disabled = el.stop.disabled = busy || !active || !explorationId;
+    // 任务一经受理即可暂停或停止，不等探索真正启动。
+    el.pause.disabled = el.stop.disabled = busy || !active;
     el.resume.disabled = busy || active || !el.checkpoint.value;
   }
   async function checkpoints() {
@@ -42,13 +43,13 @@
   }
   async function refresh() {
     const state = await invoke('get_navigation_state');
-    explorationId = state.exploration?.exploration_id || null;
     const tasks = await request('/api/tasks');
     if (!taskId) taskId = tasks.active_tasks.find(task => ['explore_area_v2', 'resume_exploration', 'explore_building'].includes(task.capability))?.task_id || null;
+    // 有探索任务时编号以任务进度为准；Geometry 状态里可能还是上一次已结束的探索。
     if (taskId) applyTask((await request('/api/tasks/' + encodeURIComponent(taskId))).task);
-    else { active = state.exploration?.phase === 'running'; status(state.exploration?.message || '等待操作。'); buttons(); }
+    else { explorationId = state.exploration?.exploration_id || null; active = state.exploration?.phase === 'running'; status(state.exploration?.message || '等待操作。'); buttons(); }
   }
-  async function track(reply) { taskId = reply.task.task_id; loadedCheckpoint = null; applyTask(reply.task); await refresh(); }
+  async function track(reply) { taskId = reply.task.task_id; explorationId = null; loadedCheckpoint = null; applyTask(reply.task); await refresh(); }
   async function run(action) {
     if (busy) return;
     busy = true; buttons();
@@ -68,14 +69,18 @@
       }
       await track(await invoke('explore_area_v2', args));
     }));
-    el.pause.addEventListener('click', () => run(async () => { const reply = await invoke('pause_exploration', {exploration_id: explorationId}); taskId = reply.task_id; status('暂停已受理，正在停止探索并保存。'); }));
-    el.stop.addEventListener('click', () => run(async () => { await invoke('stop_exploration', {exploration_id: explorationId}); status('已发送停止探索命令，等待任务退出。'); }));
+    // 探索尚未启动时没有探索编号，不带编号由后端按当前探索任务处理。
+    const target = () => explorationId ? {exploration_id: explorationId} : {};
+    el.pause.addEventListener('click', () => run(async () => {
+      const reply = await invoke('pause_exploration', target()); taskId = reply.task_id;
+      status(reply.checkpoint_pending ? '暂停已受理，正在停止探索并保存。' : '探索尚未开始，已结束任务，没有可保存的进度。');
+    }));
+    el.stop.addEventListener('click', () => run(async () => { await invoke('stop_exploration', target()); status('已发送停止探索命令，等待任务退出。'); }));
     el.resume.addEventListener('click', () => run(async () => { await track(await invoke('resume_exploration', {checkpoint_id: el.checkpoint.value, timeout_sec: Number(el.timeout.value)})); }));
     el.refresh.addEventListener('click', () => run(async () => { await checkpoints(); await refresh(); }));
     el.checkpoint.addEventListener('change', buttons);
     panel.addEventListener('toggle', () => { if (panel.open) run(async () => { await checkpoints(); await refresh(); }); });
     window.addEventListener('stream:tasks.state', event => applyTask(event.detail));
-    window.addEventListener('stream:exploration.state', event => { if (event.detail) explorationId = event.detail.exploration_id; buttons(); });
     buttons();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();

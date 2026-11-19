@@ -3,7 +3,9 @@
   'use strict';
   const state = {container: null, active: false, taskId: null, pendingPose: null, submittedPose: null, submittedGoalId: null, submitting: false};
   const terminal = ['succeeded', 'failed', 'cancelled', 'timed_out'];
-  const PICK_HINT = '未选点：点击地图选点，按住拖动设定朝向';
+  const PICK_HINT = '未选点：双击地图选点，双击后按住拖动设定朝向';
+  // 双击判定与三维地图一致：两次按下间隔与位移上限。
+  const DOUBLE_CLICK_MS = 500, CLICK_PIXELS = 6;
   function setStatus(text, level = '') { state.statusEl.textContent = text; state.statusEl.dataset.level = level; }
   function requestJson(url, options) {
     return fetch(url, options).then(async response => {
@@ -23,12 +25,12 @@
   function selectedPoseLabel(pose) {
     const position = 'x=' + pose.x.toFixed(2) + ' y=' + pose.y.toFixed(2);
     return Number.isFinite(pose.yaw) ? position + ' 朝向' + Math.round(pose.yaw * 180 / Math.PI) + '°'
-      : position + '，未定朝向（按住拖动设定朝向）';
+      : position + '，未定朝向（双击后按住拖动设定朝向）';
   }
   // 选点标记同时画在三维与二维地图上。
   function showPick(pose) {
     window.pointcloud3d?.previewNavigationPoint(pose);
-    window.__nuwaxMapRequestDraw();
+    window.__nuwaxMapRequestDraw?.();
   }
   function selectMapPoint(x, y, frameId, selection) {
     state.pendingPose = {...selection, x, y, frame_id: frameId || 'map'};
@@ -55,9 +57,7 @@
       if (!window.__nuwaxNavigationActive || state.container.hidden) return;
       const point = event.detail;
       if (!point) {
-        state.pendingPose = null;
-        showPick(null);
-        setStatus('未命中地图点，请放大并点击可见地面；拖动可调整视角', 'warn'); return;
+        setStatus('双击处没有地图点，未选点；请放大后双击可见地面', 'warn'); return;
       }
       selectMapPoint(point.x, point.y, point.frame_id, point);
     });
@@ -68,22 +68,30 @@
       if (!d) return;
       selectMapPoint(d.x, d.y, d.frame_id);
     });
-    // 二维地图：按下处为位置，拖动方向为朝向；导航选点时二维地图本身不旋转不平移。
-    let drag = null;
+    // 二维地图与三维一致：单击按住拖动照常旋转平移；双击选点，双击的第二下按住拖动设定朝向，
+    // 按下处为位置、拖动方向为朝向，此时地图不动。捕获阶段先于地图画布自身的拖动处理。
+    let drag = null, press = null, lastClick = null;
     function unproject(ev) {
       return typeof window.__nuwaxMapUnproject === 'function' ? window.__nuwaxMapUnproject(ev.clientX, ev.clientY) : null;
     }
     mapEl.addEventListener('pointerdown', function (ev) {
       if (!window.__nuwaxNavigationActive || ev.button !== 0 || ev.isPrimary === false) return;
+      const second = lastClick && ev.timeStamp - lastClick.time <= DOUBLE_CLICK_MS
+        && Math.hypot(ev.clientX - lastClick.x, ev.clientY - lastClick.y) <= CLICK_PIXELS;
+      lastClick = null;
+      press = second ? null : {id: ev.pointerId, x: ev.clientX, y: ev.clientY, time: ev.timeStamp};
+      if (!second) return;
       const point = unproject(ev);
       if (!point) { setStatus('等待可用的二维地图后选点', 'warn'); return; }
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
       drag = {id: ev.pointerId, x: ev.clientX, y: ev.clientY, point, dragged: false};
       mapEl.setPointerCapture(ev.pointerId);
       selectMapPoint(point.x, point.y, point.frame_id);
-    });
+    }, true);
     mapEl.addEventListener('pointermove', function (ev) {
       if (!drag || drag.id !== ev.pointerId) return;
-      if (!drag.dragged && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) <= 6) return;
+      if (!drag.dragged && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) <= CLICK_PIXELS) return;
       const point = unproject(ev);
       if (!point) return;
       drag.dragged = true;
@@ -91,9 +99,18 @@
       showPick(state.pendingPose);
     });
     function finishDrag(ev) {
-      if (!drag || drag.id !== ev.pointerId) return;
-      drag = null;
-      setStatus('已选点：' + selectedPoseLabel(state.pendingPose), 'pending');
+      if (drag && drag.id === ev.pointerId) {
+        drag = null;
+        setStatus('已选点：' + selectedPoseLabel(state.pendingPose), 'pending');
+        return;
+      }
+      const start = press;
+      press = null;
+      // 按下后几乎没动的单击留作双击的第一下。
+      if (ev.type === 'pointerup' && start && start.id === ev.pointerId
+          && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) <= CLICK_PIXELS) {
+        lastClick = {time: start.time, x: start.x, y: start.y};
+      }
     }
     mapEl.addEventListener('pointerup', finishDrag);
     mapEl.addEventListener('pointercancel', finishDrag);

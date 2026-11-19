@@ -25,6 +25,9 @@ const COLORS = {
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
 const DEFAULT_POINT_STYLE = 'height';
+// 导航双击选点：两次按下间隔与位移上限，与常见系统双击判定相当。
+const NAVIGATION_DOUBLE_CLICK_MS = 500;
+const NAVIGATION_CLICK_PIXELS = 6;
 const DEFAULT_POINTCLOUD3D_CONFIG = Object.freeze({
   spacingM: 0.1,
   size: 1.35,
@@ -672,11 +675,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       const x = Number(event.clientX);
       const y = Number(event.clientY);
       if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - start.x, y - start.y) > 6) return;
-      if (window.__nuwaxNavigationActive) {
-        const point = this.pickNavigationPoint(x, y);
-        window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
-        return;
-      }
+      // 导航选点期间单击只交给地图控件，选点由双击完成。
+      if (window.__nuwaxNavigationActive) return;
       if (this._emitSemanticSelectionAtClientPoint(x, y)) return;
       if (window.__nuwaxBoundaryActive) return;
       const graphNodeId = this._sceneGraphLayer?.pick(x,y,this._camera,canvas);
@@ -692,13 +692,24 @@ class PointCloud3DViewer extends PointCloudProcessor {
     canvas.addEventListener('pointercancel', this._semanticPointerCancelHandler);
   }
 
-  // 导航选点与 RViz 设目标位姿手势一致：在地图点上按下左键为位置，拖动方向为朝向，松开结束。
-  // 捕获阶段先于地图控件处理，命中地图点时本次手势不旋转不平移；未命中时地图照常交互。
+  // 导航选点：单击按住拖动照常旋转平移地图；双击地图点选点，双击的第二下按住拖动同时设定朝向
+  // （按下处为位置、拖动方向为朝向，同 RViz 设目标位姿），拖动中地图不动，松开结束。
+  // 捕获阶段先于地图控件处理双击的第二下；双击没命中地图点时不选点，地图照常交互。
   _setupNavigationPickInteraction(canvas) {
     this._navigationPointerDownHandler = (event) => {
       if (!window.__nuwaxNavigationActive || event.isPrimary === false || (event.button ?? 0) !== 0) return;
+      const last = this._navigationLastClick;
+      this._navigationLastClick = null;
+      const second = last && event.timeStamp - last.time <= NAVIGATION_DOUBLE_CLICK_MS
+        && Math.hypot(event.clientX - last.x, event.clientY - last.y) <= NAVIGATION_CLICK_PIXELS;
+      this._navigationPress = second ? null
+        : { pointerId: event.pointerId, x: event.clientX, y: event.clientY, time: event.timeStamp };
+      if (!second) return;
       const point = this.pickNavigationPoint(event.clientX, event.clientY);
-      if (!point) return;
+      if (!point) {
+        window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: null }));
+        return;
+      }
       event.stopImmediatePropagation();
       event.preventDefault();
       this._settleControlsMotion();
@@ -709,7 +720,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._navigationPointerMoveHandler = (event) => {
       const drag = this._navigationDrag;
       if (!drag || event.pointerId !== drag.pointerId) return;
-      if (drag.yaw === undefined && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 6) return;
+      if (drag.yaw === undefined && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= NAVIGATION_CLICK_PIXELS) return;
       // 光标投到按下点所在的水平面上，朝向取按下点指向光标的方向。
       const target = this.boundaryPointAt(event.clientX, event.clientY, drag.point);
       if (!target) return;
@@ -718,10 +729,19 @@ class PointCloud3DViewer extends PointCloudProcessor {
     };
     this._navigationPointerUpHandler = (event) => {
       const drag = this._navigationDrag;
-      if (!drag || event.pointerId !== drag.pointerId) return;
-      this._navigationDrag = null;
-      const point = drag.yaw === undefined ? drag.point : { ...drag.point, yaw: drag.yaw };
-      window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
+      if (drag && event.pointerId === drag.pointerId) {
+        this._navigationDrag = null;
+        const point = drag.yaw === undefined ? drag.point : { ...drag.point, yaw: drag.yaw };
+        window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
+        return;
+      }
+      const press = this._navigationPress;
+      this._navigationPress = null;
+      // 按下后几乎没动的单击留作双击的第一下。
+      if (event.type === 'pointerup' && press && event.pointerId === press.pointerId
+          && Math.hypot(event.clientX - press.x, event.clientY - press.y) <= NAVIGATION_CLICK_PIXELS) {
+        this._navigationLastClick = { time: press.time, x: press.x, y: press.y };
+      }
     };
     canvas.addEventListener('pointerdown', this._navigationPointerDownHandler, { capture: true });
     canvas.addEventListener('pointermove', this._navigationPointerMoveHandler);
@@ -2743,6 +2763,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._navGoalMesh = null;
     this._navigationPickMarker = null;
     this._navigationDrag = null;
+    this._navigationPress = null;
+    this._navigationLastClick = null;
     this._semanticPointerDown = null;
     this._semanticPointerDownHandler = null;
     this._semanticPointerUpHandler = null;

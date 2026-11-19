@@ -10,7 +10,6 @@ from time import perf_counter
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Deque,
     Dict,
     Iterable,
@@ -20,7 +19,6 @@ from typing import (
     Tuple,
     runtime_checkable,
 )
-from urllib.parse import urlencode
 
 from contracts.events import RuntimeEventCategory
 from contracts.naming import build_observation_id
@@ -60,9 +58,6 @@ _POINT_CLOUD_CACHE_FRAMES = 10
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
 
-VideoFrameSink = Callable[[object], Optional[object]]
-
-
 @runtime_checkable
 class VideoFrameSource(Protocol):
     """平台已接收的标准图像源，不执行硬件抓拍。"""
@@ -91,7 +86,6 @@ class PerceptionService:
         self_body_filter: Optional[SelfBodyFilter] = None,
         event_bus: Optional[EventBus] = None,
         stream_bus: Optional[StreamBus] = None,
-        video_frame_sink: Optional[VideoFrameSink] = None,
         video_frame_source: Optional[VideoFrameSource] = None,
         geometry_state=None,
         geometry_client=None,
@@ -109,7 +103,6 @@ class PerceptionService:
         self._self_body_filter = self_body_filter or DisabledSelfBodyFilter("not_configured")
         self._event_bus = event_bus
         self._stream_bus = stream_bus
-        self._video_frame_sink = video_frame_sink
         self._video_frame_source = video_frame_source
         self._geometry_state = geometry_state
         self._geometry_client = geometry_client
@@ -134,9 +127,6 @@ class PerceptionService:
         self._point_cloud_frames = ()
         self._point_cloud_subscription = (stream_bus.subscribe(self._cache_point_cloud, topics=("pointcloud.frame",))
                                           if stream_bus is not None else None)
-
-    def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
-        self._video_frame_sink = video_frame_sink
 
     def set_video_frame_source(self, video_frame_source: Optional[VideoFrameSource]) -> None:
         self._video_frame_source = video_frame_source
@@ -896,22 +886,6 @@ class PerceptionService:
             raise GatewayError("当前还没有可用的感知缓存。")
         return context
 
-    def publish_current_video_frame(
-        self,
-        *,
-        camera_id: Optional[str] = None,
-        requested_by: Optional[str] = None,
-    ) -> None:
-        with self._operation():
-            del requested_by
-            image_frame = self._read_latest_pushed_image(camera_id)
-            if image_frame is None:
-                return
-            self._publish_video_frame(
-                image_frame,
-                source_name=str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver"),
-            )
-
     def _read_latest_pushed_image(
         self,
         camera_id: Optional[str],
@@ -1390,11 +1364,8 @@ class PerceptionService:
         }
 
     def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
+        # 只发布帧元数据；页面画面由 /streams/video.mjpeg 单独提供。
         if self._stream_bus is None:
-            return
-        preview_camera_id = getattr(self._video_frame_sink, "camera_id", None)
-        if preview_camera_id and image_frame.camera_id != preview_camera_id:
-            # 单槽预览按绑定来源发布，另一相机不能清空已显示画面。
             return
         input_signature = self._fast_input_signature(image_frame, None)
         previous = self._last_published_video_frames.get(image_frame.camera_id)
@@ -1405,37 +1376,15 @@ class PerceptionService:
             self._last_published_video_frames.pop(next(iter(self._last_published_video_frames)))
         metadata = dict(image_frame.metadata or {})
         payload_bytes = len(image_frame.data or b"")
-        latest_frame = None
-        if image_frame.data and image_frame.encoding.value == "jpeg" and self._video_frame_sink is not None:
-            try:
-                latest_frame = self._video_frame_sink(image_frame)
-            except Exception:
-                latest_frame = None
-        sequence = getattr(latest_frame, "sequence", None)
-        if not isinstance(sequence, int) and isinstance(metadata.get("ingest_sequence"), int):
-            sequence = int(metadata["ingest_sequence"])
-        source_kind = str(metadata.get("source_kind") or source_name or "")
-        ingest_stream_frame = source_kind == "platform_video_ingest_stream"
-        mjpeg_available = bool(
-            (latest_frame is not None and isinstance(sequence, int))
-            or (
-                ingest_stream_frame
-                and image_frame.data
-                and image_frame.encoding.value == "jpeg"
-                and isinstance(sequence, int)
-            )
-        )
+        sequence = metadata.get("ingest_sequence") if isinstance(metadata.get("ingest_sequence"), int) else None
         payload = {
             **self._source_timestamp_metadata(image_frame),
-            "available": bool(mjpeg_available or image_frame.uri or image_frame.artifact_id),
             "camera_id": image_frame.camera_id,
             "frame_id": image_frame.frame_id,
             "width_px": image_frame.width_px,
             "height_px": image_frame.height_px,
             "encoding": image_frame.encoding.value,
             "payload_bytes": payload_bytes,
-            "transport": "mjpeg" if mjpeg_available else "metadata",
-            "stream_url": "/streams/video.mjpeg?" + urlencode({"camera_id": image_frame.camera_id}) if mjpeg_available else None,
             "metadata": dict(metadata),
             "ingest_status": self._video_frame_source_status(),
         }
@@ -1443,16 +1392,12 @@ class PerceptionService:
             payload["uri"] = image_frame.uri
         elif image_frame.artifact_id:
             payload["artifact_id"] = image_frame.artifact_id
-        status = "available" if payload.get("stream_url") or payload.get("uri") or payload.get("artifact_id") else "unsupported"
-        if status != "available":
-            payload["message"] = f"浏览器暂不支持直接显示 {image_frame.encoding.value} 图像帧。"
         self._stream_bus.publish(
             "video.frame",
             source=source_name or "image_provider",
             payload=payload,
             frame_id=image_frame.frame_id,
             sequence=sequence,
-            status=status,
             metadata={
                 "camera_id": image_frame.camera_id,
                 "encoding": image_frame.encoding.value,
@@ -1478,11 +1423,7 @@ class PerceptionService:
     def video_frame_source_status(self) -> Dict[str, Any]:
         """返回平台端侧推流接收状态，供持续感知运行时做实时性门禁。"""
 
-        status = self._video_frame_source_status()
-        preview_camera_id = getattr(self._video_frame_sink, "camera_id", None)
-        if preview_camera_id:
-            status["camera_id"] = preview_camera_id
-        return status
+        return self._video_frame_source_status()
 
     def _camera_info_from_video_frame(self, image_frame):
         from contracts.image import CameraInfo

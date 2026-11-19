@@ -108,9 +108,6 @@
         pendingTaskFrames: [],
         streamFlushFrame: null,
         videoFrames: 0,
-        pendingVideoEnvelope: null,
-        videoRenderFrame: null,
-        lastVideoFrameKey: null,
         videoStreamSrc: null,
         videoStreamController: null,
         videoStreamGeneration: 0,
@@ -127,7 +124,6 @@
         videoDetections: [],
         videoSourceSize: null,
         videoDetectionDrawFrame: null,
-        videoFrameMetadata: null,
         videoDisplayedIdentity: null,
         videoDetectionFrame: null,
         videoDetectionRevision: 0,
@@ -2287,6 +2283,7 @@
         drawTrajectory(ctx, anchor, scale);
         drawNavigationPath(ctx, anchor, scale);
         drawGoal(ctx, anchor, scale);
+        drawNavigationPick(ctx, anchor, scale);
         drawFrontiers(ctx, anchor, scale);
         drawSemanticInstances(ctx, anchor, scale);
         drawRobot(ctx, anchor);
@@ -2356,8 +2353,14 @@
       }
       function drawGoal(ctx, anchor, scale) {
         const point = pointFromPose(state.goalPose);
-        if (!point) return;
-        const yaw = yawFromPose(state.goalPose);
+        if (point) drawGoalMarker(ctx, anchor, scale, point, yawFromPose(state.goalPose));
+      }
+      // 导航面板正在选的点：有朝向画箭头，没有朝向画圆点，与提交后的目标显示一致。
+      function drawNavigationPick(ctx, anchor, scale) {
+        const pick = window.__nuwaxNavigationModule?.getState().pendingPose;
+        if (pick) drawGoalMarker(ctx, anchor, scale, pick, pick.yaw);
+      }
+      function drawGoalMarker(ctx, anchor, scale, point, yaw) {
         if (Number.isFinite(yaw)) {
           drawOrientedGoal(
             ctx,
@@ -3987,33 +3990,6 @@
         reevaluateCachedMapDisplay();
         requestMapDraw(false);
       }
-      function scheduleVideoUpdate(envelope) {
-        state.pendingVideoEnvelope = envelope;
-        if (state.videoRenderFrame) return;
-        state.videoRenderFrame = window.requestAnimationFrame(() => {
-          state.videoRenderFrame = null;
-          const next = state.pendingVideoEnvelope;
-          state.pendingVideoEnvelope = null;
-          if (next) updateVideo(next);
-        });
-      }
-      function buildVideoFrameSrc(data) {
-        if (data.stream_url) {
-          const url = new URL(data.stream_url, window.location.origin);
-          // 默认跟随新帧通知；显式 fps 参数仍作为用户选择的发送上限。
-          return url.toString();
-        }
-        return data.data_uri || data.uri || "";
-      }
-      function revokeVideoObjectUrl() {
-        if (!state.videoCurrentObjectUrl) return;
-        try {
-          URL.revokeObjectURL(state.videoCurrentObjectUrl);
-        } catch (err) {
-          // 忽略浏览器释放失败；下一帧会覆盖显示。
-        }
-        state.videoCurrentObjectUrl = null;
-      }
       function setVideoStreamStatus(status, message) {
         state.videoStreamStatus = status;
         state.videoStreamMessage = message || "";
@@ -4116,42 +4092,10 @@
           startVideoStream({ force: true, reason: "reconnect" });
         }, delayMs);
       }
-      function stopVideoStream(reason) {
-        state.videoStreamGeneration += 1;
-        if (state.videoStreamController) {
-          try {
-            state.videoStreamController.abort();
-          } catch (err) {
-            // AbortController 可能已结束。
-          }
-          state.videoStreamController = null;
-        }
-        if (state.videoStreamReconnectTimer) {
-          window.clearTimeout(state.videoStreamReconnectTimer);
-          state.videoStreamReconnectTimer = null;
-        }
-        setVideoStreamStatus("stopped", reason || "视频流已停止。");
-      }
-      function clearVideoDisplay(reason) {
-        stopVideoStream(reason);
-        revokeVideoObjectUrl();
-        els.videoFrame.removeAttribute("src");
-        els.videoFrame.hidden = true;
-        state.videoStreamSrc = null;
-        state.videoPendingSingleFrame = null;
-        state.lastVideoFrameKey = null;
-        state.videoDisplayedIdentity = null;
-        state.videoLastFrameAt = null;
-        scheduleVideoDetectionDraw();
-        renderVisionPanel();
-      }
       function startVideoStream(options) {
+        // 页面直接连接网关 MJPEG 流；video.frame 元数据不决定是否连接。
         const opts = options || {};
-        const videoSrc = opts.streamUrl
-          ? new URL(opts.streamUrl, window.location.origin).toString()
-          : buildVideoFrameSrc({ stream_url: DEFAULT_VIDEO_STREAM_URL });
-        if (!videoSrc) return;
-        if (state.videoRejectedSource === videoSrc && Date.now() < state.videoRejectedSourceUntil) return;
+        const videoSrc = new URL(DEFAULT_VIDEO_STREAM_URL, window.location.origin).toString();
         if (!opts.force && state.videoStreamSrc === videoSrc && state.videoStreamController) return;
         const reconnectDelay = opts.reason === "reconnect" ? state.videoStreamReconnectDelayMs : VIDEO_STREAM_INITIAL_RECONNECT_MS;
         if (state.videoStreamController) {
@@ -4185,36 +4129,12 @@
             setVideoStreamStatus("pending", "等待摄像头视频帧，接收到数据后会自动显示。");
             return;
           }
-          if (err && err.code === "video_camera_unavailable") {
-            state.videoStreamController = null;
-            state.videoRejectedSource = videoSrc;
-            state.videoRejectedSourceUntil = Date.now() + 30000;
-            state.videoDisplayedIdentity = null;
-            state.videoLastFrameAt = null;
-            els.videoFrame.hidden = true;
-            setVideoStreamStatus("error", err.message);
-            return;
-          }
           const message = err && err.message ? err.message : String(err || "未知错误");
           state.videoLastError = message;
           state.videoStreamErrors = (state.videoStreamErrors || 0) + 1;
           state.videoStreamController = null;
           scheduleVideoStreamReconnect(`视频流连接失败：${message}`);
         });
-      }
-      function resetVideoStreamFromMetadata(videoSrc) {
-        if (!videoSrc) return false;
-        const latestRenderedAgeMs = state.videoLastFrameAt ? Date.now() - state.videoLastFrameAt : Infinity;
-        if (
-          state.videoStreamSrc === videoSrc
-          && !state.videoStreamController
-          && !state.videoStreamReconnectTimer
-          && latestRenderedAgeMs > VIDEO_STREAM_MAX_RECONNECT_MS
-        ) {
-          startVideoStream({ streamUrl: videoSrc, force: true, reason: "metadata_watchdog" });
-          return true;
-        }
-        return false;
       }
       async function consumeMjpegStream(videoSrc, signal, generation) {
         const response = await fetch(videoSrc, { method: "GET", cache: "no-store", signal });
@@ -4421,42 +4341,6 @@
           try { URL.revokeObjectURL(previousUrl); } catch (_) { /* 释放失败不阻塞新图。 */ }
         }
         return nextUrl;
-      }
-      function updateVideo(envelope) {
-        const data = envelope.data || {};
-        if (Array.isArray(data.detections_2d)) {
-          updateVideoDetections(data, envelope);
-          return;
-        }
-        const metadata = videoFrameIdentity(data);
-        const previousCamera = state.videoFrameMetadata?.cameraId;
-        state.videoFrameMetadata = metadata;
-        if (previousCamera && metadata.cameraId && previousCamera !== metadata.cameraId) {
-          state.videoDisplayedIdentity = null;
-          state.videoLastFrameAt = null;
-          els.videoFrame.hidden = true;
-          scheduleVideoDetectionDraw();
-        }
-        const videoSrc = buildVideoFrameSrc(data);
-        if (videoSrc && data.available !== false && !["missing", "failed", "error", "stale"].includes(statusOf(envelope))) {
-          if (data.stream_url) {
-            if (state.videoStreamSrc !== videoSrc || (!state.videoStreamController && !state.videoStreamReconnectTimer)) {
-              startVideoStream({ streamUrl: videoSrc, force: state.videoStreamSrc !== videoSrc, reason: "metadata" });
-            } else resetVideoStreamFromMetadata(videoSrc);
-          } else if (state.lastVideoFrameKey !== videoSrc) {
-            stopVideoStream("正在加载图像。");
-            revokeVideoObjectUrl();
-            state.videoPendingSingleFrame = { src: videoSrc, identity: metadata, generation: state.videoStreamGeneration };
-            state.videoStreamSrc = videoSrc;
-            state.lastVideoFrameKey = videoSrc;
-            els.videoFrame.setAttribute("src", videoSrc);
-          }
-        } else if (data.available === false || !videoSrc) {
-          clearVideoDisplay(errorReason(envelope, "尚未收到摄像头发布的视频帧。"));
-        }
-        renderVideoStreamSummary();
-        renderVisionPanel();
-        scheduleVideoDetectionDraw();
       }
       function updateVideoDetections(data, envelope) {
         data = data || {};
@@ -5201,8 +5085,10 @@
           const nav = frame.payload;
           const terminal = ["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav?.status);
           const target = terminal ? null : nav?.target;
+          // 后端目标总带四元数（未指定朝向时为 0）；本页提交时未定朝向的目标按不带方向显示。
+          const unoriented = target && window.__nuwaxNavigationModule?.goalOrientationUnset(nav.goal_id);
           state.goalPose = target ? {position: {x: target.x, y: target.y, z: target.z},
-            orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}} : null;
+            ...(unoriented ? {} : {orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}})} : null;
           state.navigationPath = (terminal ? [] : nav?.planned_path || []).map(([x, y, z]) => ({x, y, z}));
           state.navigationLocalPath = [];
           state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
@@ -5222,7 +5108,7 @@
         } else if (frame.topic === "pointcloud_map.meta") {
           updatePointcloudMapFrame(frame);
         } else if (frame.topic === "video.frame") {
-          scheduleVideoUpdate(envelopeFromFrame(frame));
+          // 画面由 MJPEG 流显示、检测框按帧头与检测结果对齐；此主题只更新总览。
         } else if (frame.topic === "video.detections") {
           updateVideoDetections(frame.payload || {}, envelopeFromFrame(frame));
         } else if (frame.topic === "memory.instances") {
@@ -5401,6 +5287,11 @@
         }
         refreshTaskStore();
       }
+      // 选点导航得知自己提交的目标号时，该目标的状态可能已先到达；按提交时的朝向选择重画一次。
+      window.addEventListener("navigation:submitted-goal", (event) => {
+        const frame = state.latestStreamFrames["navigation.state"];
+        if (frame?.payload?.goal_id === event.detail.goal_id) processStreamFrame(frame);
+      });
       function updateStreamOverview(frame) {
         const keyByTopic = {
           "robot.state": "state",
@@ -5474,30 +5365,6 @@
       els.showDetections.addEventListener("change", () => {
         state.showDetections = Boolean(els.showDetections.checked);
         scheduleVideoDetectionDraw();
-      });
-      els.videoFrame.addEventListener("load", () => {
-        const pending = state.videoPendingSingleFrame;
-        if (!pending || pending.generation !== state.videoStreamGeneration || els.videoFrame.getAttribute("src") !== pending.src) return;
-        state.videoPendingSingleFrame = null;
-        state.videoFrames += 1;
-        state.videoLastFrameAt = Date.now();
-        state.videoDisplayedIdentity = { ...pending.identity, receivedAt: state.videoLastFrameAt };
-        recordVideoFrameMetric();
-        state.videoSourceSize = { width: els.videoFrame.naturalWidth, height: els.videoFrame.naturalHeight };
-        state.videoStreamStatus = "rendering";
-        els.videoFrame.hidden = false;
-        renderVideoStreamSummary();
-        scheduleVideoDetectionDraw();
-      });
-      els.videoFrame.addEventListener("error", () => {
-        if (!state.videoPendingSingleFrame) return;
-        state.videoPendingSingleFrame = null;
-        state.videoDecodeErrors += 1;
-        state.videoLastError = "浏览器无法显示图像。";
-        state.videoDisplayedIdentity = null;
-        state.videoLastFrameAt = null;
-        els.videoFrame.hidden = true;
-        setVideoStreamStatus("error", "浏览器无法显示收到的图像，请检查图像编码与来源。");
       });
       const resizeVideoOverlay = () => {
         state.videoDetectionLayoutRevision += 1;

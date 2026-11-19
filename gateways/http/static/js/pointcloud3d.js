@@ -655,6 +655,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
   _setupSemanticInteraction() {
     const canvas = this._renderer?.domElement;
     if (!canvas?.addEventListener) return;
+    this._setupNavigationPickInteraction(canvas);
     this._semanticPointerDownHandler = (event) => {
       if (event.isPrimary === false || (event.button ?? 0) !== 0) return;
       this._semanticPointerDown = {
@@ -689,6 +690,43 @@ class PointCloud3DViewer extends PointCloudProcessor {
     canvas.addEventListener('pointerdown', this._semanticPointerDownHandler);
     canvas.addEventListener('pointerup', this._semanticPointerUpHandler);
     canvas.addEventListener('pointercancel', this._semanticPointerCancelHandler);
+  }
+
+  // 导航选点与 RViz 设目标位姿手势一致：在地图点上按下左键为位置，拖动方向为朝向，松开结束。
+  // 捕获阶段先于地图控件处理，命中地图点时本次手势不旋转不平移；未命中时地图照常交互。
+  _setupNavigationPickInteraction(canvas) {
+    this._navigationPointerDownHandler = (event) => {
+      if (!window.__nuwaxNavigationActive || event.isPrimary === false || (event.button ?? 0) !== 0) return;
+      const point = this.pickNavigationPoint(event.clientX, event.clientY);
+      if (!point) return;
+      event.stopImmediatePropagation();
+      event.preventDefault();
+      this._settleControlsMotion();
+      canvas.setPointerCapture(event.pointerId);
+      this._navigationDrag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, point, yaw: undefined };
+      this.previewNavigationPoint(point);
+    };
+    this._navigationPointerMoveHandler = (event) => {
+      const drag = this._navigationDrag;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      if (drag.yaw === undefined && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 6) return;
+      // 光标投到按下点所在的水平面上，朝向取按下点指向光标的方向。
+      const target = this.boundaryPointAt(event.clientX, event.clientY, drag.point);
+      if (!target) return;
+      drag.yaw = Math.atan2(target.y - drag.point.y, target.x - drag.point.x);
+      this.previewNavigationPoint({ ...drag.point, yaw: drag.yaw });
+    };
+    this._navigationPointerUpHandler = (event) => {
+      const drag = this._navigationDrag;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      this._navigationDrag = null;
+      const point = drag.yaw === undefined ? drag.point : { ...drag.point, yaw: drag.yaw };
+      window.dispatchEvent(new CustomEvent('pointcloud3d:navigation-pick', { detail: point }));
+    };
+    canvas.addEventListener('pointerdown', this._navigationPointerDownHandler, { capture: true });
+    canvas.addEventListener('pointermove', this._navigationPointerMoveHandler);
+    canvas.addEventListener('pointerup', this._navigationPointerUpHandler);
+    canvas.addEventListener('pointercancel', this._navigationPointerUpHandler);
   }
 
   _setupControls() {
@@ -797,20 +835,26 @@ class PointCloud3DViewer extends PointCloudProcessor {
         && source.session_id === current.session_id && source.session_generation === current.session_generation)));
   }
 
+  // 选点标记画在拾取点表面高度；有朝向时与提交后的目标一样画圆锥箭头，没有朝向画圆点。
   previewNavigationPoint(point) {
-    if (this._navigationPickMarker) {
-      this._scene?.remove(this._navigationPickMarker);
-      this._navigationPickMarker.geometry.dispose();
-      this._navigationPickMarker.material.dispose();
-      this._navigationPickMarker = null;
-    }
-    if (point && this._scene && Number.isFinite(point.z)) {
-      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), new THREE.MeshBasicMaterial({ color: COLORS.navGoal, transparent: true, depthTest: false, depthWrite: false }));
-      marker.position.set(point.x, point.y, point.z);
-      marker.renderOrder = 10;
-      this._navigationPickMarker = marker;
-      this._scene.add(marker);
-    }
+    if (point && this._scene && Number.isFinite(point.surface_z)) {
+      const oriented = Number.isFinite(point.yaw);
+      if (!this._navigationPickMarker) {
+        this._navigationPickMarker = new THREE.Mesh(undefined, new THREE.MeshBasicMaterial({ color: COLORS.navGoal, transparent: true, depthTest: false, depthWrite: false }));
+        this._navigationPickMarker.renderOrder = 10;
+        this._scene.add(this._navigationPickMarker);
+      }
+      const marker = this._navigationPickMarker;
+      if (marker.userData.oriented !== oriented) {
+        marker.geometry.dispose();
+        marker.geometry = oriented ? new THREE.ConeGeometry(0.25, 0.6, 8) : new THREE.SphereGeometry(0.1, 12, 8);
+        if (oriented) marker.geometry.rotateZ(-Math.PI / 2);
+        marker.userData.oriented = oriented;
+      }
+      marker.position.set(point.x, point.y, point.surface_z);
+      marker.rotation.z = oriented ? point.yaw : 0;
+      marker.visible = true;
+    } else if (this._navigationPickMarker) this._navigationPickMarker.visible = false;
     this._requestRender();
   }
 
@@ -2621,7 +2665,6 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._incrementalActive = false;
     this._denseCloud?.dispose();
     this._denseCloud = null;
-    this.previewNavigationPoint(null);
     this._cloudLoadToken += 1;
     this._invalidatePointCloudWork();
     this._cloudWorker?.terminate();
@@ -2632,6 +2675,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
     canvas?.removeEventListener?.('pointerdown', this._semanticPointerDownHandler);
     canvas?.removeEventListener?.('pointerup', this._semanticPointerUpHandler);
     canvas?.removeEventListener?.('pointercancel', this._semanticPointerCancelHandler);
+    canvas?.removeEventListener?.('pointerdown', this._navigationPointerDownHandler, { capture: true });
+    canvas?.removeEventListener?.('pointermove', this._navigationPointerMoveHandler);
+    canvas?.removeEventListener?.('pointerup', this._navigationPointerUpHandler);
+    canvas?.removeEventListener?.('pointercancel', this._navigationPointerUpHandler);
     this._resizeObserver?.disconnect();
     this._resizeObserver = null;
     this._disposePointsMesh();
@@ -2669,7 +2716,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       if (Array.isArray(object.material)) object.material.forEach((material) => material.dispose?.());
       else object.material?.dispose?.();
     });
-    for (const object of [this._trajectoryLine, this._navPathLine, this._navLocalPathLine, this._navGoalMesh]) {
+    for (const object of [this._trajectoryLine, this._navPathLine, this._navLocalPathLine, this._navGoalMesh, this._navigationPickMarker]) {
       object?.geometry?.dispose?.();
       if (Array.isArray(object?.material)) object.material.forEach((material) => material.dispose?.());
       else object?.material?.dispose?.();
@@ -2694,6 +2741,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._navPathLine = null;
     this._navLocalPathLine = null;
     this._navGoalMesh = null;
+    this._navigationPickMarker = null;
+    this._navigationDrag = null;
     this._semanticPointerDown = null;
     this._semanticPointerDownHandler = null;
     this._semanticPointerUpHandler = null;

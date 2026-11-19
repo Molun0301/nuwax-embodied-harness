@@ -5091,8 +5091,9 @@
           state.navigationLocalPath = [];
           state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
             isPublic: navigationContextIsPublic(nav), status: nav?.status};
+          // 高亮环按平面点 {x, y} 读取，与物品导航写入的格式一致。
           state.highlightTarget = target && !["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav.status)
-            ? {target_pose: state.goalPose} : null;
+            ? {target_pose: {x: target.x, y: target.y, z: target.z}} : null;
           window.dispatchEvent(new CustomEvent("stream:navigation.state", {detail: nav}));
           requestMapDraw(false);
         } else if (frame.topic === "exploration.state") {

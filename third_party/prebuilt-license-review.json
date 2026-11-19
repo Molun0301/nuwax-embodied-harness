@@ -6,11 +6,11 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "1234a1e331961da64a28a31199ba2226cfbbf1e686abf9c7d54d451c77130ccd",
+          "review_key": "600f6832f3da63ee5add2b3c2614e9a5c84d8b9f691bc7c2b8f28efe3d97db94",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包108个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包109个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
             "boost-1.83.0",
@@ -18,24 +18,25 @@
             "slam2d-onetbb",
             "drivers/sensors/slamtec_native/sdk",
             "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-slam-2d-worker.json",
-            "reviewed_at": "2026-11-07T05:48:33.343364+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值1234a1e331961da64a28a31199ba2226cfbbf1e686abf9c7d54d451c77130ccd一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；仓库内crate 11个不变、Cargo包108→109。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "9fbdaad3a4b0e7c71b7272a23201266e3c8ab027bc0441914b0f62f10871a585",
+          "review_key": "8dd79435684a2d44477d29ed2b1dcd710bb6d0eab28cac8a76b3fb694f8f04ac",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包108个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包109个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
             "boost-1.83.0",
@@ -43,16 +44,18 @@
             "slam2d-onetbb",
             "drivers/sensors/slamtec_native/sdk",
             "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现",
+            "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-slam-2d-worker.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42332792045的已批准审计（原review_key 83596f91032f04b767c8fdb30a623e20fbdcd603d5340bf07980e37613838fe3）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：仅系统包libpcre2-8-0补丁版本变化。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值9fbdaad3a4b0e7c71b7272a23201266e3c8ab027bc0441914b0f62f10871a585一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；系统包libc6、libc6-dev补丁版本变化；仓库内crate 11个不变、Cargo包108→109。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json。"
           }
         }
       }
@@ -61,7 +64,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "b5a083e17f7ef32a518d774a1288ff1710c984b3b7c634906cc4491c6fa45169",
+          "review_key": "c78ab2a0f7e06d0dadb245a9dc74418775c0d795fabfb99b678eac34ccb417e9",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -79,19 +82,20 @@
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream",
             "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
             "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由64fa391e62478abaedfb16711824d8ab6a353436变为dded80f9f0a4d4f59f0489652546872d97c042b4；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp（优化器的净空与碰撞检查改用规划朝向，新增27行、删除6行），源码文件无新增或删除，许可文件无改动"
+            "已批准内嵌SCAN源码树（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树dded80f9f0a4d4f59f0489652546872d97c042b4",
+            "本次内嵌PCT源码变更（GPL-2.0-or-later）：services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream的Git树由41db00764f17c8a6aeca2ca036bd7ddf26700892变为c42509b12e704b3d9f586e7bbe70a628e8123cf2；仅修改a_star/a_star_search.cc（重建网格时复用已有节点，新增11行、删除3行），源码文件无新增或删除，许可文件无改动；用途仍为linked-native（进入原生链接）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-geometry-runtime.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42952575550的已批准审计（原review_key c675a132512c5ba9dff715e24c181f59c7110705648a58adf934041ed6711590）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：SCAN内嵌源码Git树更新；仓库内crate 42个、Cargo包267个逐项一致。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值b5a083e17f7ef32a518d774a1288ff1710c984b3b7c634906cc4491c6fa45169一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：PCT内嵌源码Git树更新；仓库内crate与Cargo包309个逐项一致。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "12c62a44d915cca26de3d7a05d4bd5740f9335476eb50aa6db52600baa362806",
+          "review_key": "a0625a6fcf928f92d70c0766f42f592947137e33d5c3b0c8b66393a87e95549e",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -109,15 +113,17 @@
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream",
             "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
             "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由64fa391e62478abaedfb16711824d8ab6a353436变为dded80f9f0a4d4f59f0489652546872d97c042b4；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp（优化器的净空与碰撞检查改用规划朝向，新增27行、删除6行），源码文件无新增或删除，许可文件无改动",
-            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）"
+            "已批准内嵌SCAN源码树（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树dded80f9f0a4d4f59f0489652546872d97c042b4",
+            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）",
+            "本次内嵌PCT源码变更（GPL-2.0-or-later）：services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream的Git树由41db00764f17c8a6aeca2ca036bd7ddf26700892变为c42509b12e704b3d9f586e7bbe70a628e8123cf2；仅修改a_star/a_star_search.cc（重建网格时复用已有节点，新增11行、删除3行），源码文件无新增或删除，许可文件无改动；用途仍为linked-native（进入原生链接）",
+            "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-geometry-runtime.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42952575550的已批准审计（原review_key 06d4117ca130163794287d3d2370a3703ba5b8ac3ded89d44d2b089e667c6277）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：SCAN内嵌源码Git树更新与系统包libpcre2-8-0补丁版本变化；仓库内crate 42个、Cargo包267个逐项一致。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值12c62a44d915cca26de3d7a05d4bd5740f9335476eb50aa6db52600baa362806一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：PCT内嵌源码Git树更新；系统包libc6、libc6-dev补丁版本变化；仓库内crate与Cargo包309个逐项一致。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json。"
           }
         }
       }
@@ -126,53 +132,56 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "5582f58cd608bec9a234c20dccf799a215bb3b89bd0d2cbc91d3397aee94d1cf",
+          "review_key": "dab42a9229ae9a25ba7c2edfaec3d5ba8a55414134c3ff8341d213d81ce8a6c6",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
             "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner",
-            "实际编译Cargo包229个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包230个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
             "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
             "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由64fa391e62478abaedfb16711824d8ab6a353436变为dded80f9f0a4d4f59f0489652546872d97c042b4；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp（优化器的净空与碰撞检查改用规划朝向，新增27行、删除6行），源码文件无新增或删除，许可文件无改动",
-            "本次删除仓库内crate nuwax-rpc（GPL-2.0-or-later）与Cargo依赖base64 0.22.1（MIT OR Apache-2.0）；无新增crate或依赖，无版本或许可变更"
+            "已批准内嵌SCAN源码树（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树dded80f9f0a4d4f59f0489652546872d97c042b4",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现",
+            "本次内嵌PCT源码变更（GPL-2.0-or-later）：services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream的Git树由41db00764f17c8a6aeca2ca036bd7ddf26700892变为c42509b12e704b3d9f586e7bbe70a628e8123cf2；仅修改a_star/a_star_search.cc（重建网格时复用已有节点，新增11行、删除3行），源码文件无新增或删除，许可文件无改动；用途仍为linked-native（进入原生链接）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-nav-stack.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42952575550的已批准审计（原review_key 5d0402333de3009d7374e1d83d2a9a4baa842cf318c8690dbcde7427f6383211）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：SCAN内嵌源码Git树更新；删除nuwax-rpc与base64 0.22.1，仓库内crate 26→25、Cargo包205→204。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值5582f58cd608bec9a234c20dccf799a215bb3b89bd0d2cbc91d3397aee94d1cf一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；PCT内嵌源码Git树更新；仓库内crate 25个不变、Cargo包229→230。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "4a99aa5fd102ca0af7e89556427b7d885102a545ef1d92513389d7509b76018d",
+          "review_key": "582055f305e6acef7d0b36beae673fffdcc053c3f8d88b5af535690bf4113447",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
             "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner",
-            "实际编译Cargo包229个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包230个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
             "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream",
             "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
             "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "本次内嵌SCAN源码变更（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树由64fa391e62478abaedfb16711824d8ab6a353436变为dded80f9f0a4d4f59f0489652546872d97c042b4；仅修改bspline_opt/include/bspline_opt/bspline_optimizer.h、bspline_opt/src/bspline_optimizer.cpp（优化器的净空与碰撞检查改用规划朝向，新增27行、删除6行），源码文件无新增或删除，许可文件无改动",
-            "本次删除仓库内crate nuwax-rpc（GPL-2.0-or-later）与Cargo依赖base64 0.22.1（MIT OR Apache-2.0）；无新增crate或依赖，无版本或许可变更",
-            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）"
+            "已批准内嵌SCAN源码树（Apache-2.0）：services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream的Git树dded80f9f0a4d4f59f0489652546872d97c042b4",
+            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现",
+            "本次内嵌PCT源码变更（GPL-2.0-or-later）：services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream的Git树由41db00764f17c8a6aeca2ca036bd7ddf26700892变为c42509b12e704b3d9f586e7bbe70a628e8123cf2；仅修改a_star/a_star_search.cc（重建网格时复用已有节点，新增11行、删除3行），源码文件无新增或删除，许可文件无改动；用途仍为linked-native（进入原生链接）",
+            "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-nav-stack.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42952575550的已批准审计（原review_key 47809b4c5ba6d140ad5f60474eb5bf0eda1dc6972ae08f827c0c49bc9565852d）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：SCAN内嵌源码Git树更新；删除nuwax-rpc与base64 0.22.1，仓库内crate 26→25、Cargo包205→204；系统包libpcre2-8-0补丁版本变化。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值4a99aa5fd102ca0af7e89556427b7d885102a545ef1d92513389d7509b76018d一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；PCT内嵌源码Git树更新；系统包libc6、libc6-dev补丁版本变化；仓库内crate 25个不变、Cargo包229→230。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json。"
           }
         }
       }
@@ -181,41 +190,44 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "6ad96d676884fda2a21d78d874e820ffb01e7d4b004594bb9eb4f780a9e3c95e",
+          "review_key": "081cb38403b92cdf796c644eeb4281ab91756bba97bca03d8c9f443bc586c84b",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包189个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包190个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-person-follow.json",
-            "reviewed_at": "2026-11-07T05:48:33.391811+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-person-follow/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值6ad96d676884fda2a21d78d874e820ffb01e7d4b004594bb9eb4f780a9e3c95e一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；仓库内crate 16个不变、Cargo包189→190。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-person-follow/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "070fa4cd635268f6a98a4ea846a5a9b30975d1432d12772189628c61347c34fd",
+          "review_key": "1901212c8965f63aaa7328c5bce4820f7846364948e908358d902bf73d5cca66",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包189个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包190个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "系统包补丁升级：libpcre2-8-0:amd64 由10.42-4ubuntu2.1变为10.42-4ubuntu2.2（Ubuntu安全更新，同一软件包、许可不变）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现",
+            "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-person-follow.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42332792045的已批准审计（原review_key bce89b01262cd531f3e1a41049a1324830619c38a0ecf42691859d685179666f）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：仅系统包libpcre2-8-0补丁版本变化。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-person-follow/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值070fa4cd635268f6a98a4ea846a5a9b30975d1432d12772189628c61347c34fd一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；系统包libc6、libc6-dev补丁版本变化；仓库内crate 16个不变、Cargo包189→190。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-person-follow/audit/inputs.json。"
           }
         }
       }
@@ -224,11 +236,11 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "28771e1a9a290384ac6e1cf6841c7efe7a92ad361e4b5971bd682babd7fd6c87",
+          "review_key": "620a7f23f0c2b213cbac29ff80e7e3f470df3b914ed03c2cba707fa52941fa90",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包238个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包239个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "GTSAM/Cephes",
             "GTSAM/GKlib",
@@ -236,24 +248,25 @@
             "Boost-system-headers",
             "Eigen3",
             "gtsam_source",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现"
           ],
           "evidence": {
-            "run_id": 42332792045,
-            "source_revision": "91ac65187f66128445409faac9b071c62f532a33",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-focal-arm64/audit-nuwax-mapping-cli.json",
-            "reviewed_at": "2026-11-07T05:48:33.406684+00:00",
-            "说明": "对比运行41289319821及已批准的仓库许可声明、DimOS LICENSE/NOTICE；旧批准key逐项复算一致。新增nuwax-config与六个TOML依赖，许可种类均已在本程序批准组合中出现，无依赖删除；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值28771e1a9a290384ac6e1cf6841c7efe7a92ad361e4b5971bd682babd7fd6c87一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；仓库内crate 12个不变、Cargo包238→239。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "e284033d75ef7e04eef3130750a021d433b559aab50b8f8722baa088ad4af060",
+          "review_key": "7fd0456cccc82c99e652c78297ac0ce2512a04e0a6e7c8ee9f57484fffca43e9",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
-            "实际编译Cargo包238个：逐包许可及build/runtime角色见随包组件记录",
+            "实际编译Cargo包239个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "GTSAM/Cephes",
             "GTSAM/GKlib",
@@ -261,16 +274,18 @@
             "Boost-system-headers",
             "Eigen3",
             "gtsam_source",
-            "新增仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
-            "新增Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
-            "系统包补丁升级：libsqlite3-0:amd64 由3.45.1-1ubuntu2.8变为3.45.1-1ubuntu2.9（Ubuntu安全更新，同一软件包、许可不变）"
+            "已批准仓库内crate：nuwax-config 0.1.0（GPL-2.0-or-later）",
+            "已批准Cargo依赖：serde_spanned 0.6.9、toml 0.8.23、toml_datetime 0.6.11、toml_edit 0.22.27、toml_write 0.1.2（MIT OR Apache-2.0）；winnow 0.7.15（MIT）",
+            "系统包补丁升级：libsqlite3-0:amd64 由3.45.1-1ubuntu2.8变为3.45.1-1ubuntu2.9（Ubuntu安全更新，同一软件包、许可不变）",
+            "本次新增Cargo依赖：memmap2 0.9.12（MIT OR Apache-2.0，运行依赖，未进入原生链接），由仓库内crate nuwax-types引入，用于读取设备时钟共享内存；许可种类已在本程序批准组合中出现",
+            "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 43361156973,
-            "source_revision": "35dd73c102d07e826c2e2f68b6183fbca69984f0",
+            "run_id": 44393919541,
+            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-mapping-cli.json",
-            "reviewed_at": "2026-11-13T05:39:10.155481+00:00",
-            "说明": "对比运行42332792045的已批准审计（原review_key 4526e2e93bef333567a65d289c26a1d952b3c62ec0823dd0c468da4a336c0e4b）与运行43361156973的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单。核查输入的全部变化：仅系统包libsqlite3-0补丁版本变化。没有新增组件，没有新增许可种类、许可不明或著佐权强度变化；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json。"
+            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
+            "说明": "对比运行43361156973的审计（review_key与原批准值e284033d75ef7e04eef3130750a021d433b559aab50b8f8722baa088ad4af060一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；系统包libc6、libc6-dev补丁版本变化；仓库内crate 12个不变、Cargo包238→239。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json。"
           }
         }
       }

@@ -307,6 +307,23 @@ impl DenseCloud {
         Ok(())
     }
 
+    /// 复用主精细图使用的空域证据，覆盖稠密层单独保留的未确认回波。
+    pub(crate) fn remove_cleared(
+        &mut self,
+        evidence: &crate::dynamic_backend::MappedFrame,
+    ) -> Result<(), String> {
+        let size = f64::from(self.voxel_size);
+        let mut removed: Vec<_> = evidence
+            .candidate_grid_keys(size, |key| self.subcells.contains_key(&key))
+            .expect("去动态后端提供规则格候选")
+            .into_iter()
+            .filter(|&key| evidence.clears(crate::pointcloud::voxel_center_f64(key, self.voxel_size)))
+            .collect();
+        removed.sort_unstable();
+        self.remove_voxels(&removed, self.voxel_size)?;
+        Ok(())
+    }
+
     /// 仅检查删除区域关联的文件页。旧快照仍持有原可见性，读取/保存不会跨修订串帧。
     pub fn remove_voxels(&mut self, keys: &[Key], voxel_size: f32) -> Result<usize, String> {
         #[cfg(test)]

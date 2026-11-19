@@ -105,7 +105,7 @@ impl StructureUpdates {
         points: &[Point3<f64>],
         static_indices: &[u32],
         stamp: u64,
-    ) -> Vec<Point3<f64>> {
+    ) -> Vec<u32> {
         self.expire(stamp);
         let mut fine_decisions = AHashMap::new();
         let mut coarse_decisions = AHashMap::new();
@@ -126,7 +126,7 @@ impl StructureUpdates {
                         .or_insert_with(|| self.confirm(cell, stamp))
                 }
             }) {
-                confirmed.push(point);
+                confirmed.push(index);
             }
         }
         confirmed
@@ -341,7 +341,8 @@ impl CloudMap {
             updates.expire(stamp);
             return Ok(None);
         }
-        let confirmed = updates.select(points, static_indices, stamp);
+        let confirmed: Vec<_> = updates.select(points, static_indices, stamp)
+            .into_iter().map(|index| points[index as usize]).collect();
         if confirmed.is_empty() {
             return Ok(None);
         }
@@ -392,35 +393,26 @@ impl CloudMap {
         )?;
         dynamic.bind_points(points, &indices);
         let stamp = frame.odom_pose.timestamp_ns;
-        let confirmed = self.structure_updates.select(points, &indices, stamp);
-        // 完整帧分类沿用 L6 的独立分类器。近期避障和稠密扫描不等待确认。
-        let session_id = self.session_id;
-        let ground_indices = self.full_scan_classifier()?.accumulate(
-            session_id,
-            &frame.sensor_id,
-            sequence,
-            points,
-            origin,
-            stamp,
-            Some(dynamic.clone()),
-        )?;
-        let classifier = self.scan_classifier.as_ref().unwrap();
-        self.dense.remove_voxels(classifier.removed_keys(), VOXEL_SIZE)?;
-        let retained: Vec<_> = points
-            .iter()
-            .filter(|point| !classifier.is_dynamic(point))
-            .copied()
-            .collect();
-        self.dense.append(&retained)?;
-        self.fine.accumulate(
+        let confirmed_indices = self.structure_updates.select(points, &indices, stamp);
+        let ground_indices = self.fine.accumulate_confirmed(
             self.session_id,
             &frame.sensor_id,
             sequence,
-            &confirmed,
+            points,
+            &confirmed_indices,
             origin,
             stamp,
-            Some(dynamic.clone()),
+            dynamic.clone(),
         )?;
+        self.dense.remove_cleared(&dynamic)?;
+        let retained: Vec<_> = points
+            .iter()
+            .filter(|point| !self.fine.is_dynamic(point))
+            .copied()
+            .collect();
+        self.dense.append(&retained)?;
+        let confirmed: Vec<_> = confirmed_indices.into_iter()
+            .map(|index| points[index as usize]).collect();
         let hits: ahash::AHashSet<_> = points
             .iter()
             .filter_map(|p| voxel_key([p.x, p.y, p.z], self.voxel_size))
@@ -916,7 +908,7 @@ impl CloudMapShmWriter {
         Ok(())
     }
 }
-fn voxel_center_f64(key: VoxelKey, size: f32) -> [f64; 3] {
+pub(crate) fn voxel_center_f64(key: VoxelKey, size: f32) -> [f64; 3] {
     [key.0, key.1, key.2].map(|v| (f64::from(v) + 0.5) * f64::from(size))
 }
 pub(crate) fn voxel_key(point: [f64; 3], size: f32) -> Option<VoxelKey> {

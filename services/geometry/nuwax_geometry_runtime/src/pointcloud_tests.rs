@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn building_full_frame_ground_labels_only_write_confirmed_members() {
+    let mut map = CloudMap::new(975, None, None).unwrap();
+    let size = f64::from(VOXEL_SIZE);
+    let points: Vec<_> = (-4..=4).flat_map(|x| {
+        (-4..=4).map(move |y| Point3::new(
+            (f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size, 0.02,
+        ))
+    }).collect();
+    let admitted: Vec<_> = points.iter().enumerate()
+        .filter(|(_, p)| p.x < 0.).map(|(i, _)| i as u32).collect();
+    let labels = map.fine.accumulate_confirmed(
+        975, "地面回波", 1, &points, &admitted, [0., 0., 0.5], 1,
+        crate::dynamic_backend::MappedFrame::unfiltered(),
+    ).unwrap();
+    assert_eq!(labels, (0..points.len() as u32).collect::<Vec<_>>());
+
+    let sealed = map.fine.seal(domain(975), 1, 1).unwrap();
+    let mut reader = nuwax_map_chunks::RegionReader::new(sealed.repository.clone(), 1024 * 1024);
+    let occupied = reader.region(
+        sealed.manifest(), [-4, -4, 0], [4, 4, 0], points.len()
+    ).unwrap();
+    assert_eq!(occupied.len(), admitted.len());
+    assert!(occupied.iter().all(|(key, _)| key[0] < 0));
+}
+
+#[test]
+fn dense_raw_retraction_keeps_using_free_evidence_for_unconfirmed_points() {
+    let mut map = CloudMap::new(976, None, None).unwrap();
+    map.dense.append(&[Point3::new(0.15, 0.15, 0.15)]).unwrap();
+    let before = map.dense.snapshot(1, 1, "稠密撤销").unwrap();
+    assert_eq!(before.point_count, 1);
+    let cleared = crate::dynamic_backend::test_free_cells(
+        1., [([0, 0, 0], 0)], Isometry3::identity(),
+    );
+    map.dense.remove_cleared(&cleared).unwrap();
+    assert!(map.dense.snapshot(2, 2, "稠密撤销").is_none());
+}
+
+#[test]
 fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_continues() {
     for stage in ["open", "scan", "progress"] {
         let root = std::env::temp_dir().join(format!("g1-budget-{}", uuid::Uuid::new_v4()));

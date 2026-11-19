@@ -157,6 +157,7 @@ pub(super) struct Return {
     pub bin: Bin,
     pub index: u32,
     pub dynamic: bool,
+    pub admitted: bool,
 }
 impl Return {
     pub(super) fn from_key(point: [f64; 3], key: Key, index: u32, dynamic: bool, q: f32) -> Self {
@@ -168,6 +169,7 @@ impl Return {
             bin: i64::from(key[2]) * 8 + sub,
             index,
             dynamic,
+            admitted: true,
         }
     }
 }
@@ -766,6 +768,98 @@ pub(super) fn capture(
     }
     Ok(indices)
 }
+/// 同一份历史地面列服务整帧标签和确认回波的地面写入。
+pub(super) fn capture_confirmed(
+    writer: &mut Writer,
+    returns: &[Return],
+    removed: &[Key],
+    sequence: u64,
+    timestamp_ns: u64,
+    source: Arc<LayerSource>,
+) -> Result<Vec<u32>, String> {
+    if returns.iter().all(|point| point.admitted) {
+        return capture(writer, returns, removed, sequence, timestamp_ns, source);
+    }
+    let mut full = BTreeMap::<Xy, Vec<&Return>>::new();
+    let mut confirmed = BTreeMap::<Xy, Vec<&Return>>::new();
+    for point in returns {
+        let xy = [point.key[0], point.key[1]];
+        full.entry(xy).or_default().push(point);
+        if point.admitted {
+            confirmed.entry(xy).or_default().push(point);
+        }
+    }
+    let touched = full.keys().copied()
+        .chain(removed.iter().map(|key| [key[0], key[1]])).collect();
+    let voxel = writer.voxel_size_m();
+    let q = f64::from(voxel);
+    let old = writer.ground_columns_in_rows(&neighborhood_rows(&touched, 4 + 8))?;
+    let history = OnceLock::new();
+    let full_context = Context::new(Columns::frame(old, &full), q);
+    let confirmed_context = Context::new(Columns::frame(old, &confirmed), q);
+    let frame = |context| Frame {
+        context, old, historical: &history, q, voxel, source: &source, sequence, timestamp_ns,
+    };
+    let full_frame = frame(&full_context);
+    let confirmed_frame = frame(&confirmed_context);
+    let changed = different_columns(&full_context.columns, &confirmed_context.columns);
+    // local 读取 9×9 窗口，邻列种子最多再外扩四列。窗口完全相同时可直接复用分类。
+    let influence = neighborhood_rows(&changed, 8);
+    let columns: Vec<_> = full.iter().collect();
+    let results: Vec<_> = columns.par_iter().with_min_len(256)
+        .map(|&(&xy, returns)| {
+            let selected = confirmed.get(&xy);
+            let (update, selected_labels) = selected
+                .map(|points| confirmed_frame.column(xy, points, false))
+                .transpose()?
+                .unwrap_or_default();
+            let row = influence.partition_point(|&(x, low, _)| (x, low) <= (xy[0], xy[1]));
+            let geometry_differs = row > 0 && influence[row - 1].0 == xy[0]
+                && xy[1] <= influence[row - 1].2;
+            let labels = if !geometry_differs && selected.is_some_and(|points| points.len() == returns.len()) {
+                selected_labels
+            } else {
+                let reader = if geometry_differs { &full_frame } else { &confirmed_frame };
+                reader.column(xy, returns, true)?.1
+            };
+            Ok::<_, String>((update, labels))
+        })
+        .collect();
+    let mut indices = Vec::new();
+    let mut updates = BTreeMap::new();
+    for (&(&xy, _), result) in columns.iter().zip(results) {
+        let (update, labels) = result?;
+        indices.extend(labels);
+        if let Some(update) = update {
+            updates.insert(xy, update);
+        }
+    }
+    if !updates.is_empty() {
+        writer.replace_ground_columns(updates.iter().map(|(xy, value)| (*xy, value)))?;
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    Ok(indices)
+}
+
+/// 找出两份当帧几何视图中不同的列。历史地面记录为同一份引用。
+fn different_columns(full: &Columns<'_>, confirmed: &Columns<'_>) -> BTreeSet<Xy> {
+    let mut different = BTreeSet::new();
+    let mut selected = confirmed.xy.iter().enumerate().peekable();
+    for (index, &xy) in full.xy.iter().enumerate() {
+        while let Some((_, &other)) = selected.next_if(|(_, other)| **other < xy) {
+            different.insert(other);
+        }
+        let equivalent = selected.next_if(|(_, other)| **other == xy)
+            .is_some_and(|(other, _)| full.bins(index) == confirmed.bins(other));
+        if !equivalent {
+            different.insert(xy);
+        }
+    }
+    different.extend(selected.map(|(_, &xy)| xy));
+    different
+}
+
 /// 本帧分类：返回待替换的列记录和归入地面的点索引，写入由 `capture` 完成。
 fn classify(
     writer: &mut Writer,
@@ -808,7 +902,7 @@ fn classify(
     let results: Vec<_> = columns
         .par_iter()
         .with_min_len(256)
-        .map(|&(&xy, points)| frame.column(xy, points))
+        .map(|&(&xy, points)| frame.column(xy, points, false))
         .collect();
     let mut updates = BTreeMap::new();
     let mut indices = Vec::new();
@@ -840,6 +934,7 @@ impl Frame<'_, '_> {
         &self,
         xy: Xy,
         points: &[&Return],
+        labels_only: bool,
     ) -> Result<(Option<ColumnGroundRecords>, Vec<u32>), String> {
         let Self {
             context,
@@ -914,6 +1009,10 @@ impl Frame<'_, '_> {
         // Ambiguous middle returns are still occupancy. They are not a reason
         // to retract an unseen old member, so never add these keys to denied.
         safe.retain(|_, g| !withheld.contains(g));
+        if labels_only {
+            indices.extend(points.iter().filter(|p| safe.contains_key(&p.key[2])).map(|p| p.index));
+            return Ok((None, indices));
+        }
         let mut frames = BTreeMap::new();
         for (g, group) in grouping.iter().enumerate() {
             let mut counts: BTreeMap<i32, [u32; 8]> = BTreeMap::new();

@@ -161,20 +161,60 @@ impl FineCloud {
         stamp: u64,
         shared: Option<crate::dynamic_backend::MappedFrame>,
     ) -> Result<Vec<u32>, String> {
+        self.accumulate_frame(session_id, sensor_id, sequence, points, origin, stamp, shared, None)
+    }
+
+    /// 全部回波参与当帧地面分类，只积累确认索引指向的占据及地面成员。
+    pub(crate) fn accumulate_confirmed(
+        &mut self,
+        session_id: u64,
+        sensor_id: &str,
+        sequence: u64,
+        points: &[Point3<f64>],
+        confirmed: &[u32],
+        origin: [f64; 3],
+        stamp: u64,
+        shared: crate::dynamic_backend::MappedFrame,
+    ) -> Result<Vec<u32>, String> {
+        self.accumulate_frame(
+            session_id, sensor_id, sequence, points, origin, stamp, Some(shared), Some(confirmed),
+        )
+    }
+
+    fn accumulate_frame(
+        &mut self,
+        session_id: u64,
+        sensor_id: &str,
+        sequence: u64,
+        points: &[Point3<f64>],
+        origin: [f64; 3],
+        stamp: u64,
+        shared: Option<crate::dynamic_backend::MappedFrame>,
+        confirmed: Option<&[u32]>,
+    ) -> Result<Vec<u32>, String> {
         let result = (|| {
-            let keys = self.accumulate_inner(points, Some(origin), stamp, shared)?;
+            let keys = self.accumulate_inner(points, Some(origin), stamp, shared, confirmed)?;
+            let admitted = confirmed.map(|indices| {
+                let mut admitted = vec![false; points.len()];
+                for &index in indices {
+                    admitted[index as usize] = true;
+                }
+                admitted
+            });
             let returns: Vec<_> = points
                 .iter()
                 .zip(keys)
                 .enumerate()
                 .map(|(index, (p, key))| {
-                    heightfield_capture::Return::from_key(
+                    let mut value = heightfield_capture::Return::from_key(
                         [p.x, p.y, p.z],
                         key,
                         index as u32,
                         self.dynamic.is_dynamic([p.x, p.y, p.z]),
                         self.writer.voxel_size_m(),
-                    )
+                    );
+                    value.admitted = admitted.as_ref().is_none_or(|mask| mask[index]);
+                    value
                 })
                 .collect();
             let removed: Vec<_> = self
@@ -189,7 +229,11 @@ impl FineCloud {
                 runtime_generation: 1,
                 session_generation: session_id,
             });
-            heightfield_capture::capture(
+            let capture = match confirmed {
+                Some(_) => heightfield_capture::capture_confirmed,
+                None => heightfield_capture::capture,
+            };
+            capture(
                 &mut self.writer,
                 &returns,
                 &removed,
@@ -209,6 +253,7 @@ impl FineCloud {
         origin: Option<[f64; 3]>,
         timestamp_ns: u64,
         mut shared: Option<crate::dynamic_backend::MappedFrame>,
+        confirmed: Option<&[u32]>,
     ) -> Result<Vec<nuwax_map_chunks::Key>, String> {
         self.dynamic.clear_frame();
         #[cfg(test)]
@@ -226,7 +271,6 @@ impl FineCloud {
                     .ok_or("精细输入坐标无效")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let hits: AHashSet<_> = keys.iter().map(|k| (k[0], k[1], k[2])).collect();
         // 零时间种子也先取得DUFO分类；observe内部不插入，其空增量应绕过旧窗口查询。
         if shared.is_none() {
             if let Some(origin) = origin {
@@ -325,15 +369,18 @@ impl FineCloud {
         {
             self.last_revoke_ms = revoke_started.elapsed().as_secs_f64() * 1000.0;
         }
-        if timestamp_ns == 0 {
-            self.writer
-                .seed_unknown(hits.into_iter().map(|key| [key.0, key.1, key.2]))?;
+        let retained: AHashSet<_> = if let Some(indices) = confirmed {
+            indices.iter().map(|&index| keys[index as usize]).collect()
+        } else if timestamp_ns == 0 {
+            keys.iter().copied().collect()
         } else {
-            let retained: AHashSet<_> = points
-                .iter()
-                .zip(&keys)
-                .filter_map(|(p, &k)| (!self.dynamic.is_dynamic([p.x, p.y, p.z])).then_some(k))
-                .collect();
+            points.iter().zip(&keys)
+                .filter_map(|(p, &key)| (!self.dynamic.is_dynamic([p.x, p.y, p.z])).then_some(key))
+                .collect()
+        };
+        if timestamp_ns == 0 {
+            self.writer.seed_unknown(retained)?;
+        } else {
             self.writer.observe(retained, timestamp_ns)?;
         }
         Ok(keys)

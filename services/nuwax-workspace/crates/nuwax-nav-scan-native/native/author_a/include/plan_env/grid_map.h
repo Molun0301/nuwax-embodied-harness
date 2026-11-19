@@ -511,7 +511,7 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
       // 位图与原概率阈值完全对应；环形Z范围仍按相同两段查询。
       const std::size_t column = getLocalIndex(x, 0) * mp_.map_voxel_num_.y() + getLocalIndex(y, 1);
       const auto* bits = collisionData().occupancy_bits_.data() + column * collisionData().occupancy_words_per_column_;
-      const auto occupied = [&](int begin, int count) {
+      const auto occupied = [&](int begin, int count, int global_start) {
         if (count == 0) return false;
         const int first_word = begin / 64, last_word = (begin + count - 1) / 64;
         for (int word = first_word; word <= last_word; ++word) {
@@ -525,14 +525,17 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
             const int address = static_cast<int>(column) * nz + z;
             const auto member = collisionData().support_member_max_z_.find(address);
             // 原碰撞带不移动：只有真实支撑点全部低于下沿时，排除体素格顶放大的虚假相交。
-            if (member == collisionData().support_member_max_z_.end() || !(member->second < low))
+            if (member == collisionData().support_member_max_z_.end() || !(member->second < low)) {
+              const int global_z = global_start + z - begin;
+              recordCollision((x + .5) * r, (y + .5) * r, global_z * r, (global_z + 1.) * r, OccupiedVoxel);
               return true;
+            }
             hits &= hits - 1;
           }
         }
         return false;
       };
-      if (occupied(local_z, first_count) || occupied(0, second_count)) return 1;
+      if (occupied(local_z, first_count, z0) || occupied(0, second_count, z0 + first_count)) return 1;
     }
   return 0;
 }
@@ -579,6 +582,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
           const BodyCell cell{x,y,global};
           if((support==collisionData().support_member_max_z_.end()||!(support->second<low))
               &&(!initial||!initial->count(cell))) {
+            recordCollision((x+.5)*r,(y+.5)*r,global*r,(global+1.)*r,OccupiedVoxel);
             found=true;if(!contacts)return 1;
             contacts->push_back(cell);
             if(planar){column_hit=true;break;}

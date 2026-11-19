@@ -603,6 +603,8 @@ impl SurfaceFollower {
             }
         }
         let mut tracking_failure = None;
+        let goal_pose = self.goal.as_ref().unwrap();
+        let q = goal_pose.pose.orientation;
         let checked = match self.tracker.track_terminal_position(
             &config,
             &map.snapshot,
@@ -614,6 +616,7 @@ impl SurfaceFollower {
             ],
             terminal_yaw,
             terminal_position,
+            Some((Self::position(goal_pose), [q.x, q.y, q.z, q.w])),
         ) {
             Ok(checked) => checked,
             Err(failure) => {

@@ -65,8 +65,13 @@ inline bool sweepFree(GridMap& map,const State& start,const Eigen::Vector2d& mea
         ||map.getInflateOccupancy(finish.position,finish.yaw)!=0)return false;
   }
   const double padding=(mean.norm()+radius*std::abs(angular))*(end-begin)/2.;
-  if(map.bodyContacts(pose.position,pose.yaw,padding,nullptr,initial)==0)return true;
-  if(depth>=12||padding<=1e-8)return false;
+  const bool final_probe=depth>=12||padding<=1e-8;
+  {
+    // 可由二分继续证实安全的粗外包候选不进入挡路格。
+    const CollisionEvidenceScope capture(final_probe ? collision_evidence : nullptr);
+    if(map.bodyContacts(pose.position,pose.yaw,padding,nullptr,initial)==0)return true;
+  }
+  if(final_probe)return false;
   return sweepFree(map,start,mean,angular,radius,begin,mid,deadline,exhausted,initial,depth+1)
       &&sweepFree(map,start,mean,angular,radius,mid,end,deadline,exhausted,initial,depth+1);
 }

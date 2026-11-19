@@ -1210,6 +1210,7 @@ name = "nuwax-nav-pct-native"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "nuwax-core",
 ]
 
 [[package]]
@@ -1235,6 +1236,7 @@ name = "nuwax-nav-scan-native"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "nuwax-core",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 #pragma once
+#include <scan_native.h>
 
 #include <Eigen/Eigen>
 #include <algorithm>
@@ -61,11 +62,18 @@ class BusinessConstraintMask {
     for (const auto& p : std::array<Eigen::Vector2d,2>{
         center+offset_*heading,center-offset_*heading}) {
       if (boundary_.size() >= 3) {
-        if (!insideBoundary(p)) return true;
+        if (!insideBoundary(p)) {
+          recordForbiddenPoint(p.x(), p.y(), resolution_);
+          return true;
+        }
         for (size_t i=0,j=boundary_.size()-1;i<boundary_.size();j=i++) {
           const auto d=(boundary_[i]-boundary_[j]).eval();
           const double t=d.squaredNorm()>0.?std::clamp((p-boundary_[j]).dot(d)/d.squaredNorm(),0.,1.):0.;
-          if ((p-(boundary_[j]+t*d)).norm() < radius_ + padding) return true;
+          const auto edge = (boundary_[j]+t*d).eval();
+          if ((p-edge).norm() < radius_ + padding) {
+            recordForbiddenPoint(edge.x(), edge.y(), resolution_);
+            return true;
+          }
         }
       }
     }
@@ -105,7 +113,10 @@ class BusinessConstraintMask {
       for (const auto& c : found->second) {
         const double dx = std::max(0.0, std::abs((c.x() + 0.5) * resolution_ - p.x()) - half_voxel);
         const double dy = std::max(0.0, std::abs((c.y() + 0.5) * resolution_ - p.y()) - half_voxel);
-        if (dx * dx + dy * dy <= radius * radius) return true;
+        if (dx * dx + dy * dy <= radius * radius) {
+          recordForbiddenCell((c.x()+.5)*resolution_, (c.y()+.5)*resolution_);
+          return true;
+        }
       }
     }
     return false;

@@ -4,7 +4,48 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::MakeWriter;
+
+mod collision;
+pub use collision::{CollisionEvidence, CollisionLogPose};
+
+/// 导航输入诊断与碰撞日志共用的一秒限频。
+pub const INPUT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 统计被抑制的重复诊断。
+#[derive(Default)]
+pub struct DiagnosticLimiter {
+    next_emit: Option<Instant>,
+    suppressed: u64,
+}
+
+impl DiagnosticLimiter {
+    /// 限频窗口是否允许取证。
+    fn ready_at(&self, now: Instant) -> bool {
+        self.next_emit.is_none_or(|deadline| now >= deadline)
+    }
+
+    /// 更新现有窗口并返回上个窗口内的抑制次数。
+    pub fn record_at(&mut self, now: Instant) -> Option<u64> {
+        if self.ready_at(now) {
+            let suppressed = std::mem::take(&mut self.suppressed);
+            self.next_emit = Some(now + INPUT_DIAGNOSTIC_INTERVAL);
+            Some(suppressed)
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+
+    /// 保留现有导航输入拒绝消息。
+    pub fn reject(&mut self, component: &str, reason: &str) {
+        if let Some(suppressed) = self.record_at(Instant::now()) {
+            tracing::warn!(target: "nuwax_nav_stack::lcm_dataflow",
+                input=component, reason, suppressed, "导航输入被拒绝");
+        }
+    }
+}
 
 struct ComponentFile {
     path: PathBuf,

@@ -1,9 +1,11 @@
 //! 固定上游PCT源码的无ROS封装，仅从有效实测地面构建全局路线。
+use nuwax_core::logging::{CollisionEvidence, CollisionLogPose, DiagnosticLimiter};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 thread_local! {
     static CANCELLATIONS: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
@@ -178,7 +180,7 @@ unsafe extern "C" {
     fn pct_multi_goal_cost(
         search: *mut c_void, start: *const f64, goal: *const f64, cost: *mut RouteCost,
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
-        err: *mut c_char, cap: usize,
+        err: *mut c_char, cap: usize, evidence: *mut CollisionEvidence,
     ) -> i32;
     fn pct_source_begin(
         search: *mut c_void, start: *const f64, goals: *const f64, count: usize, reachable: *mut u8,
@@ -203,6 +205,7 @@ unsafe extern "C" {
         progressive: bool,
         err: *mut c_char,
         cap: usize,
+        evidence: *mut CollisionEvidence,
     ) -> i32;
     #[cfg(test)]
     fn pct_retry_regression() -> bool;
@@ -210,6 +213,8 @@ unsafe extern "C" {
 /// 内核由实例唯一持有，所有搜索均通过可变借用串行执行。
 pub struct Planner {
     native: NonNull<c_void>,
+    body_to_ground: f64,
+    diagnostics: DiagnosticLimiter,
 }
 // 原生实例无共享全局可变状态，移动所有权不会产生并发访问。
 unsafe impl Send for Planner {}
@@ -217,7 +222,7 @@ unsafe impl Send for Planner {}
 /// 完整查询保留原目标窗口与启发式；排序使用按需展开的单源父链。
 pub struct MultiGoalSearch<'a> {
     native: NonNull<c_void>,
-    _planner: std::marker::PhantomData<&'a mut Planner>,
+    planner: &'a mut Planner,
 }
 impl Drop for MultiGoalSearch<'_> {
     fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
@@ -295,9 +300,20 @@ impl MultiGoalSearch<'_> {
     fn cost_inner(&mut self, start: [f64; 3], goal: [f64; 3], cancel: *const c_void) -> Result<RouteCost, String> {
         let mut result = RouteCost::default();
         let mut error = [0; 512];
+        let now = Instant::now();
+        let mut evidence = CollisionEvidence::new(start, self.planner.body_to_ground);
+        let output = if CollisionEvidence::capture(&self.planner.diagnostics, now) {
+            &mut evidence
+        } else {
+            std::ptr::null_mut()
+        };
         let status = unsafe { pct_multi_goal_cost(self.native.as_ptr(), start.as_ptr(), goal.as_ptr(),
-            &mut result, cancelled, cancel, error.as_mut_ptr(), error.len()) };
-        if status == 0 { Ok(result) } else { Err(native_error(&error)) }
+            &mut result, cancelled, cancel, error.as_mut_ptr(), error.len(), output) };
+        if status == 0 {
+            Ok(result)
+        } else {
+            Err(self.planner.planning_failure(status, native_error(&error), now, evidence, start.into(), goal.into()))
+        }
     }
     pub fn stats(&self) -> MultiGoalStats {
         unsafe { pct_multi_goal_stats(self.native.as_ptr()) }
@@ -325,7 +341,7 @@ impl Planner {
     pub fn multi_goal_search(&mut self) -> Result<MultiGoalSearch<'_>, String> {
         let mut error = [0; 512];
         let native = unsafe { pct_multi_goal_create(self.native.as_ptr(), error.as_mut_ptr(), error.len()) };
-        NonNull::new(native).map(|native| MultiGoalSearch { native, _planner: std::marker::PhantomData })
+        NonNull::new(native).map(|native| MultiGoalSearch { native, planner: self })
             .ok_or_else(|| native_error(&error))
     }
     pub fn new(config: Config, points: &[[f64; 3]]) -> Result<Self, String> {
@@ -373,7 +389,7 @@ impl Planner {
             )
         };
         NonNull::new(native)
-            .map(|native| Self { native })
+            .map(|native| Self { native, body_to_ground: raw.body_to_ground, diagnostics: Default::default() })
             .ok_or_else(|| native_error(&error))
     }
     /// 替换已变化的静态列；空列同时撤回旧地面与占据。
@@ -399,42 +415,47 @@ impl Planner {
         }
         (cells, bands)
     }
-    pub fn plan(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<Route, String> {
-        self.plan_inner(start, goal, std::ptr::null(), false)
+    pub fn plan(&mut self, start: impl Into<CollisionLogPose>, goal: impl Into<CollisionLogPose>) -> Result<Route, String> {
+        self.plan_inner(start.into(), goal.into(), std::ptr::null(), false)
     }
     pub fn plan_cancellable(
         &mut self,
-        start: [f64; 3],
-        goal: [f64; 3],
+        start: impl Into<CollisionLogPose>,
+        goal: impl Into<CollisionLogPose>,
         cancel: &AtomicBool,
     ) -> Result<Route, String> {
-        self.plan_inner(start, goal, (cancel as *const AtomicBool).cast(), false)
+        self.plan_inner(start.into(), goal.into(), (cancel as *const AtomicBool).cast(), false)
     }
     /// 完整路线优先；失败时返回本次搜索已展开区域内三维距离最近的可达格。
-    pub fn plan_progressive(&mut self, start: [f64; 3], goal: [f64; 3], cancel: Option<&AtomicBool>) -> Result<Route, String> {
-        self.plan_inner(start, goal, cancel.map_or(std::ptr::null(), |flag| (flag as *const AtomicBool).cast()), true)
+    pub fn plan_progressive(&mut self, start: impl Into<CollisionLogPose>, goal: impl Into<CollisionLogPose>,
+        cancel: Option<&AtomicBool>) -> Result<Route, String> {
+        self.plan_inner(start.into(), goal.into(), cancel.map_or(std::ptr::null(), |flag| (flag as *const AtomicBool).cast()), true)
     }
     fn plan_inner(
         &mut self,
-        start: [f64; 3],
-        goal: [f64; 3],
+        start: CollisionLogPose,
+        goal: CollisionLogPose,
         cancel: *const c_void,
         progressive: bool,
     ) -> Result<Route, String> {
         let mut result = ResultRaw::default();
         let mut error = [0; 512];
+        let now = Instant::now();
+        let mut evidence = CollisionEvidence::new(start.position, self.body_to_ground);
+        let output = if CollisionEvidence::capture(&self.diagnostics, now) { &mut evidence } else { std::ptr::null_mut() };
         // 调用同步完成，取消指针在整个原生搜索期间有效。
         let status = unsafe {
             pct_plan(
                 self.native.as_ptr(),
-                start.as_ptr(),
-                goal.as_ptr(),
+                start.position.as_ptr(),
+                goal.position.as_ptr(),
                 &mut result,
                 cancelled,
                 cancel,
                 progressive,
                 error.as_mut_ptr(),
                 error.len(),
+                output,
             )
         };
         let route = if status == 0 && result.length > 0 {
@@ -446,10 +467,18 @@ impl Planner {
                 expanded: result.expanded,
             })
         } else {
-            Err(native_error(&error))
+            Err(self.planning_failure(status, native_error(&error), now, evidence, start, goal))
         };
         unsafe { pct_result_free(&mut result) };
         route
+    }
+
+    fn planning_failure(&mut self, status: i32, reason: String, now: Instant,
+        evidence: CollisionEvidence, start: CollisionLogPose, goal: CollisionLogPose) -> String {
+        if status == 1 {
+            evidence.log_failure(&mut self.diagnostics, now, "PCT全局规划", &reason, start, Some(goal));
+        }
+        reason
     }
 }
 

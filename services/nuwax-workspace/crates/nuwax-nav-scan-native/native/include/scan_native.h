@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "../../../nuwax-core/native/collision_evidence.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -67,7 +68,7 @@ void *nuwax_scan_planner_create(void);
 void nuwax_scan_planner_destroy(void *planner);
 void *nuwax_scan_planner_plan(void *planner,const ScanConfig *config,const void *snapshot,
     const double *reference,size_t count,const ScanState *state,const void *active,double phase,double goal_yaw,
-    char *error,size_t error_capacity);
+    char *error,size_t error_capacity,CollisionEvidence *evidence);
 void nuwax_scan_trajectory_destroy(void *trajectory);
 void nuwax_scan_trajectory_samples(const void *trajectory,double from,double dt,ScanOutput *output);
 void *nuwax_scan_tracker_create(void);
@@ -77,7 +78,7 @@ void nuwax_scan_tracker_clear_trajectory(void *tracker);
 void nuwax_scan_tracker_install(void *tracker,const void *trajectory);
 void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void *snapshot,
     const ScanState *state,const double previous_command[3],double terminal_yaw,const double *terminal_position,ScanTrackOutput *output,ScanOutput *recovery,
-    char *error,size_t error_capacity);
+    char *error,size_t error_capacity,CollisionEvidence *evidence);
 void nuwax_scan_free(ScanOutput *output);
 #ifdef __cplusplus
 }

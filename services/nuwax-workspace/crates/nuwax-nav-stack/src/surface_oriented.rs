@@ -82,11 +82,11 @@ impl PctPlanner {
         let route = if progressive {
             cached
                 .planner()
-                .plan_progressive(start.0, goal.0, cancelled)?
+                .plan_progressive(start, goal, cancelled)?
         } else {
             match cancelled {
-                Some(flag) => cached.planner().plan_cancellable(start.0, goal.0, flag)?,
-                None => cached.planner().plan(start.0, goal.0)?,
+                Some(flag) => cached.planner().plan_cancellable(start, goal, flag)?,
+                None => cached.planner().plan(start, goal)?,
             }
         };
         tracing::debug!(

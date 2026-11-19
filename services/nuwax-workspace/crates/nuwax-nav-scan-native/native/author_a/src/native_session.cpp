@@ -195,7 +195,8 @@ extern "C" void nuwax_scan_pose_clearance(const void* snapshot,const double* pos
 extern "C" void* nuwax_scan_planner_create(){return new PlannerSession;}
 extern "C" void nuwax_scan_planner_destroy(void* p){delete static_cast<PlannerSession*>(p);}
 extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void* snapshot,const double* reference,size_t count,
-    const ScanState* state,const void* active,double phase,double goal_yaw,char* error,size_t capacity) {
+    const ScanState* state,const void* active,double phase,double goal_yaw,char* error,size_t capacity,CollisionEvidence* evidence) {
+  const CollisionEvidenceScope capture(evidence);
   try {
     auto& s=*static_cast<PlannerSession*>(p);s.map->bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
     ros::host_time_seconds=state->timestamp_ns*1e-9;
@@ -252,7 +253,9 @@ extern "C" void nuwax_scan_tracker_clear_trajectory(void* p){auto& s=*static_cas
 extern "C" void nuwax_scan_tracker_clear(void* p){nuwax_scan_tracker_clear_trajectory(p);static_cast<TrackerSession*>(p)->escape=scan_planner::AuthorOverlapEscape{};}
 extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
 extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
-    const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
+    const double previous[3],double terminal_yaw,const double* terminal_position,ScanTrackOutput* out,ScanOutput* recovery,
+    char* error,size_t capacity,CollisionEvidence* evidence) {
+  const CollisionEvidenceScope capture(evidence);
   *out={};*recovery={};scan_native_diagnostic.clear();try {
     auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
     s.escape.observeSource(state->timestamp_ns);

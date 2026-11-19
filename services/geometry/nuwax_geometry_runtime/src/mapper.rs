@@ -849,10 +849,10 @@ impl Worker {
             let integration = self
                 .cloud
                 .accumulate_loaded(self.sequence, &frame, &points, &static_indices, origin)?
-                .map(|(confirmed, dynamic)| (Some(confirmed), dynamic, Vec::new()));
+                .map(|(confirmed, dynamic)| (confirmed, dynamic, Vec::new()));
             (ground, integration)
         } else {
-            let (dynamic, pgo, ground) = self.cloud.accumulate(
+            let observation = self.cloud.accumulate(
                 self.sequence,
                 &frame,
                 &points,
@@ -868,7 +868,10 @@ impl Worker {
                     self.correction_stopped.send_replace(Some("扫描记录已达上限，后续扫描不再记录".into()));
                 }
             }
-            (ground, Some((None, dynamic, pgo)))
+            (
+                observation.ground_indices,
+                Some((observation.confirmed, observation.dynamic, observation.static_indices)),
+            )
         };
         if !frame.mapping_only {
             self.publish_recent(encode_recent_cloud(
@@ -890,7 +893,7 @@ impl Worker {
             registered_frame_id: self.config.map_frame_id.clone(),
             sensor_origin_map: origin,
             dynamic_frame: Some(dynamic),
-            registered_points_map: confirmed.unwrap_or(points),
+            registered_points_map: confirmed,
         };
         let candidate = mapping_backend::compute_candidate_in_place(
             self.kernel.as_mut().unwrap(),
@@ -907,7 +910,15 @@ impl Worker {
                 tracing::warn!(%error,"禁行区尚未刷新，等待输入");
             }
         }
-        self.last_input = Some(input);
+        // 无已确认回波时不构建二维栅格，仍发布已发生的精细图撤销。
+        if !committed_this_frame && !self.read_only && self.cloud.has_retractions() {
+            self.cloud.commit(stamp)?;
+            self.fine_root.send_replace(self.cloud.surface());
+        }
+        // 无已确认回波不能覆盖仍待封存的上一帧投影输入。
+        if !input.registered_points_map.is_empty() {
+            self.last_input = Some(input);
+        }
         if committed_this_frame && !frame.mapping_only {
             if let Some(corrector) = &self.corrector {
                 corrector.submit(CorrectionInput::new(&frame, &pgo,

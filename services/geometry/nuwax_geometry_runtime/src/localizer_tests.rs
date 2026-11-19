@@ -453,8 +453,12 @@ async fn l6_loaded_session(id: u64, root: std::path::PathBuf) -> super::super::S
     use crate::proto::{LoadMapRequest, SaveMapRequest};
     let mapper = Mapper::start(id, MapperConfig::default()).unwrap();
     let mut session = super::super::tests::actor(mapper.clone(), root).await;
-    let input = l6_frame(id, super::super::now_ns(), 0., 0., 0., None);
-    session.router.publish_frame(input);
+    let start = super::super::now_ns().saturating_sub(1_000_000_000);
+    for index in 0..5 {
+        let input = l6_frame(id, start + index * 250_000_000, 0., 0., 0., None);
+        session.router.publish_frame(input);
+        mapper.surface_map().await.unwrap();
+    }
     session
         .save(SaveMapRequest {
             map_name: "L6原图".into(),

@@ -744,6 +744,47 @@ fn persistent_grid_keeps_old_world_cells_and_expands_for_new_cells() {
     assert_eq!(persistent.grid.origin[0], -4.);
 }
 #[tokio::test]
+async fn building_confirmation_delays_static_map_but_keeps_recent_frames_on_start_and_resume() {
+    use nuwax_codec::lcm::recent_cloud;
+    let source = Mapper::start(76, config()).unwrap();
+    let seed_stamp = 1_000_000_000;
+    for index in 0..5_u64 {
+        let stamp = seed_stamp + index * 250_000_000;
+        let frame = room_frame(76, stamp);
+        let raw_points = frame.points_body.len() as i32;
+        source.feed(frame);
+        let surface = source.surface_map().await.unwrap();
+        assert_eq!(surface.is_some(), index == 4);
+        let publication = source.recent_cloud_rx().borrow().clone().unwrap();
+        let recent = recent_cloud::decode_body(publication.frame.as_ref().unwrap()).unwrap();
+        assert_eq!(recent.cloud.unwrap().width, raw_points);
+    }
+    let saved = source.snapshot().await.unwrap();
+    assert!(saved.occupancy.is_some());
+    assert!(!saved.cloud.display.is_empty());
+    let saved_source_stamp = saved.cloud.source_timestamp_ns;
+    source.shutdown().await.unwrap();
+
+    let resumed = Mapper::load(77, config(), saved, false).unwrap();
+    for index in 0..5_u64 {
+        let stamp = 3_000_000_000 + index * 250_000_000;
+        let mut frame = room_frame(77, stamp);
+        frame.odom_pose.position.as_mut().unwrap().x += 10.0;
+        let raw_points = frame.points_body.len() as i32;
+        resumed.feed(frame);
+        let surface = resumed.surface_map().await.unwrap().unwrap();
+        let expected_stamp = if index == 4 { stamp } else { saved_source_stamp };
+        assert_eq!(surface.manifest().source_timestamp_ns, expected_stamp);
+        let publication = resumed.recent_cloud_rx().borrow().clone().unwrap();
+        let recent = recent_cloud::decode_body(publication.frame.as_ref().unwrap()).unwrap();
+        assert_eq!(recent.cloud.unwrap().width, raw_points);
+    }
+    let updated = resumed.snapshot().await.unwrap();
+    assert_eq!(updated.occupancy.unwrap().meta.unwrap().timestamp_ns, 4_000_000_000);
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn restored_checkpoint_accepts_later_live_frames() {
     let mapper = Mapper::start(61, config()).unwrap();
     mapper.feed(room_frame(61, 1_000_000_000));

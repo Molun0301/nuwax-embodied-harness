@@ -90,6 +90,9 @@ fn display_removals_match_full_scan_for_every_frame() {
     for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {
         let mut map = CloudMap::new(931, None, None).unwrap();
         map.disable_recording();
+        // 此用例逐格核对撤销，使用一帧即可进入地图的确认参数。
+        map.structure_updates.min_frames = 1;
+        map.structure_updates.min_span_ns = 0;
         map.voxel_size = size;
         let transform = Isometry3::new(
             nalgebra::Vector3::new(0.37, -0.19, 0.08),
@@ -109,13 +112,13 @@ fn display_removals_match_full_scan_for_every_frame() {
             let points: Vec<_> = body.iter().map(|p| transform * p).collect();
             let origin = transform * Point3::from(frame.ray_origin_body);
             let before = map.voxels.clone();
-            let (dynamic, _, _) = map.accumulate(index + 1, &frame, &points,
+            let observation = map.accumulate(index + 1, &frame, &points,
                 [origin.x, origin.y, origin.z], transform, Isometry3::identity()).unwrap();
             let hits: VoxelIndex = points.iter()
                 .filter_map(|p| voxel_key([p.x, p.y, p.z], size)).collect();
             // 保留旧实现的逐键判定作为独立对照，比较生产 accumulate 实际删除结果。
             let expected: VoxelIndex = before.iter().copied().filter(|key| {
-                !hits.contains(key) && dynamic.clears(voxel_center_f64(*key, size))
+                !hits.contains(key) && observation.dynamic.clears(voxel_center_f64(*key, size))
             }).collect();
             let actual: VoxelIndex = before.difference(&map.voxels).copied().collect();
             assert_eq!(actual, expected, "体素边长={size}，帧={index}");

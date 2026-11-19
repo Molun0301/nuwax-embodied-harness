@@ -754,6 +754,32 @@ impl RaytracingKernel {
         Ok(())
     }
 
+    fn retain_uncleared(
+        &mut self,
+        frame: &crate::dynamic_backend::MappedFrame,
+        hits: &ahash::AHashSet<(i32, i32, i32)>,
+    ) {
+        let size = f64::from(self.config.voxel_size);
+        let center = |(x, y, z): (i32, i32, i32)| {
+            [x, y, z].map(|axis| (f64::from(axis) + 0.5) * size)
+        };
+        let candidates = (!crate::dynamic_backend::reference_revoke())
+            .then(|| frame.candidate_grid_keys(size, |key| {
+                !hits.contains(&key) && self.map.voxels.contains_key(&key)
+            }))
+            .flatten();
+        if let Some(candidates) = candidates {
+            for key in candidates {
+                if frame.clears(center(key)) {
+                    self.map.voxels.remove(&key);
+                }
+            }
+        } else {
+            // 测试参考路径保留原来的整表复核和本帧命中保护。
+            self.map.voxels.retain(|key, _| hits.contains(key) || !frame.clears(center(*key)));
+        }
+    }
+
     fn validate_checkpoint_budget(&self) -> Result<(), String> {
         // 已拥有的栅格由构图或检查点解码验证；预算只需精确长度，不再逐格检查旧内容。
         let occupancy_len = self
@@ -1441,6 +1467,12 @@ fn compute_candidate_with_parallelism(
     parallel: bool,
 ) -> Result<Option<MappingBackendCandidate>, String> {
     if input.registered_points_map.is_empty() {
+        if let Some(frame) = &input.dynamic_frame {
+            match kernel {
+                MappingKernel::Voxel(voxel) => voxel.retain_uncleared(Some(frame)),
+                MappingKernel::Raytracing(ray) => ray.retain_uncleared(frame, &ahash::AHashSet::new()),
+            }
+        }
         return Ok(None);
     }
 
@@ -1513,58 +1545,14 @@ fn compute_candidate_with_parallelism(
             let update_us = phase.elapsed().as_micros();
             #[cfg(test)]
             let phase = Instant::now();
-            if input.dynamic_frame.is_some() {
-                // 当前回波仍作为导航障碍，清理只撤销本帧未占据的历史体素。
-                let size = f64::from(ray.config.voxel_size);
-                // 命中键必须与射线库的单精度乘逆量化完全相同，边界点不可漏保护。
-                let inv = 1.0_f32 / ray.config.voxel_size;
-                let hits: ahash::AHashSet<_> = ray
-                    .input
-                    .iter()
-                    .map(|point| {
-                        (
-                            (point.0 * inv).floor() as i32,
-                            (point.1 * inv).floor() as i32,
-                            (point.2 * inv).floor() as i32,
-                        )
-                    })
-                    .collect();
-                let candidates = (!crate::dynamic_backend::reference_revoke())
-                    .then(|| {
-                        input.dynamic_frame.as_ref().and_then(|frame| {
-                            frame.candidate_grid_keys(size, |key| {
-                                !hits.contains(&key) && ray.map.voxels.contains_key(&key)
-                            })
-                        })
-                    })
-                    .flatten();
-                if let Some(candidates) = candidates {
-                    let frame = input.dynamic_frame.as_ref().unwrap();
-                    for key in candidates {
-                        let point = [
-                            (key.0 as f64 + 0.5) * size,
-                            (key.1 as f64 + 0.5) * size,
-                            (key.2 as f64 + 0.5) * size,
-                        ];
-                        if frame.clears(point) {
-                            ray.map.voxels.remove(&key);
-                        }
-                    }
-                } else {
-                    // 测试参考路径保留原来的整表复核和本帧命中保护。
-                    ray.map.voxels.retain(|key, _| {
-                        hits.contains(key)
-                            || !{
-                                let p = [
-                                    (key.0 as f64 + 0.5) * size,
-                                    (key.1 as f64 + 0.5) * size,
-                                    (key.2 as f64 + 0.5) * size,
-                                ];
-                                input.dynamic_frame.as_ref().is_some_and(|f| f.clears(p))
-                            }
-                    });
-                }
-            }
+            // 命中键使用射线库的单精度量化，保留本帧已接纳的命中。
+            let inv = 1.0_f32 / ray.config.voxel_size;
+            let hits = ray.input.iter().map(|point| (
+                (point.0 * inv).floor() as i32,
+                (point.1 * inv).floor() as i32,
+                (point.2 * inv).floor() as i32,
+            )).collect();
+            ray.retain_uncleared(input.dynamic_frame.as_ref().unwrap(), &hits);
             #[cfg(test)]
             if diagnostic {
                 eprintln!("PGO_RAY_PHASE frame={} points={} voxels={} prepare_us={prepare_us} update_us={update_us} dynamic_us={}", input.source_timestamp_ns, input.registered_points_map.len(), ray.map.voxels.len(), phase.elapsed().as_micros());

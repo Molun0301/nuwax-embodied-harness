@@ -46,15 +46,6 @@ type VoxelIndex = ahash::AHashSet<VoxelKey>;
 
 // 基础层的排除半径为三个精细体素（0.15 米，约为跟踪误差 95 分位的两倍）。
 const BASE_RADIUS_VOXELS: i32 = 3;
-// 远处回波在相邻精细体素间变动，按 0.20 米粗格累计命中帧。
-const NEW_STRUCTURE_CELL_VOXELS: i32 = (0.20 / VOXEL_SIZE) as i32;
-// 至少五个不同帧命中，同一帧每个粗格只计一次。
-const NEW_STRUCTURE_FRAMES: usize = 5;
-// 从首次命中到确认至少一秒，使用帧的源时间。
-const NEW_STRUCTURE_SPAN_NS: u64 = 1_000_000_000;
-// 未确认候选从首次命中起最多保留十秒。
-const NEW_STRUCTURE_TIMEOUT_NS: u64 = 10_000_000_000;
-
 static BASE_NEIGHBORS: LazyLock<Vec<VoxelKey>> = LazyLock::new(|| {
     let radius = BASE_RADIUS_VOXELS;
     let mut offsets = Vec::new();
@@ -72,8 +63,11 @@ static BASE_NEIGHBORS: LazyLock<Vec<VoxelKey>> = LazyLock::new(|| {
     offsets.into_iter().map(|(_, offset)| offset).collect()
 });
 
-#[derive(Default)]
-struct LoadedMapUpdates {
+struct StructureUpdates {
+    cell_voxels: i32,
+    min_frames: u32,
+    min_span_ns: u64,
+    timeout_ns: u64,
     base: VoxelIndex,
     candidates: AHashMap<VoxelKey, StructureCandidate>,
     confirmed: VoxelIndex,
@@ -82,10 +76,62 @@ struct LoadedMapUpdates {
 
 struct StructureCandidate {
     first_stamp: u64,
-    frames: usize,
+    frames: u32,
 }
 
-impl LoadedMapUpdates {
+impl StructureUpdates {
+    fn from_runtime() -> Result<Self, String> {
+        let geometry = nuwax_config::geometry()?;
+        Ok(Self {
+            cell_voxels: (geometry.mapping_confirmation_cell_m / f64::from(VOXEL_SIZE)).round() as i32,
+            min_frames: geometry.mapping_confirmation_frames,
+            min_span_ns: (geometry.mapping_confirmation_span_s * 1e9) as u64,
+            timeout_ns: (geometry.mapping_confirmation_timeout_s * 1e9) as u64,
+            base: VoxelIndex::default(),
+            candidates: AHashMap::new(),
+            confirmed: VoxelIndex::default(),
+            allowed: false,
+        })
+    }
+
+    fn expire(&mut self, stamp: u64) {
+        self.candidates.retain(|_, candidate| {
+            stamp.saturating_sub(candidate.first_stamp) <= self.timeout_ns
+        });
+    }
+
+    fn select(
+        &mut self,
+        points: &[Point3<f64>],
+        static_indices: &[u32],
+        stamp: u64,
+    ) -> Vec<Point3<f64>> {
+        self.expire(stamp);
+        let mut fine_decisions = AHashMap::new();
+        let mut coarse_decisions = AHashMap::new();
+        let mut confirmed = Vec::new();
+        for &index in static_indices {
+            let point = points[index as usize];
+            let key = voxel_key(point.into(), VOXEL_SIZE).expect("静态分类已验证精细体素坐标");
+            if *fine_decisions.entry(key).or_insert_with(|| {
+                // 粗格确认后，该格内每个精细体素仍须通过基础层距离判定。
+                (self.base.is_empty() || self.outside_base(key)) && {
+                    let cell = (
+                        key.0.div_euclid(self.cell_voxels),
+                        key.1.div_euclid(self.cell_voxels),
+                        key.2.div_euclid(self.cell_voxels),
+                    );
+                    *coarse_decisions
+                        .entry(cell)
+                        .or_insert_with(|| self.confirm(cell, stamp))
+                }
+            }) {
+                confirmed.push(point);
+            }
+        }
+        confirmed
+    }
+
     fn outside_base(&self, key: VoxelKey) -> bool {
         !BASE_NEIGHBORS.iter().any(|&(x, y, z)| {
             let neighbor = || {
@@ -108,8 +154,8 @@ impl LoadedMapUpdates {
             frames: 0,
         });
         candidate.frames += 1;
-        if candidate.frames < NEW_STRUCTURE_FRAMES
-            || stamp.saturating_sub(candidate.first_stamp) < NEW_STRUCTURE_SPAN_NS
+        if candidate.frames < self.min_frames
+            || stamp.saturating_sub(candidate.first_stamp) < self.min_span_ns
         {
             return false;
         }
@@ -129,6 +175,13 @@ pub(crate) struct CloudSnapshot {
     pub revision: u64,
     pub source_timestamp_ns: u64,
 }
+pub(crate) struct BuildingObservation {
+    pub dynamic: MappedFrame,
+    pub static_indices: Vec<u32>,
+    pub ground_indices: Vec<u32>,
+    pub confirmed: Vec<Point3<f64>>,
+}
+
 pub(crate) struct CloudMap {
     session_id: u64,
     fine: FineCloud,
@@ -149,8 +202,8 @@ pub(crate) struct CloudMap {
     recording: bool,
     recording_limit_reached: bool,
     raw_directory: Option<PathBuf>,
-    readonly_classifier: Option<FineCloud>,
-    loaded_updates: Option<LoadedMapUpdates>,
+    scan_classifier: Option<FineCloud>,
+    structure_updates: StructureUpdates,
     history_scans: Vec<(PathBuf, u64)>,
     dirty: bool,
 }
@@ -249,8 +302,8 @@ impl CloudMap {
             recording: true,
             recording_limit_reached: false,
             raw_directory: None,
-            readonly_classifier: None,
-            loaded_updates: None,
+            scan_classifier: None,
+            structure_updates: StructureUpdates::from_runtime()?,
             history_scans: Vec::new(),
             dirty: false,
         };
@@ -258,22 +311,20 @@ impl CloudMap {
         Ok(value)
     }
     pub(crate) fn prepare_loaded_updates(&mut self) -> Result<(), String> {
-        let mut updates = LoadedMapUpdates::default();
         if let Some(root) = &self.surface {
             let mut reader = root.reader();
             for reference in &root.manifest().blocks {
                 for &local in reader.block(reference)?.keys() {
                     let [x, y, z] = nuwax_map_chunks::global_key(reference.key, local)?;
-                    updates.base.insert((x, y, z));
+                    self.structure_updates.base.insert((x, y, z));
                 }
             }
         }
-        self.loaded_updates = Some(updates);
         Ok(())
     }
 
     pub(crate) fn set_loaded_writing(&mut self, allowed: bool) {
-        self.loaded_updates.as_mut().unwrap().allowed = allowed;
+        self.structure_updates.allowed = allowed;
     }
 
     pub(crate) fn accumulate_loaded(
@@ -285,35 +336,12 @@ impl CloudMap {
         origin: [f64; 3],
     ) -> Result<Option<(Vec<Point3<f64>>, MappedFrame)>, String> {
         let stamp = frame.odom_pose.timestamp_ns;
-        let updates = self.loaded_updates.as_mut().unwrap();
-        updates.candidates.retain(|_, candidate| {
-            stamp.saturating_sub(candidate.first_stamp) <= NEW_STRUCTURE_TIMEOUT_NS
-        });
+        let updates = &mut self.structure_updates;
         if !updates.allowed {
+            updates.expire(stamp);
             return Ok(None);
         }
-        let mut fine_decisions = AHashMap::new();
-        let mut coarse_decisions = AHashMap::new();
-        let mut confirmed = Vec::new();
-        for &index in static_indices {
-            let point = points[index as usize];
-            let key = voxel_key(point.into(), VOXEL_SIZE).expect("只读分类已验证精细体素坐标");
-            if *fine_decisions.entry(key).or_insert_with(|| {
-                // 粗格确认后，该格内每个精细体素仍须通过基础层距离判定。
-                updates.outside_base(key) && {
-                    let cell = (
-                        key.0.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
-                        key.1.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
-                        key.2.div_euclid(NEW_STRUCTURE_CELL_VOXELS),
-                    );
-                    *coarse_decisions
-                        .entry(cell)
-                        .or_insert_with(|| updates.confirm(cell, stamp))
-                }
-            }) {
-                confirmed.push(point);
-            }
-        }
+        let confirmed = updates.select(points, static_indices, stamp);
         if confirmed.is_empty() {
             return Ok(None);
         }
@@ -347,7 +375,7 @@ impl CloudMap {
         origin: [f64; 3],
         map_from_odom: Isometry3<f64>,
         evidence_from_odom: Isometry3<f64>,
-    ) -> Result<(MappedFrame, Vec<u32>, Vec<u32>), String> {
+    ) -> Result<BuildingObservation, String> {
         let odom = pose_isometry(&frame.odom_pose);
         let evidence_from_body = evidence_from_odom * odom;
         let evidence_points: Vec<_> = frame
@@ -363,23 +391,36 @@ impl CloudMap {
             map_from_odom * evidence_from_odom.inverse(),
         )?;
         dynamic.bind_points(points, &indices);
-        let ground = self.fine.accumulate(
-            self.session_id,
+        let stamp = frame.odom_pose.timestamp_ns;
+        let confirmed = self.structure_updates.select(points, &indices, stamp);
+        // 完整帧分类沿用 L6 的独立分类器。近期避障和稠密扫描不等待确认。
+        let session_id = self.session_id;
+        let ground_indices = self.full_scan_classifier()?.accumulate(
+            session_id,
             &frame.sensor_id,
             sequence,
             points,
             origin,
-            frame.odom_pose.timestamp_ns,
+            stamp,
             Some(dynamic.clone()),
         )?;
-        let removed = self.fine.removed_keys();
-        self.dense.remove_voxels(removed, VOXEL_SIZE)?;
+        let classifier = self.scan_classifier.as_ref().unwrap();
+        self.dense.remove_voxels(classifier.removed_keys(), VOXEL_SIZE)?;
         let retained: Vec<_> = points
             .iter()
-            .filter(|p| !self.fine.is_dynamic(p))
+            .filter(|point| !classifier.is_dynamic(point))
             .copied()
             .collect();
         self.dense.append(&retained)?;
+        self.fine.accumulate(
+            self.session_id,
+            &frame.sensor_id,
+            sequence,
+            &confirmed,
+            origin,
+            stamp,
+            Some(dynamic.clone()),
+        )?;
         let hits: ahash::AHashSet<_> = points
             .iter()
             .filter_map(|p| voxel_key([p.x, p.y, p.z], self.voxel_size))
@@ -396,11 +437,22 @@ impl CloudMap {
             self.voxels.remove(&key);
             self.pages.removed(key, CM_MAX_POINTS);
         }
-        self.accumulate_display(&retained, frame.odom_pose.timestamp_ns)?;
+        if !confirmed.is_empty() || !self.fine.removed_keys().is_empty() {
+            self.accumulate_display(&confirmed, stamp)?;
+        }
         self.poses
-            .push((self.stamp, isometry_matrix(&(map_from_odom * odom))));
+            .push((stamp, isometry_matrix(&(map_from_odom * odom))));
         self.record(sequence, frame, map_from_odom)?;
-        Ok((dynamic, indices, ground))
+        Ok(BuildingObservation {
+            dynamic,
+            static_indices: indices,
+            ground_indices,
+            confirmed,
+        })
+    }
+
+    pub(crate) fn has_retractions(&self) -> bool {
+        !self.fine.removed_keys().is_empty()
     }
 
     fn accumulate_display(&mut self, points: &[Point3<f64>], stamp: u64) -> Result<(), String> {
@@ -539,6 +591,18 @@ impl CloudMap {
         self.pages.committed();
         Ok(())
     }
+    fn full_scan_classifier(&mut self) -> Result<&mut FineCloud, String> {
+        if self.scan_classifier.is_none() {
+            let classifier = if let Some(root) = &self.surface {
+                let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository)?;
+                FineCloud::from_archive(file)?.0
+            } else {
+                FineCloud::new(VOXEL_SIZE)?
+            };
+            self.scan_classifier = Some(classifier);
+        }
+        Ok(self.scan_classifier.as_mut().unwrap())
+    }
     pub fn classify_readonly(
         &mut self,
         sequence: u64,
@@ -547,15 +611,7 @@ impl CloudMap {
         origin: [f64; 3],
         map_from_odom: Isometry3<f64>,
     ) -> Result<(Vec<u32>, Vec<u32>), String> {
-        if self.readonly_classifier.is_none() {
-            let classifier = if let Some(root) = &self.surface {
-                let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository)?;
-                FineCloud::from_archive(file)?.0
-            } else {
-                FineCloud::new(VOXEL_SIZE)?
-            };
-            self.readonly_classifier = Some(classifier);
-        }
+        self.full_scan_classifier()?;
         let odom = pose_isometry(&frame.odom_pose);
         let odom_points: Vec<_> = frame
             .points_body
@@ -570,7 +626,7 @@ impl CloudMap {
             map_from_odom,
         )?;
         dynamic.bind_points(points, &indices);
-        let ground = self.readonly_classifier.as_mut().unwrap().accumulate(
+        let ground = self.scan_classifier.as_mut().unwrap().accumulate(
             self.session_id,
             &frame.sensor_id,
             sequence,

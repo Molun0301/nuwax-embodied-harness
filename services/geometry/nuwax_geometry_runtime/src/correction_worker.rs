@@ -161,13 +161,13 @@ impl Rebuilt {
             let points: Vec<_> = frame.points_body.iter().map(|p| body * Point3::from(*p)).collect();
             let origin = body * Point3::from(frame.ray_origin_body);
             // 证据坐标取该帧时刻的校正，即校正后的地图坐标。
-            let (dynamic, _, _) = self.cloud.accumulate(self.sequence, &frame, &points,
+            let observation = self.cloud.accumulate(self.sequence, &frame, &points,
                 [origin.x, origin.y, origin.z], correction, correction)?;
             let input = MappingBackendInput {
                 source_timestamp_ns: self.stamp, received_at_ns: self.stamp,
                 registered_frame_id: self.config.map_frame_id.clone(),
-                sensor_origin_map: [origin.x, origin.y, origin.z], dynamic_frame: Some(dynamic),
-                registered_points_map: points,
+                sensor_origin_map: [origin.x, origin.y, origin.z], dynamic_frame: Some(observation.dynamic),
+                registered_points_map: observation.confirmed,
             };
             if let Some(candidate) = mapping_backend::compute_candidate_in_place_with_interval(
                 &mut self.kernel, &input, self.config.compute, 0)? {

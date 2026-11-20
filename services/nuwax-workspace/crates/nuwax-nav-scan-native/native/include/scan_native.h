@@ -83,7 +83,7 @@ void nuwax_scan_free(ScanOutput *output);
 /* 单次绑定快照的真实机身批量查询。 */
 typedef struct { double clearance, depth; int32_t occupied; } ScanBodySample;
 void nuwax_scan_sample_poses(const void *snapshot,const ScanConfig *config,const double *poses,size_t count,
-    ScanBodySample *output,CollisionEvidence *evidence);
+    ScanBodySample *output,CollisionEvidence *evidence,uint32_t measure_clearance);
 double nuwax_scan_clearance_speed_cap(const ScanConfig *config,double clearance);
 #ifdef __cplusplus
 }

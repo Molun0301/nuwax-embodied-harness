@@ -121,7 +121,7 @@ impl SamplingFollower {
             .zip(self.goal.as_ref())
             .is_some_and(|(pose, goal)| orientation_within_tolerance(pose, goal, self.options))
     }
-    fn reached(&self) -> bool {
+    pub(crate) fn reached(&self) -> bool {
         self.position_reached() && self.orientation_reached()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {

@@ -6,13 +6,12 @@ use nuwax_nav_types_messages::{Point2, Twist2};
 pub(crate) const PREDICTION_SECONDS: f64 = 1.5;
 const SAMPLE_SECONDS: f64 = 0.1;
 const PREDICTION_STEPS: usize = 15;
-const LOOKAHEAD_MIN_M: f64 = 0.6;
+const HEADING_LOOKAHEAD_M: f64 = 0.6;
+const PROJECTION_MARGIN_M: f64 = 0.5;
 const LINEAR_INTERVALS: usize = 4;
 const ANGULAR_INTERVALS: usize = 8;
 // 得分统一为等效米数，偏航按机身半长折算，净空差额按一米等于一米计。
 const CLEARANCE_WEIGHT: f64 = 1.0;
-// 同等走向的小速度差用少量代价区分。
-const UNUSED_SPEED_WEIGHT_M: f64 = 0.02;
 
 #[derive(Default)]
 pub(crate) struct Route {
@@ -63,6 +62,53 @@ impl Route {
         best
     }
 
+    /// 候选终点只投影到当前弧长之后、本次可达范围内的路线。
+    fn project_endpoint(&self, position: [f64; 4], start: f64, end: f64) -> (f64, [f64; 3]) {
+        let mut best = (start, self.point_at(start));
+        let mut distance = xy_distance_squared(best.1, position);
+        let first = self.arc.partition_point(|&s| s <= start).saturating_sub(1);
+        for index in first..self.points.len() - 1 {
+            let arc = self.arc[index];
+            if arc >= end {
+                break;
+            }
+            let length = self.arc[index + 1] - arc;
+            if length == 0. {
+                continue;
+            }
+            let a = self.points[index];
+            let b = self.points[index + 1];
+            let dx = b[0] - a[0];
+            let dy = b[1] - a[1];
+            let fraction = (((position[0] - a[0]) * dx + (position[1] - a[1]) * dy)
+                / (length * length))
+                .clamp(
+                    ((start - arc) / length).max(0.),
+                    ((end - arc) / length).min(1.),
+                );
+            let point = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * fraction);
+            let candidate = xy_distance_squared(point, position);
+            if candidate < distance {
+                distance = candidate;
+                best = (arc + fraction * length, point);
+            }
+        }
+        best
+    }
+
+    fn heading_at(&self, arc: f64, point: [f64; 3], from: [f64; 3]) -> f64 {
+        let forward = self.point_at(arc + HEADING_LOOKAHEAD_M);
+        let delta = [forward[0] - point[0], forward[1] - point[1]];
+        if delta != [0., 0.] {
+            return delta[1].atan2(delta[0]);
+        }
+        // 到达路线末点时以最后一个非零路段的方向延续。
+        if let Some(last) = self.points.iter().rev().find(|p| p[..2] != forward[..2]) {
+            return (forward[1] - last[1]).atan2(forward[0] - last[0]);
+        }
+        (forward[1] - from[1]).atan2(forward[0] - from[0])
+    }
+
     fn point_at(&self, distance: f64) -> [f64; 3] {
         let index = self.arc.partition_point(|&v| v <= distance);
         if index == self.arc.len() {
@@ -74,6 +120,10 @@ impl Route {
             self.points[before][i] + fraction * (self.points[index][i] - self.points[before][i])
         })
     }
+}
+
+fn xy_distance_squared(a: [f64; 3], b: [f64; 4]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
 }
 
 fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -115,10 +165,25 @@ pub(crate) struct Selection {
     pub(crate) poses: Vec<[f64; 3]>,
 }
 
+fn blocked(sample: &BodySample, here: BodySample) -> bool {
+    sample.occupied < 0
+        || (sample.occupied != 0 && (here.occupied != 1 || sample.depth > here.depth))
+}
+
+struct Candidate {
+    score: f64,
+    same_turn: bool,
+    index: usize,
+    v: f64,
+    w: f64,
+}
+
 #[derive(Default)]
 pub(crate) struct Sampler {
     poses: Vec<[f64; 4]>,
     samples: Vec<BodySample>,
+    refined_poses: Vec<[f64; 4]>,
+    refined_samples: Vec<BodySample>,
     pub(crate) yaw_error: Option<f64>,
 }
 
@@ -134,14 +199,9 @@ impl Sampler {
         turn_to: Option<f64>,
     ) -> Option<Selection> {
         let (arc, nearest) = reference.nearest(position);
-        let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * previous.linear.x);
-        let target = if turn_to.is_some() {
-            position
-        } else {
-            reference.point_at(arc + lookahead)
-        };
-        let delta = [target[0] - position[0], target[1] - position[1]];
-        let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
+        let end = (arc + config.max_velocity * PREDICTION_SECONDS + PROJECTION_MARGIN_M)
+            .min(reference.length());
+        let heading = turn_to.unwrap_or_else(|| reference.heading_at(arc, nearest, position));
         self.yaw_error = Some(angle_delta(heading, yaw));
 
         let mut here = [BodySample::default()];
@@ -185,7 +245,7 @@ impl Sampler {
         self.samples.resize(self.poses.len(), BodySample::default());
         snapshot.sample_poses(config, &self.poses, &mut self.samples, None);
 
-        let mut best: Option<(f64, bool, usize, f64, f64)> = None;
+        let mut ranked = Vec::new();
         for ((index, samples), (v, w)) in
             self.samples.chunks_exact(PREDICTION_STEPS).enumerate().zip(
                 forward
@@ -193,39 +253,83 @@ impl Sampler {
                     .flat_map(|&v| angular.iter().map(move |&w| (v, w))),
             )
         {
-            if samples.iter().any(|sample| {
-                sample.occupied < 0
-                    || (sample.occupied != 0 && (here.occupied != 1 || sample.depth > here.depth))
-            }) {
+            if samples.iter().any(|sample| blocked(sample, here)) {
                 continue;
             }
             let endpoint = self.poses[(index + 1) * PREDICTION_STEPS - 1];
-            let clearance = samples
-                .iter()
-                .map(|sample| sample.clearance)
-                .fold(f64::INFINITY, f64::min);
-            let speed_fraction = v.abs() / config.max_velocity.max(config.max_reverse_velocity);
-            let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
-                + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
-                + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
-                + UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction);
-            let same_turn = w * previous.angular_z > 0.;
-            if best.is_none_or(|(old, old_turn, ..)| {
-                score < old || (score == old && same_turn && !old_turn)
-            }) {
-                best = Some((score, same_turn, index, v, w));
-            }
+            let score = if let Some(target_yaw) = turn_to {
+                angle_delta(target_yaw, endpoint[3]).abs()
+            } else {
+                let (projected_arc, projected) = reference.project_endpoint(endpoint, arc, end);
+                let route_heading = reference.heading_at(projected_arc, projected, position);
+                let clearance = samples
+                    .iter()
+                    .map(|s| s.clearance)
+                    .fold(f64::INFINITY, f64::min);
+                reference.length() - projected_arc
+                    + xy_distance_squared(projected, endpoint).sqrt()
+                    + config.body_length / 2. * angle_delta(route_heading, endpoint[3]).abs()
+                    + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
+            };
+            ranked.push(Candidate {
+                score,
+                same_turn: w * previous.angular_z > 0.,
+                index,
+                v,
+                w,
+            });
         }
-        best.map(|(_, _, index, v, w)| Selection {
-            command: Twist2 {
-                linear: Point2::new(v, 0.),
-                angular_z: w,
-            },
-            poses: self.poses[index * PREDICTION_STEPS..(index + 1) * PREDICTION_STEPS]
+        ranked.sort_by(|a, b| {
+            a.score
+                .total_cmp(&b.score)
+                .then_with(|| b.same_turn.cmp(&a.same_turn))
+        });
+        self.refined_poses.clear();
+        self.refined_samples.clear();
+        let radius = (config.body_length / 2. + config.body_center_x.abs())
+            .hypot(config.body_width / 2. + config.body_center_y.abs());
+        for Candidate { index, v, w, .. } in ranked {
+            let coarse = &self.poses[index * PREDICTION_STEPS..(index + 1) * PREDICTION_STEPS];
+            self.refined_poses.clear();
+            let mut start_z = position[2];
+            for (step, point) in coarse.iter().enumerate() {
+                let dz = point[2] - start_z;
+                // 平移、转角扫过的最远机身点及沿路线的高度变化共同限定步距。
+                let travel = SAMPLE_SECONDS * (v.abs() + radius * w.abs()) + dz.abs();
+                let subdivisions = (2. * travel / config.resolution).ceil().max(1.) as usize;
+                for part in 1..=subdivisions {
+                    let fraction = part as f64 / subdivisions as f64;
+                    let mut sample = arc_pose(
+                        position,
+                        yaw,
+                        v,
+                        w,
+                        (step as f64 + fraction) * SAMPLE_SECONDS,
+                    );
+                    sample[2] = start_z + fraction * dz;
+                    self.refined_poses.push(sample);
+                }
+                start_z = point[2];
+            }
+            self.refined_samples
+                .resize(self.refined_poses.len(), BodySample::default());
+            snapshot.check_poses(config, &self.refined_poses, &mut self.refined_samples, None);
+            if self
+                .refined_samples
                 .iter()
-                .map(|pose| [pose[0], pose[1], pose[2]])
-                .collect(),
-        })
+                .any(|sample| blocked(sample, here))
+            {
+                continue;
+            }
+            return Some(Selection {
+                command: Twist2 {
+                    linear: Point2::new(v, 0.),
+                    angular_z: w,
+                },
+                poses: coarse.iter().map(|p| [p[0], p[1], p[2]]).collect(),
+            });
+        }
+        None
     }
 
     pub(crate) fn blocking_cells(
@@ -243,6 +347,12 @@ impl Sampler {
             Some(&mut evidence),
         );
         snapshot.sample_poses(config, &self.poses, &mut self.samples, Some(&mut evidence));
+        snapshot.check_poses(
+            config,
+            &self.refined_poses,
+            &mut self.refined_samples,
+            Some(&mut evidence),
+        );
         evidence
     }
 }
@@ -280,6 +390,60 @@ mod tests {
         );
         assert_eq!(chosen.command.linear.y, 0.);
         assert_eq!(chosen.command.angular_z, 0.);
+    }
+
+    #[test]
+    fn along_route_progress_keeps_accelerating_past_the_old_speed_plateau() {
+        let (config, map) = fixture(&[]);
+        let route = Route::new(vec![START, [7., 0., START[2]]]);
+        let mut sampler = Sampler::default();
+        let mut twist = Twist2::ZERO;
+        let mut position = START;
+        for _ in 0..20 {
+            twist = sampler
+                .select(&map, &config, &route, position, 0., twist, None)
+                .unwrap()
+                .command;
+            position[0] += twist.linear.x * config.sample_dt;
+        }
+        assert_eq!(twist.linear.x, config.max_velocity);
+        assert_eq!(twist.angular_z, 0.);
+    }
+
+    #[test]
+    fn endpoint_projection_cannot_jump_to_a_later_fold() {
+        let route = Route::new(vec![
+            START,
+            [3., 0., START[2]],
+            [3., 0.1, START[2]],
+            [0., 0.1, START[2]],
+        ]);
+        let (arc, point) = route.project_endpoint([0.8, 0.1, START[2], 0.], 0.4, 2.4);
+        assert!((arc - 0.8).abs() < 1e-12);
+        assert!(squared_distance(point, [0.8, 0., START[2]]) < 1e-24);
+    }
+
+    #[test]
+    fn dense_review_rejects_a_cell_between_clear_coarse_poses() {
+        let (mut config, _) = fixture(&[]);
+        config.resolution = 0.02;
+        config.body_length = 0.02;
+        config.body_width = 0.02;
+        let mut owner = MapOwner::new(&config).unwrap();
+        owner.seed_occupied(&[[0.05, 0.01, 0.425]], START);
+        owner.update_surface(&[], &[], &[], &[]).unwrap();
+        let map = owner.snapshot();
+        assert_eq!(map.pose_clearance(START, 0.).occupied, 0);
+        assert_eq!(map.pose_clearance([0.1, 0., START[2]], 0.).occupied, 0);
+        assert_eq!(map.pose_clearance([0.05, 0., START[2]], 0.).occupied, 1);
+        let route = Route::new(vec![START, [3., 0., START[2]]]);
+        let previous = Twist2 {
+            linear: Point2::new(1., 0.),
+            ..Twist2::ZERO
+        };
+        assert!(Sampler::default()
+            .select(&map, &config, &route, START, 0., previous, None)
+            .is_none());
     }
 
     #[test]

@@ -203,7 +203,7 @@ pub struct BodySample {
 extern "C" {
     fn nuwax_scan_sample_poses(
         map: *const c_void, config: *const Config, poses: *const f64, count: usize,
-        output: *mut BodySample, evidence: *mut CollisionEvidence,
+        output: *mut BodySample, evidence: *mut CollisionEvidence, measure_clearance: u32,
     );
     fn nuwax_scan_clearance_speed_cap(config: *const Config, clearance: f64) -> f64;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
@@ -426,10 +426,26 @@ impl CollisionSnapshot {
         &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
         evidence: Option<&mut CollisionEvidence>,
     ) {
+        self.query_bodies(config, poses, output, evidence, true);
+    }
+
+    /// 加密复核只读碰撞与穿透深度，排序所需的净空已在粗查计算。
+    pub fn check_poses(
+        &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
+        evidence: Option<&mut CollisionEvidence>,
+    ) {
+        self.query_bodies(config, poses, output, evidence, false);
+    }
+
+    fn query_bodies(
+        &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
+        evidence: Option<&mut CollisionEvidence>, measure_clearance: bool,
+    ) {
         let count = poses.len().min(output.len());
         unsafe {
             nuwax_scan_sample_poses(self.0.0.as_ptr(), config, poses.as_ptr().cast(), count,
-                output.as_mut_ptr(), evidence.map_or(std::ptr::null_mut(), |value| value));
+                output.as_mut_ptr(), evidence.map_or(std::ptr::null_mut(), |value| value),
+                u32::from(measure_clearance));
         }
     }
     pub fn affects(&self, previous: &Self, trajectory: &Trajectory, from: f64) -> bool {

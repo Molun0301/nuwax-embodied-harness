@@ -61,6 +61,14 @@ impl SurfaceExecutor {
         }
     }
 
+    /// 采样闭环停稳后按生产到达条件复核最终位姿。
+    pub fn sampled_goal_reached(&self) -> Option<bool> {
+        match &self.0 {
+            LocalExecution::Scan(_) => None,
+            LocalExecution::Sampling(sampling) => Some(sampling.reached()),
+        }
+    }
+
     /// 前视方向诊断，采样控制拍才有值。
     pub fn lookahead_yaw_error(&self) -> Option<f64> {
         match &self.0 {

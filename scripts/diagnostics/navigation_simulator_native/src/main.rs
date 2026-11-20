@@ -1245,9 +1245,10 @@ impl Simulation {
             let angle = (yaw(self.current) - yaw(self.goal) + std::f64::consts::PI)
                 .rem_euclid(std::f64::consts::TAU)
                 - std::f64::consts::PI;
-            if distance(self.current, self.goal) <= self.options.position_tolerance_m
-                && (!self.options.requires_orientation()
-                    || angle.abs() <= self.options.yaw_tolerance_rad)
+            if self.follower.sampled_goal_reached().unwrap_or_else(||
+                distance(self.current, self.goal) <= self.options.position_tolerance_m
+                    && (!self.options.requires_orientation()
+                        || angle.abs() <= self.options.yaw_tolerance_rad))
             {
                 self.status = "succeeded".into();
                 self.message = "到达目标并停稳".into();

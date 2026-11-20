@@ -382,7 +382,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
 extern "C" void nuwax_scan_free(ScanOutput* out){std::free(out->samples);out->samples=nullptr;out->sample_count=0;}
 
 extern "C" void nuwax_scan_sample_poses(const void* snapshot,const ScanConfig* c,const double* poses,
-    size_t count, ScanBodySample* output, CollisionEvidence* evidence) {
+    size_t count, ScanBodySample* output, CollisionEvidence* evidence, uint32_t measure_clearance) {
   const CollisionEvidenceScope capture(evidence);
   GridMap map;
   map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
@@ -397,7 +397,7 @@ extern "C" void nuwax_scan_sample_poses(const void* snapshot,const ScanConfig* c
     sample={};
     sample.occupied=map.getInflateOccupancy(point,yaw);
     if(sample.occupied==0) {
-      sample.clearance=map.bodyFieldClearance(point,yaw,std::max(.20,c->obstacle_clearance_m));
+      if(measure_clearance) sample.clearance=map.bodyFieldClearance(point,yaw,std::max(.20,c->obstacle_clearance_m));
       continue;
     }
     // 最深的接触按矩形分离轴和竖向碰撞带的最小退出距离度量。

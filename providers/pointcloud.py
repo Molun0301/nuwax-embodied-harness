@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import Callable, ContextManager, Optional, Protocol, runtime_checkable
 
 from contracts.pointcloud import PointCloudFrame
 from providers.base import BaseProvider
@@ -12,6 +12,14 @@ class PointCloudProvider(BaseProvider, Protocol):
 
     def get_latest_point_cloud(self) -> Optional[PointCloudFrame]:
         """返回最近可用的一帧点云。"""
+
+
+@runtime_checkable
+class DemandPointCloudProvider(Protocol):
+    """提供按真实业务使用者启停点云采集的能力。"""
+
+    def point_cloud_consumer(self) -> ContextManager:
+        """在使用期间持有点云需求，退出时释放。"""
 
 
 @runtime_checkable

@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 from gateways.ws.console_projection import console_payload, field_value, selected_fields
 from gateways.ws.instance_encoding import InstanceSnapshotEncoder
 from gateways.ws.pointcloud_encoding import CanonicalPointCloudEncoder
-from gateways.ws.pointcloud_stream import install_pointcloud_stream
+from gateways.ws.pointcloud_stream import install_pointcloud_stream, point_cloud_usage
 
 try:
     from services.geometry.video_shm_reader import VideoShmReader
@@ -913,6 +913,11 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
             await websocket.close(code=4403, reason=error.message)
             return
 
+        cloud_topics = {"pointcloud.frame", "pointcloud_map.snapshot", "pointcloud_map.meta"}
+        async with point_cloud_usage(runtime, enabled=topic_filter is None or bool(cloud_topics.intersection(topic_filter))):
+            await stream_websocket(websocket, topic_filter, after_cursor, map_binary_version)
+
+    async def stream_websocket(websocket, topic_filter, after_cursor, map_binary_version):
         await websocket.accept()
         loop = asyncio.get_running_loop()
         queue = _ClientStreamQueue(

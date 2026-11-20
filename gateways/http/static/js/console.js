@@ -247,7 +247,6 @@
         videoDetections: document.getElementById("videoDetections"),
         showDetections: document.getElementById("showDetections"),
         perceptionRuntimeToggle: document.getElementById("perceptionRuntimeToggle"),
-        perceptionRuntimeSettings: document.getElementById("perceptionRuntimeSettings"),
         showSemanticInstances: document.getElementById("showSemanticInstances"),
         semanticInstancesRefresh: document.getElementById("semanticInstancesRefresh"),
         semanticMemoryToggle: document.getElementById("semanticMemoryToggle"),
@@ -1064,14 +1063,13 @@
       function renderPerceptionRuntime(status) {
         state.perceptionRuntime = status;
         const manual = status.reasons.includes("manual");
-        // 一个按钮按当前是否有手动原因切换开启与关闭。视觉识别未开启时没有检测后端，开启检测不可用，
-        // 旁边给出去设置页开启的入口。
+        // 一个按钮按当前是否有手动原因切换开启与关闭。视觉识别未开启时没有检测后端，开启检测置灰，
+        // 悬停说明在设置页哪个板块开启。
         const unavailable = state.detectionEnabled === false;
         setText(els.perceptionRuntimeToggle, manual ? "关闭检测" : "开启检测");
         els.perceptionRuntimeToggle.setAttribute("aria-pressed", String(manual));
         els.perceptionRuntimeToggle.disabled = state.perceptionRuntimeBusy || (unavailable && !manual);
-        if (unavailable && !manual) els.perceptionRuntimeToggle.title = "视觉识别未开启：在设置 → 视频与视觉识别中开启，重启后可用";
-        els.perceptionRuntimeSettings.hidden = !unavailable;
+        if (unavailable && !manual) els.perceptionRuntimeToggle.title = "视觉识别未开启：在设置 → 视频与视觉识别板块中开启，重启后可用";
       }
       function loadPerceptionRuntimeStatus() {
         if (state.perceptionRuntimeBusy) return Promise.resolve();
@@ -5058,10 +5056,6 @@
       document.getElementById("rail-tab-service")?.addEventListener("click", () => void refreshServiceHealth());
       loadInitialTasks();
       loadPerceptionRuntimeStatus();
-      els.perceptionRuntimeSettings.addEventListener("click", () => {
-        openConsoleView("config-view");
-        window.nuwaxConsoleSettings?.focus("视频与视觉识别");
-      });
       els.perceptionRuntimeToggle.addEventListener("click",
         () => setManualPerception(!state.perceptionRuntime.reasons.includes("manual")));
       window.setInterval(() => {

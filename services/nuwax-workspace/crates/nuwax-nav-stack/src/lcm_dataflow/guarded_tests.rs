@@ -960,7 +960,7 @@ path: schema::Path {
                 .expect("guarded reached test stream");
             let loop_transport = transport.clone();
             let loop_task = tokio::spawn(async move {
-                run_guarded_nav_loop(&node, &loop_transport, &loop_scheduler, shutdown_rx, goal_stream, pose_stream, path_stream, costmap_stream, cancel_stream, status, None, planar_mode, body_reference, None)
+                run_guarded_nav_loop(&node, &loop_transport, &loop_scheduler, shutdown_rx, goal_stream, pose_stream, path_stream, costmap_stream, cancel_stream, status, None, planar_mode, body_reference, None, None)
                 .await
             });
 

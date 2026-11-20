@@ -296,7 +296,7 @@ pub(super) async fn run_guarded_nav_scheduler(
     let status = scheduler.subscribe_status();
     signal_ready(ready)?;
 
-    let loop_future = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, costmaps, cancels, status, Some(source_max_age), planar_navigation_enabled(), &body_reference_frame_id, None);
+    let loop_future = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, costmaps, cancels, status, Some(source_max_age), planar_navigation_enabled(), &body_reference_frame_id, None, None);
     let task_future = async move {
         task.await
             .map_err(|error| NavStackError::Internal(format!("guard scheduler join: {error}")))?
@@ -396,6 +396,7 @@ pub(super) async fn run_guarded_nav_loop<M, T>(
     planar_mode: bool,
     _body_reference_frame_id: &str,
     recent_source_max_age: Option<Duration>,
+    lio_motion: Option<crate::map_pose::LioMotionReceiver>,
 ) -> NavStackResult<()>
 where
     M: Stream<Item = TransportResult<T>> + Unpin + Send,
@@ -456,12 +457,17 @@ where
                     continue;
                 };
                 let source_age_limit = source_max_age;
+                let measured = lio_motion.as_ref().and_then(|source| {
+                    source.borrow().as_ref()
+                        .filter(|m| m.source_timestamp_ns == input.pose.stamp.nanos as u64)
+                        .cloned()
+                });
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 let settlement = (async {
                     match source_age_limit {
                         Some(maximum) => scheduler
-                            .update_odometry_with_source_age(input.pose, maximum).await,
+                            .update_odometry_with_lio_motion(input.pose, maximum, measured).await,
                         None => scheduler.update_odometry(input.pose).await,
                     }
                 }).await;

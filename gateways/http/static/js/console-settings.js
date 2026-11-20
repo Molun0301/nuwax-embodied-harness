@@ -327,25 +327,31 @@ function renderConfigSchema(schema) {
   const forceAdvanced = document.getElementById("configShowAdvanced").checked;
   const query = (document.getElementById("configSearch").value || "").trim().toLowerCase();
   const match = (f) => !query || f.key.toLowerCase().includes(query) || (f.zh_name || "").toLowerCase().includes(query) || (f.description || "").toLowerCase().includes(query)
+    || [f.panel, f.category, f.switch].some((text) => (text || "").toLowerCase().includes(query))
     || Object.entries(f.options_schema || {}).some(([key, spec]) => (key + ' ' + (spec.description || '')).toLowerCase().includes(query));
   const applyingKeys = new Set(schema.profile_context?.is_active
     ? schema.application?.hot_apply_pending || [] : []);
-  let sectionIndex = 0;
+  // 板块、子类、总开关与高级项来自配置模式：没有子类的开关是板块总开关，带子类的开关放在子类标题栏。
+  const buildGrid = (list) => {
+    const grid = document.createElement("div");
+    grid.className = "config-grid";
+    for (const f of list) grid.appendChild(buildConfigRow(f, applyingKeys.has(f.key)));
+    return grid;
+  };
   for (const section of schema.sections || []) {
     const fields = (section.fields || []).filter(match);
-    // 模式放在预算上限之前，其余设置继续沿用目录顺序。
-    fields.sort((a, b) => Number(b.key === FINE_CLOUD_CACHE_KEY) - Number(a.key === FINE_CLOUD_CACHE_KEY));
     if (!fields.length) continue;
-    const normal = fields.filter((f) => !f.advanced);
-    const advanced = fields.filter((f) => f.advanced);
     const block = document.createElement("div");
     block.className = "config-section-block";
-    const blockId = "section-" + (section.section_id || ("cfgsec-" + sectionIndex++)).replace(/_/g, "-");
+    const blockId = "section-" + section.section_id;
     block.id = blockId;
     const title = document.createElement("div");
     title.className = "config-section-title";
-    title.innerHTML = configEscape(section.section_title) +
-      ' <span class="config-badge">' + fields.length + "</span>";
+    const name = document.createElement("span");
+    name.textContent = section.section_title;
+    title.appendChild(name);
+    const panelSwitch = fields.find((f) => f.switch && !f.category);
+    if (panelSwitch) title.appendChild(buildConfigSwitch(panelSwitch));
     block.appendChild(title);
     if (nav) {
       const link = document.createElement("a");
@@ -359,22 +365,38 @@ function renderConfigSchema(schema) {
       nav.appendChild(link);
       navLinks.push(link);
     }
-    if (normal.length) {
-      const grid = document.createElement("div");
-      grid.className = "config-grid";
-      for (const f of normal) { grid.appendChild(buildConfigRow(f, applyingKeys.has(f.key))); }
-      block.appendChild(grid);
+    if (!(section.categories || []).some((category) => fields.some((f) => f.category === category))) {
+      const empty = document.createElement("p");
+      empty.className = "config-category-empty";
+      empty.textContent = "此功能只有总开关。";
+      block.appendChild(empty);
     }
-    if (advanced.length) {
-      // 高级设置只有这一层入口，与参数分组共用折叠控件。
-      const wrap = configDisclosure('高级项', advanced.length);
-      wrap.classList.add('config-adv');
-      wrap.open = forceAdvanced || Boolean(query);
-      const grid = document.createElement("div");
-      grid.className = "config-grid";
-      for (const f of advanced) { grid.appendChild(buildConfigRow(f, applyingKeys.has(f.key))); }
-      wrap.appendChild(grid);
-      block.appendChild(wrap);
+    for (const category of section.categories || []) {
+      const items = fields.filter((f) => f.category === category);
+      if (!items.length) continue;
+      // 精细点云缓存模式放在预算上限之前。
+      items.sort((a, b) => Number(b.key === FINE_CLOUD_CACHE_KEY) - Number(a.key === FINE_CLOUD_CACHE_KEY));
+      const group = document.createElement("section");
+      group.className = "config-category";
+      const head = document.createElement("div");
+      head.className = "config-category-title";
+      const label = document.createElement("span");
+      label.textContent = category;
+      head.appendChild(label);
+      const categorySwitch = items.find((f) => f.switch);
+      if (categorySwitch) head.appendChild(buildConfigSwitch(categorySwitch));
+      group.appendChild(head);
+      const normal = items.filter((f) => !f.switch && !f.advanced);
+      const advanced = items.filter((f) => !f.switch && f.advanced);
+      if (normal.length) group.appendChild(buildGrid(normal));
+      if (advanced.length) {
+        const wrap = configDisclosure('高级项', advanced.length);
+        wrap.classList.add('config-adv');
+        wrap.open = forceAdvanced || Boolean(query);
+        wrap.appendChild(buildGrid(advanced));
+        group.appendChild(wrap);
+      }
+      block.appendChild(group);
     }
     host.appendChild(block);
   }
@@ -386,10 +408,64 @@ function renderConfigSchema(schema) {
     host.innerHTML = '<div class="empty panel-meta">无匹配设置项。</div>';
   }
 }
+// 板块与子类标题栏的开关：切换即保存这一项，热加载项立即生效，其余提示重启。
+function buildConfigSwitch(field) {
+  const label = document.createElement("label");
+  label.className = "config-switch";
+  label.title = field.description || "";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.setAttribute("role", "switch");
+  input.id = "cfg__" + field.key;
+  input.dataset.key = field.key;
+  input.checked = configFieldInputValue(field) === "true";
+  input.disabled = Boolean(field.readonly);
+  const text = document.createElement("span");
+  text.textContent = field.switch;
+  const note = document.createElement("span");
+  note.className = "config-switch-note";
+  note.textContent = field.apply_mode === "hot" ? "立即生效" : "重启后生效";
+  label.append(input, text, note);
+  input.addEventListener("change", () => saveConfigSwitch(field, input));
+  return label;
+}
+async function saveConfigSwitch(field, input) {
+  const enabled = input.checked;
+  if (configState.saving) { input.checked = !enabled; return; }
+  configState.saving = true;
+  input.disabled = true;
+  const message = document.getElementById("configDirty");
+  try {
+    setConfigStatus("stale", "保存中");
+    const resp = await fetch("/api/manager/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-NEH-CSRF": configState.csrf },
+      body: JSON.stringify({ values: { [field.key]: enabled }, profile: profileIdentity().profile }),
+    });
+    const result = await resp.json();
+    if (!resp.ok) throw new Error(result.error?.message || result.error || result.detail || "请求失败：" + resp.status);
+    if (Object.hasOwn(result.rejected || {}, field.key)) throw new Error(result.rejected[field.key]);
+    if (result.restart_required) showRestartChoice(result);
+    // 重新读取会刷新底部的改动统计，结果说明在读取之后写入。
+    await loadConfigSchema({ afterSave: true });
+    const applyError = (result.apply_errors || {})[field.key];
+    setConfigStatus(applyError ? "error" : "available", applyError ? "已保存，热加载失败" : "已保存");
+    message.textContent = applyError ? field.switch + "已保存，但热加载失败：" + applyError
+      : field.switch + "已" + (enabled ? "开启" : "关闭") + (field.apply_mode === "hot" ? "，已生效。" : "，重启业务后生效。");
+  } catch (error) {
+    input.checked = !enabled;
+    setConfigStatus("error", "保存失败");
+    message.textContent = field.switch + "保存失败：" + error.message;
+  } finally {
+    configState.saving = false;
+    input.disabled = Boolean(field.readonly);
+  }
+}
 function syncGeometryPipelineFields() {
   const selected = document.getElementById("cfg__geometry.pipeline")?.value
     || configState.dirty.get("geometry.pipeline")
-    || window.__geometry.pipeline__ || "lio_3d";
+    || configState.lastSchema?.sections.flatMap(section => section.fields).find(field => field.key === "geometry.pipeline")?.value
+    || "lio_3d";
   const planar = selected === "slam_2d";
   for (const row of document.querySelectorAll("#configSections [data-key]")) {
     const key = row.dataset.key;
@@ -961,5 +1037,10 @@ async function saveConfig() {
 window.nuwaxConsoleSettings = {
   open() { if (!configState.loaded) return loadConfigSchema(); },
   reload: loadConfigSchema,
+  // 跳到指定板块，例如视频卡片“去开启”跳到“视频与视觉识别”。
+  async focus(panel) {
+    await (configState.schemaPromise || loadConfigSchema());
+    document.getElementById("section-" + panel)?.scrollIntoView({ block: "start" });
+  },
 };
 })();

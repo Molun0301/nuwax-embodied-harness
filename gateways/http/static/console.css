@@ -737,6 +737,19 @@ details.msb-pane>summary{display:none}
 .config-section-block{border:1px solid var(--line-2);border-radius:var(--r);overflow:hidden;background:var(--surface-2);scroll-margin-top:8px;margin-bottom:14px}
 .config-section-block:last-child{margin-bottom:0}
 .config-section-title{display:flex;align-items:center;gap:8px;padding:11px 14px;font-size:var(--fs-md);font-weight:660;border-bottom:1px solid var(--line-2)}
+/* 板块内按子类分组；子类标题栏可带该功能的开关。 */
+.config-category+.config-category{border-top:1px solid var(--line-2)}
+.config-category-title{display:flex;align-items:center;gap:10px;padding:12px 16px 0;font-size:var(--fs);font-weight:640;color:var(--strong)}
+.config-category-title+.config-adv{margin-top:10px}
+.config-category-empty{margin:0;padding:12px 16px;color:var(--muted);font-size:var(--fs-sm)}
+.config-switch{margin-left:auto;display:inline-flex;align-items:center;gap:7px;font-size:var(--fs);font-weight:560;color:var(--strong);cursor:pointer}
+.config-switch input{appearance:none;-webkit-appearance:none;position:relative;width:34px;height:20px;margin:0;border-radius:10px;background:var(--inset-2);
+  border:1px solid var(--line);cursor:pointer;transition:background .15s}
+.config-switch input::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--surface);box-shadow:var(--sh-thumb);transition:transform .15s}
+.config-switch input:checked{background:var(--good);border-color:transparent}
+.config-switch input:checked::after{transform:translateX(14px)}
+.config-switch input:disabled{opacity:.5;cursor:not-allowed}
+.config-switch-note{font-size:var(--fs-xs);font-weight:500;color:var(--faint)}
 .config-badge{font-size:var(--fs-xs);font-weight:600;line-height:1.5;padding:0 6px;border-radius:var(--r-xs);background:var(--inset-2);color:var(--muted);font-variant-numeric:tabular-nums}
 .cfg-nav a.on .config-badge{background:var(--surface);color:var(--strong)}
 .config-badge.adv{background:var(--warn-w);color:var(--warn)}

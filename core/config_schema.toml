@@ -21,6 +21,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_linear_mps",
 ]
 apply = "restart"
+panel = "机器人"
+category = "运动上限"
 
 [robot.actuator_max_yaw_rps]
 type = "float"
@@ -35,6 +37,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_yaw_rps",
 ]
 apply = "restart"
+panel = "机器人"
+category = "运动上限"
 
 [robot.actuator_motion_model]
 type = "string"
@@ -46,6 +50,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_motion_model",
 ]
 apply = "restart"
+panel = "机器人"
+category = "运动上限"
 
 [robot.base_frame]
 type = "string"
@@ -59,6 +65,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.base_frame",
 ]
 apply = "restart"
+panel = "机器人"
+category = "坐标系"
+advanced = true
 
 [robot.center_x_m]
 type = "float"
@@ -70,6 +79,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_x_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.center_y_m]
 type = "float"
@@ -81,6 +92,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_y_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.center_z_m]
 type = "float"
@@ -92,6 +105,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_z_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.driver]
 type = "string"
@@ -104,6 +119,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.driver",
 ]
 apply = "restart"
+panel = "机器人"
+category = "型号与驱动"
 
 [robot.height_m]
 type = "float"
@@ -117,6 +134,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.height_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.length_m]
 type = "float"
@@ -130,6 +149,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.length_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.lidar_frame]
 type = "string"
@@ -140,6 +161,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.lidar_frame",
 ]
 apply = "restart"
+panel = "机器人"
+category = "坐标系"
+advanced = true
 
 [robot.map_frame]
 type = "string"
@@ -150,6 +174,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.map_frame",
 ]
 apply = "restart"
+panel = "机器人"
+category = "坐标系"
+advanced = true
 
 [robot.model_base_link]
 type = "string"
@@ -160,6 +187,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_base_link",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
+advanced = true
 
 [robot.model_joint_positions_json]
 type = "string"
@@ -170,6 +200,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_joint_positions_json",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
+advanced = true
 
 [robot.model_path]
 type = "string"
@@ -180,6 +213,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_path",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [robot.odom_frame]
 type = "string"
@@ -190,6 +225,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.odom_frame",
 ]
 apply = "restart"
+panel = "机器人"
+category = "坐标系"
+advanced = true
 
 [robot.width_m]
 type = "float"
@@ -203,6 +241,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.width_m",
 ]
 apply = "restart"
+panel = "机器人"
+category = "外形尺寸"
 
 [transport.lcm_url]
 type = "string"
@@ -214,6 +254,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.lcm_url",
 ]
 apply = "restart"
+panel = "机器人"
+category = "通信"
+advanced = true
 
 [transport.real_lcm_required]
 type = "boolean"
@@ -224,6 +267,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.real_lcm_required",
 ]
 apply = "restart"
+panel = "机器人"
+category = "通信"
+advanced = true
 
 [gateway.artifact_cleanup_batch_size]
 type = "integer"
@@ -234,6 +280,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "制品存储"
+advanced = true
 
 [gateway.artifact_dir]
 type = "string"
@@ -243,6 +292,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "制品存储"
 
 [gateway.artifact_max_count]
 type = "integer"
@@ -253,6 +304,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "制品存储"
+advanced = true
 
 [gateway.artifact_max_total_bytes]
 type = "integer"
@@ -263,6 +317,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "制品存储"
+advanced = true
 
 [gateway.artifact_retention_days]
 type = "integer"
@@ -273,6 +330,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "制品存储"
 
 [gateway.geometry_grpc_max_message_bytes]
 type = "integer"
@@ -282,6 +341,9 @@ consumers = [
     "services/geometry/client.py:GeometryClient.__init__",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
+advanced = true
 
 [gateway.host]
 type = "string"
@@ -291,6 +353,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
+advanced = true
 
 [gateway.pointcloud3d_color]
 type = "string"
@@ -300,6 +365,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_ground_color]
 type = "string"
@@ -309,6 +376,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_height_colors]
 type = "array"
@@ -320,6 +389,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_object_color]
 type = "string"
@@ -329,6 +400,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_size]
 type = "float"
@@ -340,6 +413,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_spacing_m]
 type = "float"
@@ -351,6 +426,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.pointcloud3d_structure_color]
 type = "string"
@@ -360,6 +437,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "网页与接口"
+category = "点云显示"
 
 [gateway.port]
 type = "integer"
@@ -371,6 +450,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
 
 [gateway.public_base_url]
 type = "string"
@@ -380,6 +461,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
 
 [gateway.sse_keepalive_sec]
 type = "float"
@@ -389,6 +472,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
+advanced = true
 
 [gateway.telemetry_enabled]
 type = "boolean"
@@ -398,6 +484,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "性能监控"
+switch = "性能监控"
 
 [gateway.telemetry_include_process_tree]
 type = "boolean"
@@ -407,6 +495,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "性能监控"
+category = "采集"
+advanced = true
 
 [gateway.telemetry_interval_sec]
 type = "float"
@@ -417,6 +508,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "性能监控"
+category = "采集"
 
 [gateway.telemetry_process_keywords]
 type = "array"
@@ -427,6 +520,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "性能监控"
+category = "采集"
+advanced = true
 
 [gateway.ws_ping_interval_sec]
 type = "float"
@@ -436,6 +532,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
+advanced = true
 
 [perception.burst_frame_count]
 type = "integer"
@@ -446,6 +545,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "持续识别"
 
 [perception.burst_interval_sec]
 type = "float"
@@ -456,6 +557,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "持续识别"
 
 [perception.bytetrack_high_threshold]
 type = "float"
@@ -467,6 +570,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.bytetrack_iou]
 type = "float"
@@ -478,6 +584,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.bytetrack_lost_ttl_frames]
 type = "integer"
@@ -488,6 +597,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.bytetrack_low_threshold]
 type = "float"
@@ -499,6 +611,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.bytetrack_name]
 type = "string"
@@ -508,6 +623,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.bytetrack_trajectory_limit]
 type = "integer"
@@ -518,6 +636,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
+advanced = true
 
 [perception.default_detector_backend]
 type = "string"
@@ -527,6 +648,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.default_scene_backend]
 type = "string"
@@ -536,6 +660,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
 
 [perception.default_segmentation_backend]
 type = "string"
@@ -545,6 +671,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.deferred_strategy]
 type = "string"
@@ -555,6 +684,9 @@ consumers = [
     "core/settings.py:_build_deferred_projection_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "物品定位"
+advanced = true
 
 [perception.ground_tolerance_m]
 type = "float"
@@ -565,6 +697,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
+advanced = true
 
 [perception.keyframe_min_interval_sec]
 type = "float"
@@ -575,6 +710,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "关键帧记忆"
 
 [perception.keyframe_remember_enabled]
 type = "boolean"
@@ -584,6 +721,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "关键帧记忆"
+switch = "关键帧写入记忆"
 
 [perception.keyframe_translation_m]
 type = "float"
@@ -594,6 +734,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "关键帧记忆"
 
 [perception.keyframe_yaw_deg]
 type = "float"
@@ -604,6 +746,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "关键帧记忆"
 
 [perception.openai_api_key]
 type = "string"
@@ -614,6 +758,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
 
 [perception.openai_api_style]
 type = "string"
@@ -624,6 +770,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+advanced = true
 
 [perception.openai_backend_name]
 type = "string"
@@ -633,6 +782,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+advanced = true
 
 [perception.openai_base_url]
 type = "string"
@@ -642,6 +794,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
 
 [perception.openai_enabled]
 type = "boolean"
@@ -651,6 +805,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+switch = "云端视觉"
 
 [perception.openai_max_tokens]
 type = "integer"
@@ -661,6 +818,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+advanced = true
 
 [perception.openai_model]
 type = "string"
@@ -670,6 +830,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
 
 [perception.openai_temperature]
 type = "float"
@@ -680,6 +842,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+advanced = true
 
 [perception.openai_timeout_sec]
 type = "float"
@@ -690,6 +855,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "云端视觉"
+advanced = true
 
 [perception.postprocess_nms_enabled]
 type = "boolean"
@@ -699,6 +867,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.postprocess_nms_iou]
 type = "float"
@@ -710,6 +881,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.segmentation_allow_bbox_only_fallback]
 type = "boolean"
@@ -719,6 +893,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_backend_kind]
 type = "string"
@@ -728,6 +905,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
 
 [perception.segmentation_backend_name]
 type = "string"
@@ -737,6 +916,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_depth_coverage_threshold]
 type = "float"
@@ -748,6 +930,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_emit_polygon]
 type = "boolean"
@@ -757,6 +942,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_emit_quality_details]
 type = "boolean"
@@ -766,6 +954,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_emit_raw_mask]
 type = "boolean"
@@ -775,6 +966,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_emit_runtime_summary]
 type = "boolean"
@@ -784,6 +978,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_enabled]
 type = "boolean"
@@ -793,6 +990,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+switch = "分割"
 
 [perception.segmentation_low_latency_backend_name]
 type = "string"
@@ -802,6 +1002,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_map_projection_coverage_threshold]
 type = "float"
@@ -813,6 +1016,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_polygon_simplification_epsilon_px]
 type = "float"
@@ -823,6 +1029,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_predicted_iou_threshold]
 type = "float"
@@ -834,6 +1043,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_primary_backend_name]
 type = "string"
@@ -843,6 +1055,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_reprojection_error_threshold_px]
 type = "float"
@@ -853,6 +1068,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_route]
 type = "string"
@@ -862,6 +1080,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
 
 [perception.segmentation_score_threshold]
 type = "float"
@@ -873,6 +1093,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.segmentation_stability_score_threshold]
 type = "float"
@@ -884,6 +1107,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "分割"
+advanced = true
 
 [perception.self_filter_bbox_iou]
 type = "float"
@@ -895,6 +1121,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
 
 [perception.self_filter_coverage]
 type = "float"
@@ -906,6 +1134,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
 
 [perception.self_filter_dilation_px]
 type = "float"
@@ -916,6 +1146,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
 
 [perception.self_filter_enabled]
 type = "boolean"
@@ -925,6 +1157,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
+switch = "过滤画面中的机器人自身"
 
 [perception.self_filter_max_joint_age_sec]
 type = "float"
@@ -935,6 +1170,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
+advanced = true
 
 [perception.self_filter_static_regions_json]
 type = "string"
@@ -944,6 +1182,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "画面自体过滤"
+advanced = true
 
 [perception.stream_camera_id]
 type = "string"
@@ -953,6 +1194,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "视频输入"
 
 [perception.stream_detector_backend]
 type = "string"
@@ -962,6 +1205,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.stream_failure_backoff_sec]
 type = "float"
@@ -972,6 +1218,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "持续识别"
+advanced = true
 
 [perception.stream_interval_sec]
 type = "float"
@@ -982,6 +1231,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "持续识别"
 
 [perception.tracker_backend]
 type = "string"
@@ -991,6 +1242,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标跟踪"
 
 [perception.triangulation_max_residual_m]
 type = "float"
@@ -1001,6 +1254,9 @@ consumers = [
     "core/settings.py:_build_deferred_projection_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "物品定位"
+advanced = true
 
 [perception.triangulation_min_parallax_deg]
 type = "float"
@@ -1011,6 +1267,9 @@ consumers = [
     "core/settings.py:_build_deferred_projection_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "物品定位"
+advanced = true
 
 [perception.triangulation_min_rays]
 type = "integer"
@@ -1021,6 +1280,8 @@ consumers = [
     "core/settings.py:_build_deferred_projection_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "物品定位"
 
 [perception.yolo_world_aliases]
 type = "array"
@@ -1031,6 +1292,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_backend_name]
 type = "string"
@@ -1040,6 +1304,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_classes]
 type = "array"
@@ -1050,6 +1317,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
 
 [perception.yolo_world_confidence]
 type = "float"
@@ -1061,6 +1330,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "目标检测"
 
 [perception.yolo_world_device]
 type = "string"
@@ -1070,6 +1341,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
 
 [perception.yolo_world_dynamic_class_keys]
 type = "array"
@@ -1080,6 +1353,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_enabled]
 type = "boolean"
@@ -1089,6 +1365,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+switch = "视觉识别"
 
 [perception.yolo_world_image_size]
 type = "integer"
@@ -1099,6 +1377,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_iou]
 type = "float"
@@ -1110,6 +1391,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_max_detections]
 type = "integer"
@@ -1120,6 +1404,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "hot"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [perception.yolo_world_model]
 type = "string"
@@ -1129,6 +1416,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
 
 [perception.yolo_world_use_worker]
 type = "boolean"
@@ -1138,6 +1427,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "目标检测"
+advanced = true
 
 [memory.association_confirm_min_observations]
 type = "integer"
@@ -1148,6 +1440,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
 
 [memory.association_confirm_window_sec]
 type = "float"
@@ -1158,6 +1452,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
 
 [memory.association_cross_label_overlap]
 type = "float"
@@ -1169,6 +1465,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.association_cross_label_size_ratio]
 type = "float"
@@ -1179,6 +1478,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.association_gate_sigma]
 type = "float"
@@ -1189,6 +1491,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.association_max_voxels]
 type = "integer"
@@ -1199,6 +1504,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.association_min_support_points]
 type = "integer"
@@ -1209,6 +1517,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.association_voxel_size_m]
 type = "float"
@@ -1219,6 +1530,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "物体关联"
+advanced = true
 
 [memory.embedding_api_key]
 type = "string"
@@ -1229,6 +1543,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
 
 [memory.embedding_base_url]
 type = "string"
@@ -1238,6 +1554,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
 
 [memory.embedding_timeout_sec]
 type = "float"
@@ -1248,6 +1566,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
+advanced = true
 
 [memory.image_embedding_dim]
 type = "integer"
@@ -1258,6 +1579,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
+advanced = true
 
 [memory.image_embedding_model]
 type = "string"
@@ -1267,6 +1591,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
 
 [memory.text_embedding_dim]
 type = "integer"
@@ -1277,6 +1603,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
+advanced = true
 
 [memory.text_embedding_model]
 type = "string"
@@ -1286,6 +1615,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "向量模型"
 
 [semantic_map.NUWAX_SCENE_MAPPING_API_KEY]
 type = "string"
@@ -1296,6 +1627,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_AUTO_APPLY]
 type = "boolean"
@@ -1305,6 +1638,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_AUTO_START]
 type = "boolean"
@@ -1314,6 +1649,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_BACKEND]
 type = "string"
@@ -1324,6 +1661,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_BASE_URL]
 type = "string"
@@ -1333,6 +1672,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_DOORWAY_WIDTH_M]
 type = "float"
@@ -1344,6 +1685,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
 
 [semantic_map.NUWAX_SCENE_MAPPING_ENABLED]
 type = "boolean"
@@ -1353,6 +1696,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
+switch = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_INTERVAL_SEC]
 type = "float"
@@ -1364,6 +1710,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_MAX_CELLS]
 type = "integer"
@@ -1375,6 +1724,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_MAX_EVIDENCE_AGE_SEC]
 type = "float"
@@ -1386,6 +1738,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_MAX_IMAGES]
 type = "integer"
@@ -1397,6 +1752,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_MAX_REGIONS_PER_CYCLE]
 type = "integer"
@@ -1408,6 +1766,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_MIN_AREA_M2]
 type = "float"
@@ -1419,6 +1780,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
 
 [semantic_map.NUWAX_SCENE_MAPPING_MIN_EVIDENCE_VIEWS]
 type = "integer"
@@ -1430,6 +1793,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
 
 [semantic_map.NUWAX_SCENE_MAPPING_MIN_LABEL_MARGIN]
 type = "float"
@@ -1441,6 +1806,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
 
 [semantic_map.NUWAX_SCENE_MAPPING_MIN_LABEL_SCORE]
 type = "float"
@@ -1452,6 +1819,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "区域划分与命名"
 
 [semantic_map.NUWAX_SCENE_MAPPING_MODEL]
 type = "string"
@@ -1461,6 +1830,8 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_TIMEOUT_SEC]
 type = "float"
@@ -1472,6 +1843,9 @@ consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
+advanced = true
 
 [geometry.correction_backend]
 type = "string"
@@ -1483,6 +1857,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.correction_backend",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "回环与校正"
 
 [geometry.enabled]
 type = "boolean"
@@ -1493,6 +1869,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.enabled",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.external_enabled]
 type = "boolean"
@@ -1503,6 +1882,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.external_enabled",
 ]
 apply = "restart"
+panel = "建图与定位"
+switch = "按需启动定位建图"
 
 [geometry.fine_cloud_cache_auto_max_mib]
 type = "integer"
@@ -1514,6 +1895,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_auto_max_mib",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
 
 [geometry.fine_cloud_cache_mib]
 type = "integer"
@@ -1526,6 +1909,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_mib",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
 
 [geometry.lio_backend]
 type = "string"
@@ -1538,6 +1923,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_backend",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
 
 [geometry.lio_body_from_imu]
 type = "string"
@@ -1549,6 +1936,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_body_from_imu",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.lio_body_from_sensor]
 type = "string"
@@ -1560,6 +1950,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_body_from_sensor",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.lio_initial_map_frames]
 type = "integer"
@@ -1572,6 +1965,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_initial_map_frames",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.lio_map_voxel_size_m]
 type = "float"
@@ -1583,6 +1979,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_map_voxel_size_m",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.lio_scan_voxel_size_m]
 type = "float"
@@ -1594,6 +1993,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_scan_voxel_size_m",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.map_catalog_root]
 type = "string"
@@ -1604,6 +2006,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.map_catalog_root",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "地图目录"
 
 [geometry.mapping_backend]
 type = "string"
@@ -1615,6 +2019,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_backend",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
 
 [geometry.mapping_dynamic_inflate_hits_dist_m]
 type = "float"
@@ -1625,6 +2031,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_inflate_hits_dist_m",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "去动态"
+advanced = true
 
 [geometry.mapping_dynamic_inflate_unknown]
 type = "integer"
@@ -1636,6 +2045,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_inflate_unknown",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "去动态"
+advanced = true
 
 [geometry.mapping_dynamic_resolution_m]
 type = "float"
@@ -1647,6 +2059,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_resolution_m",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "去动态"
 
 [geometry.mapping_dynamic_sliding_window_size]
 type = "integer"
@@ -1658,6 +2072,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_sliding_window_size",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "去动态"
 
 [geometry.mapping_confirmation_cell_m]
 type = "float"
@@ -1666,6 +2082,9 @@ default = 0.20
 description = "建图和已定位地图共用的持续性粗格边长（米），取最接近的精细体素整数倍。"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_cell_m"]
 apply = "restart"
+panel = "建图与定位"
+category = "持续性确认"
+advanced = true
 
 [geometry.mapping_confirmation_frames]
 type = "integer"
@@ -1675,6 +2094,8 @@ default = 5
 description = "同一粗格确认所需的最少命中帧数，每帧只计一次。"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_frames"]
 apply = "restart"
+panel = "建图与定位"
+category = "持续性确认"
 
 [geometry.mapping_confirmation_ground_band_m]
 type = "float"
@@ -1683,6 +2104,9 @@ default = 0.05
 description = "建图时，已标为地面的回波距站立地面的最大免确认高度差（米）。"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_ground_band_m"]
 apply = "restart"
+panel = "建图与定位"
+category = "持续性确认"
+advanced = true
 
 [geometry.mapping_confirmation_span_s]
 type = "float"
@@ -1691,6 +2115,8 @@ default = 1.0
 description = "同一粗格确认所需的首末命中最短源时间间隔（秒）。"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_span_s"]
 apply = "restart"
+panel = "建图与定位"
+category = "持续性确认"
 
 [geometry.mapping_confirmation_timeout_s]
 type = "float"
@@ -1699,6 +2125,9 @@ default = 10.0
 description = "还未确认的粗格自首次命中起的保留时间（秒）。"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_timeout_s"]
 apply = "restart"
+panel = "建图与定位"
+category = "持续性确认"
+advanced = true
 
 [geometry.mapping_initial_safe_radius_meters]
 type = "float"
@@ -1709,6 +2138,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_initial_safe_radius_meters",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_grace_depth]
 type = "float"
@@ -1719,6 +2151,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_grace_depth",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_graze_cos]
 type = "float"
@@ -1730,6 +2165,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_graze_cos",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_max_health]
 type = "integer"
@@ -1741,6 +2179,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_max_health",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_max_range]
 type = "float"
@@ -1751,6 +2192,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_max_range",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_min_health]
 type = "integer"
@@ -1762,6 +2206,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_min_health",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_ray_subsample]
 type = "integer"
@@ -1773,6 +2220,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_ray_subsample",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_recency_window]
 type = "integer"
@@ -1784,6 +2234,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_recency_window",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_shadow_depth]
 type = "float"
@@ -1794,6 +2247,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_shadow_depth",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_raytracing_voxel_size]
 type = "float"
@@ -1804,6 +2260,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_voxel_size",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
+advanced = true
 
 [geometry.mapping_recording_dir]
 type = "string"
@@ -1814,6 +2273,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_dir",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图录制"
 
 [geometry.mapping_recording_enabled]
 type = "boolean"
@@ -1824,6 +2285,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_enabled",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图录制"
+switch = "建图录制"
 
 [geometry.mapping_recording_max_bytes]
 type = "integer"
@@ -1835,6 +2299,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_max_bytes",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图录制"
 
 [geometry.mapping_resolution]
 type = "float"
@@ -1846,6 +2312,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_resolution",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "建图"
 
 [geometry.native_lio_pair_max_skew_ms]
 type = "integer"
@@ -1857,6 +2325,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.native_lio_pair_max_skew_ms",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.odom_max_age_sec]
 type = "float"
@@ -1868,6 +2339,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.odom_max_age_sec",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.pgo_options]
 type = "string"
@@ -1877,6 +2351,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pgo_options",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "回环与校正"
+advanced = true
 
 [geometry.pipeline]
 type = "string"
@@ -1888,6 +2365,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pipeline",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
 
 [geometry.pointlio_options]
 type = "string"
@@ -1897,6 +2376,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pointlio_options",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [geometry.raw_scan_directory]
 type = "string"
@@ -1906,6 +2388,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_directory",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "原始扫描（清除残影用）"
+advanced = true
 
 [geometry.raw_scan_interval_s]
 type = "float"
@@ -1917,6 +2402,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_interval_s",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "原始扫描（清除残影用）"
+advanced = true
 
 [geometry.raw_scan_max_mib]
 type = "integer"
@@ -1928,6 +2416,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_max_mib",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "原始扫描（清除残影用）"
 
 [geometry.raw_scan_rotation_deg]
 type = "float"
@@ -1939,6 +2429,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_rotation_deg",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "原始扫描（清除残影用）"
+advanced = true
 
 [geometry.raw_scan_translation_m]
 type = "float"
@@ -1950,6 +2443,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_translation_m",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "原始扫描（清除残影用）"
+advanced = true
 
 [geometry.runtime_data_dir]
 type = "string"
@@ -1959,6 +2455,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.runtime_data_dir",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "地图目录"
+advanced = true
 
 [geometry.runtime_port]
 type = "integer"
@@ -1971,6 +2470,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.runtime_port",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "地图目录"
+advanced = true
 
 [geometry.self_filter_ground_clearance_m]
 type = "float"
@@ -1978,6 +2480,8 @@ default = 0.04
 description = "腿足摆动盒底部与实际站立地面之间的最小间距（米）"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
+panel = "建图与定位"
+category = "点云自体过滤"
 
 [geometry.self_filter_joint_swing_rad]
 type = "float"
@@ -1985,6 +2489,8 @@ default = 0.6
 description = "点云自体过滤在各活动关节参考位置两侧的采样角偏移（弧度，移动关节为米）。"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
+panel = "建图与定位"
+category = "点云自体过滤"
 
 [geometry.self_filter_margin_m]
 type = "float"
@@ -1992,6 +2498,8 @@ default = 0.03
 description = "点云自体过滤的腿足摆动包围盒在每侧外扩的距离（米）。"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
+panel = "建图与定位"
+category = "点云自体过滤"
 
 [geometry.slam2d_config]
 type = "string"
@@ -2002,6 +2510,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.slam2d_config",
 ]
 apply = "restart"
+panel = "建图与定位"
+category = "执行链与定位"
+advanced = true
 
 [navigation.autostart]
 type = "boolean"
@@ -2012,6 +2523,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.autostart",
 ]
 apply = "restart"
+panel = "导航与探索"
+switch = "按需启动导航"
 
 [navigation.capabilities_json]
 type = "string"
@@ -2021,6 +2534,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.capabilities_json",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
+advanced = true
 
 [navigation.explore_pose_ttl_ms]
 type = "integer"
@@ -2031,6 +2547,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.explore_pose_ttl_ms",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "探索"
+advanced = true
 
 [navigation.facility_providers_json]
 type = "string"
@@ -2042,6 +2561,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.facility_providers_json",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "跨楼层与地名"
+advanced = true
 
 [navigation.local_horizon_m]
 type = "float"
@@ -2052,6 +2574,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.local_horizon_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "局部规划"
 
 [navigation.obstacle_clearance_m]
 type = "float"
@@ -2063,6 +2587,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.obstacle_clearance_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "局部规划"
 
 [navigation.max_step_down_m]
 type = "float"
@@ -2075,6 +2601,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_down_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
 
 [navigation.max_step_up_m]
 type = "float"
@@ -2087,6 +2615,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_up_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
 
 [navigation.min_stair_tread_m]
 type = "float"
@@ -2098,6 +2628,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.min_stair_tread_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
+advanced = true
 
 [navigation.pct_terrain_source]
 type = "string"
@@ -2108,6 +2641,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.pct_terrain_source",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
+advanced = true
 
 [navigation.surface_voxel_size_m]
 type = "float"
@@ -2119,6 +2655,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.surface_voxel_size_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
 
 [navigation.traversability_max_slope_deg]
 type = "float"
@@ -2131,6 +2669,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_slope_deg",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
 
 [navigation.traversability_max_step_height_m]
 type = "float"
@@ -2141,6 +2681,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_step_height_m",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "机体与地形"
 
 [navigation.terminal_stall_timeout_sec]
 type = "float"
@@ -2152,6 +2694,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.terminal_stall_timeout_sec",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "局部规划"
 
 [navigation.wavefront_goal_timeout_ms]
 type = "integer"
@@ -2162,6 +2706,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.wavefront_goal_timeout_ms",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "探索"
+advanced = true
 
 [motion_guard.backend]
 type = "string"
@@ -2173,6 +2720,8 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "运动守卫"
 
 [motion_guard.control_factory]
 type = "string"
@@ -2182,6 +2731,9 @@ consumers = [
     "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "运动守卫"
+advanced = true
 
 [person_follow.autostart]
 type = "boolean"
@@ -2191,6 +2743,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:PersonFollow.autostart",
 ]
 apply = "restart"
+panel = "人员跟随"
+switch = "按需启动人员跟随"
 
 [go2.data_plane_dds_iface]
 type = "string"
@@ -2201,6 +2755,8 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
 
 [go2.data_plane_enabled]
 type = "boolean"
@@ -2210,6 +2766,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+switch = "Go2 数据接入"
 
 [go2.dds_iface]
 type = "string"
@@ -2220,6 +2779,8 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
 
 [go2.direct_dds_enabled]
 type = "boolean"
@@ -2229,6 +2790,8 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
 
 [go2.direct_dds_low_state_topic]
 type = "string"
@@ -2238,6 +2801,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.direct_dds_point_cloud_enabled]
 type = "boolean"
@@ -2247,6 +2813,8 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
 
 [go2.direct_dds_point_cloud_topic]
 type = "string"
@@ -2256,6 +2824,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.direct_dds_point_cloud_xyz_registered_to_odom]
 type = "boolean"
@@ -2265,6 +2836,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.direct_dds_pose_topic]
 type = "string"
@@ -2276,6 +2850,9 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:_load_sdk_factories.subscribe_motion_state",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.direct_dds_read_timeout_sec]
 type = "float"
@@ -2286,6 +2863,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.imu_gyro_deadband_rps]
 type = "float"
@@ -2296,6 +2876,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 数据接入"
+advanced = true
 
 [go2.low_level_interval_sec]
 type = "float"
@@ -2305,6 +2888,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 低层控制"
+advanced = true
 
 [go2.low_level_kd]
 type = "float"
@@ -2314,6 +2900,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 低层控制"
+advanced = true
 
 [go2.low_level_kp]
 type = "float"
@@ -2323,6 +2912,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 低层控制"
+advanced = true
 
 [go2.low_level_max_torque]
 type = "float"
@@ -2332,6 +2924,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 低层控制"
+advanced = true
 
 [go2.low_level_max_velocity]
 type = "float"
@@ -2341,6 +2936,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 低层控制"
+advanced = true
 
 [go2.official_backend_enabled]
 type = "boolean"
@@ -2350,6 +2948,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 官方连接"
+switch = "Go2 官方连接"
 
 [go2.official_client_timeout_sec]
 type = "float"
@@ -2362,6 +2963,9 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 官方连接"
+advanced = true
 
 [go2.official_max_linear_velocity_mps]
 type = "float"
@@ -2376,6 +2980,8 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 官方连接"
 
 [go2.official_max_yaw_rate_rps]
 type = "float"
@@ -2390,6 +2996,8 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 官方连接"
 
 [go2.official_yaw_rate_deadband_rps]
 type = "float"
@@ -2401,6 +3009,9 @@ consumers = [
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
+panel = "机器人"
+category = "Go2 官方连接"
+advanced = true
 
 [go2.robot_ip]
 type = "string"
@@ -2410,6 +3021,8 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "视频输入"
 
 [go2.video_stream_enabled]
 type = "boolean"
@@ -2419,6 +3032,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "视频输入"
+switch = "摄像头视频"
 
 [go2.video_stream_reconnect_sec]
 type = "float"
@@ -2429,6 +3045,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "视频输入"
+advanced = true
 
 [go2.volume_auto_enable_vui_switch]
 type = "boolean"
@@ -2438,6 +3057,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "音量"
 
 [go2.vui_max_level]
 type = "integer"
@@ -2447,6 +3068,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "音量"
+advanced = true
 
 [go2.vui_min_level]
 type = "integer"
@@ -2456,6 +3080,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "机器人"
+category = "音量"
+advanced = true
 
 [go2.webrtc_aes_128_key]
 type = "string"
@@ -2466,6 +3093,9 @@ consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
+panel = "视频与视觉识别"
+category = "视频输入"
+advanced = true
 
 [logging.backup_count]
 type = "integer"
@@ -2479,6 +3109,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.backup_count",
 ]
 apply = "hot"
+panel = "日志"
+category = "文件与轮转"
 
 [logging.dir]
 type = "string"
@@ -2490,6 +3122,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.dir",
 ]
 apply = "restart"
+panel = "日志"
+category = "文件与轮转"
 
 [logging.file]
 type = "string"
@@ -2501,6 +3135,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.file",
 ]
 apply = "restart"
+panel = "日志"
+category = "文件与轮转"
+advanced = true
 
 [logging.format]
 type = "string"
@@ -2513,6 +3150,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.format",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
 
 [logging.go2_video_level]
 type = "string"
@@ -2524,6 +3163,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.go2_video_level",
 ]
 apply = "restart"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level]
 type = "string"
@@ -2536,6 +3178,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
 
 [logging.level_config]
 type = "string"
@@ -2546,6 +3190,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_config",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_driver]
 type = "string"
@@ -2556,6 +3203,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_driver",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_gateway]
 type = "string"
@@ -2566,6 +3216,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_gateway",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_geometry]
 type = "string"
@@ -2576,6 +3229,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_geometry",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_navigation]
 type = "string"
@@ -2586,6 +3242,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_navigation",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_perception]
 type = "string"
@@ -2596,6 +3255,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_perception",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_runtime]
 type = "string"
@@ -2606,6 +3268,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_runtime",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_settings]
 type = "string"
@@ -2616,6 +3281,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_settings",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.level_skills]
 type = "string"
@@ -2626,6 +3294,9 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_skills",
 ]
 apply = "hot"
+panel = "日志"
+category = "级别与格式"
+advanced = true
 
 [logging.max_bytes]
 type = "integer"
@@ -2639,6 +3310,8 @@ consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.max_bytes",
 ]
 apply = "hot"
+panel = "日志"
+category = "文件与轮转"
 
 [relay.enabled]
 type = "boolean"
@@ -2649,6 +3322,9 @@ consumers = [
     "gateways/app.py:create_relay_app_from_env",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "容器中继"
+switch = "容器中继"
 
 [relay.incoming_tokens]
 type = "array"
@@ -2661,6 +3337,9 @@ consumers = [
     "gateways/app.py:create_relay_app_from_env",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "容器中继"
+advanced = true
 
 [relay.upstream_base_url]
 type = "string"
@@ -2671,6 +3350,9 @@ consumers = [
     "gateways/app.py:create_relay_app_from_env",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "容器中继"
+advanced = true
 
 [relay.upstream_token]
 type = "string"
@@ -2682,6 +3364,9 @@ consumers = [
     "gateways/app.py:create_relay_app_from_env",
 ]
 apply = "restart"
+panel = "网页与接口"
+category = "容器中继"
+advanced = true
 
 [manipulation.base_url]
 type = "string"
@@ -2691,6 +3376,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "操作设备"
+category = "外部设备"
 
 [manipulation.enabled]
 type = "boolean"
@@ -2700,6 +3387,8 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "操作设备"
+switch = "外部操作设备"
 
 [manipulation.http_timeout_sec]
 type = "float"
@@ -2709,6 +3398,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+advanced = true
 
 [manipulation.poll_interval_sec]
 type = "float"
@@ -2718,6 +3410,9 @@ consumers = [
     "core/settings.py:load_config",
 ]
 apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+advanced = true
 
 [map_cloud.nominatim_url]
 type = "string"
@@ -2727,6 +3422,8 @@ consumers = [
     "services/navigation/places.py:PlaceLookup.__init__",
 ]
 apply = "restart"
+panel = "导航与探索"
+category = "跨楼层与地名"
 
 [unitree_sim.base_url]
 type = "string"
@@ -2734,6 +3431,8 @@ default = "http://127.0.0.1:18910"
 description = "unitree-sim/1 设备管理服务地址。安装时从该设备读取实际标定与命令策略。"
 consumers = ["drivers/unitree_sim/device.py:Device", "drivers/unitree_sim/configuration.py:configure"]
 apply = "restart"
+panel = "机器人"
+category = "型号与驱动"
 
 [unitree_sim.model]
 type = "string"
@@ -2742,3 +3441,5 @@ default = "go2"
 description = "设备当前机器人型号。Go2 使用 NEH 自带外形；G1 须在 robot.model_path 指定外形文件。"
 consumers = ["drivers/unitree_sim/assembly.py:UnitreeSimAssembly", "drivers/unitree_sim/configuration.py:configure"]
 apply = "restart"
+panel = "机器人"
+category = "型号与驱动"

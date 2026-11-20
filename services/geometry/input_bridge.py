@@ -61,7 +61,9 @@ class InputBridge:
     def start(self):
         with self._lifecycle:
             if self._started:
-                return
+                if self._executor is None or not self._executor.input_delivery_status().get("runtime_unavailable"):
+                    return
+                self.stop()
             try:
                 self._runtime_info = self._info() if callable(self._info) else self._info
                 self._settings = json.loads(self._runtime_info.planar_input_config_json or "{}")

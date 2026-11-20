@@ -165,15 +165,32 @@ class RecoveryGo2Source:
         pass
 
 
-def test_first_mapping_request_reaps_backlogged_go2_generation(input_service, monkeypatch, tmp_path):
+def _mapping_platform(input_service, monkeypatch, tmp_path, owner):
     from core.capability import CapabilityTable
+    from gateways.capabilities import maps
+    from gateways.platform import Platform
+    from services.geometry.maps import MapStore
+
+    monkeypatch.setattr("core.components.ensure", lambda *_: None)
+    platform = Platform()
+    platform.geometry = input_service.client
+    platform.geometry_state = SimpleNamespace(connected=True, start=lambda: None,
+        snapshot=lambda: SimpleNamespace(info=info()), subscribe=lambda _fn: lambda: None)
+    platform.mapping_recorder = SimpleNamespace(start=lambda _config: None)
+    platform._recording_configuration = {}
+    platform.maps = MapStore(str(tmp_path / "maps"))
+    platform.input_bridge = InputBridge(client=input_service.client, info=info(),
+        input_executor=owner.get_sensor_input_executor, lio_backend="pointlio")
+    platform.capabilities = CapabilityTable()
+    platform.capabilities.register(next(cap for cap in maps.CAPABILITIES if cap.name == "start_mapping"))
+    return platform
+
+
+def test_first_mapping_request_reaps_backlogged_go2_generation(input_service, monkeypatch, tmp_path):
     from drivers.go2 import sensor_process
     from drivers.go2.data_plane import Go2DirectDdsBridge
     from drivers.go2.settings import Go2DataPlaneConfig
-    from gateways.capabilities import maps
     from gateways.invoke import invoke
-    from gateways.platform import Platform
-    from services.geometry.maps import MapStore
 
     blocked, release, failed = threading.Event(), threading.Event(), threading.Event()
     errors = []
@@ -195,19 +212,8 @@ def test_first_mapping_request_reaps_backlogged_go2_generation(input_service, mo
             "source_factory": RecoveryGo2Source, "on_sample": consume, "on_error": on_error})
 
     monkeypatch.setattr(sensor_process, "Go2SensorProcess", spawn)
-    monkeypatch.setattr("core.components.ensure", lambda *_: None)
     owner = Go2DirectDdsBridge(Go2DataPlaneConfig(lio_backend="pointlio"), isolate_native_input=True)
-    platform = Platform()
-    platform.geometry = input_service.client
-    platform.geometry_state = SimpleNamespace(connected=True, start=lambda: None,
-        snapshot=lambda: SimpleNamespace(info=info()), subscribe=lambda _fn: lambda: None)
-    platform.mapping_recorder = SimpleNamespace(start=lambda _config: None)
-    platform._recording_configuration = {}
-    platform.maps = MapStore(str(tmp_path / "maps"))
-    platform.input_bridge = InputBridge(client=input_service.client, info=info(),
-        input_executor=owner.get_sensor_input_executor, lio_backend="pointlio")
-    platform.capabilities = CapabilityTable()
-    platform.capabilities.register(next(cap for cap in maps.CAPABILITIES if cap.name == "start_mapping"))
+    platform = _mapping_platform(input_service, monkeypatch, tmp_path, owner)
     try:
         owner.start()
         worker = owner.get_sensor_input_executor()
@@ -218,6 +224,65 @@ def test_first_mapping_request_reaps_backlogged_go2_generation(input_service, mo
         assert failed.wait(4)
         assert errors == ["标准输入跨进程交付积压超过1秒"]
         assert worker.input_delivery_status()["runtime_unavailable"]
+
+        state = invoke(platform, "start_mapping", {"map_name": "采集恢复"}, "test")
+        assert state["phase"] == "mapping" and state["map_name"] == "采集恢复"
+        assert not previous.is_alive()
+        assert platform.input_bridge._executor is worker and worker.pid != previous.pid
+        assert not worker.input_delivery_status().get("runtime_unavailable")
+        request = input_service.receiver.clouds.get(timeout=5)
+        assert request.timestamp_ns == 1000
+        assert [sample.timestamp_ns for sample in request.imu_samples] == [900, 1100]
+    finally:
+        release.set()
+        try:
+            platform.input_bridge.stop()
+        finally:
+            owner.stop()
+
+
+class StoppingGo2Source(RecoveryGo2Source):
+    def __init__(self, config, *, stopping, release, calibration_profile=None):
+        super().__init__(config, calibration_profile=calibration_profile)
+        self.stopping = stopping
+        self.release = release
+
+    def stop(self):
+        self.stopping.set()
+        self.release.wait(10)
+
+
+def test_next_mapping_recovers_failed_executor_of_started_bridge(input_service, monkeypatch, tmp_path):
+    from functools import partial
+    from multiprocessing import get_context
+    from drivers.go2 import sensor_process
+    from drivers.go2.data_plane import Go2DirectDdsBridge
+    from drivers.go2.settings import Go2DataPlaneConfig
+    from gateways.invoke import invoke
+
+    context = get_context("spawn")
+    stopping, release = context.Event(), context.Event()
+    source = partial(StoppingGo2Source, stopping=stopping, release=release)
+    monkeypatch.setattr(sensor_process, "Go2SensorProcess",
+                        partial(sensor_process.Go2SensorProcess, source_factory=source))
+    owner = Go2DirectDdsBridge(Go2DataPlaneConfig(lio_backend="pointlio"), isolate_native_input=True)
+    platform = _mapping_platform(input_service, monkeypatch, tmp_path, owner)
+    try:
+        owner.start()
+        first = invoke(platform, "start_mapping", {"map_name": "首张地图"}, "test")
+        assert first["phase"] == "mapping"
+        assert input_service.receiver.clouds.get(timeout=5).timestamp_ns == 1000
+        worker = platform.input_bridge._executor
+        previous = worker._process
+        worker._fail("合成采集故障")
+        assert stopping.wait(5)
+        assert previous.is_alive() and worker.input_delivery_status()["runtime_unavailable"]
+
+        close = worker.close
+        def finish_stopping():
+            release.set()
+            close()
+        monkeypatch.setattr(worker, "close", finish_stopping)
 
         state = invoke(platform, "start_mapping", {"map_name": "采集恢复"}, "test")
         assert state["phase"] == "mapping" and state["map_name"] == "采集恢复"

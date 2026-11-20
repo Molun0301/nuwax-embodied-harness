@@ -442,8 +442,8 @@ class Go2SensorProcess:
     def stop_input_delivery(self):
         with self._command_lock:
             self._delivery_request = None
-            if self._process is not None and not self._process.is_alive():
-                self._process.join()
+            if self.input_delivery_status().get("runtime_unavailable"):
+                self.close()
                 self._delivery_status = {"started": False, "ready": False}
                 self._recording_sink = None
                 return

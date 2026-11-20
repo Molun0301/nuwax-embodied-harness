@@ -36,7 +36,11 @@ pub use local_workers::MapInitializer;
 /// Typed actual execution feedback for deduplicating identical rejected work.
 pub mod replan_feedback;
 use replan_feedback::{ActualExecutionContext, SurfaceReplanFeedback};
+mod sampling_controller;
+mod sampling_follower;
+mod surface_executor;
 pub mod surface_follower;
+pub use surface_executor::SurfaceExecutor;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig, TerminalPhase};
 /// Shared ON/OFF source-change proofs.
@@ -44,7 +48,7 @@ pub mod surface_changes;
 /// 原生地图输入适配。
 pub mod native_map;
 /// 三维路线与局部执行共用同一个原生内核拥有者。
-pub type RouteFollower = SurfaceFollower;
+pub type RouteFollower = SurfaceExecutor;
 #[cfg(test)]
 mod native_test_helpers;
 
@@ -523,6 +527,10 @@ pub trait NavPlanner: Send + 'static {
     fn observe_registered_frame(&mut self, _frame: Option<Arc<RegisteredFrame>>) {}
     /// 清空近期观测后的路线失效须在等待新帧前交给原重规划链路。
     fn has_pending_replan(&self) -> bool { false }
+    /// 三维采样在开始执行路线后使用剩余距离的进展时限。
+    fn uses_route_progress(&self) -> bool { false }
+    /// 感知暂停时无法更新路线长度，仍保留该路线的进展期限。
+    fn suspended_route_failure(&mut self) -> Option<String> { None }
     /// 本次原算法执行周期结束，不是实际几何拒绝；只用于反馈原因分类。
     fn execution_cycle_complete(&self) -> bool { false }
     /// 等待轨迹或当拍命令受阻的原因；速度回执不覆盖该原因。
@@ -1337,6 +1345,15 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
+        if self.current_execution_identity.is_some() && self.planner.uses_route_progress() {
+            if self.status.input_wait_reason.is_some() {
+                if let Some(reason) = self.planner.suspended_route_failure() {
+                    self.status.message = reason;
+                    self.finish_terminal(status_tx, TerminalOutcome::PlannerFailed, SchedulerPhase::Failed).await?;
+                }
+            }
+            return Ok(());
+        }
         let Some(started_at)=self.path_wait_started_at else{return Ok(())};
         if self.config.path_wait_timeout.is_zero()
             || clock::Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
@@ -1780,7 +1797,9 @@ pub async fn spawn_production_surface_scheduler(
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
 }
 
-fn production_surface_backend(config:SurfaceFollowerConfig)->Result<SurfaceFollower,RuntimeError>{SurfaceFollower::new(config)}
+fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<SurfaceExecutor, RuntimeError> {
+    SurfaceExecutor::new(config)
+}
 
 enum SchedulerEvent{Input(Option<InputCommand>),Tick}
 

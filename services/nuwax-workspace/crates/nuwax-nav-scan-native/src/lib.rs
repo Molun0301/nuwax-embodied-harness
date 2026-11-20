@@ -192,7 +192,20 @@ impl TrackResult {
         self.reason & track_reason::FINISHED != 0
     }
 }
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BodySample {
+    pub clearance: f64,
+    pub depth: f64,
+    pub occupied: i32,
+}
+
 extern "C" {
+    fn nuwax_scan_sample_poses(
+        map: *const c_void, config: *const Config, poses: *const f64, count: usize,
+        output: *mut BodySample, evidence: *mut CollisionEvidence,
+    );
+    fn nuwax_scan_clearance_speed_cap(config: *const Config, clearance: f64) -> f64;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
     fn nuwax_scan_map_destroy(map: *mut c_void);
     fn nuwax_scan_map_surface(
@@ -408,6 +421,17 @@ impl CollisionSnapshot {
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    /// 一批位姿绑定一次不可变快照，机身查询不添加首选净空。
+    pub fn sample_poses(
+        &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
+        evidence: Option<&mut CollisionEvidence>,
+    ) {
+        let count = poses.len().min(output.len());
+        unsafe {
+            nuwax_scan_sample_poses(self.0.0.as_ptr(), config, poses.as_ptr().cast(), count,
+                output.as_mut_ptr(), evidence.map_or(std::ptr::null_mut(), |value| value));
+        }
+    }
     pub fn affects(&self, previous: &Self, trajectory: &Trajectory, from: f64) -> bool {
         unsafe {
             nuwax_scan_snapshot_affects(
@@ -419,6 +443,11 @@ impl CollisionSnapshot {
         }
     }
 }
+/// 沿用地图净空到速度上限的标定。
+pub fn clearance_speed_cap(config: &Config, clearance: f64) -> f64 {
+    unsafe { nuwax_scan_clearance_speed_cap(config, clearance) }
+}
+
 struct TrajectoryHandle(NonNull<c_void>);
 // 原样条只读，控制器与规划状态机不写入这个载荷。
 unsafe impl Send for TrajectoryHandle {}

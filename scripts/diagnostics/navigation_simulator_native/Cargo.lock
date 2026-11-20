@@ -872,6 +872,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,8 +1143,8 @@ name = "nuwax-motion-safety-guard"
 version = "0.1.0"
 dependencies = [
  "nuwax-config",
+ "nuwax-types",
  "prost",
- "rustix",
  "thiserror",
  "tokio",
  "tonic-build",
@@ -1219,6 +1228,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "nuwax-config",
+ "nuwax-core",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-mls-planner",
@@ -1358,10 +1368,12 @@ dependencies = [
  "chrono",
  "indexmap",
  "libc",
+ "memmap2",
  "once_cell",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 

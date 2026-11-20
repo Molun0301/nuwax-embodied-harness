@@ -92,6 +92,15 @@ pub struct Geometry {
     pub slam2d_config: String,
 }
 
+/// 三维局部执行在进程启动时选定。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceLocalPlanner {
+    #[default]
+    Sampling,
+    Scan,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Navigation {
     pub autostart: bool,
@@ -99,6 +108,8 @@ pub struct Navigation {
     pub explore_pose_ttl_ms: i64,
     pub facility_providers_json: String,
     pub local_horizon_m: f64,
+    #[serde(default)]
+    pub local_planner: SurfaceLocalPlanner,
     pub obstacle_clearance_m: f64,
     #[serde(deserialize_with = "crate::optional_number")]
     pub max_step_down_m: Option<f64>,

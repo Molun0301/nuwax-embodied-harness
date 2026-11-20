@@ -1136,8 +1136,8 @@ pub(super) fn build_guarded_navigation_status(
         let age = |stamp: i64| {
             if stamp <= 0 { return "尚未收到，年龄未知".to_string(); }
             let stamp = stamp as u64;
-            if stamp > source_now.saturating_add(50_000_000) {
-                "来源年龄不可用：数据源时间超前当前来源时钟超过50毫秒".to_string()
+            if stamp > source_now.saturating_add(nuwax_nav_types_messages::clock::SOURCE_FUTURE_TOLERANCE_NS) {
+                "来源年龄不可用：数据源时间超前当前来源时钟超过500毫秒".to_string()
             } else {
                 format!("来源年龄={}毫秒", source_now.saturating_sub(stamp) / 1_000_000)
             }
@@ -1266,4 +1266,33 @@ fn navigation_status_reports_one_input_ready_signal_and_typed_goal_reason() {
     status.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Stopped);
     assert_eq!(build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
     assert_eq!(build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).reason, status.message);
+}
+
+#[cfg(all(test, feature = "guard-runtime"))]
+#[test]
+fn go2_input_status_reports_ages_in_the_shared_source_clock() {
+    const CHILD: &str = "NEH_TEST_GO2_GUARDED_OFFSET";
+    const OFFSET: u64 = 71_844_000_000_000;
+    if std::env::var_os(CHILD).is_none() {
+        let path = std::env::temp_dir().join(format!("neh-go2-guarded-offset-{}", std::process::id()));
+        std::fs::write(&path, (OFFSET as i64).to_ne_bytes()).unwrap();
+        let name = format!("{}::go2_input_status_reports_ages_in_the_shared_source_clock",
+            module_path!().split_once("::").unwrap().1);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name]).env(CHILD, "1").env("NUWAX_DEVICE_CLOCK_OFFSET", &path)
+            .status().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(status.success());
+        return;
+    }
+    let source = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap().as_nanos() as u64 + OFFSET;
+    let status = nuwax_nav_runtime::SchedulerStatus {
+        pose_source_timestamp_ns: (source + 400_000_000) as i64,
+        costmap_source_timestamp_ns: (source + 900_000_000) as i64,
+        ..Default::default()
+    };
+    let message = build_guarded_navigation_status(&status, &GuardedNavTelemetry::default(), None, Duration::ZERO).reason;
+    assert!(message.contains("位姿来源年龄=0毫秒"), "{message}");
+    assert!(message.contains("栅格/曲面来源年龄不可用：数据源时间超前当前来源时钟超过500毫秒"), "{message}");
 }

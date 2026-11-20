@@ -1764,8 +1764,8 @@ fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeE
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
         .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
     let now = clock::source_now_ns();
-    if source > now.saturating_add(50_000_000) {
-        return Err(RuntimeError::StaleInput("数据源时间超前当前来源时钟超过50毫秒".into()));
+    if source > now.saturating_add(clock::SOURCE_FUTURE_TOLERANCE_NS) {
+        return Err(RuntimeError::StaleInput("数据源时间超前当前来源时钟超过500毫秒".into()));
     }
     let age = now.saturating_sub(source);
     if u128::from(age) >= maximum.as_nanos() {
@@ -2528,6 +2528,39 @@ mod tests {
         write_clock(6, source + 600_000_000, true);
         scheduler.session_tick(&tx).await.unwrap();
         assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("pose source deadline elapsed"));
+    }
+
+    #[tokio::test]
+    async fn go2_pose_age_uses_shared_source_offset() {
+        const CHILD: &str = "NEH_TEST_GO2_POSE_OFFSET";
+        const OFFSET: u64 = 71_844_000_000_000;
+        if std::env::var_os(CHILD).is_none() {
+            let path = std::env::temp_dir().join(format!("neh-go2-pose-offset-{}", std::process::id()));
+            std::fs::write(&path, (OFFSET as i64).to_ne_bytes()).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::go2_pose_age_uses_shared_source_offset"])
+                .env(CHILD, "1").env("NUWAX_DEVICE_CLOCK_OFFSET", &path)
+                .status().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut scheduler = NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
+        let (tx, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_costmap(&tx, costmap_at(1), Instant::now()).unwrap();
+        let local_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos() as u64;
+        let source = local_now + OFFSET;
+        let mut pose = map_pose_at(1);
+        pose.stamp.nanos = source as i64;
+        let limit = Duration::from_millis(500);
+        scheduler.observe_odometry(&tx, pose, Some(limit)).unwrap();
+        scheduler.session_tick(&tx).await.unwrap();
+        assert!(scheduler.status.planner_inputs_fresh);
+        assert!(check_pose_data_age((source + 400_000_000) as i64, limit).is_ok());
+        assert!(check_pose_data_age((source + 900_000_000) as i64, limit).unwrap_err().to_string().contains("超过500毫秒"));
+        assert!(check_pose_data_age((source - 600_000_000) as i64, limit).unwrap_err().to_string().contains("pose source deadline elapsed"));
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {

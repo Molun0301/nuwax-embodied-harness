@@ -120,9 +120,33 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         source = self.clock.unix if source is None else source
         message = SimpleNamespace(stamp=SimpleNamespace(sec=source // 1_000_000_000, nanosec=source % 1_000_000_000),
                                   velocity=velocity, imu_state=SimpleNamespace(quaternion=quaternion, gyroscope=gyro), mode=3)
-        with patch('services.navigation.motion_safety_guard.go2_actuator.time.monotonic_ns', return_value=self.clock.mono), \
-             patch('services.navigation.motion_safety_guard.go2_actuator.time.time_ns', return_value=self.clock.unix):
+        with patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono), \
+             patch.object(clock.time, "time_ns", return_value=self.clock.unix):
             actuator._observe_motion_state(message)
+
+    def test_go2_aligned_feedback_keeps_monotonic_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offset"
+            clock.initialize_source_clock_offset(path)
+            with patch.dict(os.environ, {clock.CLOCK_OFFSET_ENV: str(path)}):
+                actuator = self.go2()
+                offset = 71_844_000_000_000
+                source = self.clock.unix + offset
+                self.observe(actuator, source=source)
+                self.assertIsNone(actuator.get_motion_execution_feedback())
+                clock.publish_source_clock_offset_ns(str(path), offset)
+                self.observe(actuator, source=source)
+                gate = ExecutionFeedback()
+                with patch.object(clock.time, "time_ns", return_value=self.clock.unix), \
+                     patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono):
+                    feedback = gate.feedback(actuator)
+                    self.assertEqual(feedback.source_timestamp_ns, source)
+                    self.assertEqual(gate.feedback_valid_until_monotonic_ns(feedback), self.clock.mono + 250_000_000)
+                self.clock.step(251_000_000)
+                with patch.object(clock.time, "time_ns", return_value=self.clock.unix), \
+                     patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono):
+                    with self.assertRaisesRegex(RuntimeError, "接收已过期"):
+                        gate.feedback(actuator)
 
     def test_rotate_world_to_body_once(self):
         # 非零滚转/俯仰/偏航；独立 R 先将已知机体速度送入厂商世界坐标接口。
@@ -175,7 +199,9 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertEqual(self.query().measured_motion, initial)
         self.clock.step(150_000_001)
         self.assertFalse(self.query().HasField('measured_motion'))
-        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 50_000_001)
+        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 500_000_000)
+        self.assertTrue(self.query().HasField('measured_motion'))
+        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 500_000_001)
         self.assertFalse(self.query().HasField('measured_motion'))
         self.device.feedback = self.sample(received_monotonic_ns=self.clock.mono + 1)
         self.assertFalse(self.query().HasField('measured_motion'))
@@ -187,6 +213,11 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertIs(actuator.get_motion_execution_feedback(), sample)
         self.observe(actuator, source=sample.source_timestamp_ns - 1)
         self.assertIs(actuator.get_motion_execution_feedback(), sample)
+        self.observe(actuator, source=self.clock.unix + 500_000_000)
+        self.assertEqual(actuator.get_motion_execution_feedback().source_timestamp_ns,
+                         self.clock.unix + 500_000_000)
+        self.observe(actuator, source=self.clock.unix + 500_000_001)
+        self.assertIsNone(actuator.get_motion_execution_feedback())
 
     def test_encode_provenance_and_deadline(self):
         self.device.feedback = self.sample()
@@ -244,6 +275,13 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
                 with path.open('r+b') as stream:
                     stream.seek(8)
                     stream.write(struct.pack('<QQdQ', 4, source + 250_000_001, 1.0, 0))
+                self.assertFalse(self.query().HasField('measured_motion'))
+                now = clock.source_now_ns()
+                self.device.feedback = self.sample(source_timestamp_ns=now + 500_000_000,
+                                                   received_monotonic_ns=now)
+                self.assertTrue(self.query().HasField('measured_motion'))
+                self.device.feedback = self.sample(source_timestamp_ns=now + 500_000_001,
+                                                   received_monotonic_ns=now)
                 self.assertFalse(self.query().HasField('measured_motion'))
 
     def test_invalid_finite_frame_and_orientation(self):

@@ -30,6 +30,7 @@ def parent_death_signal():
 
 def load_environment(root):
     """启动时合成完整配置，子进程仅继承系统和诊断环境。"""
+    from core.clock import CLOCK_OFFSET_ENV
     from core.config import ConfigStore, install_home
     home = install_home()
     config = ConfigStore(home, root).compose()
@@ -44,6 +45,8 @@ def load_environment(root):
     env["NUWAX_INSTALL_HOME"] = str(home)
     if config["robot"]["driver"] == "unitree_sim":
         env["NUWAX_DEVICE_CLOCK"] = str(home / "run/device_clock")
+    elif config["robot"]["driver"] == "go2":
+        env[CLOCK_OFFSET_ENV] = str(home / "run/device_clock_offset")
     env["PYTHONUNBUFFERED"] = "1"
     return env
 
@@ -287,6 +290,8 @@ class Supervisor:
         await asyncio.gather(*self.background, return_exceptions=True)
 
     async def run(self):
+        from core.clock import CLOCK_OFFSET_ENV, initialize_source_clock_offset
+
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         with (self.home / "run/business.lock").open("a") as lock:
             try:
@@ -294,6 +299,8 @@ class Supervisor:
             except BlockingIOError:
                 print("业务已在运行", flush=True)
                 return 1
+            if CLOCK_OFFSET_ENV in self.environment:
+                initialize_source_clock_offset(Path(self.environment[CLOCK_OFFSET_ENV]))
             self.socket_path.unlink(missing_ok=True)
             server = await asyncio.start_unix_server(self.handle, path=self.socket_path)
             loop = asyncio.get_running_loop()

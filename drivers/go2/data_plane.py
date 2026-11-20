@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import importlib
 import logging
 import math
+import os
 import threading
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple
@@ -35,6 +36,7 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField
 from contracts.robot_state import IMUState, JointState
 from contracts.sensors import RegistrationState, SensorSample
+from core import clock
 from core.logging_utils import LogRateLimiter, SamplingLogFilter as _SamplingLogFilter
 
 if TYPE_CHECKING:
@@ -54,6 +56,7 @@ _MAX_POINT_CLOUD_POSE_SKEW_SEC = 0.5
 _NATIVE_IMU_READER_HISTORY_DEPTH = 256
 _NATIVE_CLOUD_READER_HISTORY_DEPTH = 16
 _NATIVE_STATE_SAMPLE_INTERVAL_SEC = 0.05
+_SOURCE_CLOCK_WINDOW_SEC = 2.0
 
 
 class _HistoryChannelSubscriber:
@@ -457,6 +460,8 @@ class Go2DirectDdsBridge:
         self._point_cloud_callbacks: Dict[int, Callable[[PointCloudFrame], None]] = {}
         self._sensor_sample_callbacks: Dict[int, Callable[[SensorSample], None]] = {}
         self._dds_input_timing: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._source_clock_offset_path = os.environ.get(clock.CLOCK_OFFSET_ENV)
+        self._source_clock_windows: Dict[str, Deque[Tuple[float, int]]] = {}
         self._next_callback_id = 1
         self._direct_pose_ready = False
         self._direct_imu_ready = False
@@ -706,13 +711,15 @@ class Go2DirectDdsBridge:
             return
         source_ns = sec * 1_000_000_000 + nanosec
         values = {
-            "source_age_ms": (received_wall_ns - source_ns) / 1_000_000,
             "read_ms": (read_returned - read_started) * 1000.0,
             "callback_ms": (completed - read_returned) * 1000.0,
         }
         with self._lock:
             if not self._is_generation_active_locked(generation):
                 return
+            if self._source_clock_offset_path:
+                self._observe_source_clock_locked(kind, read_returned, source_ns - received_wall_ns)
+            values["source_age_ms"] = (received_wall_ns + clock.source_clock_offset_ns() - source_ns) / 1_000_000
             buckets = self._dds_input_timing.setdefault(kind, deque(maxlen=10))
             second = int(completed)
             if not buckets or buckets[-1]["second"] != second:
@@ -723,6 +730,22 @@ class Go2DirectDdsBridge:
             for name, value in values.items():
                 total, maximum, _last = bucket.get(name, (0.0, value, value))
                 bucket[name] = (total + value, max(maximum, value), value)
+
+    def _observe_source_clock_locked(self, kind, received_at, offset_ns):
+        # 每种数据由同一个读取线程顺序交付，队首保存该源窗口内的最大钟差。
+        window = self._source_clock_windows.setdefault(kind, deque())
+        while window and window[-1][1] <= offset_ns:
+            window.pop()
+        window.append((received_at, offset_ns))
+        cutoff = time.monotonic() - _SOURCE_CLOCK_WINDOW_SEC
+        recent_maxima = []
+        for samples in self._source_clock_windows.values():
+            while samples and samples[0][0] < cutoff:
+                samples.popleft()
+            if samples:
+                recent_maxima.append(samples[0][1])
+        if recent_maxima:
+            clock.publish_source_clock_offset_ns(self._source_clock_offset_path, max(recent_maxima))
 
     def _input_timing_snapshot_locked(self) -> Dict[str, Any]:
         """诊断读取只汇总近期常量规模计数；无新输入不延长窗口。"""
@@ -773,6 +796,7 @@ class Go2DirectDdsBridge:
                 "direct_dds_started": self._direct_dds_started and active_generation is not None,
                 "lifecycle_generation": self._lifecycle_generation,
                 "active_generation": active_generation,
+                "source_clock_offset_ns": clock.source_clock_offset_ns(),
                 "input_timing": self._sensor_process_status.get("input_timing", {}) if self._sensor_process is not None else self._input_timing_snapshot_locked(),
                 "sensor_process_pid": self._sensor_process.pid if self._sensor_process is not None else None,
                 "dds_pose_ready": pose_active,
@@ -833,6 +857,7 @@ class Go2DirectDdsBridge:
 
     def _invalidate_observations_locked(self, message: str) -> None:
         self._dds_input_timing.clear()
+        self._source_clock_windows.clear()
         self._latest_pose_from_dds = None
         self._latest_imu_state_from_dds = None
         self._latest_joint_snapshot = None

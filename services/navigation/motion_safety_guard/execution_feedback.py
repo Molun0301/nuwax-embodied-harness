@@ -1,6 +1,5 @@
 """读取执行器的真实运动反馈，供测量旁路使用。"""
 from __future__ import annotations
-import time
 from typing import Optional
 
 from contracts.motion_feedback import MotionExecutionFeedback
@@ -12,7 +11,7 @@ _FEEDBACK_VALIDITY_NS = 250_000_000
 
 
 class ExecutionFeedback:
-    def __init__(self, *, frame_id: str = "base_link", monotonic=None, unix_ns=time.time_ns):
+    def __init__(self, *, frame_id: str = "base_link", monotonic=None, unix_ns=clock.source_now_ns):
         self.frame_id = frame_id
         self._monotonic_ns = (clock.monotonic_ns if monotonic is None
                               else lambda: round(monotonic() * 1_000_000_000))
@@ -42,10 +41,10 @@ class ExecutionFeedback:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器速度未使用受控机体坐标。")
         if clock.uses_device_clock():
             source_age = clock.source_now_ns() - feedback.source_timestamp_ns
-            stale = not -50_000_000 <= source_age <= _FEEDBACK_VALIDITY_NS
+            stale = not -clock.SOURCE_FUTURE_TOLERANCE_NS <= source_age <= _FEEDBACK_VALIDITY_NS
         else:
             now = self._unix_ns()
-            if feedback.source_timestamp_ns > now + 50_000_000:
+            if feedback.source_timestamp_ns > now + clock.SOURCE_FUTURE_TOLERANCE_NS:
                 raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈过期或位于未来。")
             stale = (feedback.received_monotonic_ns is None
                      and now - feedback.source_timestamp_ns > _FEEDBACK_VALIDITY_NS)

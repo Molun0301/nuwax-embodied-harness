@@ -862,22 +862,7 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
                 "camera_id": camera_id,
                 "available_camera_id": source_camera_id,
             })
-        video_available = False
-        if VideoShmReader is not None:
-            _shm_path = "/tmp/nuwax_video.shm"
-            _probe = VideoShmReader(_shm_path)
-            video_available = _probe.has_new_frame()
-            _probe.close()
-        if not video_available:
-            request.state.error_category = "not_ready"
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "video_stream_not_available",
-                    "reason": "rust_bridge_no_frames",
-                    "message": "Rust 视频中转尚未收到帧数据。",
-                },
-            )
+        # 首帧及写者重启由共享读取拥有方等待，瞬时空发布头不结束网页视频连接。
         # 默认随输入到达交付；显式请求的帧率仅作为发送上限。
         requested_fps = float(fps) if fps is not None else 0.0
         if not math.isfinite(requested_fps) or requested_fps < 0:

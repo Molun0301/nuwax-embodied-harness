@@ -1,4 +1,4 @@
-/* 常用机器人控制：急停、音量、运动面板与按名称导航，全部调用智能体同名能力。 */
+/* 常用机器人控制：急停、音量、移动与转向、按名称导航，全部调用智能体同名能力。 */
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -64,107 +64,104 @@
     });
   }
 
-  // ---- 运动面板 ----
-  const motion = {
-    panel: $('motionPanel'), toggle: $('mapMotionToggle'), status: $('motionStatus'), speed: $('motionSpeed'),
-    turn: $('motionTurnSpeed'), duration: $('motionDuration'), action: $('motionAction'), params: $('motionActionParams'),
-    level: $('motionSpeedLevel'), mode: $('motionMode'), avoidance: $('motionAvoidance'),
-  };
-  const MOVES = {
-    forward: ['前进', 1, 0, 0], backward: ['后退', -1, 0, 0], left: ['左移', 0, 1, 0],
-    right: ['右移', 0, -1, 0], turn_left: ['左转', 0, 0, 1], turn_right: ['右转', 0, 0, -1],
-  };
-  const MODE_LABELS = {high: '高层', low: '低层'};
-  let catalog = {};
+  // ---- 移动与转向：按住移动、松开即停，按键与面板按钮共用一套逻辑 ----
+  // 按住期间每 RENEW_MS 提交一次 HOLD_SEC 秒的 relative_move，新命令接管旧命令；
+  // 松开、页面失焦或面板关闭时取消当前任务（cancel_task），任务退出即释放租约，守卫立即零速。
+  // 网络断开导致取消发不出去时，最后一条命令最多再走 HOLD_SEC 秒。
+  const HOLD_SEC = 2, RENEW_MS = 1500;
+  const motion = {panel: $('motionPanel'), toggle: $('mapMotionToggle'), status: $('motionPanelStatus'),
+    speed: $('motionSpeed'), turn: $('motionTurnSpeed')};
+  // 每个键对应 [前后, 左右, 转向] 方向；方向键映射到面板上的同义按钮。
+  const DRIVE_KEYS = {KeyW: [1, 0, 0], KeyS: [-1, 0, 0], KeyA: [0, 1, 0], KeyD: [0, -1, 0], KeyQ: [0, 0, 1], KeyE: [0, 0, -1]};
+  const ARROWS = {ArrowUp: 'KeyW', ArrowDown: 'KeyS', ArrowLeft: 'KeyQ', ArrowRight: 'KeyE'};
+  const KEY_LABELS = {KeyW: '前进', KeyS: '后退', KeyA: '左移', KeyD: '右移', KeyQ: '左转', KeyE: '右转'};
+  const drive = {held: new Set(), vectorKey: '', taskId: null, seq: 0, timer: null};
   function motionSay(text, level = '') { motion.status.textContent = text; motion.status.dataset.level = level; }
-  async function motionRun(label, name, args, done) {
-    motionSay(label + '：已发送。');
+  function driveVector() {
+    const axis = [0, 0, 0];
+    for (const key of drive.held) DRIVE_KEYS[key].forEach((value, index) => { axis[index] += value; });
+    const [forward, side, turn] = axis.map(value => Math.max(-1, Math.min(1, value)));
+    if (!forward && !side && !turn) return null;
+    const linear = Number(motion.speed.value), angular = Number(motion.turn.value);
+    return {vx: forward * linear, vy: side * linear, vyaw: turn * angular};
+  }
+  async function sendDrive() {
+    const vector = driveVector();
+    const seq = ++drive.seq;
     try {
-      const reply = await invoke(name, args);
-      if (reply.task) {
-        follow(reply.task, task => {
-          if (!terminal.includes(task.state)) motionSay(label + '：' + task.message + percent(task));
-          else if (task.state === 'succeeded') motionSay(done(task.result || {}));
-          else motionSay(label + (task.state === 'cancelled' ? '已取消：' : '失败：') + task.message, 'error');
-        });
-      } else motionSay(done(reply));
+      const reply = await invoke('relative_move', {...vector, duration_sec: HOLD_SEC});
+      if (seq === drive.seq) drive.taskId = reply.task.task_id;
+      // 回应到达前已经松开：这条命令立即取消。
+      else if (!drive.held.size) invoke('cancel_task', {task_id: reply.task.task_id}).catch(() => {});
     } catch (error) {
-      motionSay(label + '失败：' + error.message, 'error');
+      motionSay('移动失败：' + error.message, 'error');
     }
   }
-  function renderActionParams() {
-    const params = catalog[motion.action.value]?.params_schema?.properties || {};
-    const fragment = document.createDocumentFragment();
-    for (const [name, schema] of Object.entries(params)) {
-      const label = document.createElement('label');
-      label.className = 'msb-check';
-      label.title = schema.description || name;
-      const input = document.createElement('input');
-      input.dataset.param = name;
-      if (schema.type === 'boolean') {
-        input.type = 'checkbox';
-        input.checked = schema.default !== false;
-        label.append(input, '开启');
-      } else {
-        input.className = 'msb-input msb-num';
-        input.placeholder = name;
-        label.append(name, input);
-      }
-      fragment.append(label);
+  function stopDrive() {
+    window.clearInterval(drive.timer);
+    drive.timer = null;
+    drive.seq += 1;
+    const taskId = drive.taskId;
+    drive.taskId = null;
+    if (taskId) invoke('cancel_task', {task_id: taskId}).catch(error => motionSay('停止失败：' + error.message, 'error'));
+  }
+  function applyDrive() {
+    for (const button of motion.panel.querySelectorAll('[data-key]')) button.classList.toggle('is-active', drive.held.has(button.dataset.key));
+    const vector = driveVector();
+    const key = vector ? [vector.vx, vector.vy, vector.vyaw].join() : '';
+    if (key === drive.vectorKey) return;
+    drive.vectorKey = key;
+    if (!vector) {
+      stopDrive();
+      motionSay('已停止。');
+      return;
     }
-    motion.params.replaceChildren(fragment);
+    motionSay('移动中：' + [...drive.held].map(item => KEY_LABELS[item]).join(' + '));
+    window.clearInterval(drive.timer);
+    sendDrive();
+    drive.timer = window.setInterval(sendDrive, RENEW_MS);
+  }
+  function releaseAll() {
+    if (!drive.held.size) return;
+    drive.held.clear();
+    applyDrive();
+  }
+  function typing(target) {
+    return target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+  }
+  document.addEventListener('keydown', event => {
+    const key = ARROWS[event.code] || event.code;
+    if (motion.panel.hidden || !DRIVE_KEYS[key] || event.ctrlKey || event.metaKey || event.altKey || typing(event.target)) return;
+    event.preventDefault();
+    if (event.repeat || drive.held.has(key)) return;
+    drive.held.add(key);
+    applyDrive();
+  });
+  // 松开键在任何焦点下都处理，避免按住时点进输入框后停不下来。
+  document.addEventListener('keyup', event => {
+    const key = ARROWS[event.code] || event.code;
+    if (!drive.held.delete(key)) return;
+    applyDrive();
+  });
+  window.addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+  new MutationObserver(() => { if (motion.panel.hidden) releaseAll(); }).observe(motion.panel, {attributes: true, attributeFilter: ['hidden']});
+  for (const button of motion.panel.querySelectorAll('[data-key]')) {
+    button.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      button.setPointerCapture(event.pointerId);
+      drive.held.add(button.dataset.key);
+      applyDrive();
+    });
+    const up = () => { if (drive.held.delete(button.dataset.key)) applyDrive(); };
+    button.addEventListener('pointerup', up);
+    button.addEventListener('pointercancel', up);
+    button.addEventListener('lostpointercapture', up);
   }
   function setupMotion(caps) {
-    const byName = new Map(caps.map(cap => [cap.name, cap]));
-    // 只显示当前机器人实际提供的运动能力。
-    const controls = [...motion.panel.querySelectorAll('[data-motion-capability]')];
-    for (const control of controls) control.hidden = !byName.has(control.dataset.motionCapability);
-    for (const row of motion.panel.querySelectorAll('.motion-settings')) row.hidden = !row.querySelector('[data-motion-capability]:not([hidden])');
-    motion.toggle.hidden = !controls.some(control => !control.hidden);
-    const sport = byName.get('execute_sport_command')?.input_schema;
-    if (sport) {
-      catalog = sport['x-nuwax-action-catalog'] || {};
-      for (const name of sport.properties.action.enum) {
-        motion.action.append(new Option((catalog[name]?.display_name || name) + '（' + name + '）', name));
-      }
-      renderActionParams();
-    }
-    const level = byName.get('set_speed_level')?.input_schema.properties.level;
-    if (level) for (let value = level.minimum; value <= level.maximum; value += 1) motion.level.append(new Option(value + ' 档', value));
-    const mode = byName.get('switch_control_mode')?.input_schema.properties.mode;
-    if (mode) for (const value of mode.enum) motion.mode.append(new Option((MODE_LABELS[value] || value) + '（' + value + '）', value));
+    // 只有当前机器人提供 relative_move 时才显示面板入口。
+    motion.toggle.hidden = !caps.some(cap => cap.name === 'relative_move');
   }
-  motion.panel?.querySelectorAll('[data-move]').forEach(button => button.addEventListener('click', () => {
-    const [label, forward, side, turn] = MOVES[button.dataset.move];
-    const speed = Number(motion.speed.value), rate = Number(motion.turn.value);
-    const args = {vx: forward * speed, vy: side * speed, vyaw: turn * rate, duration_sec: Number(motion.duration.value)};
-    motionRun(label, 'relative_move', args, result => label + '完成' + (result.limited ? '（速度已按设备限幅）' : '') + '。');
-  }));
-  motion.action?.addEventListener('change', renderActionParams);
-  $('motionActionRun')?.addEventListener('click', () => {
-    const name = motion.action.value;
-    const args = {action: name};
-    const inputs = [...motion.params.querySelectorAll('[data-param]')];
-    if (inputs.length) args.params = Object.fromEntries(inputs.map(input => [input.dataset.param, input.type === 'checkbox' ? input.checked : input.value]));
-    const label = catalog[name]?.display_name || name;
-    motionRun(label, 'execute_sport_command', args, () => '已执行「' + label + '」。');
-  });
-  $('motionPoseApply')?.addEventListener('click', () => {
-    const args = Object.fromEntries(['roll', 'pitch', 'yaw'].map(key => [key, Number($('motionPose-' + key).value)]));
-    motionRun('设置姿态', 'set_body_pose', args, () => '机身姿态已设置。');
-  });
-  $('motionSpeedLevelApply')?.addEventListener('click', () => {
-    const level = Number(motion.level.value);
-    motionRun('设置速度档位', 'set_speed_level', {level}, () => '速度档位已设为 ' + level + ' 档。');
-  });
-  $('motionAvoidanceApply')?.addEventListener('click', () => {
-    const enabled = motion.avoidance.value === 'true';
-    motionRun('设置实时避障', 'set_obstacle_avoidance', {enabled}, () => '实时避障已' + (enabled ? '开启' : '关闭') + '。');
-  });
-  $('motionModeApply')?.addEventListener('click', () => {
-    const mode = motion.mode.value;
-    motionRun('切换控制模式', 'switch_control_mode', {mode}, () => '已切换到' + (MODE_LABELS[mode] || mode) + '控制。');
-  });
   motion.toggle?.addEventListener('click', () => {
     if (!motion.panel.hidden) { window.nuwaxMapPanels.close(motion.panel.id, true); return; }
     window.nuwaxMapPanels.activate(motion.panel.id);

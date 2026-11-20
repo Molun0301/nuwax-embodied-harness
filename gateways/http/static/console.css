@@ -199,7 +199,7 @@ button{font-family:inherit;cursor:pointer}
 
 /* ===== 视频卡片 ===== */
 .vision-content{display:flex;flex-direction:column;gap:10px;padding:12px;flex:1;min-height:0}
-.vision-media,.vision-information{min-width:0;flex:none}
+.vision-media{min-width:0;flex:none}
 .vision-media{display:flex;flex-direction:column;gap:10px}
 .video{position:relative;border-radius:var(--r);overflow:hidden;background:var(--grid-occ);aspect-ratio:16/9;border:1px solid var(--line);flex:none}
 .video>img{width:100%;height:100%;object-fit:contain;display:block}
@@ -209,10 +209,6 @@ button{font-family:inherit;cursor:pointer}
 #visionModelStatus{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 没有画面时只保留一行提示，把高度留给下方运行信息；放大模式仍保留画面区域。 */
 .workspace:not(.swapped) #video-perception:has(#videoFrame[hidden]) .video{display:none}
-.vision-status-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:var(--fs-sm)}
-.vision-information:has(.vision-labels:empty){display:none}
-.vision-labels{display:flex;flex-wrap:wrap;gap:5px;margin:0}
-.vision-labels span{font-size:var(--fs-sm);color:var(--strong);background:var(--inset);border:1px solid var(--line);padding:2px 7px;border-radius:var(--r-xs);overflow-wrap:anywhere;max-width:100%}
 .workspace.swapped .vision-media{flex:1;min-height:0}
 .workspace.swapped #video-perception .video{flex:1;min-height:0;aspect-ratio:auto}
 
@@ -254,6 +250,8 @@ button{font-family:inherit;cursor:pointer}
 .task-row-heading>.pill{flex-shrink:0}
 .task-row-heading>.task-cancel{flex-shrink:0;min-height:22px;padding:0 8px}
 .task-row-heading>.pill{margin-left:auto}
+#perceptionRuntimeToggle[data-level="error"]{color:var(--bad)}
+.perception-settings-link{width:30px;padding:0;justify-content:center}
 .task-feedback-details{margin-top:8px;font-size:var(--fs);min-width:0}
 .task-feedback-details summary{cursor:pointer;line-height:1.7}
 .task-feedback-fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
@@ -407,7 +405,16 @@ button{font-family:inherit;cursor:pointer}
 #live-map .forbidden-zone-item button:hover:not(:disabled){background:var(--bad-w);color:var(--bad)}
 /* 地图管理：当前地图醒目，列表每行一张地图，操作按钮靠右。 */
 #live-map .map-manager-current{font-size:var(--fs-md);font-weight:660;color:var(--ink);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#live-map .map-manager-list{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none;max-height:220px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+#live-map .map-manager-list{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none;max-height:min(260px,34vh);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+/* 地图列表默认收起；展开后是限高的下拉层，列表自身滚动。 */
+#live-map .map-manager-dropdown{margin-top:6px;padding:6px;border:1px solid var(--line);border-radius:var(--r);background:var(--surface);box-shadow:var(--sh-sm)}
+#live-map .map-manager-dropdown-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px 6px;color:var(--muted);font-size:var(--fs-sm)}
+#live-map .map-manager-list-toggle::after{content:"▾";margin-left:6px;color:var(--faint)}
+#live-map .map-manager-list-toggle[aria-expanded="true"]::after{content:"▴"}
+#live-map .map-manager-status{font-size:var(--fs-sm);color:var(--strong);overflow-wrap:anywhere}
+#live-map .map-manager-status[data-level="error"]{color:var(--bad)}
+#live-map #mapManagerEditor .msb-input{width:180px}
+#live-map .map-cleanup-intro{margin:0 0 2px;color:var(--strong)}
 #live-map .map-manager-item{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:4px 6px 4px 10px;
   border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface)}
 #live-map .map-manager-item[data-current="true"]{border-color:var(--info);background:var(--info-w);box-shadow:inset 3px 0 0 var(--info)}
@@ -417,7 +424,14 @@ button{font-family:inherit;cursor:pointer}
 #live-map .map-manager-actions .msb-btn{min-height:26px;padding:0 9px}
 #live-map .map-manager-empty{padding:6px 2px;color:var(--muted);font-size:var(--fs)}
 /* 运动面板：方向按钮成组，执行按钮一律显式点击。 */
-#live-map .motion-pad .msb-btn{min-width:52px}
+/* 按键图示即控制按钮：按住移动，按下的键高亮。 */
+#live-map .motion-pad{display:grid;grid-template-columns:repeat(3,64px);gap:4px;flex:none}
+#live-map .motion-key{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;height:46px;padding:0;border:1px solid var(--line);
+  border-radius:var(--r-sm);background:var(--surface);color:var(--strong);font:inherit;font-size:var(--fs-sm);cursor:pointer;touch-action:none;user-select:none}
+#live-map .motion-key:hover{border-color:var(--ring)}
+#live-map .motion-key.is-active{background:var(--info-w);border-color:var(--info);color:var(--ink)}
+#live-map .motion-key kbd,#live-map .motion-settings kbd{font-family:var(--mono);font-size:var(--fs-xs);font-weight:700;padding:0 4px;border:1px solid var(--line);border-radius:4px;background:var(--inset)}
+#live-map .motion-settings{display:flex;flex-direction:column;align-items:flex-start;gap:6px;min-width:0}
 /* 状态行：当前结果在前，说明文字随后；空项不占位。 */
 .msb-status{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 14px;margin:0;color:var(--strong);font-size:var(--fs-sm);line-height:1.55;min-width:0}
 .msb-status>*{min-width:0;overflow-wrap:anywhere}

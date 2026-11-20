@@ -3,10 +3,14 @@
 use super::*;
 
 #[cfg(feature = "guard-runtime")]
-pub(crate) fn map_pose_owner(node: &TaskChannels, body_reference_frame_id: Arc<str>) -> NavStackResult<TaskThread> {
+pub(crate) fn map_pose_owner(
+    node: &TaskChannels,
+    body_reference_frame_id: Arc<str>,
+    lio_motion: Option<(bool, crate::map_pose::LioMotionSender)>,
+) -> NavStackResult<TaskThread> {
     let node = node.clone();
     spawn_task("map-pose-adapter", Box::new(move |shutdown, ready| {
-        Box::pin(run_map_pose_adapter(node, body_reference_frame_id, shutdown, ready))
+        Box::pin(run_map_pose_adapter(node, body_reference_frame_id, lio_motion, shutdown, ready))
     }))
 }
 
@@ -92,9 +96,13 @@ pub(super) async fn publish_map_pose_observation(
     transport: &LcmTransport,
     channel: &str,
     observed: crate::map_pose::MapPoseObservation,
+    motion: Option<&mut crate::map_pose::LioMotionEstimator>,
 ) -> NavStackResult<()> {
     let body = schema::encode_pose_stamped_body(&observed.pose)
         .map_err(|e| NavStackError::Internal(e.to_string()))?;
+    if let Some(motion) = motion {
+        motion.observe(observed.odometry);
+    }
     publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await
 }
 
@@ -113,6 +121,7 @@ pub(super) fn bound_map_pose_adapter(
 pub(super) async fn run_map_pose_adapter(
     node: TaskChannels,
     body_reference_frame_id: Arc<str>,
+    lio_motion: Option<(bool, crate::map_pose::LioMotionSender)>,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -132,6 +141,12 @@ pub(super) async fn run_map_pose_adapter(
     )?;
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut pending_odometry: Option<Box<schema::Odometry>> = None;
+    let mut motion = match lio_motion {
+        Some((native_twist, output)) => Some(crate::map_pose::LioMotionEstimator::new(
+            native_twist, configured_pose_source_max_age()?, body_reference_frame_id, output,
+        )),
+        None => None,
+    };
     signal_ready(ready)?;
 
     loop {
@@ -172,7 +187,7 @@ pub(super) async fn run_map_pose_adapter(
                 }
                 if let Some(observed) = newest {
                     publish_map_pose_observation(&transport, &node.outputs[0],
-                        observed).await?;
+                        observed, motion.as_mut()).await?;
                 }
             }
             message = odometry.next() => {
@@ -195,7 +210,7 @@ pub(super) async fn run_map_pose_adapter(
                 }
                 if let Some(observed) = newest {
                     publish_map_pose_observation(&transport, &node.outputs[0],
-                        observed).await?;
+                        observed, motion.as_mut()).await?;
                 }
             }
         }

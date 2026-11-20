@@ -10,6 +10,7 @@ import re
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -285,6 +286,29 @@ def system_helper(action, payload=None):
                        environment=environment, payload=json.dumps(payload or {}), timeout=1800)
 
 
+def _correct_clock_after_start(process, clock_offset, previous_offset_inode):
+    deadline = time.monotonic() + 15
+    try:
+        record = clock_offset.open("rb")
+    except FileNotFoundError:
+        return
+    with record:
+        # 固定为本次监督者创建的记录，避免读到前次或后次启动的钟差。
+        fd = record.fileno()
+        if os.fstat(fd).st_ino == previous_offset_inode:
+            return
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            offset_ns, = struct.unpack("@q", os.pread(fd, 8, 0))
+            if offset_ns:
+                if abs(offset_ns) >= 2_000_000_000:
+                    system_helper("set-system-time", {"unix_ns": time.time_ns() + offset_ns})
+                return
+            time.sleep(min(0.1, remaining))
+
+
 class Runtime:
     def __init__(self, home, manager_home=None):
         self.home = home
@@ -371,6 +395,8 @@ class Runtime:
         values = probe(prefix, "effective")
         if values["transport.real_lcm_required"] and Path("/usr/local/libexec/neh-system-helper").is_file():
             system_helper("prepare-network", {"url": values["transport.lcm_url"]})
+        clock_offset = self.home / "run/device_clock_offset"
+        previous_offset_inode = clock_offset.stat().st_ino if clock_offset.exists() else None
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:
@@ -386,6 +412,9 @@ class Runtime:
                 raise ManagerError("start_failed", "业务监督者提前退出。", 500,
                                    log_diagnostic(self.home, self.home / "logs/runtime.log"))
             if self.status()["healthy"]:
+                # 管理任务标记完成后，工作进程仍需让后台校时结束。
+                threading.Thread(target=_correct_clock_after_start,
+                                 args=(process, clock_offset, previous_offset_inode), daemon=False).start()
                 return
             time.sleep(0.4)
         raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, self.diagnostic())

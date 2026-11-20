@@ -86,7 +86,11 @@ impl SurfaceMapHub {
 }
 
 /// 每个导航组合捕获一次配置并拥有私有共享通道。
-pub(crate) fn start_surface_tasks(topics: &crate::topics::NavigationTopics, body: Arc<str>) -> NavStackResult<Vec<TaskThread>> {
+pub(crate) fn start_surface_tasks(
+    topics: &crate::topics::NavigationTopics,
+    body: Arc<str>,
+    lio_motion: Option<crate::map_pose::LioMotionReceiver>,
+) -> NavStackResult<Vec<TaskThread>> {
     let config = SurfaceNavigationConfig::from_runtime()?;
     let hub = SurfaceMapHub::new(body);
     let planner = topics.planner(crate::ProductionPipeline::Lio3D);
@@ -97,7 +101,7 @@ pub(crate) fn start_surface_tasks(topics: &crate::topics::NavigationTopics, body
         Box::pin(run_surface_planner(planner, planner_hub, planner_config, shutdown, ready))
     }))?];
     tasks.push(spawn_task("surface-nav-scheduler", Box::new(move |shutdown, ready| {
-        Box::pin(run_surface_scheduler(scheduler, hub, config, shutdown, ready))
+        Box::pin(run_surface_scheduler(scheduler, hub, config, lio_motion, shutdown, ready))
     }))?);
     Ok(tasks)
 }
@@ -106,13 +110,14 @@ async fn run_surface_scheduler(
     node: TaskChannels,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
+    lio_motion: Option<crate::map_pose::LioMotionReceiver>,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
     let transport = lcm_transport()?;
     let socket = nuwax_nav_runtime::motion_guard_socket_path();
     let scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
-    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
+    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), lio_motion, async move {
         nuwax_nav_runtime::spawn_production_surface_scheduler(
             socket,
             scheduler_config,
@@ -131,6 +136,7 @@ async fn run_surface_scheduler_with_transport<F>(
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
     recent_source_max_age: Option<Duration>,
+    lio_motion: Option<crate::map_pose::LioMotionReceiver>,
     create_scheduler: F,
 ) -> NavStackResult<()>
 where
@@ -183,7 +189,7 @@ where
         #[allow(unreachable_code)] Ok::<(),NavStackError>(())
     };
     signal_ready(ready)?;
-    let execution_loop = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, maps, cancels, status, Some(source_max_age), false, &hub.body_reference_frame_id, recent_source_max_age);
+    let execution_loop = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, maps, cancels, status, Some(source_max_age), false, &hub.body_reference_frame_id, recent_source_max_age, lio_motion);
     let loop_future=async {tokio::select! {
         result=execution_loop=>result,
         result=diagnostic_loop=>result,
@@ -1841,7 +1847,7 @@ goal: schema::PoseStamped {
             let executor = spawn_task(
                 "surface-real-lcm-test-executor",
                 Box::new(move |shutdown, ready| {
-                    Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
+                    Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), None, async move {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
                             let mut local = crate::static_map_follower(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(

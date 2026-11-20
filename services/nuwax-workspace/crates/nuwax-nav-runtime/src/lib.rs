@@ -664,6 +664,7 @@ pub struct NavScheduler<M, P> {
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     path_wait_started_at: Option<clock::Instant>,
     latest_pose: Option<PoseStamped>,
+    lio_measured_motion: Option<MeasuredMotion>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_source_max_age: Option<Duration>,
     obstacle_source_available: bool,
@@ -705,6 +706,7 @@ where
             current_execution_identity: None,
             path_wait_started_at: None,
             latest_pose: None,
+            lio_measured_motion: None,
             pose_receipt: None,
             pose_source_max_age: None,
             obstacle_source_available: true,
@@ -740,7 +742,7 @@ where
                 }}=>match event{
                     SchedulerEvent::Input(command)=>match command{Some(command)=>self.handle_input(&status_tx,command).await,None=>input_open=false},
                     SchedulerEvent::Tick=>{
-                        self.planner.observe_measured_motion(self.motion.measured_motion());
+                        self.refresh_measured_motion();
                         if let Err(error)=self.session_tick(&status_tx).await{
                             if !self.lease_active&&self.session.is_none(){continue;}
                             self.status.motion_sink_ready=false;self.publish_status(&status_tx);return Err(error);
@@ -809,7 +811,15 @@ where
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
-            InputKind::UpdateOdometry(odometry, maximum) => self.observe_odometry(status_tx,odometry,maximum),
+            InputKind::UpdateOdometry(odometry, maximum, measured) => {
+                self.observe_odometry(status_tx, odometry, maximum).map(|()| {
+                    let update = self.lio_measured_motion.is_some() || measured.is_some();
+                    self.lio_measured_motion = measured;
+                    if update {
+                        self.refresh_measured_motion();
+                    }
+                })
+            }
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
@@ -881,6 +891,12 @@ where
         Ok(())
     }
 
+    fn refresh_measured_motion(&mut self) {
+        let measured = self.motion.measured_motion().filter(MeasuredMotion::is_current)
+            .or_else(|| self.lio_measured_motion.as_ref().filter(|motion| motion.is_current()).cloned());
+        self.planner.observe_measured_motion(measured);
+    }
+
     fn observe_costmap(
         &mut self,
         _status_tx: &watch::Sender<SchedulerStatus>,
@@ -949,8 +965,7 @@ where
             return Err(self.fail_closed(status_tx, error).await);
         }
         self.planner.configure_boundary(&session.boundary);
-        self.planner
-            .observe_measured_motion(self.motion.measured_motion());
+        self.refresh_measured_motion();
         self.current_path = None;
         self.current_execution_identity = None;
         self.current_route_kind = RouteKind::Complete;
@@ -1203,7 +1218,7 @@ where
     async fn apply_controller_twist(&mut self,status_tx:&watch::Sender<SchedulerStatus>,twist:Twist2)->Result<(),RuntimeError>{
         if let Err(error)=self.motion.velocity(twist).await{return Err(self.motion_failed(status_tx,error).await);}
         self.status.applied_commands+=1;self.status.last_applied_twist=Some(twist);
-        self.planner.observe_measured_motion(self.motion.measured_motion());self.planner.observe_applied_command(twist);
+        self.refresh_measured_motion();self.planner.observe_applied_command(twist);
         if twist!=Twist2::ZERO{self.path_wait_started_at=None;}
         else{self.path_wait_started_at.get_or_insert_with(clock::Instant::now);}
         if let Some(feedback)=&mut self.status.surface_replan_feedback{
@@ -1267,7 +1282,7 @@ where
                 self.acquire_session(status_tx).await?;
             }
             // 控制态与等待路线态都在当拍读取测速，不能用上一拍的停稳结论收尾。
-            self.planner.observe_measured_motion(self.motion.measured_motion());
+            self.refresh_measured_motion();
             if self.status.phase == SchedulerPhase::Controlling {
                 self.control_tick(status_tx).await?;
             } else {
@@ -1555,7 +1570,7 @@ impl NavSchedulerHandle {
 
     /// 同进程当前观察入口；调用时刻保留至队列消费，传输来源须用采集时刻入口。
     pub async fn update_odometry(&self, odometry: PoseStamped) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, None))
+        self.send_input(InputKind::UpdateOdometry(odometry, None, None))
             .await
     }
 
@@ -1569,8 +1584,17 @@ impl NavSchedulerHandle {
         odometry: PoseStamped,
         max_source_age: Duration,
     ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, Some(max_source_age)))
-            .await
+        self.update_odometry_with_lio_motion(odometry, max_source_age, None).await
+    }
+
+    /// 将来源时刻与位姿一致的 LIO 实测随导航位姿一起交付。
+    pub async fn update_odometry_with_lio_motion(
+        &self,
+        odometry: PoseStamped,
+        max_source_age: Duration,
+        measured: Option<MeasuredMotion>,
+    ) -> Result<(), RuntimeError> {
+        self.send_input(InputKind::UpdateOdometry(odometry, Some(max_source_age), measured)).await
     }
 
     /// Update the planner costmap with its real revision and source timestamp.
@@ -1783,7 +1807,7 @@ struct InputCommand {
 enum InputKind {
     StartSession(NavSession),
     SubmitPath(VersionedPath),
-    UpdateOdometry(PoseStamped, Option<Duration>),
+    UpdateOdometry(PoseStamped, Option<Duration>, Option<MeasuredMotion>),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<Option<Arc<RegisteredFrame>>>),
     PlanningDiagnostic(String, GoalKey, String, bool, bool),
@@ -2374,23 +2398,37 @@ mod tests {
 
     #[tokio::test]
     async fn n6_goal_without_path_turns_or_escapes_and_keeps_collision_checks() {
-        for blocked in [false, true] {
+        for (blocked, lio_fallback) in [(false, false), (true, false), (true, true)] {
             let (config, source) = crate::native_test_helpers::fixture();
             let source = if blocked {
                 Arc::new(source.with_recent_obstacle_points(1, 1, 0, &[],
                     [(0, [0.5, 1., 0.5])]).unwrap())
             } else { source };
+            let measured = || crate::motion_feedback::tests::measured([0.; 3], [0.; 3]);
+            let guard = Arc::new(Mutex::new(FakeMotionState {
+                measured: (!lio_fallback).then(measured),
+                ..Default::default()
+            }));
             let mut scheduler = NavScheduler::new(
-                FakeMotion(Arc::new(Mutex::new(FakeMotionState {
-                    measured: Some(crate::motion_feedback::tests::measured([0.;3],[0.;3])),
-                    ..Default::default()
-                }))),
+                FakeMotion(guard.clone()),
                 crate::native_test_helpers::author_static_map_follower(config),
                 SchedulerConfig::default()).unwrap();
             let (status, _) = watch::channel(scheduler.status.clone());
             let mut pose = map_pose();
             pose.pose.position = nuwax_nav_types_messages::Point3::new(0.5, 1., 0.5);
-            scheduler.observe_odometry(&status, pose.clone(), None).unwrap();
+            if lio_fallback {
+                pose.stamp.nanos = clock::source_now_ns() as i64;
+                let mut lio = measured();
+                lio.source_id = "lio:pointlio".into();
+                lio.source_timestamp_ns = pose.stamp.nanos as u64;
+                let (reply, received) = oneshot::channel();
+                scheduler.handle_input(&status, InputCommand {
+                    kind: InputKind::UpdateOdometry(pose.clone(), Some(Duration::from_secs(1)), Some(lio)), reply,
+                }).await;
+                received.await.unwrap().unwrap();
+            } else {
+                scheduler.observe_odometry(&status, pose.clone(), None).unwrap();
+            }
             scheduler.observe_costmap(&status, CostmapObservation {
                 costmap: ExecutionMap::Surface(source), source_timestamp_ns: 1,
             }, Instant::now()).unwrap();
@@ -2422,6 +2460,23 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             assert!(acted, "自由位置执行末端转向；实体占据执行经证明的脱困");
+            if lio_fallback {
+                assert!(guard.lock().unwrap().measured.is_none());
+                let boundary = scheduler.planner.measured_boundary().unwrap();
+                assert_eq!(boundary.source_id.as_deref(), Some("lio:pointlio"));
+                let state = nuwax_nav_scan_native::MotionState {
+                    velocity: boundary.velocity.unwrap(),
+                    yaw_rate: boundary.yaw_rate.unwrap(),
+                    measured_velocity: u32::from(boundary.velocity.is_some()),
+                    measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
+                    ..Default::default()
+                };
+                assert!(state.stopped(), "原生停稳门槛接受 LIO 的实测零速");
+                guard.lock().unwrap().measured = Some(measured());
+                scheduler.refresh_measured_motion();
+                let context = scheduler.planner.refresh_execution_context(Twist2::ZERO).unwrap();
+                assert_eq!(context.measured_motion.as_ref().unwrap().source_id, "test:actual-state");
+            }
             if !blocked {
                 target.stamp.nanos += 50_000_000;
                 scheduler.observe_odometry(&status, target, None).unwrap();

@@ -92,6 +92,91 @@ fn frame_ids_semantically_equal(left: &str, right: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MapPoseObservation {
     pub(crate) pose: schema::PoseStamped,
+    pub(crate) odometry: OdometryMotionSample,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OdometryMotionSample {
+    pub(crate) source_timestamp_ns: i64,
+    pub(crate) frame_id: String,
+    pub(crate) position: [f64; 3],
+    pub(crate) orientation_xyzw: [f64; 4],
+    pub(crate) twist: Option<([f64; 3], [f64; 3])>,
+}
+
+#[cfg(feature = "guard-runtime")]
+pub(crate) type LioMotionSender = tokio::sync::watch::Sender<Option<nuwax_nav_runtime::MeasuredMotion>>;
+#[cfg(feature = "guard-runtime")]
+pub(crate) type LioMotionReceiver = tokio::sync::watch::Receiver<Option<nuwax_nav_runtime::MeasuredMotion>>;
+
+#[cfg(feature = "guard-runtime")]
+pub(crate) struct LioMotionEstimator {
+    native_twist: bool,
+    source_max_age: std::time::Duration,
+    body_frame: std::sync::Arc<str>,
+    previous: Option<OdometryMotionSample>,
+    output: LioMotionSender,
+}
+
+#[cfg(feature = "guard-runtime")]
+impl LioMotionEstimator {
+    pub(crate) fn new(
+        native_twist: bool,
+        source_max_age: std::time::Duration,
+        body_frame: std::sync::Arc<str>,
+        output: LioMotionSender,
+    ) -> Self {
+        Self { native_twist, source_max_age, body_frame, previous: None, output }
+    }
+
+    pub(crate) fn observe(&mut self, sample: OdometryMotionSample) {
+        use nuwax_nav_types_messages::clock;
+
+        let native = self.native_twist.then_some(sample.twist).flatten();
+        let source_ns = sample.source_timestamp_ns;
+        let previous = self.previous.as_ref().filter(|old| old.frame_id == sample.frame_id);
+        // 同拍的 TF 与里程计可能重复送达；位姿消息不抹去同拍的原生测速。
+        if native.is_none() && previous.is_some_and(|old| old.source_timestamp_ns == source_ns) {
+            return;
+        }
+        let orientation = sample.orientation_xyzw;
+        let velocity = native.or_else(|| {
+            let old = previous?;
+            let delta_ns = source_ns - old.source_timestamp_ns;
+            if delta_ns <= 0 {
+                return None;
+            }
+            let seconds = delta_ns as f64 * 1e-9;
+            let linear = std::array::from_fn(|i| (sample.position[i] - old.position[i]) / seconds);
+            let [x, y, z, w] = old.orientation_xyzw;
+            let delta = multiply_quaternion([-x, -y, -z, w], orientation);
+            let sin_half = delta[0].hypot(delta[1]).hypot(delta[2]);
+            let sign = if delta[3] < 0. { -1. } else { 1. };
+            let scale = if sin_half > 0. {
+                sign * 2. * sin_half.atan2(delta[3].abs()) / (seconds * sin_half)
+            } else {
+                0.
+            };
+            Some((linear, [delta[0] * scale, delta[1] * scale, delta[2] * scale]))
+        });
+        self.previous = Some(sample);
+        self.output.send_replace(velocity.map(|(linear, angular)| {
+            let [x, y, z, w] = orientation;
+            let received = clock::monotonic_ns();
+            let age = std::time::Duration::from_nanos(clock::source_now_ns().saturating_sub(source_ns as u64));
+            let remaining = self.source_max_age.saturating_sub(age);
+            nuwax_nav_runtime::MeasuredMotion {
+                source_id: if native.is_some() { "lio:pointlio" } else { "lio:pose_difference" }.into(),
+                source_timestamp_ns: source_ns as u64,
+                received_monotonic_ns: received,
+                valid_until_monotonic_ns: received + remaining.as_nanos() as u64,
+                frame_id: self.body_frame.to_string(),
+                body_linear_xyz: rotate_vector([-x, -y, -z, w], linear),
+                body_angular_xyz: angular,
+                orientation_wxyz: Some([w, x, y, z]),
+            }
+        }));
+    }
 }
 
 /// Result of consuming one TF message. A coherent canonical chain can carry a
@@ -291,6 +376,13 @@ impl MapPoseAdapter {
                             orientation_xyzw,
                         },
                     },
+                    odometry: OdometryMotionSample {
+                        source_timestamp_ns: odom_timestamp_ns,
+                        frame_id: odom_to_base.header.frame_id.clone(),
+                        position: odom_to_base.transform.translation,
+                        orientation_xyzw: odom_rotation,
+                        twist: None,
+                    },
                 })
             })
             .transpose()?;
@@ -318,6 +410,13 @@ impl MapPoseAdapter {
         let odom_rotation =
             normalize_quaternion(odometry.pose.orientation_xyzw, "odometry.pose.rotation")?;
         let odometry_timestamp_ns = header_timestamp_ns(&odometry.header, "odometry.header")?;
+        let motion = OdometryMotionSample {
+            source_timestamp_ns: odometry_timestamp_ns,
+            frame_id: odometry.header.frame_id.clone(),
+            position: odometry.pose.position,
+            orientation_xyzw: odom_rotation,
+            twist: Some((odometry.twist_linear, odometry.twist_angular)),
+        };
 
         if frame_ids_semantically_equal(&odometry.header.frame_id, &self.map_frame) {
             let mut header = odometry.header.clone();
@@ -330,6 +429,7 @@ impl MapPoseAdapter {
                         orientation_xyzw: odom_rotation,
                     },
                 },
+                odometry: motion,
             }));
         }
         if !frame_ids_semantically_equal(&odometry.header.frame_id, &self.odom_frame) {
@@ -372,6 +472,7 @@ impl MapPoseAdapter {
                     orientation_xyzw,
                 },
             },
+            odometry: motion,
         }))
     }
 }
@@ -440,6 +541,53 @@ mod tests {
     use nuwax_codec::lcm::schema;
 
     use super::*;
+
+    #[cfg(feature = "guard-runtime")]
+    #[test]
+    fn lio_motion_uses_native_twist_or_derives_from_source_pose() {
+        use nuwax_nav_types_messages::clock;
+        use std::time::Duration;
+
+        let (sender, output) = tokio::sync::watch::channel(None);
+        let start = clock::source_now_ns() as i64;
+        let mut sample = OdometryMotionSample {
+            source_timestamp_ns: start,
+            frame_id: "odom".into(),
+            position: [0.; 3],
+            orientation_xyzw: [0., 0., std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2],
+            twist: Some(([0., 1., 0.], [0., 0., 0.25])),
+        };
+        let mut estimator = LioMotionEstimator::new(true, Duration::from_millis(500), "base_link".into(), sender);
+        estimator.observe(sample.clone());
+        let native = output.borrow().as_ref().unwrap().clone();
+        assert!(native.is_current());
+        assert_eq!(native.source_id, "lio:pointlio");
+        assert!((native.body_linear_xyz[0] - 1.).abs() < 1e-12);
+        assert!(native.body_linear_xyz[1].abs() < 1e-12);
+        assert_eq!(native.body_angular_xyz, [0., 0., 0.25]);
+
+        sample.twist = None;
+        estimator.observe(sample.clone());
+        assert_eq!(output.borrow().as_ref(), Some(&native));
+        sample.source_timestamp_ns += 100_000_000;
+        sample.position[1] += 0.1;
+        estimator.observe(sample.clone());
+        let difference = output.borrow().as_ref().unwrap().clone();
+        assert_eq!(difference.source_id, "lio:pose_difference");
+        assert!((difference.body_linear_xyz[0] - 1.).abs() < 1e-12);
+
+        sample.source_timestamp_ns += 100_000_000;
+        let half = (std::f64::consts::FRAC_PI_2 + 0.05) / 2.;
+        // 四元数的等价反号不能使差分误跨一圈。
+        sample.orientation_xyzw = [0., 0., -half.sin(), -half.cos()];
+        estimator.observe(sample.clone());
+        assert!((output.borrow().as_ref().unwrap().body_angular_xyz[2] - 0.5).abs() < 1e-12);
+        sample.source_timestamp_ns += 100_000_000;
+        estimator.observe(sample);
+        let stopped = output.borrow().as_ref().unwrap().clone();
+        assert_eq!(stopped.body_linear_xyz, [0.; 3]);
+        assert_eq!(stopped.body_angular_xyz, [0.; 3]);
+    }
 
     fn odometry(frame: &str, child: &str, x: f64, y: f64) -> schema::Odometry {
         schema::Odometry {

@@ -2577,6 +2577,18 @@ apply = "restart"
 panel = "导航与探索"
 category = "局部规划"
 
+[navigation.local_planner]
+type = "string"
+default = "sampling"
+choices = ["sampling", "scan"]
+description = "三维局部执行。sampling 采用采样控制，适合传感器噪声较大、低速的平台；scan 使用样条局部规划，适合高质量雷达与准确速度反馈的平台。"
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.local_planner",
+]
+apply = "restart"
+panel = "导航与探索"
+category = "局部规划"
+
 [navigation.obstacle_clearance_m]
 type = "float"
 min = 0.0

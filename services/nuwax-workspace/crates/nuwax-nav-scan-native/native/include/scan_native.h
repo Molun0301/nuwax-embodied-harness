@@ -80,6 +80,11 @@ void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void 
     const ScanState *state,const double previous_command[3],double terminal_yaw,const double *terminal_position,ScanTrackOutput *output,ScanOutput *recovery,
     char *error,size_t error_capacity,CollisionEvidence *evidence);
 void nuwax_scan_free(ScanOutput *output);
+/* 单次绑定快照的真实机身批量查询。 */
+typedef struct { double clearance, depth; int32_t occupied; } ScanBodySample;
+void nuwax_scan_sample_poses(const void *snapshot,const ScanConfig *config,const double *poses,size_t count,
+    ScanBodySample *output,CollisionEvidence *evidence,uint32_t measure_clearance);
+double nuwax_scan_clearance_speed_cap(const ScanConfig *config,double clearance);
 #ifdef __cplusplus
 }
 #endif

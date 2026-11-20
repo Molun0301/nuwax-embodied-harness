@@ -65,6 +65,7 @@ impl SurfaceNavigationConfig {
                 .map_err(NavStackError::InvalidConfig)?,
         ));
         config.follower.scan.planning_horizon = n.local_horizon_m;
+        config.follower.local_planner = n.local_planner;
         config.follower.terminal_stall_timeout_sec = n.terminal_stall_timeout_sec;
         if d.actuator_max_linear_mps > 0.0 {
             let limit = d.actuator_max_linear_mps;

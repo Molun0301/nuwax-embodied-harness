@@ -19,6 +19,24 @@ pub fn position_within_tolerance(position: [f64; 3], goal: [f64; 3], tolerance: 
     }
 }
 
+pub(super) fn orientation_within_tolerance(pose: &PoseStamped, goal: &PoseStamped, options: GoalOptions) -> bool {
+    if !options.requires_orientation() {
+        true
+    } else if options.yaw_tolerance_rad == 0. {
+        nuwax_nav_types_messages::same_finite_yaw(
+            pose.pose.orientation.yaw(),
+            goal.pose.orientation.yaw(),
+        )
+    } else {
+        nuwax_nav_astar::controllers::angle_diff(
+            goal.pose.orientation.yaw(),
+            pose.pose.orientation.yaw(),
+        )
+        .abs()
+            < options.yaw_tolerance_rad
+    }
+}
+
 /// 旧二维后端的前向兼容策略；原生 SCAN 不调用此函数。
 pub fn forward_navigation_kinematics(mut motion: MotionKinematics) -> MotionKinematics {
     if motion.model == nuwax_nav_types_messages::MotionModel::Omnidirectional {
@@ -33,6 +51,8 @@ pub fn forward_navigation_kinematics(mut motion: MotionKinematics) -> MotionKine
 /// SCAN 使用平台声明的前进、倒退、横移与转向通道，不提升物理能力。
 #[derive(Clone, Debug)]
 pub struct SurfaceFollowerConfig {
+    /// 启动时选定的三维局部执行器。
+    pub local_planner: nuwax_config::sections::SurfaceLocalPlanner,
     /// 原生局部搜索与样条配置，尺寸由地图真实机身覆盖。
     pub scan: nuwax_nav_scan_native::Config,
     /// 机体中心到地面的真实标定。
@@ -56,6 +76,7 @@ impl SurfaceFollowerConfig {
     /// 创建物理标定明确的三维执行配置。
     pub fn new(body_to_support_z_m: f64, obstacle_clearance_m: f64) -> Self {
         Self {
+            local_planner: Default::default(),
             scan: nuwax_nav_scan_native::Config {
                 resolution: 0.1,
                 body_length: 0.5,
@@ -101,6 +122,68 @@ impl SurfaceFollowerConfig {
             .as_ref()
             .map(MotionLimits::kinematics)
             .or(self.basic_kinematics)
+    }
+    pub(super) fn native_config(&self, map: &SurfaceSnapshot, options: GoalOptions, lateral: bool) -> nuwax_nav_scan_native::Config {
+        let mut config = self.scan;
+        config.resolution = map.navigation_source_columns(None).0;
+        config.body_to_ground = self.body_to_support_z_m;
+        config.sample_dt = 1. / self.controller.control_frequency;
+        config.max_velocity =
+            self.controller.speed * self.controller.nerf_speed.min(1.);
+        config.max_yaw_rate = self.max_angular_speed_rps;
+        config.max_yaw_acceleration = config.max_yaw_rate / config.sample_dt;
+        config.max_step_up = f64::from(map.config().step_threshold_m);
+        config.max_step_down = config.max_step_up;
+        config.max_slope = f64::from(map.config().max_slope_deg).to_radians();
+        if let Some(motion) = self.kinematics() {
+            config.min_executable_linear_mps = motion.min_executable_linear_mps;
+            config.min_executable_angular_rps = motion.min_executable_angular_rps;
+            config.max_velocity = config.max_velocity.min(motion.max_forward_mps);
+            config.max_reverse_velocity = if options.allow_reverse {
+                motion.max_reverse_mps.min(config.max_velocity)
+            } else {
+                0.
+            };
+            config.max_lateral_velocity = motion.max_lateral_mps.min(config.max_velocity);
+            config.max_yaw_rate = config.max_yaw_rate.min(motion.max_angular_rps);
+        }
+        if let Some(limits) = &self.motion_limits {
+            config.max_acceleration = limits
+                .linear_acceleration_mps2
+                .min(limits.guaranteed_braking_mps2);
+            config.max_yaw_acceleration = limits
+                .angular_acceleration_rps2
+                .min(limits.guaranteed_angular_braking_rps2);
+        }
+        if !lateral {
+            config.max_lateral_velocity = 0.;
+        }
+        if let Some(limits) = &self.command_limits {
+            let [forward, reverse, lateral, yaw] = limits.search_bounds(
+                config.max_velocity,
+                config.max_reverse_velocity,
+                config.max_lateral_velocity,
+                config.max_yaw_rate,
+            );
+            config.max_velocity = forward;
+            config.max_reverse_velocity = reverse;
+            config.max_lateral_velocity = lateral;
+            config.max_yaw_rate = yaw;
+        }
+        if let Some(body) = map.body_envelope() {
+            let bounds = crate::native_map::body_rectangle(body);
+            config.body_length = bounds[1][0] - bounds[0][0];
+            config.body_width = bounds[1][1] - bounds[0][1];
+            config.body_height = body.z_bounds_m[1] - body.z_bounds_m[0];
+            config.body_center_x = (bounds[0][0] + bounds[1][0]) * 0.5;
+            config.body_center_y = (bounds[0][1] + bounds[1][1]) * 0.5;
+            config.body_z_min = body.z_bounds_m[0];
+            config.body_z_max = body.z_bounds_m[1];
+            config.max_step_up = body.max_step_up_m;
+            config.max_step_down = body.max_step_down_m;
+            config.max_slope = body.max_cross_slope_deg.to_radians();
+        }
+        config
     }
 }
 use crate::local_workers::{
@@ -310,83 +393,13 @@ impl SurfaceFollower {
         let (Some(pose), Some(goal)) = (&self.odometry, &self.goal) else {
             return false;
         };
-        if !self.options.requires_orientation() {
-            true
-        } else if self.options.yaw_tolerance_rad == 0. {
-            nuwax_nav_types_messages::same_finite_yaw(
-                pose.pose.orientation.yaw(),
-                goal.pose.orientation.yaw(),
-            )
-        } else {
-            nuwax_nav_astar::controllers::angle_diff(
-                goal.pose.orientation.yaw(),
-                pose.pose.orientation.yaw(),
-            )
-            .abs()
-                < self.options.yaw_tolerance_rad
-        }
+        orientation_within_tolerance(pose, goal, self.options)
     }
     fn reached(&self) -> bool {
         self.position_reached() && self.orientation_reached()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
-        let mut config = self.config.scan;
-        config.resolution = map.navigation_source_columns(None).0;
-        config.body_to_ground = self.config.body_to_support_z_m;
-        config.sample_dt = 1. / self.config.controller.control_frequency;
-        config.max_velocity =
-            self.config.controller.speed * self.config.controller.nerf_speed.min(1.);
-        config.max_yaw_rate = self.config.max_angular_speed_rps;
-        config.max_yaw_acceleration = config.max_yaw_rate / config.sample_dt;
-        config.max_step_up = f64::from(map.config().step_threshold_m);
-        config.max_step_down = config.max_step_up;
-        config.max_slope = f64::from(map.config().max_slope_deg).to_radians();
-        if let Some(motion) = self.config.kinematics() {
-            config.min_executable_linear_mps = motion.min_executable_linear_mps;
-            config.min_executable_angular_rps = motion.min_executable_angular_rps;
-            config.max_velocity = config.max_velocity.min(motion.max_forward_mps);
-            config.max_reverse_velocity = if self.options.allow_reverse {
-                motion.max_reverse_mps.min(config.max_velocity)
-            } else {
-                0.
-            };
-            config.max_lateral_velocity = motion.max_lateral_mps.min(config.max_velocity);
-            config.max_yaw_rate = config.max_yaw_rate.min(motion.max_angular_rps);
-        }
-        if let Some(limits) = &self.config.motion_limits {
-            config.max_acceleration = limits
-                .linear_acceleration_mps2
-                .min(limits.guaranteed_braking_mps2);
-            config.max_yaw_acceleration = limits
-                .angular_acceleration_rps2
-                .min(limits.guaranteed_angular_braking_rps2);
-        }
-        if let Some(limits) = &self.config.command_limits {
-            let [forward, reverse, lateral, yaw] = limits.search_bounds(
-                config.max_velocity,
-                config.max_reverse_velocity,
-                config.max_lateral_velocity,
-                config.max_yaw_rate,
-            );
-            config.max_velocity = forward;
-            config.max_reverse_velocity = reverse;
-            config.max_lateral_velocity = lateral;
-            config.max_yaw_rate = yaw;
-        }
-        if let Some(body) = map.body_envelope() {
-            let bounds = crate::native_map::body_rectangle(body);
-            config.body_length = bounds[1][0] - bounds[0][0];
-            config.body_width = bounds[1][1] - bounds[0][1];
-            config.body_height = body.z_bounds_m[1] - body.z_bounds_m[0];
-            config.body_center_x = (bounds[0][0] + bounds[1][0]) * 0.5;
-            config.body_center_y = (bounds[0][1] + bounds[1][1]) * 0.5;
-            config.body_z_min = body.z_bounds_m[0];
-            config.body_z_max = body.z_bounds_m[1];
-            config.max_step_up = body.max_step_up_m;
-            config.max_step_down = body.max_step_down_m;
-            config.max_slope = body.max_cross_slope_deg.to_radians();
-        }
-        config
+        self.config.native_config(map, self.options, true)
     }
     fn submit_map(&self) {
         let (Some(source), Some(pose)) = (&self.map, &self.odometry) else {
@@ -430,7 +443,7 @@ impl SurfaceFollower {
         self.terminal_heading = 0.;
         self.terminal_progress = None;
     }
-    fn reference_to_stop(reference: &[[f64; 3]], stop: [f64; 3], half_width: f64) -> Vec<[f64; 3]> {
+    pub(super) fn reference_to_stop(reference: &[[f64; 3]], stop: [f64; 3], half_width: f64) -> Vec<[f64; 3]> {
         let keep = reference.iter().position(|point|
             (point[0] - stop[0]).hypot(point[1] - stop[1]) <= half_width
         ).map_or(reference.len(), |index| index.max(1));

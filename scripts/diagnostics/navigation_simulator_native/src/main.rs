@@ -1145,7 +1145,11 @@ impl Simulation {
         let planned_this_tick=self.plans!=previous_plans;
         let began = Instant::now();
         let step = if self.braking_for_replan || self.need_plan {
-            PlannerStep::Command(Twist2::ZERO)
+            if self.follower.uses_route_progress() {
+                self.follower.step_at_goal().unwrap_or(PlannerStep::Command(Twist2::ZERO))
+            } else {
+                PlannerStep::Command(Twist2::ZERO)
+            }
         } else {
             self.follower.step()
         };
@@ -1230,7 +1234,7 @@ impl Simulation {
             self.need_plan = true;
         }
         self.follower
-            .observe_applied_command(as_twist(self.applied));
+            .observe_simulated_command(as_twist(self.command), as_twist(self.applied));
         self.follower
             .update_odometry(stamped(self.current, self.time));
         self.follower.observe_measured_motion(Some(physics_motion(previous_body,self.current,self.applied,self.time)));
@@ -1241,9 +1245,10 @@ impl Simulation {
             let angle = (yaw(self.current) - yaw(self.goal) + std::f64::consts::PI)
                 .rem_euclid(std::f64::consts::TAU)
                 - std::f64::consts::PI;
-            if distance(self.current, self.goal) <= self.options.position_tolerance_m
-                && (!self.options.requires_orientation()
-                    || angle.abs() <= self.options.yaw_tolerance_rad)
+            if self.follower.sampled_goal_reached().unwrap_or_else(||
+                distance(self.current, self.goal) <= self.options.position_tolerance_m
+                    && (!self.options.requires_orientation()
+                        || angle.abs() <= self.options.yaw_tolerance_rad))
             {
                 self.status = "succeeded".into();
                 self.message = "到达目标并停稳".into();
@@ -1251,7 +1256,7 @@ impl Simulation {
                 self.need_plan = true;
             }
         }
-        self.pending_frames.push(json!({"t":self.time,"pose":pose4(self.current),"orientation":self.current.1,"command":self.command,"velocity":self.applied,"path_revision":self.plans,"status":self.status,"message":self.message,"control_ms":self.last_control_ms,"plan_ms":if planned_this_tick {self.last_plan_ms} else {0.0}}));
+        self.pending_frames.push(json!({"t":self.time,"pose":pose4(self.current),"orientation":self.current.1,"command":self.command,"velocity":self.applied,"path_revision":self.plans,"status":self.status,"message":self.message,"control_ms":self.last_control_ms,"lookahead_yaw_error":self.follower.lookahead_yaw_error(),"plan_ms":if planned_this_tick {self.last_plan_ms} else {0.0}}));
         Ok(())
     }
     fn state(&mut self, scene: &Scene) -> Value {

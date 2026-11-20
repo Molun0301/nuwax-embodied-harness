@@ -6,12 +6,13 @@ use nuwax_nav_types_messages::{Point2, Twist2};
 pub(crate) const PREDICTION_SECONDS: f64 = 1.5;
 const SAMPLE_SECONDS: f64 = 0.1;
 const PREDICTION_STEPS: usize = 15;
-const HEADING_LOOKAHEAD_M: f64 = 0.6;
-const PROJECTION_MARGIN_M: f64 = 0.5;
+const LOOKAHEAD_MIN_M: f64 = 0.6;
 const LINEAR_INTERVALS: usize = 4;
 const ANGULAR_INTERVALS: usize = 8;
 // 得分统一为等效米数，偏航按机身半长折算，净空差额按一米等于一米计。
 const CLEARANCE_WEIGHT: f64 = 1.0;
+// 同等走向的小速度差用少量代价区分。
+const UNUSED_SPEED_WEIGHT_M: f64 = 0.02;
 
 #[derive(Default)]
 pub(crate) struct Route {
@@ -62,53 +63,6 @@ impl Route {
         best
     }
 
-    /// 候选终点只投影到当前弧长之后、本次可达范围内的路线。
-    fn project_endpoint(&self, position: [f64; 4], start: f64, end: f64) -> (f64, [f64; 3]) {
-        let mut best = (start, self.point_at(start));
-        let mut distance = xy_distance_squared(best.1, position);
-        let first = self.arc.partition_point(|&s| s <= start).saturating_sub(1);
-        for index in first..self.points.len() - 1 {
-            let arc = self.arc[index];
-            if arc >= end {
-                break;
-            }
-            let length = self.arc[index + 1] - arc;
-            if length == 0. {
-                continue;
-            }
-            let a = self.points[index];
-            let b = self.points[index + 1];
-            let dx = b[0] - a[0];
-            let dy = b[1] - a[1];
-            let fraction = (((position[0] - a[0]) * dx + (position[1] - a[1]) * dy)
-                / (length * length))
-                .clamp(
-                    ((start - arc) / length).max(0.),
-                    ((end - arc) / length).min(1.),
-                );
-            let point = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * fraction);
-            let candidate = xy_distance_squared(point, position);
-            if candidate < distance {
-                distance = candidate;
-                best = (arc + fraction * length, point);
-            }
-        }
-        best
-    }
-
-    fn heading_at(&self, arc: f64, point: [f64; 3], from: [f64; 3]) -> f64 {
-        let forward = self.point_at(arc + HEADING_LOOKAHEAD_M);
-        let delta = [forward[0] - point[0], forward[1] - point[1]];
-        if delta != [0., 0.] {
-            return delta[1].atan2(delta[0]);
-        }
-        // 到达路线末点时以最后一个非零路段的方向延续。
-        if let Some(last) = self.points.iter().rev().find(|p| p[..2] != forward[..2]) {
-            return (forward[1] - last[1]).atan2(forward[0] - last[0]);
-        }
-        (forward[1] - from[1]).atan2(forward[0] - from[0])
-    }
-
     fn point_at(&self, distance: f64) -> [f64; 3] {
         let index = self.arc.partition_point(|&v| v <= distance);
         if index == self.arc.len() {
@@ -120,10 +74,6 @@ impl Route {
             self.points[before][i] + fraction * (self.points[index][i] - self.points[before][i])
         })
     }
-}
-
-fn xy_distance_squared(a: [f64; 3], b: [f64; 4]) -> f64 {
-    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
 }
 
 fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -199,9 +149,14 @@ impl Sampler {
         turn_to: Option<f64>,
     ) -> Option<Selection> {
         let (arc, nearest) = reference.nearest(position);
-        let end = (arc + config.max_velocity * PREDICTION_SECONDS + PROJECTION_MARGIN_M)
-            .min(reference.length());
-        let heading = turn_to.unwrap_or_else(|| reference.heading_at(arc, nearest, position));
+        let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * config.max_velocity);
+        let target = if turn_to.is_some() {
+            position
+        } else {
+            reference.point_at(arc + lookahead)
+        };
+        let delta = [target[0] - position[0], target[1] - position[1]];
+        let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
         self.yaw_error = Some(angle_delta(heading, yaw));
 
         let mut here = [BodySample::default()];
@@ -257,20 +212,15 @@ impl Sampler {
                 continue;
             }
             let endpoint = self.poses[(index + 1) * PREDICTION_STEPS - 1];
-            let score = if let Some(target_yaw) = turn_to {
-                angle_delta(target_yaw, endpoint[3]).abs()
-            } else {
-                let (projected_arc, projected) = reference.project_endpoint(endpoint, arc, end);
-                let route_heading = reference.heading_at(projected_arc, projected, position);
-                let clearance = samples
-                    .iter()
-                    .map(|s| s.clearance)
-                    .fold(f64::INFINITY, f64::min);
-                reference.length() - projected_arc
-                    + xy_distance_squared(projected, endpoint).sqrt()
-                    + config.body_length / 2. * angle_delta(route_heading, endpoint[3]).abs()
-                    + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
-            };
+            let clearance = samples
+                .iter()
+                .map(|sample| sample.clearance)
+                .fold(f64::INFINITY, f64::min);
+            let speed_fraction = v.abs() / config.max_velocity.max(config.max_reverse_velocity);
+            let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
+                + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
+                + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
+                + UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction);
             ranked.push(Candidate {
                 score,
                 same_turn: w * previous.angular_z > 0.,
@@ -393,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn along_route_progress_keeps_accelerating_past_the_old_speed_plateau() {
+    fn fixed_lookahead_keeps_accelerating_past_the_old_speed_plateau() {
         let (config, map) = fixture(&[]);
         let route = Route::new(vec![START, [7., 0., START[2]]]);
         let mut sampler = Sampler::default();
@@ -408,19 +358,6 @@ mod tests {
         }
         assert_eq!(twist.linear.x, config.max_velocity);
         assert_eq!(twist.angular_z, 0.);
-    }
-
-    #[test]
-    fn endpoint_projection_cannot_jump_to_a_later_fold() {
-        let route = Route::new(vec![
-            START,
-            [3., 0., START[2]],
-            [3., 0.1, START[2]],
-            [0., 0.1, START[2]],
-        ]);
-        let (arc, point) = route.project_endpoint([0.8, 0.1, START[2], 0.], 0.4, 2.4);
-        assert!((arc - 0.8).abs() < 1e-12);
-        assert!(squared_distance(point, [0.8, 0., START[2]]) < 1e-24);
     }
 
     #[test]

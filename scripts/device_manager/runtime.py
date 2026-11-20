@@ -10,6 +10,7 @@ import re
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -371,6 +372,8 @@ class Runtime:
         values = probe(prefix, "effective")
         if values["transport.real_lcm_required"] and Path("/usr/local/libexec/neh-system-helper").is_file():
             system_helper("prepare-network", {"url": values["transport.lcm_url"]})
+        clock_offset = self.home / "run/device_clock_offset"
+        previous_offset_inode = clock_offset.stat().st_ino if clock_offset.exists() else None
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:
@@ -386,6 +389,11 @@ class Runtime:
                 raise ManagerError("start_failed", "业务监督者提前退出。", 500,
                                    log_diagnostic(self.home, self.home / "logs/runtime.log"))
             if self.status()["healthy"]:
+                # 监督者为本次启动原子创建钟差记录，旧版本遗留的文件不参与设时。
+                if clock_offset.exists() and clock_offset.stat().st_ino != previous_offset_inode:
+                    offset_ns, = struct.unpack("@q", clock_offset.read_bytes())
+                    if abs(offset_ns) >= 2_000_000_000:
+                        system_helper("set-system-time", {"unix_ns": time.time_ns() + offset_ns})
                 return
             time.sleep(0.4)
         raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, self.diagnostic())

@@ -462,6 +462,7 @@ class Go2DirectDdsBridge:
         self._dds_input_timing: Dict[str, Deque[Dict[str, Any]]] = {}
         self._source_clock_offset_path = os.environ.get(clock.CLOCK_OFFSET_ENV)
         self._source_clock_windows: Dict[str, Deque[Tuple[float, int]]] = {}
+        self._source_clock_anchor: Optional[Tuple[float, int]] = None
         self._next_callback_id = 1
         self._direct_pose_ready = False
         self._direct_imu_ready = False
@@ -718,7 +719,7 @@ class Go2DirectDdsBridge:
             if not self._is_generation_active_locked(generation):
                 return
             if self._source_clock_offset_path:
-                self._observe_source_clock_locked(kind, read_returned, source_ns - received_wall_ns)
+                self._observe_source_clock_locked(kind, read_returned, received_wall_ns, source_ns - received_wall_ns)
             values["source_age_ms"] = (received_wall_ns + clock.source_clock_offset_ns() - source_ns) / 1_000_000
             buckets = self._dds_input_timing.setdefault(kind, deque(maxlen=10))
             second = int(completed)
@@ -731,7 +732,16 @@ class Go2DirectDdsBridge:
                 total, maximum, _last = bucket.get(name, (0.0, value, value))
                 bucket[name] = (total + value, max(maximum, value), value)
 
-    def _observe_source_clock_locked(self, kind, received_at, offset_ns):
+    def _observe_source_clock_locked(self, kind, received_at, received_wall_ns, offset_ns):
+        bias = received_wall_ns - round(received_at * 1_000_000_000)
+        anchor = self._source_clock_anchor
+        if anchor is not None and abs(bias - anchor[1]) > 1_000_000_000:
+            # 两路回调可以交错完成；旧墙钟下已收到的样本不能覆盖新窗口。
+            if received_at < anchor[0]:
+                return
+            self._source_clock_windows.clear()
+        if anchor is None or received_at >= anchor[0]:
+            self._source_clock_anchor = (received_at, bias)
         # 每种数据由同一个读取线程顺序交付，队首保存该源窗口内的最大钟差。
         window = self._source_clock_windows.setdefault(kind, deque())
         while window and window[-1][1] <= offset_ns:
@@ -858,6 +868,7 @@ class Go2DirectDdsBridge:
     def _invalidate_observations_locked(self, message: str) -> None:
         self._dds_input_timing.clear()
         self._source_clock_windows.clear()
+        self._source_clock_anchor = None
         self._latest_pose_from_dds = None
         self._latest_imu_state_from_dds = None
         self._latest_joint_snapshot = None

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 STATE = Path("/var/lib/neh-system-helper")
@@ -188,6 +189,15 @@ def atomic_json(path, value):
 
 
 def dispatch(action, payload):
+    if action == "set-system-time":
+        time.clock_settime_ns(time.CLOCK_REALTIME, payload["unix_ns"])
+        try:
+            result = run(["hwclock", "--systohc"], check=False, timeout=30)
+            if result.returncode:
+                print("写入硬件时钟失败：" + result.stdout.strip(), file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("写入硬件时钟失败：" + str(exc), file=sys.stderr)
+        return {"system_time_set": True}
     if action == "install-dependencies":
         return install_dependencies(payload)
     if action == "prepare-network":

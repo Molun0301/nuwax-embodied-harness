@@ -127,6 +127,13 @@ class LogIndexChecks(unittest.TestCase):
         self.assertNotEqual(before['entries'], after['entries'])
         self.assertTrue(after['has_more'])
 
+        options = {'log_dir': str(self.root), 'limit': 201, 'level': 'WARN'}
+        with patch.object(self.index, 'query', wraps=self.index.query) as history:
+            encoded, _ = protocol._render_log_response(str(self.log), options, None,
+                reader=history, recent_page=True)
+        history.assert_called_once_with(str(self.log), **options)
+        self.assertEqual(json.loads(encoded), protocol._scan_logs(str(self.log), **options))
+
     def test_json_rust_spans_and_legacy_text_formats_keep_exact_filter_semantics(self):
         rust = {'timestamp': '2026-10-02T04:00:01Z', 'level': 'INFO',
                 'fields': {'message': 'rust structured message', 'request_id': SECRET_A},

@@ -638,8 +638,9 @@ def _render_log_response(log_file, options, export_format, *, reader=None, recen
             ("before", "level", "source", "component", "query", "request_id", "task_id")):
         # 首屏只读各文件的末尾。历史翻页、筛选和导出仍走同一套持久索引。
         result = _scan_logs(log_file, **options, recent=True)
-    elif recent_page and export_format is None and not options.get("before") and (
-            options.get("level") or options.get("query")):
+    elif (recent_page and export_format is None and not options.get("before")
+          and options.get("limit", _LOG_CACHE_PAGE_SIZE) <= _LOG_CACHE_PAGE_SIZE
+          and (options.get("level") or options.get("query"))):
         # 首个筛选页精确扫描记录，并复用按文件维护的有界候选缓存。
         result = query_logs(log_file, **options, parallel=True)
     else:

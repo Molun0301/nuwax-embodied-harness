@@ -169,7 +169,12 @@ async fn reject_unchanged(
 async fn baseline_layouts_and_original_member_indices() {
     let (config, authority, terrain) = fixture();
     let (handle, task, calls) = scheduler(&config);
-    let points = [[0.51, 0.51, 0.55], [0.52, 0.52, 0.56], [0.75, 0.75, 0.55]];
+    let points = [
+        [0.51, 0.51, 0.55],
+        [0.52, 0.52, 0.56],
+        [0.75, 0.75, 0.55],
+        [0.62, 0.52, 0.56],
+    ];
     let mut reference = None;
     for (index, (mixed, big)) in [(false, false), (false, true), (true, false), (true, true)]
         .into_iter()
@@ -181,11 +186,11 @@ async fn baseline_layouts_and_original_member_indices() {
         p.ground_point_indices = vec![0, 2];
         if mixed {
             let cloud = &mut p.cloud.as_mut().unwrap();
-            cloud.height = 3;
+            cloud.height = points.len() as i32;
             cloud.width = 1;
             cloud.row_step = cloud.point_step;
         }
-        // Ground point 0 shares its cell with obstacle 1, so the cell stays a volume.
+        // 非地面点 1 和 3 同帧相邻。地面点 0 与点 1 同格，地面点 2 独立。
         let wire = recent_cloud::encode_body(&p).unwrap();
         let decoded = recent_cloud::decode_body(&wire).unwrap();
         let cloud = point_cloud_from_schema(decoded.cloud.unwrap()).unwrap();
@@ -195,14 +200,18 @@ async fn baseline_layouts_and_original_member_indices() {
             .await
             .unwrap();
         let seen = hints(state.snapshot.as_ref().unwrap());
-        assert_eq!(seen.len(), 2);
-        assert!(
-            seen.iter().any(|(a, b)| a != b),
-            "mixed ground/obstacle cell stays occupied"
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen.iter().filter(|(a, b)| a != b).count(),
+            2,
+            "混合格与相邻非地面格均保留占据"
         );
-        assert!(
-            seen.iter().any(|(a, b)| a == b),
-            "separate ground return preserves measured point"
+        let ground = &cloud.points[2];
+        let measured = [ground.x, ground.y, ground.z];
+        assert_eq!(
+            seen.iter().find(|(a, b)| a == b),
+            Some(&(measured, measured)),
+            "独立地面点保留原成员索引对应的坐标"
         );
         // f32 and f64 represent these coordinates differently; compare each result to
         // the same decoded scalars fed directly through the original builder.
@@ -335,9 +344,13 @@ async fn baseline_retention_and_session_reset() {
     for retain in [false, true] {
         let mut state = RecentSourceState::new(retain.then_some(Duration::from_secs(5)));
         state.attach_terrain(terrain.clone());
+        let points = [[0.52, 0.52, 0.55], [0.62, 0.52, 0.55]];
+        let mut p = packet(&points, 1, false, false);
+        p.ground_point_indices.clear();
+        // 用相同源时间验证八帧上限，避免墙钟时间影响窗口计数。
         for sequence in 1..=9 {
-            let mut p = packet(&[[0.5, 0.5, 0.55]], sequence, false, false);
-            p.ground_point_indices.clear();
+            p.sequence = sequence;
+            p.cloud.as_mut().unwrap().header.seq = sequence as i32;
             state
                 .consume(
                     &recent_cloud::encode_body(&p).unwrap(),
@@ -348,14 +361,29 @@ async fn baseline_retention_and_session_reset() {
                 .unwrap();
             assert_eq!(
                 hints(state.snapshot.as_ref().unwrap()).len(),
-                if retain {
+                2 * if retain {
                     (sequence as usize).min(8)
                 } else {
                     1
                 }
             );
         }
-        let mut p = packet(&[[0.5, 0.5, 0.55]], 1, false, false);
+        if retain {
+            p.sequence = 10;
+            let header = &mut p.cloud.as_mut().unwrap().header;
+            header.seq = 10;
+            header.stamp_sec += 6;
+            state
+                .consume(
+                    &recent_cloud::encode_body(&p).unwrap(),
+                    Some(&authority),
+                    &handle,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hints(state.snapshot.as_ref().unwrap()).len(), 2);
+        }
+        let mut p = packet(&[[1.52, 0.52, 0.55], [1.62, 0.52, 0.55]], 1, false, false);
         let replacement = GuardedMapAuthority {
             session_id: "recent-next-session".into(), ..authority.clone()
         };
@@ -369,7 +397,9 @@ async fn baseline_retention_and_session_reset() {
             )
             .await
             .unwrap();
-        assert_eq!(hints(state.snapshot.as_ref().unwrap()).len(), 1);
+        let seen = hints(state.snapshot.as_ref().unwrap());
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|(low, _)| low[0] > 1.0));
     }
     assert!(calls.lock().unwrap().is_empty());
     handle.shutdown().await.unwrap();

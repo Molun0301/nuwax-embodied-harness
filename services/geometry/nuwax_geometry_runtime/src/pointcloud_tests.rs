@@ -1,8 +1,16 @@
 use super::*;
 
+fn immediate_map(session_id: u64) -> CloudMap {
+    CloudMap::new(
+        session_id, None, None, &MappingConfirmationConfig::single_frame_for_test(),
+    ).unwrap()
+}
+
 #[test]
 fn building_ground_band_writes_only_nearby_ground_on_first_frame() {
-    let mut map = CloudMap::new(975, None, None).unwrap();
+    let mut map = CloudMap::new(
+        975, None, None, &MappingConfirmationConfig::go2_defaults_for_test(),
+    ).unwrap();
     let size = f64::from(VOXEL_SIZE);
     let mut points: Vec<_> = (-4..=4).flat_map(|x| {
         (-4..=4).map(move |y| Point3::new(
@@ -34,7 +42,7 @@ fn building_ground_band_writes_only_nearby_ground_on_first_frame() {
 
 #[test]
 fn building_ground_band_does_not_confirm_other_returns_in_same_cell() {
-    let mut updates = StructureUpdates::from_runtime().unwrap();
+    let mut updates = StructureUpdates::new(&MappingConfirmationConfig::go2_defaults_for_test());
     let points = [
         Point3::new(0.025, 0.025, 0.02),
         Point3::new(0.025, 0.025, 0.12),
@@ -62,7 +70,7 @@ fn building_ground_band_does_not_confirm_other_returns_in_same_cell() {
 
 #[test]
 fn dense_raw_retraction_keeps_using_free_evidence_for_unconfirmed_points() {
-    let mut map = CloudMap::new(976, None, None).unwrap();
+    let mut map = immediate_map(976);
     map.dense.append(&[Point3::new(0.15, 0.15, 0.15)]).unwrap();
     let before = map.dense.snapshot(1, 1, "稠密撤销").unwrap();
     assert_eq!(before.point_count, 1);
@@ -77,7 +85,7 @@ fn dense_raw_retraction_keeps_using_free_evidence_for_unconfirmed_points() {
 fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_continues() {
     for stage in ["open", "scan", "progress"] {
         let root = std::env::temp_dir().join(format!("g1-budget-{}", uuid::Uuid::new_v4()));
-        let mut map = CloudMap::new(940, None, None).unwrap();
+        let mut map = immediate_map(940);
         map.raw_directory = Some(root.clone());
         let mut frame = crate::mapper::tests::room_frame(940, 1_000_000_000);
         if stage != "open" {
@@ -112,7 +120,7 @@ fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_conti
 fn recording_keeps_other_io_errors_on_the_existing_failure_path() {
     let path = std::env::temp_dir().join(format!("g1-record-io-{}", uuid::Uuid::new_v4()));
     std::fs::write(&path, b"not a directory").unwrap();
-    let mut map = CloudMap::new(941, None, None).unwrap();
+    let mut map = immediate_map(941);
     map.raw_directory = Some(path.clone());
     let frame = crate::mapper::tests::room_frame(941, 1_000_000_000);
     assert!(map.record(1, &frame, Isometry3::identity()).is_err());
@@ -125,7 +133,7 @@ fn recording_keeps_other_io_errors_on_the_existing_failure_path() {
 #[test]
 fn streamed_replay_matches_the_old_sensor_concatenation_and_stable_sort() {
     use nuwax_cloud_cleanup::scan_log::ScanReader;
-    let mut map = CloudMap::new(944, None, None).unwrap();
+    let mut map = immediate_map(944);
     for (index, (sensor, seconds)) in [
         ("主", 3), ("副", 2), ("主", 6), ("副", 3), ("辅", 1),
         ("主", 9), ("副", 9), ("辅", 9),
@@ -161,11 +169,8 @@ fn streamed_replay_matches_the_old_sensor_concatenation_and_stable_sort() {
 fn display_removals_match_full_scan_for_every_frame() {
     let mut total_removed = 0;
     for size in [VOXEL_SIZE, VOXEL_SIZE * 2., VOXEL_SIZE * 4.] {
-        let mut map = CloudMap::new(931, None, None).unwrap();
+        let mut map = immediate_map(931);
         map.disable_recording();
-        // 此用例逐格核对撤销，使用一帧即可进入地图的确认参数。
-        map.structure_updates.min_frames = 1;
-        map.structure_updates.min_span_ns = 0;
         map.voxel_size = size;
         let transform = Isometry3::new(
             nalgebra::Vector3::new(0.37, -0.19, 0.08),
@@ -202,7 +207,7 @@ fn display_removals_match_full_scan_for_every_frame() {
 }
 #[test]
 fn dense_delta_returns_only_the_unread_surviving_tail() {
-    let mut map = CloudMap::new(41, None, None).unwrap();
+    let mut map = immediate_map(41);
     let old: Vec<_> = (0..8)
         .map(|i| Point3::new(i as f64 * 0.1, 0., 0.5))
         .collect();
@@ -274,7 +279,7 @@ fn synchronous_recording_selects_against_last_saved_frame_per_sensor_and_survive
     use nuwax_cloud_cleanup::scan_log::{SavePolicy, ScanReader};
     let root = std::env::temp_dir().join(format!("e7b-selected-scans-{}", uuid::Uuid::new_v4()));
     let policy = SavePolicy { translation_m: 0.1, rotation_deg: 3., interval_s: 1. };
-    let mut map = CloudMap::new(920, None, None).unwrap();
+    let mut map = immediate_map(920);
     map.raw_directory = Some(root.clone());
     map.save_policy = policy;
     let frame = |sensor: &str, stamp, x, yaw| MappingFrame {
@@ -295,7 +300,7 @@ fn synchronous_recording_selects_against_last_saved_frame_per_sensor_and_survive
     ] {
         map.record(sequence, &frame(sensor, stamp, x, yaw), Isometry3::identity()).unwrap();
     }
-    let mut replacement = CloudMap::new(920, None, None).unwrap();
+    let mut replacement = immediate_map(920);
     replacement.stamp = 2_400_000_000;
     replacement.save_policy = policy;
     replacement.adopt_publication(&mut map).unwrap();
@@ -315,7 +320,7 @@ fn synchronous_recording_selects_against_last_saved_frame_per_sensor_and_survive
 
 #[test]
 fn recorded_scan_keeps_the_first_body_point_in_each_five_centimeter_voxel() {
-    let mut map = CloudMap::new(959, None, None).unwrap();
+    let mut map = immediate_map(959);
     let mut frame = crate::mapper::tests::room_frame(959, 1_000_000_000);
     frame.points_body = vec![
         [0.011, 0.022, 0.033], [0.014, 0.024, 0.034],

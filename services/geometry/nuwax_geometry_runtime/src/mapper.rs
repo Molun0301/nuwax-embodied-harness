@@ -33,6 +33,37 @@ pub struct MappingFrame {
     pub registered_cloud: Option<nuwax_codec::lcm::schema::PointCloud2>,
 }
 #[derive(Clone, Debug)]
+pub struct MappingConfirmationConfig {
+    pub cell_m: f64,
+    pub frames: u32,
+    pub span_s: f64,
+    pub timeout_s: f64,
+    pub ground_band_m: f64,
+    pub standing_ground_z_m: f64,
+}
+#[cfg(test)]
+impl MappingConfirmationConfig {
+    pub(crate) fn go2_defaults_for_test() -> Self {
+        Self {
+            cell_m: 0.20,
+            frames: 5,
+            span_s: 1.0,
+            timeout_s: 10.0,
+            ground_band_m: 0.05,
+            standing_ground_z_m: -0.4122421636189938,
+        }
+    }
+
+    pub(crate) fn single_frame_for_test() -> Self {
+        Self {
+            frames: 1,
+            span_s: 0.,
+            ..Self::go2_defaults_for_test()
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MapperConfig {
     pub map_name: String,
     pub map_frame_id: String,
@@ -40,6 +71,7 @@ pub struct MapperConfig {
     pub base_frame_id: String,
     pub backend: MappingBackendSpec,
     pub compute: MappingBackendComputeConfig,
+    pub confirmation: MappingConfirmationConfig,
     pub correction_backend: String,
     pub cloudmap_shm_path: Option<PathBuf>,
 }
@@ -57,6 +89,7 @@ impl Default for MapperConfig {
                 initial_safe_radius_meters: 0.0,
                 window_capacity: 8_000_000,
             },
+            confirmation: MappingConfirmationConfig::single_frame_for_test(),
             correction_backend: "none".into(),
             cloudmap_shm_path: None,
         }
@@ -64,12 +97,13 @@ impl Default for MapperConfig {
 }
 impl MapperConfig {
     pub fn from_runtime() -> Result<Self, String> {
-        Self::from_config(nuwax_config::geometry()?, nuwax_config::robot()?)
-    }
-    pub fn from_config(
-        g: &nuwax_config::sections::Geometry,
-        r: &nuwax_config::sections::Robot,
-    ) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct StandingGround {
+            standing_ground_z_m: f64,
+        }
+        let g = nuwax_config::geometry()?;
+        let r = nuwax_config::robot()?;
+        let ground: StandingGround = nuwax_config::section("derived")?;
         let kind = match g.mapping_backend.as_str() {
             "voxel" => MappingBackendKind::Voxel,
             "raytracing" => MappingBackendKind::Raytracing,
@@ -91,6 +125,14 @@ impl MapperConfig {
                 resolution: g.mapping_resolution,
                 initial_safe_radius_meters: g.mapping_initial_safe_radius_meters as f32,
                 window_capacity: 8_000_000,
+            },
+            confirmation: MappingConfirmationConfig {
+                cell_m: g.mapping_confirmation_cell_m,
+                frames: g.mapping_confirmation_frames,
+                span_s: g.mapping_confirmation_span_s,
+                timeout_s: g.mapping_confirmation_timeout_s,
+                ground_band_m: g.mapping_confirmation_ground_band_m,
+                standing_ground_z_m: ground.standing_ground_z_m,
             },
             correction_backend: if planar {
                 "none".into()
@@ -562,6 +604,7 @@ impl Worker {
                 .as_deref()
                 .filter(|_| attach_shared),
             snapshot.as_ref().map(|s| s.cloud.clone()),
+            &config.confirmation,
         )
         .map_err(Status::unavailable)?;
         if let Some(snapshot) = snapshot.as_ref() {

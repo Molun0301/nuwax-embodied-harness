@@ -159,6 +159,53 @@ fn rejected_native_correction_stops_once_and_mapping_continues() {
 }
 
 #[test]
+fn default_confirmation_replays_the_same_votes_and_can_start_native_correction() {
+    let session = 977;
+    let config = MapperConfig {
+        confirmation: MappingConfirmationConfig::go2_defaults_for_test(),
+        correction_backend: "native_pgo".into(),
+        ..config()
+    };
+    let mut online = Worker::new(
+        session, config.clone(), None, false,
+        watch::channel(None).0, watch::channel(None).0, watch::channel(None).0,
+        watch::channel((Isometry3::identity(), 0)).0, watch::channel(None).0,
+        watch::channel(None).0, watch::channel(Ok(())).0, false,
+    ).unwrap();
+    let mut stopped = online.correction_stopped.subscribe();
+    let mut replay = Rebuilt::new(
+        session, config, PgoUpdate::constant_for_test(1_000_000_000, Isometry3::identity()),
+    ).unwrap();
+    let offsets = [0, 125_000_000, 250_000_000, 375_000_000, 500_000_000, 1_000_000_000];
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let stamp = 1_000_000_000 + offset;
+        // 逐帧移动 0.125 米，让现有录制策略保存每个输入，同时反复看到相同地图点。
+        let y = index as f64 * 0.125;
+        let mut frame = room_frame(session, stamp);
+        frame.odom_pose = pose_from_isometry(Isometry3::translation(0., y, 0.), "odom", stamp);
+        frame.points_body = [1.125, 1.375, 1.625].map(|x| [x, 0.125 - y, 0.125]).to_vec();
+        online.frame(frame).unwrap();
+        assert!(replay.replay(&online.cloud.replay_prefix().unwrap(), &stop).unwrap());
+        assert_eq!(replay.stamp, stamp);
+        let online_display = online.cloud.snapshot().display;
+        assert_eq!(online_display, replay.cloud.snapshot().display);
+        assert_eq!(online_display.is_empty(), index < offsets.len() - 1);
+        assert_eq!(online.grid.as_ref().map(|value| &value.grid.data),
+            replay.grid.as_ref().map(|value| &value.grid.data));
+        assert_eq!(online.grid.is_none(), index < offsets.len() - 1);
+    }
+    let started = Instant::now();
+    while !stopped.has_changed().unwrap() {
+        online.poll_correction();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    let reason = stopped.borrow_and_update();
+    assert!(reason.as_ref().unwrap().contains("原生PGO拒绝本帧："), "{reason:?}");
+}
+
+#[test]
 fn full_scan_budget_stops_correction_and_keeps_mapping_and_saving() {
     let mut worker = Worker::new(
         942, MapperConfig { correction_backend: "library_pgo".into(), ..config() }, None, false,
@@ -748,8 +795,7 @@ async fn building_ground_and_recent_are_immediate_on_start_and_resume() {
     async fn feed(mapper: &Mapper, session: u64, stamp: u64, x: f64) {
         let mut frame = room_frame(session, stamp);
         frame.odom_pose.position.as_mut().unwrap().x += x;
-        let derived: serde_json::Value = nuwax_config::section("derived").unwrap();
-        let ground_z = derived["standing_ground_z_m"].as_f64().unwrap();
+        let ground_z = mapper.config.confirmation.standing_ground_z_m;
         for point in &mut frame.points_body {
             point[2] += ground_z;
         }
@@ -767,14 +813,18 @@ async fn building_ground_and_recent_are_immediate_on_start_and_resume() {
         assert!(!surface.manifest().blocks.is_empty());
     }
 
-    let source = Mapper::start(76, config()).unwrap();
+    let config = MapperConfig {
+        confirmation: MappingConfirmationConfig::go2_defaults_for_test(),
+        ..config()
+    };
+    let source = Mapper::start(76, config.clone()).unwrap();
     feed(&source, 76, 1_000_000_000, 0.).await;
     let saved = source.snapshot().await.unwrap();
     assert!(saved.occupancy.is_some());
     assert!(!saved.cloud.display.is_empty());
     source.shutdown().await.unwrap();
 
-    let resumed = Mapper::load(77, config(), saved, false).unwrap();
+    let resumed = Mapper::load(77, config, saved, false).unwrap();
     feed(&resumed, 77, 3_000_000_000, 10.).await;
     let updated = resumed.snapshot().await.unwrap();
     assert_eq!(updated.occupancy.unwrap().meta.unwrap().timestamp_ns, 3_000_000_000);

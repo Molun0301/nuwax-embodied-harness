@@ -449,10 +449,15 @@ fn l6_keys(root: &nuwax_map_chunks::SealedMap) -> std::collections::BTreeSet<[i3
 }
 
 async fn l6_loaded_session(id: u64, root: std::path::PathBuf) -> super::super::Session {
-    use crate::mapper::MapperConfig;
+    use crate::mapper::{MapperConfig, MappingConfirmationConfig};
     use crate::proto::{LoadMapRequest, SaveMapRequest};
-    let mapper = Mapper::start(id, MapperConfig::default()).unwrap();
+    let config = MapperConfig {
+        confirmation: MappingConfirmationConfig::go2_defaults_for_test(),
+        ..MapperConfig::default()
+    };
+    let mapper = Mapper::start(id, config.clone()).unwrap();
     let mut session = super::super::tests::actor(mapper.clone(), root).await;
+    session.config = config;
     let start = super::super::now_ns().saturating_sub(1_000_000_000);
     for index in 0..5 {
         let input = l6_frame(id, start + index * 250_000_000, 0., 0., 0., None);

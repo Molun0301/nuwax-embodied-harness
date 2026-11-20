@@ -40,7 +40,7 @@ struct Corridor {
 /// 前两段按重放处理（每帧的证据坐标取该帧校正），第三段按采用新地图后的在线帧处理（取最新校正）。
 /// `corrected` 为假时证据始终留在原始里程计坐标，即旧做法，只作对照。
 fn run_corridor(drift: f64, corrected: bool) -> Corridor {
-    let mut map = CloudMap::new(961, None, None).unwrap();
+    let mut map = CloudMap::new(961, None, None, &MappingConfirmationConfig::single_frame_for_test()).unwrap();
     map.disable_recording();
     let mut counts = [(0usize, 0usize); 3];
     let mut flags = Vec::new();

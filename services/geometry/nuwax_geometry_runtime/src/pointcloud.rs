@@ -2,7 +2,10 @@
 use crate::{
     dense_cloud::{DenseCloud, DenseSnapshot},
     dynamic_backend::{MappedFrame, OnlineDufo},
-    mapper::{isometry_matrix, matrix_isometry, pose_from_isometry, pose_isometry, MappingFrame},
+    mapper::{
+        isometry_matrix, matrix_isometry, pose_from_isometry, pose_isometry,
+        MappingConfirmationConfig, MappingFrame,
+    },
     proto,
 };
 use ahash::AHashMap;
@@ -82,25 +85,19 @@ struct StructureCandidate {
 }
 
 impl StructureUpdates {
-    fn from_runtime() -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct StandingGround {
-            standing_ground_z_m: f64,
-        }
-        let geometry = nuwax_config::geometry()?;
-        let ground: StandingGround = nuwax_config::section("derived")?;
-        Ok(Self {
-            cell_voxels: (geometry.mapping_confirmation_cell_m / f64::from(VOXEL_SIZE)).round() as i32,
-            min_frames: geometry.mapping_confirmation_frames,
-            min_span_ns: (geometry.mapping_confirmation_span_s * 1e9) as u64,
-            timeout_ns: (geometry.mapping_confirmation_timeout_s * 1e9) as u64,
-            ground_band_m: geometry.mapping_confirmation_ground_band_m,
-            standing_ground_z_m: ground.standing_ground_z_m,
+    fn new(config: &MappingConfirmationConfig) -> Self {
+        Self {
+            cell_voxels: (config.cell_m / f64::from(VOXEL_SIZE)).round() as i32,
+            min_frames: config.frames,
+            min_span_ns: (config.span_s * 1e9) as u64,
+            timeout_ns: (config.timeout_s * 1e9) as u64,
+            ground_band_m: config.ground_band_m,
+            standing_ground_z_m: config.standing_ground_z_m,
             base: VoxelIndex::default(),
             candidates: AHashMap::new(),
             confirmed: VoxelIndex::default(),
             allowed: false,
-        })
+        }
     }
 
     fn expire(&mut self, stamp: u64) {
@@ -248,6 +245,7 @@ impl CloudMap {
         session_id: u64,
         shm_path: Option<&Path>,
         snapshot: Option<CloudSnapshot>,
+        confirmation: &MappingConfirmationConfig,
     ) -> Result<Self, String> {
         let mut fine = FineCloud::new(VOXEL_SIZE)?;
         let mut dense = DenseCloud::new()?;
@@ -338,7 +336,7 @@ impl CloudMap {
             recording_limit_reached: false,
             raw_directory: None,
             scan_classifier: None,
-            structure_updates: StructureUpdates::from_runtime()?,
+            structure_updates: StructureUpdates::new(confirmation),
             history_scans: Vec::new(),
             dirty: false,
         };

@@ -141,7 +141,7 @@ pub(super) struct Rebuilt {
 }
 impl Rebuilt {
     pub fn new(session_id: u64, config: MapperConfig, update: PgoUpdate) -> Result<Self, String> {
-        let mut cloud = CloudMap::new(session_id, None, None)?;
+        let mut cloud = CloudMap::new(session_id, None, None, &config.confirmation)?;
         cloud.disable_recording();
         Ok(Self { cloud, kernel: config.backend.into_kernel(config.compute.window_capacity),
             grid: None, stamp: 0, update, position: ReplayPosition::default(), config, sequence: 0,
@@ -211,7 +211,8 @@ mod tests {
     #[test]
     fn replay_shutdown_finishes_within_one_frame_and_pending_input_keeps_only_latest() {
         let frame = tests_frame(1_000_000_000);
-        let mut cloud = CloudMap::new(frame.session_id, None, None).unwrap();
+        let config = MapperConfig::default();
+        let mut cloud = CloudMap::new(frame.session_id, None, None, &config.confirmation).unwrap();
         for i in 1..=10 {
             let frame = tests_frame(i * 1_000_000_000);
             let points: Vec<_> = frame.points_body.iter().map(|p| Point3::from(*p)).collect();
@@ -220,7 +221,7 @@ mod tests {
         }
         let (corrector, _) = Corrector::scripted_for_test(vec![Ok(Some(PgoUpdate::constant_for_test(
             1_000_000_000, Isometry3::translation(0.2, 0., 0.))))]);
-        let mut worker = CorrectionWorker::start(frame.session_id, MapperConfig::default(), corrector).unwrap();
+        let mut worker = CorrectionWorker::start(frame.session_id, config, corrector).unwrap();
         *worker.inbox.probe.paused.lock() = true;
         worker.submit(CorrectionInput::new(&frame, &[], None, Isometry3::identity()));
         let Update::Correction(_, reply) = worker.updates.recv_timeout(Duration::from_secs(2)).unwrap() else { panic!() };

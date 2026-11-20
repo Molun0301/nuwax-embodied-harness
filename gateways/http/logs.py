@@ -565,9 +565,9 @@ class _LogQueryIndex:
                 except FileNotFoundError:
                     continue
         if pending:
-            count = min(len(pending), os.cpu_count() or 1, 24)
+            count = min(len(pending), os.cpu_count() or 1, 2)
             context = multiprocessing.get_context("fork")
-            with context.Pool(count) as pool:
+            with context.Pool(count, initializer=os.nice, initargs=(10,)) as pool:
                 for identity, index in zip(pending, pool.imap(_read_cold_log_file, pending.values())):
                     budget.retain(index.cache_bytes)
                     self.files[identity] = index

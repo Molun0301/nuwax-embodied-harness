@@ -55,7 +55,9 @@ def get_latest_perception(platform, args):
 
 
 def get_perception_runtime_status(platform, args):
-    return {"perception_runtime": platform.perception.video_runtime.get_status()}
+    # detection_enabled：本次启动时视觉识别（perception.yolo_world_enabled）是否开启；关闭时没有检测后端，开启连续识别也识别不了。
+    return {"perception_runtime": platform.perception.video_runtime.get_status(),
+            "detection_enabled": platform.config.perception.yolo_world.enabled}
 
 
 def start_perception_runtime(platform, args):

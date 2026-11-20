@@ -1037,10 +1037,5 @@ async function saveConfig() {
 window.nuwaxConsoleSettings = {
   open() { if (!configState.loaded) return loadConfigSchema(); },
   reload: loadConfigSchema,
-  // 跳到指定板块，例如视频卡片“去开启”跳到“视频与视觉识别”。
-  async focus(panel) {
-    await (configState.schemaPromise || loadConfigSchema());
-    document.getElementById("section-" + panel)?.scrollIntoView({ block: "start" });
-  },
 };
 })();

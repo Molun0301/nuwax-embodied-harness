@@ -870,29 +870,31 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 60.0) if requested_fps else 0.0
 
         async def frame_generator():
-            shm_path = "/tmp/nuwax_video.shm"
-            attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
-            last_sent_sequence = -1
-            next_frame_at = 0.0
-            try:
-                if not attached:
-                    return
-                while True:
-                    multipart, sequence = await _SHARED_MJPEG_SOURCE.wait_for_frame(last_sent_sequence)
-                    if multipart is None:
+            from services.perception.video_demand import video_consumer
+            with video_consumer():
+                shm_path = "/tmp/nuwax_video.shm"
+                attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
+                last_sent_sequence = -1
+                next_frame_at = 0.0
+                try:
+                    if not attached:
                         return
-                    remaining = next_frame_at - time.monotonic()
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        # 等待发送限额时只领取最新帧，不补发已经过时的候选。
-                        multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
-                    last_sent_sequence = sequence
-                    next_frame_at = time.monotonic() + frame_interval_sec
-                    yield multipart
-            finally:
-                if attached:
-                    # 读者退出由拥有方等待，不能阻塞网页事件循环。
-                    await _run_blocking(_SHARED_MJPEG_SOURCE.release)
+                    while True:
+                        multipart, sequence = await _SHARED_MJPEG_SOURCE.wait_for_frame(last_sent_sequence)
+                        if multipart is None:
+                            return
+                        remaining = next_frame_at - time.monotonic()
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                            # 等待发送限额时只领取最新帧，不补发已经过时的候选。
+                            multipart, sequence = _SHARED_MJPEG_SOURCE.latest_multipart()
+                        last_sent_sequence = sequence
+                        next_frame_at = time.monotonic() + frame_interval_sec
+                        yield multipart
+                finally:
+                    if attached:
+                        # 读者退出由拥有方等待，不能阻塞网页事件循环。
+                        await _run_blocking(_SHARED_MJPEG_SOURCE.release)
 
         return StreamingResponse(
             frame_generator(),

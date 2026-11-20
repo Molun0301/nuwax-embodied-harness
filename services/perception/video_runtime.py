@@ -52,6 +52,7 @@ class PerceptionVideoRuntime:
             yaw_threshold_deg=keyframe_yaw_threshold_deg)
         self._condition = threading.Condition(threading.RLock())
         self._reasons = {}
+        self._video_consumers = {}
         self._samples = {}
         self._bursts = []
         self._seen_frames = {}
@@ -73,6 +74,10 @@ class PerceptionVideoRuntime:
             self._condition.wait_for(lambda: not self._releasing or self._closed)
             if self._closed:
                 raise GatewayError("感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
+            if reason not in self._reasons:
+                consumer = self._perception_service.video_consumer()
+                consumer.__enter__()
+                self._video_consumers[reason] = consumer
             self._reasons[reason] = (self._interval_sec if interval_sec is None else interval_sec,
                 camera_id or self._camera_id,
                 detector_backend_name or self._detector_backend_name or None,
@@ -89,6 +94,7 @@ class PerceptionVideoRuntime:
             settings = self._reasons.pop(reason, None)
             if settings is None:
                 return self.get_status()
+            consumer = self._video_consumers.pop(reason)
             self._releasing += 1
             self._condition.notify_all()
             self._condition.wait_for(lambda: not self._processing)
@@ -102,6 +108,7 @@ class PerceptionVideoRuntime:
                     self._memory_service.flush_observations()
                 self._perception_service.detector_pipeline.unload(backend)
         finally:
+            consumer.__exit__(None, None, None)
             with self._condition:
                 self._releasing -= 1
                 self._condition.notify_all()
@@ -307,6 +314,10 @@ class PerceptionVideoRuntime:
         with self._condition:
             self._samples.clear()
             self._seen_frames.clear()
+            consumers = tuple(self._video_consumers.values())
+            self._video_consumers.clear()
+        for consumer in consumers:
+            consumer.__exit__(None, None, None)
         self._write_status()
 
     def _write_status(self):

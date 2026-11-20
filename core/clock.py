@@ -11,6 +11,7 @@ import time
 from functools import lru_cache
 
 CLOCK_OFFSET_ENV = "NUWAX_DEVICE_CLOCK_OFFSET"
+SOURCE_FUTURE_TOLERANCE_NS = 500_000_000
 _CLOCK_SIZE = 40
 _POLL_SEC = 0.010
 _FIELDS = struct.Struct("<QdQ")

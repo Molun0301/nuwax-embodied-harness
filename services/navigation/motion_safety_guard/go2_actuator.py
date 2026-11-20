@@ -285,7 +285,7 @@ class Go2Actuator:
             quaternion = [float(v) for v in message.imu_state.quaternion]
             gyro = [float(v) for v in message.imu_state.gyroscope]
             if (sec < 0 or not 0 <= nanos < 1_000_000_000 or stamp <= 0
-                    or stamp > clock.source_now_ns() + 50_000_000
+                    or stamp > clock.source_now_ns() + clock.SOURCE_FUTURE_TOLERANCE_NS
                     or len(velocity) != 3 or len(quaternion) != 4 or len(gyro) != 3
                     or not all(math.isfinite(v) for v in velocity + quaternion + gyro)):
                 raise ValueError("运动反馈时间或数值无效")

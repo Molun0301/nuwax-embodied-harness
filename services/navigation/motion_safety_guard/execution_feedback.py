@@ -41,10 +41,10 @@ class ExecutionFeedback:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器速度未使用受控机体坐标。")
         if clock.uses_device_clock():
             source_age = clock.source_now_ns() - feedback.source_timestamp_ns
-            stale = not -50_000_000 <= source_age <= _FEEDBACK_VALIDITY_NS
+            stale = not -clock.SOURCE_FUTURE_TOLERANCE_NS <= source_age <= _FEEDBACK_VALIDITY_NS
         else:
             now = self._unix_ns()
-            if feedback.source_timestamp_ns > now + 50_000_000:
+            if feedback.source_timestamp_ns > now + clock.SOURCE_FUTURE_TOLERANCE_NS:
                 raise ActuatorError("MOTION_FEEDBACK_STALE", "执行器反馈过期或位于未来。")
             stale = (feedback.received_monotonic_ns is None
                      and now - feedback.source_timestamp_ns > _FEEDBACK_VALIDITY_NS)

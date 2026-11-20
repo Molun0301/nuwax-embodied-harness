@@ -199,7 +199,9 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertEqual(self.query().measured_motion, initial)
         self.clock.step(150_000_001)
         self.assertFalse(self.query().HasField('measured_motion'))
-        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 50_000_001)
+        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 500_000_000)
+        self.assertTrue(self.query().HasField('measured_motion'))
+        self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 500_000_001)
         self.assertFalse(self.query().HasField('measured_motion'))
         self.device.feedback = self.sample(received_monotonic_ns=self.clock.mono + 1)
         self.assertFalse(self.query().HasField('measured_motion'))
@@ -211,6 +213,11 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertIs(actuator.get_motion_execution_feedback(), sample)
         self.observe(actuator, source=sample.source_timestamp_ns - 1)
         self.assertIs(actuator.get_motion_execution_feedback(), sample)
+        self.observe(actuator, source=self.clock.unix + 500_000_000)
+        self.assertEqual(actuator.get_motion_execution_feedback().source_timestamp_ns,
+                         self.clock.unix + 500_000_000)
+        self.observe(actuator, source=self.clock.unix + 500_000_001)
+        self.assertIsNone(actuator.get_motion_execution_feedback())
 
     def test_encode_provenance_and_deadline(self):
         self.device.feedback = self.sample()
@@ -268,6 +275,13 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
                 with path.open('r+b') as stream:
                     stream.seek(8)
                     stream.write(struct.pack('<QQdQ', 4, source + 250_000_001, 1.0, 0))
+                self.assertFalse(self.query().HasField('measured_motion'))
+                now = clock.source_now_ns()
+                self.device.feedback = self.sample(source_timestamp_ns=now + 500_000_000,
+                                                   received_monotonic_ns=now)
+                self.assertTrue(self.query().HasField('measured_motion'))
+                self.device.feedback = self.sample(source_timestamp_ns=now + 500_000_001,
+                                                   received_monotonic_ns=now)
                 self.assertFalse(self.query().HasField('measured_motion'))
 
     def test_invalid_finite_frame_and_orientation(self):

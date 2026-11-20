@@ -165,7 +165,7 @@ fn hotpath_pose_and_motion_real_output_trace() {
     let q=[0.,0.,0.,1.];
     assert_eq!(measured.validate_body_pose([0.025,0.025,upper],q),Ok(()));
     assert_eq!(measured.validate_body_pose([0.025,0.025,lower],q),Err(SurfaceError::InsufficientClearance));
-    let recent=measured.with_recent_obstacle_points(1,100,0,&[],[(0,[0.025,0.025,0.35])]).unwrap();
+    let recent=measured.with_confirmed_recent_fixture(1,100,0,&[],[(0,[0.025,0.025,0.35])]).unwrap();
     let fixtures=[same_coarse_measured_map(&[]),measured.clone(),mixed_hotpath_map(),recent,measured.with_observations(None)];
     let boundary=[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]];
     for (case,base) in fixtures.iter().enumerate() {for warm in [false,true] {

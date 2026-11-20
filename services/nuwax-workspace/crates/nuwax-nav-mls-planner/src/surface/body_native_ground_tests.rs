@@ -15,14 +15,14 @@ fn current_classified_ground_does_not_wait_for_static_membership_and_mixed_voxel
     let from=([2.025,0.025,0.4],[0.0,0.0,0.0,1.0]);
     assert_eq!(map.query_ground([2.025,0.025],0.0).state,GroundQueryState::Unknown);
     let point=[2.025,0.025,0.025];
-    let classified=map.with_recent_obstacle_points(1,1,0,&[0],[(0,point)]).unwrap();
+    let classified=map.with_confirmed_recent_fixture(1,1,0,&[0],[(0,point)]).unwrap();
     let owner=classified.body_query();let state=owner.start_ground_state(from).unwrap();
     owner.validate_motion_from_ground(from,from,&state,&[],&mut None).unwrap();
     assert!(classified.recent_obstacle_hints([[1.9,-0.1],[2.2,0.2]],from).unwrap().is_empty());
     for source in [
-        map.with_recent_obstacle_points(1,1,0,&[],[(0,point)]).unwrap(),
-        map.with_recent_obstacle_points(1,1,0,&[0],[(0,point),(1,[2.026,0.026,0.026])]).unwrap(),
-        map.with_recent_obstacle_points(1,1,0,&[0],[(0,[2.025,0.025,0.425])]).unwrap(),
+        map.with_confirmed_recent_fixture(1,1,0,&[],[(0,point)]).unwrap(),
+        map.with_confirmed_recent_fixture(1,1,0,&[0],[(0,point),(1,[2.026,0.026,0.026])]).unwrap(),
+        map.with_confirmed_recent_fixture(1,1,0,&[0],[(0,[2.025,0.025,0.425])]).unwrap(),
     ] {
         let owner=source.body_query();let state=owner.start_ground_state(from).unwrap();
         let mut witness=None;
@@ -47,7 +47,7 @@ fn owner_bound_cache_reuses_exact_state_without_aliasing_height_or_source() {
     another=state.sample.clone();another.reference_sources=vec![NativeGroundSource::HeightfieldFine{key:GroundKey::HeightfieldV1([1,0,0])}];
     assert!(BoundPoseGroundKey::new(QuerySample::Ground(&state.sample))!=BoundPoseGroundKey::new(QuerySample::Ground(&another)));
     // An unchanged pose on a new recent source must not inherit the old permit.
-    let blocked=map.with_recent_obstacle_points(1,1,0,&[],[(0,[0.025,0.025,0.425])]).unwrap();
+    let blocked=map.with_confirmed_recent_fixture(1,1,0,&[],[(0,[0.025,0.025,0.425])]).unwrap();
     assert_eq!(blocked.validate_body_pose_in_context(pose.0,pose.1,QuerySample::Ground(&state.sample),&mut None),
         Err(SurfaceError::InsufficientClearance));
 }
@@ -291,7 +291,7 @@ fn fixed_sweep_keeps_roundoff_boundary_and_fine_only_tangent_candidates() {
     let from=(xyz,yaw(-0.17));let to=(xyz,yaw(0.23));
     let point=[4.0*f64::from(Q),0.0,xyz[2]];
     assert!(map.fixed_body_query((xyz,yaw(0.0))).unwrap().unwrap().intersects_point(point).unwrap());
-    let recent=map.with_recent_obstacle_points(1,1,0,&[0],[(0,point)]).unwrap();
+    let recent=map.with_confirmed_recent_fixture(1,1,0,&[0],[(0,point)]).unwrap();
     let mut observed=map.observations().unwrap().as_ref().clone();
     let mut block=BTreeMap::new();
     for x in 0..12 {for y in 0..8 {
@@ -833,7 +833,7 @@ fn c1c1_same_pose_navigation_changes_survive_physical_trace() {
 #[test]
 fn c1c1_projected_reference_is_reused_by_complete_contact_sweep() {
     let raw=scene_with_raw_counts(|_,_|BTreeMap::from([(0,[1000,0,0,0,0,0,0,0])]),&[[0,0,8]]);
-    let member=scene(0,true);let recent=scene(0,false).with_recent_obstacle_points(1,1,0,&[],[(0,[0.025,0.025,0.425])]).unwrap();
+    let member=scene(0,true);let recent=scene(0,false).with_confirmed_recent_fixture(1,1,0,&[],[(0,[0.025,0.025,0.425])]).unwrap();
     for (name,map,expected_source) in [("raw",raw,OccupancySource::Fine),("member",member,OccupancySource::Fine),
         ("recent",recent,OccupancySource::Recent)] {
         let map=map.with_body_envelope(fixed_go2_model()).unwrap();let owner=map.body_query();
@@ -860,7 +860,7 @@ fn c1c1_recent_refresh_keeps_navigation_but_retires_physical_permission() {
     let to=([0.075,0.025,0.435],from.1);
     let next=owner.validate_motion_with_navigation(from,to,&state,&edge,&[],&mut None).unwrap();
     assert_eq!(next.height(),state.height());assert_eq!(to.0[2],0.435);
-    let blocked=map.with_recent_obstacle_points(2,2,0,&[],[(0,[0.075,0.025,0.435])]).unwrap();let current=blocked.body_query();
+    let blocked=map.with_confirmed_recent_fixture(2,2,0,&[],[(0,[0.075,0.025,0.435])]).unwrap();let current=blocked.body_query();
     assert!(current.same_ground_source(&map));let mut witness=None;
     assert_eq!(current.validate_motion_with_navigation(from,to,&state,&edge,&[],&mut witness),Err(SurfaceError::InsufficientClearance));
     assert!(matches!(witness.unwrap().rejection,BodyRejection::Occupancy{source:OccupancySource::Recent,..}));

@@ -480,6 +480,7 @@ impl SurfaceSnapshot {
                                     }
                                     continue;
                                 }
+                                if !recent.confirmed.contains(&[x,y,z]) {continue;}
                                 let low=[x,y,z].map(|v|f64::from(v)*fine);
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]<min[2] || low[2]>max[2] {continue;}

@@ -3804,7 +3804,7 @@ mod tests {
         handle
             .update_costmap(CostmapObservation {
                 costmap: surface_follower::prepared_test_surface(Arc::new(surface_follower::test_snapshot(0.0, true)
-                    .with_recent_obstacle_points(1,1,0,&[],[(0,[0.55,1.55,0.5])]).unwrap())),
+                    .with_recent_obstacle_points(1,1,0,&[],[(0,[0.55,1.55,0.5]),(1,[0.55,1.55,0.55])]).unwrap())),
                 source_timestamp_ns: 2_000_000_000,
             })
             .await

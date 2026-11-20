@@ -73,14 +73,23 @@ fn original(
     if frames.len() >= 8 {
         frames.drain(..frames.len() - 7);
     }
+    let spatially_supported = obstacles.iter().copied()
+        .filter(|&key| has_obstacle_neighbour(key, &obstacles)).collect();
     frames.push(Arc::new(RecentFrame {
         sequence: source_sequence,
         timestamp: source_timestamp_ns,
         columns,
         surface_points,
+        obstacles,
+        spatially_supported,
     }));
+    let confirmed = frames.iter().flat_map(|frame| frame.obstacles.iter().copied())
+        .filter(|key| frames.iter().filter(|frame| frame.obstacles.contains(key)).count()
+            >= RECENT_OBSTACLE_CONFIRMATION_FRAMES)
+        .chain(frames.iter().flat_map(|frame| frame.spatially_supported.iter().copied()))
+        .collect();
     let mut result = map.clone();
-    result.recent_obstacles = Some(Arc::new(RecentObstacles { size, frames }));
+    result.recent_obstacles = Some(Arc::new(RecentObstacles { size, frames, confirmed }));
     result.body_query_cache = Default::default();
     Ok(result)
 }

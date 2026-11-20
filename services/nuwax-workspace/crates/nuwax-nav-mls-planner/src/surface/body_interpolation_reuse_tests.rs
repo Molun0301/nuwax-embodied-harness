@@ -194,7 +194,7 @@ fn actual_scene(kind:usize)->SurfaceSnapshot {
     let mut map=SurfaceSnapshot::from_points(&points,config(),source).unwrap()
         .with_body_envelope(envelope(kind%2==1)).unwrap().with_observations(Some(Arc::new(observed)));
     if kind==4 {map=map.with_observations(None);}
-    if kind==5 {map=map.with_recent_obstacle_points(1,100,0,&[],[(0,[0.0,0.0,0.4])]).unwrap();}
+    if kind==5 {map=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[0.0,0.0,0.4])]).unwrap();}
     map
 }
 fn witness_bits(witness:Option<BodyFailureWitness>)->String {

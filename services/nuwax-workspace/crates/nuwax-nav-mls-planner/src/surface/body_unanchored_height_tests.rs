@@ -111,7 +111,7 @@ fn p0_unanchored_overlap_fringe_recent_and_invalid_pose_preserve_exact_witness()
     assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::FineFringe,cell:[1,0,10],..})));
     let recent=|| {let (map,pose)=disjoint_contact_fixture(0.05,0.1,false,true);
         let point=pose.0;
-        (map.with_recent_obstacle_points(1,1,0,&[],[(0,point)]).unwrap(),pose)};
+        (map.with_confirmed_recent_fixture(1,1,0,&[],[(0,point)]).unwrap(),pose)};
     let (result,witness)=p0_pair(recent,0);assert_eq!(result,Err(SurfaceError::InsufficientClearance));
     assert!(matches!(witness,Some(BodyRejection::Occupancy{source:OccupancySource::Recent,..})));
     let invalid=|| {let (map,mut pose)=disjoint_contact_fixture(0.05,0.1,false,true);pose.1=[0.0;4];(map,pose)};

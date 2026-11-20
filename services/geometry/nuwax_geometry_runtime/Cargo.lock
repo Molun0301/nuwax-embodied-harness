@@ -1829,6 +1829,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "nuwax-config",
+ "nuwax-core",
  "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-mls-planner",

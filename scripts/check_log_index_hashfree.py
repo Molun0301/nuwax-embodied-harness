@@ -97,6 +97,43 @@ class LogIndexChecks(unittest.TestCase):
         self.assertEqual(self.index.stats['read_bytes'], 0)
         self.assertEqual(self.index.stats['raw_candidates'], 0)
 
+    def test_filtered_first_page_reads_plain_rotations_and_matches_complete_scan(self):
+        rotation = self.root / 'geometry.log.1'
+        self.write([entry(9, source='old-geometry', level='warning', message='只在最早轮转的 Straße'),
+                    entry(1, message='早于文件头的时间')], path=rotation)
+        self.write([entry(5, message=SECRET_A), entry(3, level='warning')])
+        self.write([entry(7, source='nav-stack', message='新消息')], path=self.root / 'nav_stack.log')
+        self.write([entry(11, source='unrelated', message='只在最早轮转的 Straße')],
+                   path=self.root / 'other.log')
+
+        def filtered_page(**filters):
+            options = {'log_dir': str(self.root), 'limit': 2, **filters}
+            with patch.object(self.index, 'query', side_effect=AssertionError('首个筛选页不建持久索引')):
+                encoded, _ = protocol._render_log_response(str(self.log), options, None,
+                    reader=self.index.query, recent_page=True)
+            actual = json.loads(encoded)
+            self.assertEqual(actual, protocol._scan_logs(str(self.log), **options))
+            self.assertEqual(actual['sources'], ['nav-stack', 'old-geometry', 'python'])
+            return actual
+
+        before = filtered_page(level='WARN')
+        self.assertEqual(filtered_page(level='WARN'), before)
+        self.assertEqual(len(filtered_page(query='STRASSE')['entries']), 1)
+        self.assertEqual(filtered_page(query='AlphaSyntheticPrivate123')['entries'], [])
+        self.assertEqual(len(filtered_page(query='token=********')['entries']), 1)
+        self.write([entry(10, level='warning')], append=True)
+        rotation.rename(self.root / 'geometry.log.2')
+        after = filtered_page(level='WARN')
+        self.assertNotEqual(before['entries'], after['entries'])
+        self.assertTrue(after['has_more'])
+
+        options = {'log_dir': str(self.root), 'limit': 201, 'level': 'WARN'}
+        with patch.object(self.index, 'query', wraps=self.index.query) as history:
+            encoded, _ = protocol._render_log_response(str(self.log), options, None,
+                reader=history, recent_page=True)
+        history.assert_called_once_with(str(self.log), **options)
+        self.assertEqual(json.loads(encoded), protocol._scan_logs(str(self.log), **options))
+
     def test_json_rust_spans_and_legacy_text_formats_keep_exact_filter_semantics(self):
         rust = {'timestamp': '2026-10-02T04:00:01Z', 'level': 'INFO',
                 'fields': {'message': 'rust structured message', 'request_id': SECRET_A},

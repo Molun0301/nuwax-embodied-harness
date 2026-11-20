@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, ExitStack
 import asyncio
 import multiprocessing
 import base64
@@ -28,6 +28,7 @@ _TEXT_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d[,.]\d
 _RUST_LINE = re.compile(r"^(?P<timestamp>\d{4}-\d\d-\d\dT\S+)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<message>.*)$")
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 _RECENT_FILE_BYTES = 256 * 1024
+_COMPONENT_LOGS = ("motion_guard", "nav_stack", "geometry", "person_follow", "gateway", "video")
 
 
 def _reverse_open_lines(handle, start: int, end: int):
@@ -135,7 +136,8 @@ def _redact_entry(value):
 def _log_paths(log_file: str, log_dir: str = "") -> list[list[Path]]:
     main = Path(log_file).expanduser()
     directory = Path(log_dir).expanduser() if log_dir else main.parent
-    bases = {main, *directory.glob("nuwax-*.log")}
+    bases = {main, *directory.glob("nuwax-*.log"),
+             *(directory / (name + ".log") for name in _COMPONENT_LOGS)}
     # 组件当前文件尚未重建时，也包含已有轮转文件。
     for candidate in directory.glob("nuwax-*.log.[0-9]*"):
         base, _, suffix = str(candidate).rpartition(".")
@@ -209,6 +211,7 @@ class _LogFilter:
         self.valid = not before or self.cursor is not None or bool(self.timestamp_before)
         self.levels = {"warning" if item.strip().lower() == "warn" else item.strip().lower() for item in level.split(",") if item.strip()}
         self.source, self.component, self.search = source, component.casefold(), query.casefold()
+        self.search_token = max(re.findall(r"[^\W_]+", self.search), key=len, default="")
         self.request_id, self.task_id = request_id, task_id
 
     def before_key(self, key):
@@ -351,8 +354,10 @@ class _FileLogIndex:
         continuation = []
         complete_header_seen = False
         next_tail_start = 0
+        identity_prefix = f"{stat.st_dev:020}:{stat.st_ino:020}:"
+        restrict_time = matcher.cursor or matcher.timestamp_before
         for offset, raw, complete in _reverse_open_lines(handle, start, stat.st_size):
-            identity = f"{stat.st_dev:020}:{stat.st_ino:020}:{offset:020}"
+            identity = f"{identity_prefix}{offset:020}"
             entry = _parse_entry(raw, identity=identity, fallback_time=fallback_time)
             if entry is None:
                 continuation.append(raw)
@@ -360,8 +365,8 @@ class _FileLogIndex:
             if continuation:
                 entry["exception"] = "\n".join(reversed(continuation))
                 continuation.clear()
-            key = _entry_key(entry)
-            before = matcher.before_key(key)
+            key = _entry_key(entry) if restrict_time else None
+            before = key is None or matcher.before_key(key)
             if not complete_header_seen:
                 # 无换行末行以后可能变成异常续行，连同前一个完整头一起回读。
                 if before:
@@ -390,10 +395,12 @@ class _FileLogIndex:
                     size = sys.getsizeof(source)
                     budget.retain(size + sys.getsizeof(sources) - previous_container_size)
                     source_bytes += size
-                if len(heap) < capacity or (key, offset) > heap[0][:2]:
-                    item = _matched_cached_item(entry, key, offset, matcher)
-                    if item is None:
+                if len(heap) >= capacity:
+                    key = key or _entry_key(entry)
+                    if (key, offset) <= heap[0][:2]:
                         continue
+                item = _matched_cached_item(entry, key, offset, matcher)
+                if item is not None:
                     size = item[3]
                     if len(heap) < capacity:
                         budget.retain(size)
@@ -458,6 +465,9 @@ def _cache_size(value):
 
 def _matched_cached_item(entry, key, offset, matcher):
     """只缓存脱敏后的紧凑字节，避免各查询重复保留大量字典与字符串对象。"""
+    # 脱敏用星号替换敏感内容，无法产生新的字母数字子串。
+    if matcher.search_token and matcher.search_token not in json.dumps(entry, ensure_ascii=False).casefold():
+        return None
     redacted = _redact_entry(entry) if matcher.search else None
     if not matcher.matches(entry, redacted):
         return None
@@ -465,7 +475,15 @@ def _matched_cached_item(entry, key, offset, matcher):
         redacted = _redact_entry(entry)
     encoded = json.dumps(redacted, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     size = _cache_size((key, offset, encoded)) + 64
-    return key, offset, encoded, size
+    return key or _entry_key(entry), offset, encoded, size
+
+
+def _read_cold_log_file(arguments):
+    descriptor, stat, path, matcher = arguments
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        index = _FileLogIndex()
+        index.refresh(handle, stat, path, matcher, _LOG_CACHE_PAGE_SIZE + 1)
+        return index
 
 
 def _encode_cached_page(items, sources):
@@ -489,10 +507,11 @@ class _LogQueryIndex:
         self.response_bytes = 0
         self.cache_bytes = 0
 
-    def read(self, log_file, log_dir, limit, matcher):
+    def read(self, log_file, log_dir, limit, matcher, parallel=False):
         with self.lock:
             try:
-                return self._read_files(log_file, log_dir, limit, matcher)
+                with ExitStack() as opened:
+                    return self._read_files(log_file, log_dir, limit, matcher, parallel, opened)
             except _LogCacheFull:
                 self.files.clear()
                 self.order = ()
@@ -501,7 +520,7 @@ class _LogQueryIndex:
                 self.cache_bytes = 0
                 return None
 
-    def _read_files(self, log_file, log_dir, limit, matcher):
+    def _read_files(self, log_file, log_dir, limit, matcher, parallel, opened):
         cached_response = self.response
         cached_response_bytes = self.response_bytes
         # 某文件刷新后其它文件可能失败；已持有本索引的等待者也须重建页面。
@@ -509,10 +528,12 @@ class _LogQueryIndex:
         self.response_bytes = 0
         budget = _LogCacheBudget(self.files_bytes + cached_response_bytes)
         seen, order, changed = set(), [], False
+        pending = {}
         for paths in _log_paths(log_file, log_dir):
             for path in paths:
                 try:
-                    with path.open("rb") as handle:
+                    with ExitStack() as entry:
+                        handle = entry.enter_context(path.open("rb"))
                         stat = os.fstat(handle.fileno())
                         identity = (stat.st_dev, stat.st_ino)
                         if identity in seen:
@@ -526,6 +547,11 @@ class _LogQueryIndex:
                             self.cache_bytes = 0
                             return None
                         index = self.files.setdefault(identity, _FileLogIndex())
+                        if parallel and index.stat is None:
+                            # 冷文件用预先打开的描述符，轮转仍按本轮已经打开的文件读取。
+                            opened.enter_context(entry.pop_all())
+                            pending[identity] = (handle.fileno(), stat, str(path), matcher)
+                            continue
                         previous_bytes = index.cache_bytes
                         previous_budget = budget.used
                         try:
@@ -538,6 +564,15 @@ class _LogQueryIndex:
                             budget.used = previous_budget - previous_bytes + index.cache_bytes
                 except FileNotFoundError:
                     continue
+        if pending:
+            count = min(len(pending), os.cpu_count() or 1, 2)
+            context = multiprocessing.get_context("fork")
+            with context.Pool(count, initializer=os.nice, initargs=(10,)) as pool:
+                for identity, index in zip(pending, pool.imap(_read_cold_log_file, pending.values())):
+                    budget.retain(index.cache_bytes)
+                    self.files[identity] = index
+                    self.files_bytes += index.cache_bytes
+            changed = True
         changed = changed or tuple(order) != self.order
         removed_bytes = sum(index.cache_bytes for identity, index in self.files.items() if identity not in seen)
         self.files_bytes -= removed_bytes
@@ -562,7 +597,8 @@ class _LogQueryIndex:
 
 
 def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: str = "", level: str = "", source: str = "",
-               component: str = "", query: str = "", request_id: str = "", task_id: str = "") -> dict:
+               component: str = "", query: str = "", request_id: str = "", task_id: str = "",
+               parallel: bool = False) -> dict:
     """最近四种普通页查询按文件增量更新；追加不再使全部历史失去缓存。"""
     if limit > _LOG_CACHE_PAGE_SIZE or limit < 1:
         return _scan_logs(log_file, log_dir=log_dir, limit=limit, before=before, level=level, source=source,
@@ -577,7 +613,7 @@ def query_logs(log_file: str, *, log_dir: str = "", limit: int = 200, before: st
         while len(_LOG_QUERY_CACHE) > _LOG_CACHE_MAX_QUERIES:
             _LOG_QUERY_CACHE.popitem(last=False)
     try:
-        result = index.read(log_file, log_dir, limit, matcher)
+        result = index.read(log_file, log_dir, limit, matcher, parallel)
     except _LogSnapshotChanged:
         with _LOG_QUERY_CACHE_LOCK:
             if _LOG_QUERY_CACHE.get(signature) is index:
@@ -602,6 +638,11 @@ def _render_log_response(log_file, options, export_format, *, reader=None, recen
             ("before", "level", "source", "component", "query", "request_id", "task_id")):
         # 首屏只读各文件的末尾。历史翻页、筛选和导出仍走同一套持久索引。
         result = _scan_logs(log_file, **options, recent=True)
+    elif (recent_page and export_format is None and not options.get("before")
+          and options.get("limit", _LOG_CACHE_PAGE_SIZE) <= _LOG_CACHE_PAGE_SIZE
+          and (options.get("level") or options.get("query"))):
+        # 首个筛选页精确扫描记录，并复用按文件维护的有界候选缓存。
+        result = query_logs(log_file, **options, parallel=True)
     else:
         result = (query_logs if reader is None else reader)(log_file, **options)
     if export_format is None:

@@ -130,6 +130,17 @@ class LifecycleChecks(unittest.TestCase):
         self.assertEqual(values["gateway.host"], "127.0.0.7")
         self.assertFalse((self.prefix / "settings.env").exists())
 
+    def test_perception_module_does_not_override_saved_detector_switch(self):
+        key = "perception.yolo_world_enabled"
+        for modules in (["core"], ["core", "perception"]):
+            default = write_runtime(self.root, self.prefix, modules, "customrobot", {})
+            self.assertTrue(default["gateway.telemetry_enabled"])
+            self.assertFalse(default[key])
+            for enabled in (True, False):
+                with self.subTest(modules=modules, enabled=enabled):
+                    values = write_runtime(self.root, self.prefix, modules, "customrobot", {key: enabled})
+                    self.assertIs(values[key], enabled)
+
     def test_lio_default_and_explicit_backend(self):
         cases = (
             ((), None, "device"),

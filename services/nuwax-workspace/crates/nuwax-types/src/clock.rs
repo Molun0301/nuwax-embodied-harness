@@ -6,7 +6,7 @@ use std::{
     io::ErrorKind,
     ops::{Add, Sub},
     sync::{
-        atomic::{fence, AtomicU64, Ordering},
+        atomic::{fence, AtomicI64, AtomicU64, Ordering},
         LazyLock,
     },
     thread,
@@ -15,6 +15,21 @@ use std::{
 
 const CLOCK_LEN: usize = 40;
 const FILE_POLL: Duration = Duration::from_millis(10);
+
+/// 导航与探索允许的来源时间超前余量。
+pub const SOURCE_FUTURE_TOLERANCE_NS: u64 = 500_000_000;
+
+static SOURCE_OFFSET: LazyLock<Option<MmapRaw>> = LazyLock::new(|| {
+    std::env::var_os("NUWAX_DEVICE_CLOCK_OFFSET")
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let file = File::open(path).expect("打开真机来源钟差失败");
+            memmap2::MmapOptions::new()
+                .len(std::mem::size_of::<i64>())
+                .map_raw_read_only(&file)
+                .expect("映射真机来源钟差失败")
+        })
+});
 
 static DEVICE_PATH: LazyLock<Option<std::ffi::OsString>> =
     LazyLock::new(|| std::env::var_os("NUWAX_DEVICE_CLOCK").filter(|path| !path.is_empty()));
@@ -71,15 +86,20 @@ pub fn uses_device_clock() -> bool {
     DEVICE_PATH.is_some()
 }
 
-/// 当前样本来源时刻，未配置设备时为系统 Unix 纳秒。
+/// 当前样本来源时刻。仿真使用平台时刻，真机用系统 Unix 纳秒加钟差。
 pub fn source_now_ns() -> u64 {
     if uses_device_clock() {
         read_sample(&DEVICE).source_ns
     } else {
-        SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as u64
+            .as_nanos() as u64;
+        let offset = SOURCE_OFFSET.as_ref().map_or(0, |map| {
+            // 监督者创建的共享记录是单个自然对齐的主机字节序 i64。
+            unsafe { &*map.as_ptr().cast::<AtomicI64>() }.load(Ordering::Relaxed)
+        });
+        now.saturating_add_signed(offset)
     }
 }
 
@@ -383,5 +403,40 @@ mod tests {
         sleeper.await.unwrap();
         ticker.await.unwrap();
         assert!(expiring.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn real_source_offset_keeps_ticking_without_samples() {
+        const CHILD: &str = "NEH_TEST_SOURCE_CLOCK_OFFSET";
+        let Some(path) = std::env::var_os(CHILD) else {
+            let path = std::env::temp_dir().join(format!("neh-source-offset-{}", std::process::id()));
+            std::fs::write(&path, 0_i64.to_ne_bytes()).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "clock::tests::real_source_offset_keeps_ticking_without_samples"])
+                .env(CHILD, &path).env("NUWAX_DEVICE_CLOCK_OFFSET", &path)
+                .status().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(status.success());
+            return;
+        };
+        let wall = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let before = wall();
+        let zero = source_now_ns();
+        assert!((before..=wall()).contains(&zero));
+        assert!(!uses_device_clock());
+        let begin = Instant::now();
+        let file = File::options().write(true).open(path).unwrap();
+        const OFFSET: i64 = 71_844_000_000_000;
+        file.write_all_at(&OFFSET.to_ne_bytes(), 0).unwrap();
+        let before = wall();
+        let source = source_now_ns();
+        assert!((before..=wall()).contains(&(source - OFFSET as u64)));
+        thread::sleep(Duration::from_millis(20));
+        assert!(source_now_ns() - source >= 20_000_000);
+        assert!(begin.elapsed() >= Duration::from_millis(20));
+        file.write_all_at(&(-OFFSET).to_ne_bytes(), 0).unwrap();
+        let before = wall();
+        let adjusted = source_now_ns() + OFFSET as u64;
+        assert!((before..=wall()).contains(&adjusted));
     }
 }

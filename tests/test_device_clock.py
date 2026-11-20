@@ -33,6 +33,7 @@ def publish(path, sequence, ns, rate=1.0, paused=False):
 
 def test_system_clock(monkeypatch):
     monkeypatch.delenv("NUWAX_DEVICE_CLOCK", raising=False)
+    monkeypatch.delenv(clock.CLOCK_OFFSET_ENV, raising=False)
     assert time.time_ns() <= clock.source_now_ns() <= time.time_ns()
     start = time.monotonic()
     clock.sleep(0.004)
@@ -40,6 +41,82 @@ def test_system_clock(monkeypatch):
     ready = threading.Event()
     ready.set()
     assert clock.wait_until(clock.monotonic() + 1, ready.wait)
+
+
+def test_go2_reader_uses_recent_largest_offset_and_keeps_ticking(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from drivers.go2.data_plane import Go2DirectDdsBridge
+    from drivers.go2.settings import Go2DataPlaneConfig
+
+    path = tmp_path / "clock-offset"
+    monkeypatch.setenv(clock.CLOCK_OFFSET_ENV, str(path))
+    monkeypatch.delenv("NUWAX_DEVICE_CLOCK", raising=False)
+    clock.initialize_source_clock_offset(path)
+    now = [1_700_000_000_000_000_000, 10.0]
+    monkeypatch.setattr(clock.time, "time_ns", lambda: now[0])
+    monkeypatch.setattr(clock.time, "monotonic", lambda: now[1])
+    assert clock.source_now_ns() == now[0]
+    assert not clock.uses_device_clock()
+    bridge = Go2DirectDdsBridge(Go2DataPlaneConfig())
+    bridge._started = bridge._direct_dds_started = True
+    bridge._active_generation = 1
+    bridge._direct_dds_stop_event = threading.Event()
+    offset = 71_844_000_000_000
+
+    def receive(kind, elapsed_ns, estimate):
+        now[0] = 1_700_000_000_000_000_000 + elapsed_ns
+        now[1] = 10 + elapsed_ns / 1e9
+        source = now[0] + estimate
+        sec, nanosec = divmod(source, 1_000_000_000)
+        bridge._record_dds_input_timing(
+            kind, SimpleNamespace(sec=sec, nanosec=nanosec), 1, now[1], now[1], now[0],
+        )
+        return source
+
+    receive("imu", 0, offset)
+    lidar = receive("pointcloud", 200_000_000, offset - 30_000_000)
+    assert clock.source_now_ns() - lidar == 30_000_000
+    assert bridge.get_status()["source_clock_offset_ns"] == offset
+    assert bridge.get_status()["input_timing"]["pointcloud"]["source_age_ms_latest"] == 30
+    latest = receive("pointcloud", 2_100_000_000, offset - 40_000_000)
+    assert clock.source_now_ns() - latest == 10_000_000
+    assert clock.source_clock_offset_ns() == offset - 30_000_000
+    deadline = clock.monotonic() + 1
+    now[0] += 4_000_000_000
+    now[1] += 4
+    assert clock.source_now_ns() - latest == 4_010_000_000
+    assert clock.next_wait(deadline) == 0
+
+
+def test_supervisor_chooses_source_offset_only_for_go2(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from core.config import ConfigStore
+    from scripts.supervisor import Supervisor, load_environment
+
+    monkeypatch.setenv("NUWAX_INSTALL_HOME", str(tmp_path))
+    root = Path(__file__).resolve().parents[1]
+    store = ConfigStore(tmp_path)
+    store.create("开发")
+    store.activate("开发")
+    store.save({"robot.driver": "go2"})
+    env = load_environment(root)
+    assert "NUWAX_DEVICE_CLOCK" not in env
+    path = tmp_path / "run/device_clock_offset"
+    assert env[clock.CLOCK_OFFSET_ENV] == str(path)
+
+    async def run():
+        owner = Supervisor(root, env, components={})
+        owner.stopping.set()
+        await owner.run()
+
+    asyncio.run(run())
+    assert struct.unpack("@q", path.read_bytes()) == (0,)
+    store.save({"robot.driver": "unitree_sim"})
+    env = load_environment(root)
+    assert env["NUWAX_DEVICE_CLOCK"] == str(tmp_path / "run/device_clock")
+    assert clock.CLOCK_OFFSET_ENV not in env
 
 
 def test_device_rate_and_pause(device_clock):

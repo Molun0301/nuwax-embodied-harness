@@ -120,9 +120,33 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         source = self.clock.unix if source is None else source
         message = SimpleNamespace(stamp=SimpleNamespace(sec=source // 1_000_000_000, nanosec=source % 1_000_000_000),
                                   velocity=velocity, imu_state=SimpleNamespace(quaternion=quaternion, gyroscope=gyro), mode=3)
-        with patch('services.navigation.motion_safety_guard.go2_actuator.time.monotonic_ns', return_value=self.clock.mono), \
-             patch('services.navigation.motion_safety_guard.go2_actuator.time.time_ns', return_value=self.clock.unix):
+        with patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono), \
+             patch.object(clock.time, "time_ns", return_value=self.clock.unix):
             actuator._observe_motion_state(message)
+
+    def test_go2_aligned_feedback_keeps_monotonic_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offset"
+            clock.initialize_source_clock_offset(path)
+            with patch.dict(os.environ, {clock.CLOCK_OFFSET_ENV: str(path)}):
+                actuator = self.go2()
+                offset = 71_844_000_000_000
+                source = self.clock.unix + offset
+                self.observe(actuator, source=source)
+                self.assertIsNone(actuator.get_motion_execution_feedback())
+                clock.publish_source_clock_offset_ns(str(path), offset)
+                self.observe(actuator, source=source)
+                gate = ExecutionFeedback()
+                with patch.object(clock.time, "time_ns", return_value=self.clock.unix), \
+                     patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono):
+                    feedback = gate.feedback(actuator)
+                    self.assertEqual(feedback.source_timestamp_ns, source)
+                    self.assertEqual(gate.feedback_valid_until_monotonic_ns(feedback), self.clock.mono + 250_000_000)
+                self.clock.step(251_000_000)
+                with patch.object(clock.time, "time_ns", return_value=self.clock.unix), \
+                     patch.object(clock.time, "monotonic_ns", return_value=self.clock.mono):
+                    with self.assertRaisesRegex(RuntimeError, "接收已过期"):
+                        gate.feedback(actuator)
 
     def test_rotate_world_to_body_once(self):
         # 非零滚转/俯仰/偏航；独立 R 先将已知机体速度送入厂商世界坐标接口。

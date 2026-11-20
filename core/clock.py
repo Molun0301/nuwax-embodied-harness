@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+from ctypes import c_int64
 import mmap
 import os
 import struct
 import threading
 import time
+from functools import lru_cache
 
+CLOCK_OFFSET_ENV = "NUWAX_DEVICE_CLOCK_OFFSET"
 _CLOCK_SIZE = 40
 _POLL_SEC = 0.010
 _FIELDS = struct.Struct("<QdQ")
 _SEQUENCE = struct.Struct("<Q")
+# 单个自然对齐的主机字节序 i64，供同一 64 位宿主机上的进程共享。
+_OFFSET = struct.Struct("@q")
 _mapping = None
 _mapping_lock = threading.Lock()
 
@@ -43,9 +48,32 @@ def _device_sample():
                 return sample
 
 
+def initialize_source_clock_offset(path):
+    """监督者在业务锁内创建本次业务使用的共享钟差。"""
+    from core.config import atomic_write
+    atomic_write(path, _OFFSET.pack(0))
+
+
+@lru_cache(maxsize=2)
+def _offset_mapping(path, access):
+    with open(path, "r+b" if access == mmap.ACCESS_WRITE else "rb") as file:
+        return mmap.mmap(file.fileno(), _OFFSET.size, access=access)
+
+
+def publish_source_clock_offset_ns(path, offset_ns):
+    """采集拥有方更新最近一次估计的有符号钟差。"""
+    c_int64.from_buffer(_offset_mapping(path, mmap.ACCESS_WRITE)).value = offset_ns
+
+
+def source_clock_offset_ns():
+    """读取真机钟差，未启用钟差时为零。"""
+    path = os.environ.get(CLOCK_OFFSET_ENV)
+    return _OFFSET.unpack_from(_offset_mapping(path, mmap.ACCESS_READ))[0] if path else 0
+
+
 def source_now_ns():
-    """当前样本来源时刻，未配置设备时为系统 Unix 纳秒。"""
-    return _device_sample()[0] if uses_device_clock() else time.time_ns()
+    """仿真使用平台时刻，真机使用以钟差对齐的 Unix 纳秒。"""
+    return _device_sample()[0] if uses_device_clock() else time.time_ns() + source_clock_offset_ns()
 
 
 def monotonic_ns():

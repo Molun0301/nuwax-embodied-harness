@@ -142,6 +142,42 @@ fn stale_pose_waits_and_fresh_pose_resumes_without_new_start() {
 }
 
 #[test]
+fn go2_shared_offset_accepts_map_pose_and_resumes_exploration() {
+    const CHILD: &str = "NEH_TEST_GO2_EXPLORE_OFFSET";
+    let Some(path) = std::env::var_os(CHILD) else {
+        let path = std::env::temp_dir().join(format!("neh-go2-explore-offset-{}", std::process::id()));
+        std::fs::write(&path, 0_i64.to_ne_bytes()).unwrap();
+        let name = format!("{}::go2_shared_offset_accepts_map_pose_and_resumes_exploration",
+            module_path!().split_once("::").unwrap().1);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name]).env(CHILD, &path).env("NUWAX_DEVICE_CLOCK_OFFSET", &path)
+            .status().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(status.success());
+        return;
+    };
+    use std::os::unix::fs::FileExt;
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
+    explorer.start("实机时钟".into(), request()).unwrap();
+    const OFFSET: u64 = 71_844_000_000_000;
+    let source = unix_ns() + OFFSET;
+    let mut current = pose();
+    current.timestamp_ns = source;
+    let mut map = grid();
+    map.meta.as_mut().unwrap().timestamp_ns = source;
+    let waiting = explorer.tick(Some(current.clone()), Some(map.clone()), Err("未启用曲面".into()), Ok(())).unwrap();
+    assert!(waiting.status.message.starts_with("等待地图位姿"));
+    assert!(waiting.status.message.contains("超过500毫秒"));
+    std::fs::File::options().write(true).open(path).unwrap()
+        .write_all_at(&(OFFSET as i64).to_ne_bytes(), 0).unwrap();
+    assert!(fresh(source + 400_000_000, 500_000_000).is_ok());
+    assert!(fresh(source + 900_000_000, 500_000_000).unwrap_err().contains("超过500毫秒"));
+    let resumed = explorer.tick(Some(current), Some(map), Err("未启用曲面".into()), Ok(())).unwrap();
+    assert!(resumed.goal.is_some(), "{}", resumed.status.message);
+    assert_eq!(resumed.status.exploration_id, "实机时钟");
+}
+
+#[test]
 fn forbidden_mask_changes_surface_input_without_changing_physical_snapshot() {
     let points: Vec<_> = (0..30)
         .flat_map(|x| (0..30).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.0)))

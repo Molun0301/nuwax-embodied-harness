@@ -1,6 +1,5 @@
 """读取执行器的真实运动反馈，供测量旁路使用。"""
 from __future__ import annotations
-import time
 from typing import Optional
 
 from contracts.motion_feedback import MotionExecutionFeedback
@@ -12,7 +11,7 @@ _FEEDBACK_VALIDITY_NS = 250_000_000
 
 
 class ExecutionFeedback:
-    def __init__(self, *, frame_id: str = "base_link", monotonic=None, unix_ns=time.time_ns):
+    def __init__(self, *, frame_id: str = "base_link", monotonic=None, unix_ns=clock.source_now_ns):
         self.frame_id = frame_id
         self._monotonic_ns = (clock.monotonic_ns if monotonic is None
                               else lambda: round(monotonic() * 1_000_000_000))

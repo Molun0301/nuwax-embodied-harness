@@ -86,6 +86,8 @@ class Component:
     error: object = None
     started_at: float = 0
     log_file: object = None
+    # 网页服务状态显示的中文名称。
+    title: str = ""
 
 
 class ComponentLog(RotatingFileHandler):
@@ -122,20 +124,31 @@ def component_table(root, config):
     follow_ready = home / "runtime_data/person-follow/nuwax_person_follow.ready.runtime"
     return {
         "motion_guard": Component([sys.executable, "-m", "services.navigation.motion_safety_guard"],
-            ready=lambda: socket_ready(motion_guard_socket(home)), enabled=bool(config["motion_guard"]["backend"])),
+            ready=lambda: socket_ready(motion_guard_socket(home)), enabled=bool(config["motion_guard"]["backend"]),
+            title="运动安全守卫"),
         "nav_stack": Component([binary_path("nuwax-nav-stack"), "--profile=" + config["derived"]["nav_profile"]],
-            dependencies=("motion_guard",), ready=nav_ready, enabled=config["navigation"]["autostart"]),
+            dependencies=("motion_guard",), ready=nav_ready, enabled=config["navigation"]["autostart"],
+            title="路径规划与导航"),
         "geometry": Component([binary_path("nuwax-geometry-runtime")], ready=geometry_ready,
-            enabled=config["geometry"]["external_enabled"]),
+            enabled=config["geometry"]["external_enabled"], title="定位与建图"),
         "person_follow": Component([binary_path("nuwax-person-follow")], dependencies=("nav_stack", "geometry"),
-            ready=follow_ready, enabled=config["person_follow"]["autostart"]),
+            ready=follow_ready, enabled=config["person_follow"]["autostart"], title="人员跟随"),
         "gateway": Component([sys.executable, "-m", "uvicorn", "gateways.app:create_gateway_app_from_env", "--factory",
             "--host", config["gateway"]["host"], "--port", str(config["gateway"]["port"]),
             "--ws-per-message-deflate", "false", "--timeout-graceful-shutdown", "5"],
-            ready=lambda: gateway_ready(config["gateway"]["port"]), automatic=True),
+            ready=lambda: gateway_ready(config["gateway"]["port"]), automatic=True, title="网页与能力接口"),
         "video": Component([sys.executable, "-m", "drivers.go2.video_streamer"], automatic=True,
-            enabled=config["robot"]["driver"] == "go2" and config["go2"]["video_stream_enabled"]),
+            enabled=config["robot"]["driver"] == "go2" and config["go2"]["video_stream_enabled"], title="摄像头视频"),
     }
+
+
+def state_title(item):
+    """组件状态的中文说明；按需启动的组件未使用时不算异常。"""
+    if not item.enabled:
+        return "未启用"
+    if item.state == "stopped":
+        return "未运行" if item.automatic else "未运行（按需启动）"
+    return {"starting": "启动中", "running": "运行中", "exited": "已退出"}[item.state]
 
 
 class Supervisor:
@@ -235,10 +248,13 @@ class Supervisor:
             item.state, item.exit_code = "exited", code
 
     def status(self):
+        now = time.monotonic()
         return {"pid": os.getpid(), "components": {
             name: {"state": item.state, "pid": item.process.pid if item.process else None,
                    "exit_code": item.exit_code, "error": item.error,
-                   "log_file": str(item.log_file) if item.log_file is not None else None}
+                   "log_file": str(item.log_file) if item.log_file is not None else None,
+                   "title": item.title or name, "state_title": state_title(item), "enabled": item.enabled,
+                   "uptime_sec": now - item.started_at if item.state == "running" else None}
             for name, item in self.components.items()}}
 
     async def business_component(self, name):

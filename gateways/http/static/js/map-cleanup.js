@@ -1,4 +1,4 @@
-/* 已保存地图清理：统计与点集来自工具，另存完成以任务真实结果为准。 */
+/* 清除残影：已保存地图离线去除移动物体残留点；统计与点集来自工具，另存完成以任务真实结果为准。 */
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -8,7 +8,7 @@
   const layers = [
     {kind: 'source', label: '原图', color: '#748997', size: 1, checked: true},
     {kind: 'candidates', label: '删除候选', color: '#ff615c', size: 2, checked: true},
-    {kind: 'result', label: '清理结果', color: '#66d6a5', size: 1, checked: false},
+    {kind: 'result', label: '清除后', color: '#66d6a5', size: 1, checked: false},
   ];
   const state = {job: null, task: null, epoch: 0, timer: null, points: {}, previewReady: false,
     cancelling: null, submitting: false, angle: -.6, tilt: .65, zoom: 1};
@@ -26,14 +26,14 @@
     legend.append(label);
   }
   $('mapCleanupCanvas').before(legend);
-  $('mapCleanupCanvas').setAttribute('aria-label', '原图、删除候选和清理结果三层点云预览');
+  $('mapCleanupCanvas').setAttribute('aria-label', '原图、删除候选和清除后三层点云预览');
   $('mapCleanupDetails').style.whiteSpace = 'pre-wrap';
 
   async function request(url, body) {
     const response = await fetch(url, {credentials: 'same-origin',
       ...(body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})});
     const value = await response.json();
-    if (!response.ok) throw new Error(value.error?.message || value.detail || '地图清理请求失败');
+    if (!response.ok) throw new Error(value.error?.message || value.detail || '清除残影请求失败');
     return value;
   }
   const api = (path, body) => request('/api/maps/cleanup' + path, body);
@@ -92,7 +92,7 @@
     state.previewReady = true; draw(); buttons();
   }
   function showSummary(job) {
-    $('mapCleanupDetails').textContent = `力度 ${job.strength_percent}%。可切换原图、删除候选和清理结果；拖动旋转，滚轮缩放。大图按显示抽样。\n工具统计摘要：\n` + JSON.stringify(job.report, null, 2);
+    $('mapCleanupDetails').textContent = `力度 ${job.strength_percent}%。可切换原图、删除候选和清除后；拖动旋转，滚轮缩放。大图按显示抽样。\n工具统计摘要：\n` + JSON.stringify(job.report, null, 2);
   }
   async function poll(id, epoch) {
     try {
@@ -119,7 +119,7 @@
       } else if (job.state === 'ready') {
         showSummary(job);
         if (!state.previewReady) await loadPoints(job, epoch);
-        if (epoch === state.epoch) say('实际清理预览已就绪，请查看三层点云与工具统计摘要，再确认另存。');
+        if (epoch === state.epoch) say('残影预览已就绪，请查看三层点云与工具统计摘要，再确认另存。');
       } else if (job.state === 'applied') {
         say(`已另存为 ${job.result_map}，原图 ${job.map_name} 保留。`);
       } else if (job.state === 'cancelled') {
@@ -127,7 +127,7 @@
       } else if (job.state === 'failed') {
         say(job.error);
       } else {
-        say('正在计算清理预览。'); schedule(id, epoch);
+        say('正在计算残影预览。'); schedule(id, epoch);
       }
       buttons();
     } catch (error) {
@@ -153,7 +153,7 @@
     if (await invalidate()) say('力度已改变，请重新计算实际预览。');
   });
   $('mapCleanupSource').addEventListener('change', async () => {
-    $('mapCleanupNewName').value = $('mapCleanupSource').value + '-clean';
+    $('mapCleanupNewName').value = $('mapCleanupSource').value + '-去残影';
     if (await invalidate()) say('请选择力度并计算预览。');
   });
   $('mapCleanupCancel').addEventListener('click', async () => {
@@ -163,7 +163,7 @@
     const job = state.job, name = $('mapCleanupNewName').value.trim(), epoch = state.epoch;
     if (!job || job.state !== 'ready' || !state.previewReady) return;
     if (!name) { say('请填写新地图名称。'); return; }
-    if (!window.confirm(`确认按当前 ${job.strength_percent}% 力度，将查看过的清理结果另存为“${name}”？源地图“${job.map_name}”保留。`)) return;
+    if (!window.confirm(`确认按当前 ${job.strength_percent}% 力度，将清除残影后的地图另存为“${name}”？源地图“${job.map_name}”保留。`)) return;
     state.submitting = true; buttons(); say('正在提交另存任务。');
     try {
       const submitted = await api('/' + encodeURIComponent(job.id) + '/apply', {new_map_name: name, confirmed: true});
@@ -186,7 +186,7 @@
         $('mapCleanupSource').append(option);
       }
       if (items.some(map => map.saved && map.name === selected)) $('mapCleanupSource').value = selected;
-      if (!$('mapCleanupNewName').value) $('mapCleanupNewName').value = $('mapCleanupSource').value + '-clean';
+      if (!$('mapCleanupNewName').value) $('mapCleanupNewName').value = $('mapCleanupSource').value + '-去残影';
       if (!$('mapCleanupSource').value) say('暂无已保存地图，请先保存地图。');
     } catch (error) { say(error.message); }
   }

@@ -21,13 +21,23 @@ except ImportError:
 CODE_ROOT = Path(__file__).resolve().parents[1]
 _SNAPSHOT = ContextVar("nuwax_config", default=None)
 _RUNTIME = None
-SECTION_TITLES = {
-    "robot": "机器人", "transport": "通信", "gateway": "网关", "perception": "感知",
-    "memory": "记忆", "semantic_map": "语义地图", "geometry": "定位与建图",
-    "navigation": "导航", "motion_guard": "运动守卫", "person_follow": "人物跟随",
-    "go2": "Go2 驱动", "logging": "日志", "relay": "容器中继",
-    "unitree_sim": "仿真设备", "manipulation": "操作设备", "map_cloud": "地名查询",
-}
+# 设置页板块与子类的显示顺序。各键所属板块（panel）、子类（category）、开关标签（switch）
+# 与高级项（advanced）写在 config_schema.toml；没有子类的开关键是板块总开关。
+SETTINGS_LAYOUT = (
+    ("机器人", ("型号与驱动", "外形尺寸", "运动上限", "运动守卫", "Go2 数据接入", "Go2 官方连接", "音量",
+             "Go2 低层控制", "坐标系", "通信")),
+    ("视频与视觉识别", ("视频输入", "目标检测", "持续识别", "关键帧记忆", "目标跟踪", "画面自体过滤", "物品定位",
+                 "云端视觉", "分割")),
+    ("建图与定位", ("执行链与定位", "建图", "点云自体过滤", "去动态", "持续性确认", "回环与校正", "地图目录",
+               "原始扫描（清除残影用）", "建图录制")),
+    ("导航与探索", ("机体与地形", "局部规划", "探索", "跨楼层与地名")),
+    ("记忆与语义", ("向量模型", "物体关联", "语义地图", "区域划分与命名")),
+    ("人员跟随", ()),
+    ("操作设备", ("外部设备",)),
+    ("性能监控", ("采集",)),
+    ("日志", ("级别与格式", "文件与轮转")),
+    ("网页与接口", ("点云显示", "网关服务", "制品存储", "容器中继")),
+)
 PATH_KEYS = {
     "gateway.artifact_dir", "geometry.map_catalog_root", "geometry.mapping_recording_dir",
     "geometry.raw_scan_directory", "geometry.runtime_data_dir", "logging.dir", "logging.file",
@@ -458,9 +468,8 @@ class ConfigStore:
     def settings_schema(self, name=None):
         name = name or self.active()
         values = flatten(self.effective(name))
-        sections = []
+        fields = []
         for section, entries in schema(self.code_root).items():
-            fields = []
             for key, spec in entries.items():
                 full = section + "." + key
                 kind = {"string": "str", "integer": "int", "boolean": "bool", "array": "csv"}.get(spec["type"], spec["type"])
@@ -474,11 +483,19 @@ class ConfigStore:
                                    is_set=bool(values[full]) if spec.get("sensitive") else False,
                                    apply_scope="保存后即时生效" if spec["apply"] == "hot" else "下次业务启动生效",
                                    target_path=str(self.profile_path(name)), readonly=full == "gateway.port"))
-            for item in fields:
-                if item["key"] in ("geometry.pgo_options", "geometry.pointlio_options"):
-                    filename = item["key"].split(".", 1)[1] + ".json"
-                    item["options_schema"] = json.loads((self.code_root / "contracts" / filename).read_text())["parameters"]
-            sections.append({"section_id": section, "section_title": SECTION_TITLES[section], "fields": fields})
+        for item in fields:
+            if item["key"] in ("geometry.pgo_options", "geometry.pointlio_options"):
+                filename = item["key"].split(".", 1)[1] + ".json"
+                item["options_schema"] = json.loads((self.code_root / "contracts" / filename).read_text())["parameters"]
+        # 按板块分节：总开关在前，其后按子类顺序，子类内常用项在高级项之前。
+        sections = []
+        for panel, categories in SETTINGS_LAYOUT:
+            order = {category: index for index, category in enumerate(categories)}
+            entries = sorted((item for item in fields if item["panel"] == panel),
+                             key=lambda item: (order[item["category"]] if "category" in item else -1,
+                                               item.get("advanced", False)))
+            sections.append({"section_id": panel, "section_title": panel, "categories": list(categories),
+                             "fields": entries})
         context = self.catalog(name)
         context.update(is_active=name == self.active(), robot=values["robot.driver"])
         return {"sections": sections, "profile_context": context}

@@ -9,12 +9,15 @@
     mapping: ['建图中', 'info'], exploring: ['探索中', 'info'], loaded: ['已加载，未定位', 'warn'],
     localized: ['已定位', 'available'], fault: ['故障', 'error'],
   };
-  const state = {maps: [], phase: null, current: '', busy: false, task: null};
+  // editing：就地输入名称的用途，create 为新建地图，saveAs 为另存为。
+  const state = {maps: [], phase: null, current: '', busy: false, task: null, editing: null};
   const el = {
     current: $('mapManagerCurrentName'), phase: $('mapManagerPhase'), list: $('mapManagerList'),
     name: $('mapManagerName'), status: $('mapManagerStatus'), relocalize: $('mapManagerRelocalize'),
     save: $('mapManagerSave'), end: $('mapManagerEnd'), create: $('mapManagerCreate'), saveAs: $('mapManagerSaveAs'),
-    refresh: $('mapManagerRefresh'),
+    refresh: $('mapManagerRefresh'), actions: $('mapManagerActions'), editor: $('mapManagerEditor'),
+    confirm: $('mapManagerConfirm'), cancel: $('mapManagerCancel'), listToggle: $('mapManagerListToggle'),
+    listPanel: $('mapManagerListPanel'),
   };
 
   function say(text, level = '') { el.status.textContent = text; el.status.dataset.level = level; }
@@ -36,10 +39,25 @@
     el.current.textContent = session ? state.current || '未命名地图' : '—';
     el.phase.className = 'pill ' + level;
     el.phase.textContent = label;
-    for (const button of [el.relocalize, el.save, el.end]) button.disabled = state.busy || !session;
-    el.saveAs.disabled = state.busy || !session || !el.name.value.trim();
-    el.create.disabled = state.busy || !el.name.value.trim();
+    for (const button of [el.relocalize, el.save, el.saveAs, el.end]) button.disabled = state.busy || !session;
+    el.create.disabled = state.busy;
+    el.actions.hidden = Boolean(state.editing);
+    el.editor.hidden = !state.editing;
+    el.confirm.textContent = state.editing === 'saveAs' ? '另存' : '新建并开始建图';
+    el.confirm.disabled = state.busy || !el.name.value.trim();
     el.refresh.disabled = state.busy;
+    el.listToggle.textContent = '地图列表（' + state.maps.length + '）';
+  }
+  function edit(mode) {
+    state.editing = mode;
+    el.name.value = '';
+    el.name.placeholder = mode === 'saveAs' ? '另存为的新名称' : '新地图名称';
+    renderSession();
+    if (mode) el.name.focus();
+  }
+  function toggleList(open) {
+    el.listPanel.hidden = !open;
+    el.listToggle.setAttribute('aria-expanded', String(open));
   }
   function actionButton(text, title, handler, danger = false) {
     const button = document.createElement('button');
@@ -56,7 +74,7 @@
     if (!state.maps.length) {
       const empty = document.createElement('li');
       empty.className = 'map-manager-empty';
-      empty.textContent = '还没有地图。填写名称后点“新建并开始建图”。';
+      empty.textContent = '还没有地图。点“新建地图”开始建图。';
       fragment.append(empty);
     }
     for (const map of state.maps) {
@@ -132,12 +150,15 @@
 
   function activate(name) {
     if (!confirmed('激活地图「' + name + '」？将加载这张地图并重定位，当前地图会话会被替换。')) return;
+    toggleList(false);
     run('激活「' + name + '」', 'load_map', {map_name: name}, result => result.localized === false
       ? '已加载「' + name + '」，未定位：' + result.reason : '已激活「' + name + '」并完成定位。');
   }
   function startMapping(name, continueSaved) {
     const text = continueSaved ? '在地图「' + name + '」上继续建图？' : '新建地图「' + name + '」并开始建图？';
     if (!confirmed(text + '当前地图会话会被替换。')) return;
+    toggleList(false);
+    edit(null);
     run(continueSaved ? '续建「' + name + '」' : '新建「' + name + '」', 'start_mapping',
       {map_name: name, continue_saved: continueSaved}, () => '已开始在「' + name + '」上建图。');
   }
@@ -173,15 +194,26 @@
     result => '重定位成功' + (Number.isFinite(result.fitness) ? '，匹配度 ' + result.fitness.toFixed(3) : '') + '。'));
   el.save.addEventListener('click', () => run('保存「' + state.current + '」', 'save_map', {},
     result => '已保存地图「' + result.map_name + '」。'));
-  el.saveAs.addEventListener('click', () => {
+  el.saveAs.addEventListener('click', () => edit('saveAs'));
+  el.create.addEventListener('click', () => edit('create'));
+  el.cancel.addEventListener('click', () => edit(null));
+  function confirmEdit() {
     const name = el.name.value.trim();
+    if (state.editing === 'create') { startMapping(name, false); return; }
+    edit(null);
     run('另存为「' + name + '」', 'save_map', {map_name: name}, result => '已另存为「' + result.map_name + '」。');
+  }
+  el.confirm.addEventListener('click', confirmEdit);
+  el.name.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !el.confirm.disabled) { event.preventDefault(); confirmEdit(); }
+    // 取消输入，不收起整个地图面板。
+    if (event.key === 'Escape') { event.preventDefault(); edit(null); }
   });
+  el.listToggle.addEventListener('click', () => toggleList(el.listPanel.hidden));
   el.end.addEventListener('click', () => {
     if (!confirmed('结束当前地图会话？未保存的建图内容会丢失。')) return;
     run('结束会话', 'end_map_session', {}, () => '已结束地图会话。');
   });
-  el.create.addEventListener('click', () => startMapping(el.name.value.trim(), false));
   el.name.addEventListener('input', renderSession);
   el.refresh.addEventListener('click', () => load().then(() => say('地图列表已刷新。'))
     .catch(error => say('读取地图列表失败：' + error.message, 'error')));
@@ -189,6 +221,9 @@
     if (!panel.hidden) { window.nuwaxMapPanels.close(panel.id, true); return; }
     window.nuwaxMapPanels.activate(panel.id);
     panel.hidden = false;
+    // 每次打开都从收起的列表和普通按钮开始。
+    toggleList(false);
+    edit(null);
     render();
     load().catch(error => say('读取地图列表失败：' + error.message, 'error'));
   });

@@ -439,10 +439,16 @@
       document.addEventListener("visibilitychange", scheduleRecentLayout);
     }
     // 网关流只推送本进程事件；独立Rust/Python服务从共享文件补取，不另开连接。
+    // 日志页或监控页“最近日志”可见时补取。
     window.setInterval?.(() => {
       const pane = element("logs-view");
-      if (state.opened && !document.hidden && !state.loading && (!pane || pane.classList.contains("active"))) load(false, true);
+      const recentVisible = element("monitor-view")?.classList.contains("active")
+        && element("rail-pane-recent")?.classList.contains("is-active");
+      if (state.opened && !document.hidden && !state.loading && (!pane || pane.classList.contains("active") || recentVisible)) load(false, true);
     }, 3000);
+    // 打开页面即读首屏日志，监控页“最近日志”不依赖先进入日志页。
+    state.opened = true;
+    reload();
   }
 
   window.nuwaxConsoleLogs = {

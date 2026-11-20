@@ -52,10 +52,10 @@
 <button id="semanticRegionPanelToggle" class="tool map-action-button" type="button" aria-label="区域" title="区域" aria-expanded="false" aria-controls="semanticRegionPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg><span>区域</span><span id="semanticRegionCount" class="map-action-count">—</span></button>
 <button id="sceneGraphToggle" class="tool map-action-button" type="button" aria-label="关系图" title="关系图" aria-expanded="false" aria-controls="sceneGraphPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="8" r="3"/><circle cx="10" cy="19" r="3"/><path d="m9 6 6 1M7 9l2 7m7-5-4 5"/></svg><span>关系图</span></button>
 <button id="semanticMemoryToggle" class="tool map-action-button" type="button" aria-label="物品" title="物品" aria-expanded="false" aria-controls="semanticMemoryPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4v10l-8 4-8-4V7l8-4Zm0 9v9M4 7l8 5 8-5m-12-7 8 5"/></svg><span>物品</span><span id="semanticMemoryCount" class="map-action-count">—</span></button>
-<button id="mapCleanupToggle" class="tool map-action-button" type="button" aria-label="清理已完成地图" aria-controls="mapCleanupPanel" aria-expanded="false"><span>清理</span></button>
+<button id="mapCleanupToggle" class="tool map-action-button" type="button" aria-label="清除残影" title="清除残影：离线去除已保存地图里行人等移动物体留下的点" aria-controls="mapCleanupPanel" aria-expanded="false"><span>清除残影</span></button>
 <span class="map-actions-divider"></span>
 <button id="mapNavToggle" class="tool map-action-button" type="button" aria-label="导航" title="导航" aria-expanded="false" aria-controls="navigation-container"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 11 16-7-7 16-2-7-7-2Z"/></svg><span>导航</span></button>
-<button id="mapMotionToggle" class="tool map-action-button" type="button" aria-label="运动" title="运动控制：移动、动作、姿态与设置" aria-expanded="false" aria-controls="motionPanel" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3m3-3 3 3M12 21l-3-3m3 3 3-3M3 12l3-3m-3 3 3 3M21 12l-3-3m3 3-3 3"/></svg><span>运动</span></button>
+<button id="mapMotionToggle" class="tool map-action-button" type="button" aria-label="运动" title="移动与转向：按住按键或 WASDQE、方向键控制，松开即停" aria-expanded="false" aria-controls="motionPanel" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3m3-3 3 3M12 21l-3-3m3 3 3-3M3 12l3-3m-3 3 3 3M21 12l-3-3m3 3-3 3"/></svg><span>运动</span></button>
 <button id="mapBoundaryToggle" class="tool map-action-button" type="button" aria-label="禁行区" title="禁行区" aria-expanded="false" aria-controls="boundary-draw-container"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="m6 18 12-12"/></svg><span>禁行区</span></button></nav>
               <div class="map-header-actions">
               <div class="map-camera-dock map-tool-group" aria-label="地图镜头">
@@ -76,44 +76,53 @@
               <div id="mapSubbar" class="map-subbar" aria-label="当前地图工具">
                 <section id="mapManagerPanel" class="map-drawer map-subpanel" aria-label="地图管理" hidden>
                   <div class="msb-body">
-                    <div class="msb-row">
+                    <div class="msb-row map-manager-bar">
                       <span class="msb-lead">当前地图</span>
                       <strong id="mapManagerCurrentName" class="map-manager-current">—</strong>
                       <span id="mapManagerPhase" class="pill idle">没有地图会话</span>
                       <span class="msb-sep" aria-hidden="true"></span>
-                      <div class="msb-group">
+                      <div id="mapManagerActions" class="msb-group">
                         <button id="mapManagerRelocalize" class="msb-btn" type="button" title="在当前地图上重新估计机器人位置" disabled>重定位</button>
                         <button id="mapManagerSave" class="msb-btn" type="button" title="保存当前地图" disabled>保存</button>
+                        <button id="mapManagerSaveAs" class="msb-btn" type="button" title="把当前地图另存为新名称" disabled>另存为</button>
                         <button id="mapManagerEnd" class="msb-btn" type="button" title="结束地图会话并返回空闲" disabled>结束会话</button>
+                        <button id="mapManagerCreate" class="msb-btn primary" type="button" title="新建一张地图并开始建图">新建地图</button>
                       </div>
-                    </div>
-                    <div class="msb-row">
-                      <label class="msb-field">名称<input id="mapManagerName" class="msb-input" maxlength="64" placeholder="新地图名称" autocomplete="off"></label>
-                      <button id="mapManagerCreate" class="msb-btn primary" type="button" disabled>新建并开始建图</button>
-                      <button id="mapManagerSaveAs" class="msb-btn" type="button" disabled>当前地图另存为</button>
+                      <div id="mapManagerEditor" class="msb-group" hidden>
+                        <input id="mapManagerName" class="msb-input" maxlength="64" placeholder="新地图名称" autocomplete="off" aria-label="地图名称">
+                        <button id="mapManagerConfirm" class="msb-btn primary" type="button" disabled>新建并开始建图</button>
+                        <button id="mapManagerCancel" class="msb-btn" type="button">取消</button>
+                      </div>
                       <span class="msb-sep" aria-hidden="true"></span>
-                      <button id="mapManagerRefresh" class="msb-btn" type="button">刷新</button>
+                      <button id="mapManagerListToggle" class="msb-btn map-manager-list-toggle" type="button" aria-expanded="false" aria-controls="mapManagerListPanel" title="已保存的地图：激活、续建或删除">地图列表</button>
+                      <span id="mapManagerStatus" class="map-manager-status" role="status"></span>
                     </div>
-                    <ul id="mapManagerList" class="map-manager-list" aria-label="已保存地图"></ul>
-                    <p class="msb-status"><span id="mapManagerStatus" role="status">激活会加载地图并重定位；建图、续建与删除前会确认。</span></p>
+                    <div id="mapManagerListPanel" class="map-manager-dropdown" hidden>
+                      <div class="map-manager-dropdown-head">
+                        <span>已保存地图 · 激活会加载地图并重定位</span>
+                        <button id="mapManagerRefresh" class="msb-btn" type="button">刷新</button>
+                      </div>
+                      <ul id="mapManagerList" class="map-manager-list" aria-label="已保存地图"></ul>
+                    </div>
                   </div>
                   <button class="msb-close" type="button" data-map-panel-close="mapManagerPanel" aria-label="收起地图管理">×</button>
                 </section>
-                <section id="mapCleanupPanel" class="map-drawer map-subpanel" aria-label="清理已完成地图" hidden>
+                <section id="mapCleanupPanel" class="map-drawer map-subpanel" aria-label="清除地图残影" hidden>
                   <div class="msb-body">
+                    <p class="msb-note map-cleanup-intro">对已保存地图离线去除行人等移动物体留下的点：先预览删除候选，确认后另存为新地图，原图保留。</p>
                     <div class="msb-row">
-                      <label class="msb-field">已完成地图<select id="mapCleanupSource" class="msb-input"></select></label>
-                      <label class="msb-field">清理力度 <output id="mapCleanupPercent">50%</output><input id="mapCleanupStrength" type="range" min="0" max="100" step="1" value="50" aria-label="清理力度：0% 保守，100% 激进"></label>
+                      <label class="msb-field">已保存地图<select id="mapCleanupSource" class="msb-input"></select></label>
+                      <label class="msb-field">清除力度 <output id="mapCleanupPercent">50%</output><input id="mapCleanupStrength" type="range" min="0" max="100" step="1" value="50" aria-label="清除力度：0% 保守，100% 激进"></label>
                       <span class="msb-note">0% 保守 · 100% 激进，不是删除全图的比例</span>
-                      <button id="mapCleanupPreview" class="msb-btn primary" type="button">计算预览</button>
+                      <button id="mapCleanupPreview" class="msb-btn primary" type="button">预览残影</button>
                       <button id="mapCleanupCancel" class="msb-btn" type="button" disabled>取消预览</button>
                     </div>
-                    <p id="mapCleanupStatus" class="msb-status" role="status">建图完成并停止后，自动识别缺乏支撑的点云；原图保留。</p>
+                    <p id="mapCleanupStatus" class="msb-status" role="status">选择已保存的地图，点“预览残影”查看删除候选。</p>
                     <canvas id="mapCleanupCanvas" width="640" height="240" style="width:100%;max-height:240px;touch-action:none;border-radius:8px" aria-label="实际保存地图与红色候选点云的三维预览" hidden></canvas>
                     <p id="mapCleanupDetails" class="msb-note"></p>
-                    <div class="msb-row"><label class="msb-field">新地图名称<input id="mapCleanupNewName" class="msb-input" placeholder="原图名称-clean"></label><button id="mapCleanupApply" class="msb-btn primary" type="button" disabled>确认并另存新图</button><span class="msb-note">不覆盖原图，不自动切换当前地图</span></div>
+                    <div class="msb-row"><label class="msb-field">新地图名称<input id="mapCleanupNewName" class="msb-input" placeholder="原图名称-去残影"></label><button id="mapCleanupApply" class="msb-btn primary" type="button" disabled>确认并另存为新地图</button><span class="msb-note">不覆盖原图，不自动切换当前地图</span></div>
                   </div>
-                  <button class="msb-close" type="button" data-map-panel-close="mapCleanupPanel" aria-label="收起地图清理">×</button>
+                  <button class="msb-close" type="button" data-map-panel-close="mapCleanupPanel" aria-label="收起清除残影">×</button>
                 </section>
                 <section id="mapLayersPanel" class="map-drawer map-subpanel" aria-label="地图图层" hidden>
                   <div class="msb-body">
@@ -192,47 +201,26 @@
                   <button id="semanticMemoryClose" class="msb-close" type="button" aria-label="收起物品" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
 
-                <section id="motionPanel" class="map-drawer map-subpanel motion-panel" aria-label="运动控制" hidden>
+                <section id="motionPanel" class="map-drawer map-subpanel motion-panel" aria-label="移动与转向" hidden>
                   <div class="msb-body">
-                    <div class="msb-row" data-motion-capability="relative_move">
-                      <span class="msb-lead">移动</span>
-                      <label class="msb-field">速度（米/秒）<input id="motionSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.2"></label>
-                      <label class="msb-field">转速（弧度/秒）<input id="motionTurnSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.5"></label>
-                      <label class="msb-field">时长（秒）<input id="motionDuration" class="msb-input msb-num" type="number" min="0.1" step="0.1" value="1"></label>
-                      <div class="msb-group motion-pad" role="group" aria-label="移动方向">
-                        <button class="msb-btn" type="button" data-move="forward">前进</button>
-                        <button class="msb-btn" type="button" data-move="backward">后退</button>
-                        <button class="msb-btn" type="button" data-move="left">左移</button>
-                        <button class="msb-btn" type="button" data-move="right">右移</button>
-                        <button class="msb-btn" type="button" data-move="turn_left">左转</button>
-                        <button class="msb-btn" type="button" data-move="turn_right">右转</button>
+                    <div class="msb-row">
+                      <div class="motion-pad" role="group" aria-label="按住移动，松开停止">
+                        <button class="motion-key" type="button" data-key="KeyQ"><kbd>Q</kbd><span>左转</span></button>
+                        <button class="motion-key" type="button" data-key="KeyW"><kbd>W</kbd><span>前进</span></button>
+                        <button class="motion-key" type="button" data-key="KeyE"><kbd>E</kbd><span>右转</span></button>
+                        <button class="motion-key" type="button" data-key="KeyA"><kbd>A</kbd><span>左移</span></button>
+                        <button class="motion-key" type="button" data-key="KeyS"><kbd>S</kbd><span>后退</span></button>
+                        <button class="motion-key" type="button" data-key="KeyD"><kbd>D</kbd><span>右移</span></button>
+                      </div>
+                      <div class="motion-settings">
+                        <label class="msb-field">线速度（米/秒）<input id="motionSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.3"></label>
+                        <label class="msb-field">角速度（弧度/秒）<input id="motionTurnSpeed" class="msb-input msb-num" type="number" min="0" step="0.05" value="0.6"></label>
+                        <span class="msb-note">方向键：<kbd>↑</kbd><kbd>↓</kbd> 前进后退，<kbd>←</kbd><kbd>→</kbd> 左右转；可组合，如 W+Q 边走边转。</span>
                       </div>
                     </div>
-                    <div class="msb-row" data-motion-capability="execute_sport_command">
-                      <span class="msb-lead">动作</span>
-                      <select id="motionAction" class="msb-input" aria-label="机身动作"></select>
-                      <span id="motionActionParams" class="msb-group"></span>
-                      <button id="motionActionRun" class="msb-btn primary" type="button">执行动作</button>
-                    </div>
-                    <div class="msb-row" data-motion-capability="set_body_pose">
-                      <span class="msb-lead">姿态</span>
-                      <label class="msb-field">横滚<input id="motionPose-roll" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
-                      <label class="msb-field">俯仰<input id="motionPose-pitch" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
-                      <label class="msb-field">偏航<input id="motionPose-yaw" class="msb-input msb-num" type="number" step="0.05" value="0"></label>
-                      <span class="msb-note">弧度</span>
-                      <button id="motionPoseApply" class="msb-btn" type="button">应用姿态</button>
-                    </div>
-                    <div class="msb-row motion-settings">
-                      <span class="msb-lead">设置</span>
-                      <span class="msb-group" data-motion-capability="set_speed_level"><label class="msb-field">速度档位<select id="motionSpeedLevel" class="msb-input"></select></label><button id="motionSpeedLevelApply" class="msb-btn" type="button">设置</button></span>
-                      <span class="msb-sep" aria-hidden="true"></span>
-                      <span class="msb-group" data-motion-capability="set_obstacle_avoidance"><label class="msb-field">实时避障<select id="motionAvoidance" class="msb-input"><option value="true">开启</option><option value="false">关闭</option></select></label><button id="motionAvoidanceApply" class="msb-btn" type="button">应用</button></span>
-                      <span class="msb-sep" aria-hidden="true"></span>
-                      <span class="msb-group" data-motion-capability="switch_control_mode"><label class="msb-field">控制模式<select id="motionMode" class="msb-input"></select></label><button id="motionModeApply" class="msb-btn" type="button">切换</button></span>
-                    </div>
-                    <p class="msb-status"><span id="motionStatus" role="status">按钮直接执行，机器人会按所选动作运动；需要立即停下时点页面顶部“急停”。</span></p>
+                    <p class="msb-status"><span id="motionPanelStatus" role="status">按住按键或按钮移动，松开即停；光标在输入框里时键盘不控制机器人。动作、姿态等设备专有功能在“能力”页。</span></p>
                   </div>
-                  <button class="msb-close" type="button" data-map-panel-close="motionPanel" aria-label="收起运动控制">×</button>
+                  <button class="msb-close" type="button" data-map-panel-close="motionPanel" aria-label="收起移动与转向">×</button>
                 </section>
                 <section id="navigation-container" class="navigation-panel map-drawer map-subpanel" data-role="v2-navigation" aria-label="导航" hidden>
                   <div class="msb-body msb-tabbed">
@@ -415,6 +403,7 @@
               <div class="panel-actions">
                 <label class="chip-toggle" title="在画面上叠加检测框"><input id="showDetections" type="checkbox" checked><span>检测框</span></label>
                 <button id="perceptionRuntimeToggle" class="btn btn-sm" type="button" title="开启或关闭手动连续识别；探索、跟随和找目标使用时会继续识别" disabled>开启检测</button>
+                <button id="perceptionRuntimeSettings" class="btn btn-sm btn-quiet perception-settings-link" type="button" title="视觉识别未开启：在设置 → 视频与视觉识别中开启，重启后可用" aria-label="去设置开启视觉识别" hidden><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg></button>
               </div>
             </div>
             <div class="vision-content">
@@ -428,16 +417,6 @@
                   </div>
                 </div>
                 <div id="videoEmpty" class="empty">等待摄像头数据。</div>
-              </div>
-              <div class="vision-information">
-                <div class="vision-status-row">
-                  <span id="perceptionRuntimeStatus" class="pill missing">连续识别状态未知</span>
-                  <span id="perceptionRuntimeReasons" class="muted small">使用原因：未读取</span>
-                </div>
-                <p id="perceptionRuntimeMessage" class="muted small" role="status">关闭检测只移除手动使用原因；探索、跟随和找目标仍在使用时会继续识别。</p>
-                <div class="vision-status-row">
-                  <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
-                </div>
               </div>
             </div>
           </section>

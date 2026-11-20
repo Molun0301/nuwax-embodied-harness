@@ -76,6 +76,8 @@ class InputReceiver(rpc.GeometryRuntimeServicer):
         self.block=False
         self.entered=threading.Event()
         self.release=threading.Event()
+    def StartMapping(self,request,context):
+        return pb.GeometryState(phase=pb.SESSION_PHASE_MAPPING,map_name=request.map_name)
     def PublishPointCloud(self,request,context):
         self.entered.set()
         if self.block:
@@ -121,6 +123,116 @@ def wait_status(bridge,predicate,timeout=2):
         if predicate(value):return value
         threading.Event().wait(.005)
     assert predicate(bridge.status()),bridge.status()
+
+
+class RecoveryGo2Source:
+    """使用合成采集数据，跨真实进程及数据通道触发积压。"""
+
+    def __init__(self, config, *, calibration_profile=None):
+        self.callbacks = []
+
+    def subscribe_sensor_sample(self, callback):
+        self.callbacks.append(callback)
+        return callback
+
+    def unsubscribe_sensor_sample(self, callback):
+        self.callbacks.remove(callback)
+
+    def start(self):
+        for callback in self.callbacks:
+            callback(imu_sample(100, 1))
+            callback(imu_sample(200, 2))
+
+    def set_input_delivery_active(self, active):
+        if active:
+            for callback in self.callbacks:
+                callback(imu_sample(900, 3))
+                callback(lidar_sample())
+                callback(imu_sample(1100, 4))
+
+    def set_point_cloud_demand(self, active):
+        pass
+
+    def get_current_pose(self):
+        return None
+
+    get_imu_state = get_latest_local_point_cloud = get_current_pose
+
+    def get_status(self):
+        return {}
+
+    def stop(self):
+        pass
+
+
+def test_first_mapping_request_reaps_backlogged_go2_generation(input_service, monkeypatch, tmp_path):
+    from core.capability import CapabilityTable
+    from drivers.go2 import sensor_process
+    from drivers.go2.data_plane import Go2DirectDdsBridge
+    from drivers.go2.settings import Go2DataPlaneConfig
+    from gateways.capabilities import maps
+    from gateways.invoke import invoke
+    from gateways.platform import Platform
+    from services.geometry.maps import MapStore
+
+    blocked, release, failed = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    process_type = sensor_process.Go2SensorProcess
+
+    def consume(_sample):
+        blocked.set()
+        release.wait(5)
+
+    def spawn(config, **kwargs):
+        # 重现旧版本前置转发的故障，确认生产装配默认已关闭前置转发。
+        assert kwargs["forward_samples"] is False
+        report = kwargs["on_error"]
+        def on_error(reason, stamp):
+            errors.append(reason)
+            report(reason, stamp)
+            failed.set()
+        return process_type(config, **{**kwargs, "forward_samples": True,
+            "source_factory": RecoveryGo2Source, "on_sample": consume, "on_error": on_error})
+
+    monkeypatch.setattr(sensor_process, "Go2SensorProcess", spawn)
+    monkeypatch.setattr("core.components.ensure", lambda *_: None)
+    owner = Go2DirectDdsBridge(Go2DataPlaneConfig(lio_backend="pointlio"), isolate_native_input=True)
+    platform = Platform()
+    platform.geometry = input_service.client
+    platform.geometry_state = SimpleNamespace(connected=True, start=lambda: None,
+        snapshot=lambda: SimpleNamespace(info=info()), subscribe=lambda _fn: lambda: None)
+    platform.mapping_recorder = SimpleNamespace(start=lambda _config: None)
+    platform._recording_configuration = {}
+    platform.maps = MapStore(str(tmp_path / "maps"))
+    platform.input_bridge = InputBridge(client=input_service.client, info=info(),
+        input_executor=owner.get_sensor_input_executor, lio_backend="pointlio")
+    platform.capabilities = CapabilityTable()
+    platform.capabilities.register(next(cap for cap in maps.CAPABILITIES if cap.name == "start_mapping"))
+    try:
+        owner.start()
+        worker = owner.get_sensor_input_executor()
+        previous = worker._process
+        assert blocked.wait(3)
+        assert not release.wait(1.1)
+        release.set()
+        assert failed.wait(4)
+        assert errors == ["标准输入跨进程交付积压超过1秒"]
+        assert worker.input_delivery_status()["runtime_unavailable"]
+
+        state = invoke(platform, "start_mapping", {"map_name": "采集恢复"}, "test")
+        assert state["phase"] == "mapping" and state["map_name"] == "采集恢复"
+        assert not previous.is_alive()
+        assert platform.input_bridge._executor is worker and worker.pid != previous.pid
+        assert not worker.input_delivery_status().get("runtime_unavailable")
+        request = input_service.receiver.clouds.get(timeout=5)
+        assert request.timestamp_ns == 1000
+        assert [sample.timestamp_ns for sample in request.imu_samples] == [900, 1100]
+    finally:
+        release.set()
+        try:
+            platform.input_bridge.stop()
+        finally:
+            owner.stop()
 
 
 @pytest.mark.parametrize('intensity',[False,True])

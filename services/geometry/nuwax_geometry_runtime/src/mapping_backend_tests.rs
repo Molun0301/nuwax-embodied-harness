@@ -95,6 +95,39 @@ fn voxel_point_index_matches_full_filter_through_eviction_protection_and_restore
 }
 
 #[test]
+fn static_confirmation_empty_frame_still_retracts_backend_history() {
+    let config = compute_config();
+    let input = MappingBackendInput {
+        source_timestamp_ns: 1_000_000_000,
+        received_at_ns: 1_000_000_000,
+        registered_frame_id: "map".into(),
+        sensor_origin_map: [0.; 3],
+        dynamic_frame: Some(crate::dynamic_backend::test_free_cells(
+            1.0,
+            [([0, 0, 0], 0)],
+            nalgebra::Isometry3::identity(),
+        )),
+        registered_points_map: Vec::new(),
+    };
+    let mut voxel = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
+    let MappingKernel::Voxel(voxel_state) = &mut voxel else { unreachable!() };
+    voxel_state.append_frame(&[Point3::new(0.15, 0.15, 0.15)]);
+
+    let mut ray = MappingBackendSpec::raytracing_defaults().into_kernel(config.window_capacity);
+    let MappingKernel::Raytracing(ray_state) = &mut ray else { unreachable!() };
+    ray_state.map.voxels.insert(
+        (1, 1, 1), nuwax_mapping_raytracing::voxel_ray_tracer::Voxel::with_health(1),
+    );
+
+    assert!(compute_candidate_in_place(&mut voxel, &input, config).unwrap().is_none());
+    assert!(compute_candidate_in_place(&mut ray, &input, config).unwrap().is_none());
+    let MappingKernel::Voxel(voxel) = &voxel else { unreachable!() };
+    let MappingKernel::Raytracing(ray) = &ray else { unreachable!() };
+    assert_eq!(voxel.current_window.len(), 0);
+    assert_eq!(ray.map.healthy_count(), 0);
+}
+
+#[test]
 fn dufomap_private_kernels_revoke_history_with_the_final_native_verdict() {
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let config = MappingBackendComputeConfig {

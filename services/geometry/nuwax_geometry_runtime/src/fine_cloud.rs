@@ -161,49 +161,123 @@ impl FineCloud {
         stamp: u64,
         shared: Option<crate::dynamic_backend::MappedFrame>,
     ) -> Result<Vec<u32>, String> {
-        let result = (|| {
-            let keys = self.accumulate_inner(points, Some(origin), stamp, shared)?;
-            let returns: Vec<_> = points
-                .iter()
-                .zip(keys)
-                .enumerate()
-                .map(|(index, (p, key))| {
+        self.accumulate_frame(
+            session_id, sensor_id, sequence, points, origin, stamp, shared,
+            None::<fn(&[u32]) -> Vec<u32>>,
+        ).map(|(ground, _)| ground)
+    }
+
+    /// 先分类完整帧，再把地面和通过确认的非地面点写入同一份精细图。
+    pub(crate) fn accumulate_building(
+        &mut self,
+        session_id: u64,
+        sensor_id: &str,
+        sequence: u64,
+        points: &[Point3<f64>],
+        origin: [f64; 3],
+        stamp: u64,
+        shared: crate::dynamic_backend::MappedFrame,
+        select: impl FnOnce(&[u32]) -> Vec<u32>,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        self.accumulate_frame(
+            session_id, sensor_id, sequence, points, origin, stamp, Some(shared), Some(select),
+        )
+    }
+
+    fn accumulate_frame(
+        &mut self,
+        session_id: u64,
+        sensor_id: &str,
+        sequence: u64,
+        points: &[Point3<f64>],
+        origin: [f64; 3],
+        stamp: u64,
+        shared: Option<crate::dynamic_backend::MappedFrame>,
+        select: Option<impl FnOnce(&[u32]) -> Vec<u32>>,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        let result: Result<_, String> = (|| {
+            let keys = self.prepare_frame(points, Some(origin), stamp, shared)?;
+            if select.is_none() {
+                self.write_full_occupancy(points, &keys, stamp)?;
+            }
+            let size = self.writer.voxel_size_m();
+            let returns: Vec<_> = points.iter().zip(&keys).enumerate()
+                .map(|(index, (point, &key))| {
                     heightfield_capture::Return::from_key(
-                        [p.x, p.y, p.z],
-                        key,
-                        index as u32,
-                        self.dynamic.is_dynamic([p.x, p.y, p.z]),
-                        self.writer.voxel_size_m(),
+                        point.coords.into(), key, index as u32, self.is_dynamic(point), size,
                     )
                 })
                 .collect();
-            let removed: Vec<_> = self
-                .dynamic
-                .removed_keys()
-                .iter()
-                .map(|k| [k.0, k.1, k.2])
-                .collect();
+            let removed: Vec<_> = self.dynamic.removed_keys().iter()
+                .map(|&(x, y, z)| [x, y, z]).collect();
             let source = Arc::new(nuwax_map_chunks::LayerSource::Auxiliary {
                 sensor_id: sensor_id.into(),
                 clock_id: "unix".into(),
                 runtime_generation: 1,
                 session_generation: session_id,
             });
-            heightfield_capture::capture(
-                &mut self.writer,
-                &returns,
-                &removed,
-                sequence,
-                stamp,
-                source,
-            )
+            let (updates, ground, admitted) = if let Some(select) = select {
+                let result = heightfield_capture::classify_building(
+                    &mut self.writer, &returns, &removed, sequence, stamp, source, select,
+                )?;
+                let occupied = result.2.iter().map(|&i| keys[i as usize]).collect();
+                self.write_occupancy(occupied, stamp)?;
+                result
+            } else {
+                let (updates, ground) = heightfield_capture::classify(
+                    &mut self.writer, &returns, &removed, sequence, stamp, source,
+                )?;
+                (updates, ground, Vec::new())
+            };
+            if !updates.is_empty() {
+                self.writer.replace_ground_columns(updates.iter().map(|(xy, value)| (*xy, value)))?;
+            }
+            Ok((ground, admitted))
         })();
         if let Err(error) = &result {
             self.failure = Some(error.clone())
         }
         result
     }
+
+    #[cfg(test)]
     fn accumulate_inner(
+        &mut self,
+        points: &[Point3<f64>],
+        origin: Option<[f64; 3]>,
+        stamp: u64,
+        shared: Option<crate::dynamic_backend::MappedFrame>,
+    ) -> Result<Vec<nuwax_map_chunks::Key>, String> {
+        let keys = self.prepare_frame(points, origin, stamp, shared)?;
+        self.write_full_occupancy(points, &keys, stamp)?;
+        Ok(keys)
+    }
+
+    fn write_full_occupancy(
+        &mut self,
+        points: &[Point3<f64>],
+        keys: &[nuwax_map_chunks::Key],
+        stamp: u64,
+    ) -> Result<(), String> {
+        let retained = points.iter().zip(keys)
+            .filter_map(|(point, &key)| (stamp == 0 || !self.is_dynamic(point)).then_some(key))
+            .collect();
+        self.write_occupancy(retained, stamp)
+    }
+
+    fn write_occupancy(
+        &mut self,
+        occupied: AHashSet<nuwax_map_chunks::Key>,
+        stamp: u64,
+    ) -> Result<(), String> {
+        if stamp == 0 {
+            self.writer.seed_unknown(occupied)
+        } else {
+            self.writer.observe(occupied, stamp)
+        }
+    }
+
+    fn prepare_frame(
         &mut self,
         points: &[Point3<f64>],
         origin: Option<[f64; 3]>,
@@ -226,7 +300,6 @@ impl FineCloud {
                     .ok_or("精细输入坐标无效")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let hits: AHashSet<_> = keys.iter().map(|k| (k[0], k[1], k[2])).collect();
         // 零时间种子也先取得DUFO分类；observe内部不插入，其空增量应绕过旧窗口查询。
         if shared.is_none() {
             if let Some(origin) = origin {
@@ -324,17 +397,6 @@ impl FineCloud {
         #[cfg(test)]
         {
             self.last_revoke_ms = revoke_started.elapsed().as_secs_f64() * 1000.0;
-        }
-        if timestamp_ns == 0 {
-            self.writer
-                .seed_unknown(hits.into_iter().map(|key| [key.0, key.1, key.2]))?;
-        } else {
-            let retained: AHashSet<_> = points
-                .iter()
-                .zip(&keys)
-                .filter_map(|(p, &k)| (!self.dynamic.is_dynamic([p.x, p.y, p.z])).then_some(k))
-                .collect();
-            self.writer.observe(retained, timestamp_ns)?;
         }
         Ok(keys)
     }

@@ -1659,6 +1659,47 @@ consumers = [
 ]
 apply = "restart"
 
+[geometry.mapping_confirmation_cell_m]
+type = "float"
+min = 0.05
+default = 0.20
+description = "建图和已定位地图共用的持续性粗格边长（米），取最接近的精细体素整数倍。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_cell_m"]
+apply = "restart"
+
+[geometry.mapping_confirmation_frames]
+type = "integer"
+min = 1
+max = 2147483647
+default = 5
+description = "同一粗格确认所需的最少命中帧数，每帧只计一次。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_frames"]
+apply = "restart"
+
+[geometry.mapping_confirmation_ground_band_m]
+type = "float"
+min = 0.0
+default = 0.05
+description = "建图时，已标为地面的回波距站立地面的最大免确认高度差（米）。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_ground_band_m"]
+apply = "restart"
+
+[geometry.mapping_confirmation_span_s]
+type = "float"
+min = 0.0
+default = 1.0
+description = "同一粗格确认所需的首末命中最短源时间间隔（秒）。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_span_s"]
+apply = "restart"
+
+[geometry.mapping_confirmation_timeout_s]
+type = "float"
+min = 0.0
+default = 10.0
+description = "还未确认的粗格自首次命中起的保留时间（秒）。"
+consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_timeout_s"]
+apply = "restart"
+
 [geometry.mapping_initial_safe_radius_meters]
 type = "float"
 min = 0.0

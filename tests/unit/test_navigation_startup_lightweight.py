@@ -17,6 +17,9 @@ def test_startup_derives_profile_and_go2_limits(configuration_snapshot, pipeline
     assert values['nav_profile'] == profile
     assert values['actuator_max_linear_mps'] == .05
     assert values['actuator_max_yaw_rps'] == .7
+    bounds = json.loads(values['robot_geometry_json'])
+    assert values['standing_ground_z_m'] == pytest.approx(bounds['z_min_m'] - .05)
+    assert read_config(store.home)['geometry']['mapping_confirmation_ground_band_m'] == .05
     assert values['actuator_motion_model'] == ('omnidirectional' if pipeline == 'lio_3d' else '')
     assert not any(key.startswith(('_NUWAX_', 'GO2_')) for key in environment)
 

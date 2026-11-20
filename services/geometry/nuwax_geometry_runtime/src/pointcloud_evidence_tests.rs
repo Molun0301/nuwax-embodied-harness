@@ -40,7 +40,7 @@ struct Corridor {
 /// 前两段按重放处理（每帧的证据坐标取该帧校正），第三段按采用新地图后的在线帧处理（取最新校正）。
 /// `corrected` 为假时证据始终留在原始里程计坐标，即旧做法，只作对照。
 fn run_corridor(drift: f64, corrected: bool) -> Corridor {
-    let mut map = CloudMap::new(961, None, None).unwrap();
+    let mut map = CloudMap::new(961, None, None, &MappingConfirmationConfig::single_frame_for_test()).unwrap();
     map.disable_recording();
     let mut counts = [(0usize, 0usize); 3];
     let mut flags = Vec::new();
@@ -60,9 +60,9 @@ fn run_corridor(drift: f64, corrected: bool) -> Corridor {
             let body = correction * pose_isometry(&frame.odom_pose);
             let points: Vec<_> = frame.points_body.iter().map(|p| body * Point3::from(*p)).collect();
             let origin = body * Point3::from(frame.ray_origin_body);
-            let (dynamic, _, _) = map.accumulate(step, &frame, &points,
+            let observation = map.accumulate(step, &frame, &points,
                 [origin.x, origin.y, origin.z], correction, evidence).unwrap();
-            let frame_flags: Vec<_> = points.iter().map(|p| dynamic.is_dynamic(p.coords.into())).collect();
+            let frame_flags: Vec<_> = points.iter().map(|p| observation.dynamic.is_dynamic(p.coords.into())).collect();
             counts[phase].0 += walls.iter().filter(|i| frame_flags[**i]).count();
             counts[phase].1 += walls.len();
             flags.push(frame_flags);

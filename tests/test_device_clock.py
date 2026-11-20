@@ -130,35 +130,71 @@ def test_supervisor_chooses_source_offset_only_for_go2(tmp_path, monkeypatch):
     assert clock.CLOCK_OFFSET_ENV not in env
 
 
-@pytest.mark.parametrize("offset", [2_000_000_000, -2_000_000_000, 1_999_999_999, None])
-def test_manager_sets_time_once_using_this_startup_offset(tmp_path, monkeypatch, offset):
+@pytest.mark.parametrize(("offset", "late"), [
+    (2_000_000_000, False), (-2_000_000_000, False), (1_999_999_999, False),
+    (None, False), (2_000_000_000, True), (0, False),
+])
+def test_manager_sets_time_once_using_this_startup_offset(tmp_path, monkeypatch, offset, late):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
+    from core.config import atomic_write
     from scripts.device_manager import runtime
 
     (tmp_path / "logs").mkdir()
     (tmp_path / "config").mkdir()
     path = tmp_path / "run/device_clock_offset"
-    clock.initialize_source_clock_offset(path)
-    clock.publish_source_clock_offset_ns(str(path), 71_844_000_000_000)
+    atomic_write(path, struct.pack("@q", 71_844_000_000_000))
     helper = Mock()
     now = 1_700_000_000_000_000_000
     monkeypatch.setattr(runtime, "system_helper", helper)
     monkeypatch.setattr(runtime, "probe", lambda *_: {"transport.real_lcm_required": False})
     monkeypatch.setattr(runtime, "clean_environment", lambda *args, **kwargs: {})
-    monkeypatch.setattr(runtime.time, "time_ns", lambda: now)
+    elapsed = 0.0
+    waiting = threading.Event()
+    published = threading.Event()
+    threads = []
+
+    def sleep(seconds):
+        nonlocal elapsed
+        if late:
+            waiting.set()
+            assert published.wait(2)
+        elapsed += seconds
+
+    def create_thread(*args, **kwargs):
+        thread = threading.Thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(
+        monotonic=lambda: elapsed, time_ns=lambda: now, sleep=sleep,
+    ))
+    monkeypatch.setattr(runtime, "threading", SimpleNamespace(Thread=create_thread))
 
     def launch(*args, **kwargs):
         if offset is not None:
-            from core.config import atomic_write
-            atomic_write(path, struct.pack("@q", offset))
+            atomic_write(path, struct.pack("@q", 0 if late else offset))
         return SimpleNamespace(poll=lambda: None)
 
     monkeypatch.setattr(runtime.subprocess, "Popen", launch)
     owner = runtime.Runtime(tmp_path)
     monkeypatch.setattr(owner, "status", Mock(side_effect=[{"running": False}, {"healthy": True}]))
-    owner.start(tmp_path)
+    try:
+        owner.start(tmp_path)
+        if late:
+            assert waiting.wait(2)
+            helper.assert_not_called()
+            clock.publish_source_clock_offset_ns(str(path), offset)
+    finally:
+        published.set()
+        for thread in threads:
+            thread.join(2)
+            assert not thread.is_alive()
+    assert len(threads) == 1
+    assert not threads[0].daemon
+    if offset == 0:
+        assert elapsed == pytest.approx(15)
     if offset is not None and abs(offset) == 2_000_000_000:
         helper.assert_called_once_with("set-system-time", {"unix_ns": now + offset})
     else:

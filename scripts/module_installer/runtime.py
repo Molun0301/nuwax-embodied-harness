@@ -56,7 +56,6 @@ def write_runtime(root, prefix, modules, robot, existing):
     values.update({
         "geometry.enabled": geometry, "geometry.external_enabled": geometry,
         "navigation.autostart": "navigation" in selected, "person_follow.autostart": "follow" in selected,
-        "perception.yolo_world_enabled": perception,
         "perception.keyframe_remember_enabled": perception and "memory" in selected,
         "go2.data_plane_enabled": robot == "go2", "go2.direct_dds_enabled": robot == "go2",
         "go2.official_backend_enabled": robot == "go2", "go2.video_stream_enabled": robot == "go2" and perception,

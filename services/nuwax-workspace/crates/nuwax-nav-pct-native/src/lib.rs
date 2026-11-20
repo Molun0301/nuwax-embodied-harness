@@ -857,6 +857,28 @@ mod tests {
         assert!(route.path.iter().any(|point| point[1].abs() > 2.1));
     }
     #[test]
+    fn body_width_slope_ignores_isolated_rise_but_rejects_continuous_grade() {
+        let mut cfg = config();
+        cfg.max_slope = 18.0_f64.to_radians();
+        cfg.footprint = vec![[-0.2, -0.15], [0.2, -0.15], [0.2, 0.15], [-0.2, 0.15]];
+        for raised in [-0.025, 0.0, 0.03] {
+            let mut cells = flat_cells(0..21, -4..5);
+            cells.iter_mut().find(|cell| (cell.x, cell.y) == (10, 0)).unwrap().ground = raised;
+            let mut p = Planner::from_cells(cfg.clone(), &cells, &[]).unwrap();
+            let start = [1.05, 0.05, 0.4 + raised];
+            let route = p.plan(start, [1.75, 0.05, 0.4]).unwrap();
+            assert_eq!(route.path[0], start);
+        }
+        let rise = 0.1 * 25.0_f64.to_radians().tan();
+        let cells: Vec<_> = flat_cells(0..21, -4..5).into_iter().map(|mut cell| {
+            cell.ground = (f64::from(cell.x) + 0.5) * rise;
+            cell
+        }).collect();
+        let mut p = Planner::from_cells(cfg, &cells, &[]).unwrap();
+        assert!(p.plan([0.25, 0.05, 0.4 + 2.5 * rise], [1.75, 0.05, 0.4 + 17.5 * rise]).is_err());
+    }
+
+    #[test]
     fn continuous_measured_slope_is_not_misclassified_as_small_steps() {
         for (gradient, allowed) in [(0.2, true), (1.0, false)] {
             let mut cfg = config();

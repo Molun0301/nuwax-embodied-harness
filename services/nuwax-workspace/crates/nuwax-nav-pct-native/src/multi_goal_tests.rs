@@ -347,22 +347,21 @@ fn reference_map() -> (Config, Vec<Cell>, Vec<Band>, [f64; 3]) {
     (cfg, cells, bands, [0.53, 0.47, 0.43])
 }
 
-/// 按需展开与旧全图做法逐位等价。夹具由`01dbc3d2`在`reference_map`同一地图与起点上导出：旧做法先建全图矩阵
-/// 与全图标签，再从起点展开到队列耗尽；每个实测有效节点一行，`x y 地面 加权代价 路线长度 末段朝向`，后四项为
-/// f64位模式（未到达为无穷；起点与未到达节点的朝向为NaN）。导出时只在旧提交上临时让访问回调记下末段朝向
-/// （由父节点平面位置到本节点格心，与长度同一组坐标），其余为原代码。每个节点的加权代价、沿父链的长度和
-/// 末段朝向都相同，即每个节点的父节点相同，整棵路线树相同。
+/// 按需展开与完整建图后搜索逐位等价。夹具在 `01dbc3d2` 的全图搜索上换入机身半宽坡度计算后，
+/// 用 `reference_map` 的相同地图和起点展开到队列耗尽。每个实测有效节点记录
+/// `x y 地面 加权代价 路线长度 末段朝向`，后四项为 f64 位模式（未到达为无穷，起点及未到达朝向为 NaN）。
+/// 每个节点的加权代价、路线长度和末段朝向都相同，即两棵路线树的父链相同。
 #[test]
-fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
+fn on_demand_source_search_matches_full_graph_labels_with_body_width_slope() {
     let (cfg, cells, bands, start) = reference_map();
     let to_ground = cfg.body_to_ground;
     let bits = |text: &str| f64::from_bits(u64::from_str_radix(text, 16).unwrap());
-    let reference: Vec<_> = include_str!("multi_goal_reference_01dbc3d2.txt").lines().map(|line| {
+    let reference: Vec<_> = include_str!("multi_goal_reference_g4.txt").lines().map(|line| {
         let v: Vec<_> = line.split(' ').collect();
         (v[0].parse::<i32>().unwrap(), v[1].parse::<i32>().unwrap(), bits(v[2]), bits(v[3]), bits(v[4]), bits(v[5]))
     }).collect();
     let center = |i: i32| (f64::from(i) + 0.5) * cfg.resolution;
-    // 目标放在每个旧有效节点的格心，按绑定规则绑定到该节点本身，读出该节点的代价、长度与末段朝向。
+    // 目标放在每个全图参考有效节点的格心，按绑定规则绑定到该节点本身，读出该节点的代价、长度与末段朝向。
     let goals: Vec<_> = reference.iter().map(|&(x, y, ground, ..)| [center(x), center(y), ground + to_ground]).collect();
     let mut planner = Planner::from_cells(cfg.clone(), &cells, &bands).unwrap();
     let mut search = planner.multi_goal_search().unwrap();
@@ -372,7 +371,7 @@ fn on_demand_source_search_matches_full_graph_labels_of_01dbc3d2() {
         settled[goal.index] = Some(goal);
     }
     let reached = reference.iter().filter(|node| node.3.is_finite()).count();
-    assert_eq!(search.stats().source_expanded, reached, "展开节点数等于旧做法到达的节点数");
+    assert_eq!(search.stats().source_expanded, reached, "展开节点数等于全图搜索到达的节点数");
     let mut differences = Vec::new();
     for (&(x, y, ground, weighted, length, yaw), goal) in reference.iter().zip(&settled) {
         let expected = weighted.is_finite().then_some((weighted, length, yaw));

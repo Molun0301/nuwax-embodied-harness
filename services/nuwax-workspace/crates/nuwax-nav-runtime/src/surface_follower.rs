@@ -1266,7 +1266,7 @@ mod native_execution_tests {
         let source = unknown();
         let source = Arc::new(
             source
-                .with_recent_obstacle_points(1, 1, 0, &[], [(0, [0.5, 1., 0.5])])
+                .with_recent_obstacle_points(1, 1, 0, &[], [(0, [0.5, 1., 0.5]), (1, [0.55, 1., 0.5])])
                 .unwrap(),
         );
         let mut follower = follower(pose(0.5, 1., 0.), source);

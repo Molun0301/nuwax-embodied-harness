@@ -275,9 +275,12 @@ async function fetchConfigSchema({ afterSave = false } = {}) {
     const query = new URLSearchParams();
     if (configState.robot) query.set('robot', configState.robot);
     if (configState.profile) query.set('profile', configState.profile);
-    const session = await fetch('/api/manager/session').then(response => response.json());
+    // 读取配置不依赖会话；会话只为之后的写请求取校验值，两者并行发出。
+    const [session, resp] = await Promise.all([
+      fetch('/api/manager/session').then(response => response.json()),
+      fetch("/api/manager/config?" + query),
+    ]);
     configState.csrf = session.csrf_token;
-    const resp = await fetch("/api/manager/config?" + query);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const schema = await resp.json();
     if (request !== configState.schemaRequest) return false;

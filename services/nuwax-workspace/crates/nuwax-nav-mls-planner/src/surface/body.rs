@@ -1284,7 +1284,7 @@ impl SurfaceSnapshot {
                             && finite_member_contact(rigid.as_ref(),point,point)?};
                         if !contact {result.push((point,point));}
                     }
-                } else {
+                } else if recent.confirmed.contains(&[x,y,z]) {
                     let a=[x,y,z].map(|v|f64::from(v)*fine);let b=[x,y,z].map(|v|f64::from(v+1)*fine);
                     result.push((a,b));
                 }
@@ -1431,7 +1431,7 @@ impl SurfaceSnapshot {
                                                 || rigid.as_ref().map_or(Ok(false),|query|query.intersects_point(point))?};
                                     }
                                     if !collision {continue;}
-                                }
+                                } else if !recent.confirmed.contains(&[x,y,z]) {continue;}
                                 let low=[x,y,z].map(|v|f64::from(v)*fine);
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]>=min[2] && low[2]<=max[2] && actual_volume_intersects(&prism_query,rigid.as_ref(),low,high)? {
@@ -3510,7 +3510,7 @@ mod tests {
         let outside=[20.05,0.05,0.5];
         map.validate_body_pose_with_witness(outside,q,&mut witness).unwrap();assert!(witness.is_none());
         assert_eq!(map.query_ground([outside[0],outside[1]],0.1).state,GroundQueryState::Unknown);
-        let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[0.05,0.05,0.55])]).unwrap();
+        let blocked=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[0.05,0.05,0.55])]).unwrap();
         assert!(blocked.validate_body_pose_with_witness(body,q,&mut witness).is_err());
         assert_witness_cold_and_warm(&blocked,(body,q),witness);
         map.validate_body_pose_with_witness(body,q,&mut witness).unwrap();assert!(witness.is_none());
@@ -3540,7 +3540,7 @@ mod tests {
         let pose=([0.05,0.05,0.5],[0.0,0.0,0.0,1.0]);let mut slot=None;
         map.validate_body_pose_with_witness(pose.0,pose.1,&mut slot).unwrap();
         assert!(slot.is_none(),"a nearby nonintersecting obstacle and missing floor do not prove collision");
-        let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[-0.45,0.15,0.55])]).unwrap();
+        let blocked=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[-0.45,0.15,0.55])]).unwrap();
         assert_eq!(blocked.validate_body_pose_with_witness(pose.0,pose.1,&mut slot),Err(SurfaceError::InsufficientClearance));
         assert_witness_cold_and_warm(&blocked,pose,slot);
         assert!(matches!(slot.unwrap().rejection,BodyRejection::Occupancy{..}));
@@ -5821,7 +5821,7 @@ fn ground_context_rotation_and_contact_events_keep_actual_witness() {
     let fine=flat(true);
     assert!(fine.observations.as_ref().unwrap().get([4,4,6]).is_some());
     run(&fine,from,to,"fine-rotation",Some(0.5),None,false,None);
-    let recent=clear.with_recent_obstacle_points(1,100,0,&[],[(0,[0.225,0.225,0.325])]).unwrap();
+    let recent=clear.with_confirmed_recent_fixture(1,100,0,&[],[(0,[0.225,0.225,0.325])]).unwrap();
     run(&recent,from,to,"recent-rotation",Some(0.5),None,true,None);
 
     let translated=ground_band_sweep_scene(0.525);
@@ -5834,7 +5834,7 @@ fn ground_context_rotation_and_contact_events_keep_actual_witness() {
     let point=world(rotation(star.1).unwrap(),star.0,[0.3-1e-8,0.15-1e-8,-0.05]);
     eprintln!("C06_ROTATION_EVENT_INPUT t_star={star_t:.17} star={star:?} point={point:?} ground_indices=[0]");
     assert!((point[2]-0.35).abs()<1e-10);
-    let event=clear.with_recent_obstacle_points(1,100,0,&[0],[(0,point)]).unwrap();
+    let event=clear.with_confirmed_recent_fixture(1,100,0,&[0],[(0,point)]).unwrap();
     run(&event,from,to,"fixed-recent-point-event",Some(star_t),Some(36),true,Some(point));
 }
 

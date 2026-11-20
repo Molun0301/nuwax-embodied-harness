@@ -308,11 +308,18 @@
       }
       initTabPanels();
 
+      // 三维视图只在监控页、3D 模式且标签页可见时运行；机器人模型与完整点云的轮询随之启停。
+      function sync3dVisibility() {
+        window.pointcloud3d?.setVisible(state.mapViewMode === "3d" && !document.hidden
+          && document.getElementById("monitor-view").classList.contains("active"));
+      }
+      document.addEventListener("visibilitychange", sync3dVisibility);
       function openConsoleView(targetId) {
         const buttons = Array.from(document.querySelectorAll(".view-switch-btn"));
         const panes = Array.from(document.querySelectorAll("#view-host > .view-pane"));
         for (const item of buttons) item.classList.toggle("active", item.dataset.viewTarget === targetId);
         for (const pane of panes) pane.classList.toggle("active", pane.id === targetId);
+        sync3dVisibility();
         if (targetId === "config-view") window.nuwaxConsoleSettings?.open();
         if (targetId === "logs-view") window.nuwaxConsoleLogs?.open();
         if (targetId === "capabilities-view") window.nuwaxCapabilityPanel?.open();
@@ -629,7 +636,7 @@
         metric.appendChild(strong);
         return metric;
       }
-      function componentCard(name, item) {
+      function componentCard(name, item, childProcesses) {
         const cls = COMPONENT_STATE_CLASS[item.state] || "idle";
         const card = document.createElement("details");
         card.dataset.serviceId = name;
@@ -665,7 +672,7 @@
         const evidence = document.createElement("div");
         evidence.className = "service-health-evidence";
         evidence.textContent = `组件 ${name}${item.log_file ? ` · 日志 ${item.log_file}` : ""}`;
-        details.append(evidence);
+        details.append(evidence, ...childProcesses.map(buildProcessSummaryRow));
         card.append(top, details);
         state.serviceCardNodes ||= new Map();
         const current = state.serviceCardNodes.get(name);
@@ -677,7 +684,7 @@
         return card;
       }
       // 不属于任何组件主进程的项目进程（例如定位建图启动的激光定位进程）收进「其它进程」。
-      function serviceOthersNode(components) {
+      function serviceOthersNode(components, gatewayChildren) {
         if (!state.serviceOthersNode) {
           const node = document.createElement("details");
           node.className = "service-health-more service-others";
@@ -689,6 +696,7 @@
         }
         const node = state.serviceOthersNode;
         const claimed = new Set(Object.values(components).map((item) => String(item.pid)));
+        for (const proc of gatewayChildren) claimed.add(String(proc.pid));
         const rest = telemetryProcesses().filter((proc) => proc && !claimed.has(String(proc.pid)));
         setText(node.firstElementChild, `其它进程（${rest.length}）`);
         node.hidden = !rest.length;
@@ -749,8 +757,15 @@
         }
         const scrollHost = els.governanceMeta.parentElement;
         const scrollTop = scrollHost.scrollTop;
-        const cards = Object.entries(components).map(([name, item]) => componentCard(name, item));
-        reconcileServiceNodes(els.governanceMeta, [serviceTelemetryHintNode(), ...cards, serviceOthersNode(components)]);
+        const gatewayPid = String(components.gateway?.pid);
+        const tree = telemetryProcesses().filter((proc) => proc.matched_keyword === "process_tree");
+        const gatewayChildren = tree.some((proc) => String(proc.pid) === gatewayPid)
+          ? tree.filter((proc) => String(proc.pid) !== gatewayPid).sort((a, b) => b.cpu_percent - a.cpu_percent)
+          : [];
+        const cards = Object.entries(components).map(([name, item]) =>
+          componentCard(name, item, name === "gateway" ? gatewayChildren : []));
+        reconcileServiceNodes(els.governanceMeta,
+          [serviceTelemetryHintNode(), ...cards, serviceOthersNode(components, gatewayChildren)]);
         for (const name of state.serviceCardNodes.keys()) if (!Object.hasOwn(components, name)) state.serviceCardNodes.delete(name);
         scrollHost.scrollTop = scrollTop;
       }
@@ -798,6 +813,7 @@
           slam_2d_worker: "二维激光建图", nuwax_slam_2d_worker: "二维激光建图",
           nav_stack: "路径规划与导航执行", static_tf: "固定坐标变换",
           go2_video_streamer: "摄像头采集与视频推流", go2_data_plane: "机器人状态与传感器接入",
+          go2_sensor_input: "Go2 传感器采集",
           motion_safety_guard: "运动安全守卫", nuwax_motion_safety_guard: "运动安全守卫",
           pointlio_native: "逐点激光惯性定位", fastlio2_native: "快速激光惯性定位",
           nuwax_lcm_runtime: "机器人数据通信", lcm_runtime: "机器人数据通信",
@@ -5352,7 +5368,7 @@
         updateMapStreamChip();
         if (nextMode === "3d") resetMapInteraction(true);
         syncMapViewControls();
-        window.pointcloud3d?.setVisible(nextMode === "3d");
+        sync3dVisibility();
         if (nextMode === "3d") {
           if (!window.pointcloud3d || !els.map3dContainer) {
             updateMapStreamChip();

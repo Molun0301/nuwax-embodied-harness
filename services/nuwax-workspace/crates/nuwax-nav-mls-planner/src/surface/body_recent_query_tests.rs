@@ -74,7 +74,7 @@ impl SurfaceSnapshot {
                                 if let Some(points)=frame.surface_points.get(&[x,y,z]) {
                                     if !points.iter().any(|&point|!self.recent_surface_contact(point,height,body,r)
                                         &&prism_query.intersects(point,point)) {continue;}
-                                }
+                                } else if !recent.confirmed.contains(&[x,y,z]) {continue;}
                                 let low=[x,y,z].map(|v|f64::from(v)*fine);
                                 let high=[x,y,z].map(|v|f64::from(v+1)*fine);
                                 if high[2]>=min[2] && low[2]<=max[2] && prism_query.intersects(low,high) {
@@ -246,7 +246,7 @@ fn recent_fixture(coarse:f32,kind:&str,frames:u64)->SurfaceSnapshot {
     let ground:Vec<_>=(0..live.len() as u32).collect();
     if kind=="obstacle" {live.push([0.075,0.025,0.45]);live.push([0.125,0.025,0.4]);}
     for sequence in 1..=frames {
-        map=map.with_recent_obstacle_points(sequence,sequence*100,1000,&ground,
+        map=map.with_confirmed_recent_fixture(sequence,sequence*100,1000,&ground,
             live.iter().copied().enumerate().map(|(i,p)|(i as u32,p))).unwrap();
     }
     map
@@ -333,7 +333,7 @@ fn recent_height_rows_keep_fine_xy_unknown_layers_and_exact_height_bits() {
     // A high return at the second XY is contact there, then the unknown slice
     // must still reject; accidentally reusing the first scalar changes witness.
     let quantum=f64::from(base.source_voxel_size_m());
-    let live=base.with_recent_obstacle_points(1,100,0,&[0,1,2],
+    let live=base.with_confirmed_recent_fixture(1,100,0,&[0,1,2],
         [(0,[0.025,0.025,0.025]),(1,[0.025,0.075,0.12]),(2,[0.075,0.025,0.1])]).unwrap();
     let body=[0.05,0.05,0.45];let q=[0.,0.,0.,1.];let mut old=None;let mut new=None;
     let expected=live.reference_recent_body_pose(body,q,&mut old);
@@ -370,7 +370,7 @@ fn recent_query_reuse_is_local_to_pose_and_source() {
             let mut cases=vec![map.clone(),map.clear_recent_obstacles()];
             cases.push(map.with_observations(None));
             cases.push(map.with_observations(Some(witnessed_observations(&[(0.025,0.025,0.325)],0.05))));
-            cases.push(map.with_recent_obstacle_points(9,900,0,&[],[(0,[0.025,0.025,0.45])]).unwrap());
+            cases.push(map.with_confirmed_recent_fixture(9,900,0,&[],[(0,[0.025,0.025,0.45])]).unwrap());
             for case in cases {
                 let mut old_map=case.clone();old_map.body_query_cache=Default::default();
                 let mut new_map=case;new_map.body_query_cache=Default::default();
@@ -389,9 +389,9 @@ fn recent_query_reuse_is_local_to_pose_and_source() {
 #[test]
 fn recent_query_preserves_first_frame_witness_across_a_reused_coarse_column() {
     let map=recent_fixture(0.1,"no_recent",1)
-        .with_recent_obstacle_points(1,100,1000,&[0],[(0,[0.025,0.025,0.04])]).unwrap()
-        .with_recent_obstacle_points(2,200,1000,&[],[(0,[0.075,0.025,0.425]),(1,[0.075,0.025,0.475])]).unwrap()
-        .with_recent_obstacle_points(3,300,1000,&[],[(0,[-0.075,0.025,0.425])]).unwrap();
+        .with_confirmed_recent_fixture(1,100,1000,&[0],[(0,[0.025,0.025,0.04])]).unwrap()
+        .with_confirmed_recent_fixture(2,200,1000,&[],[(0,[0.075,0.025,0.425]),(1,[0.075,0.025,0.475])]).unwrap()
+        .with_confirmed_recent_fixture(3,300,1000,&[],[(0,[-0.075,0.025,0.425])]).unwrap();
     let body=[0.005,0.005,0.45];let q=[0.,0.,0.,1.];
     let mut old=None;let mut new=None;
     assert_eq!(map.check_body_pose(body,q,&mut new),map.reference_recent_body_pose(body,q,&mut old));
@@ -415,7 +415,7 @@ fn recent_query_preserves_real_current_overlay_and_cleared_voxels() {
     assert!(view.observations.as_ref().unwrap().get([0,0,2]).is_some());
     for obstacle in [false,true] {
         let point=if obstacle{[0.025,0.025,0.325]}else{[0.025,0.025,0.025]};
-        let map=view.with_recent_obstacle_points(1,100,0,if obstacle{&[]}else{&[0]},[(0,point)]).unwrap();
+        let map=view.with_confirmed_recent_fixture(1,100,0,if obstacle{&[]}else{&[0]},[(0,point)]).unwrap();
         for dx in [0.,0.001,0.05] {
             let p=[dx,0.,0.4];let mut old=None;let mut new=None;
             assert_eq!(map.check_body_pose(p,q,&mut new),map.reference_recent_body_pose(p,q,&mut old));

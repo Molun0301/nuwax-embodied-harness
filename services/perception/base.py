@@ -36,6 +36,10 @@ class DetectorBackend(ABC):
 
     spec: DetectorBackendSpec
 
+    def unload(self, timeout=5.0) -> bool:
+        """释放按需加载的模型；无模型的后端无需收尾。"""
+        return True
+
     @abstractmethod
     def detect(
         self,

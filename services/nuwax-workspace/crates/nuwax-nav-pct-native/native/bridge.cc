@@ -147,6 +147,7 @@ struct Planner {
   PctConfig cfg;
   std::vector<Point> footprint,boundary;
   double clearance_radius=0.;
+  std::vector<XY> slope_pairs;
   std::unordered_map<XY,Column,XYHash> columns;
   std::unordered_set<XY,XYHash> overlay_columns;
   std::unordered_set<XY,XYHash> dirty_buckets;
@@ -168,6 +169,13 @@ struct Planner {
       }
     }
     for(auto p:footprint)clearance_radius=std::max(clearance_radius,std::hypot(p[0],p[1]));
+    const auto by_width=[](Point a,Point b){return a[1]<b[1];};
+    const auto [right,left]=std::minmax_element(footprint.begin(),footprint.end(),by_width);
+    const double radius=std::max(c.resolution,((*left)[1]-(*right)[1])*0.5);
+    const int reach=static_cast<int>(std::floor(radius/c.resolution));
+    for(int x=0;x<=reach;++x)for(int y=-reach;y<=reach;++y) {
+      if((x>0||y>0)&&std::hypot(x,y)*c.resolution<=radius)slope_pairs.emplace_back(x,y);
+    }
   }
   int bucket(int cell) const {
     const int whole=cell/bucket_cells;
@@ -287,12 +295,10 @@ struct Planner {
     // 包络在窄门处可有负净距，软代价仍连续；原真实多边形硬判定保留通行能力。
     return 20.*(1.-clearance/range)*std::hypot(edge[3]-edge[0],edge[4]-edge[1])/q;
   }
-  // 完整平面梯度与行进方向无关：两侧最近实测面高度差同向且相符才计连续坡面。
+  // 用机身半宽内的实测高度拟合平面；各高度须能由同一连续面在原测量精度内描述。
   double grade_sq(XY key,double height) const {
-    const double q=cfg.resolution;
-    double grade_sq=0;
-    const double tolerance=cfg.point_resolution*0.5+1e-8;
-    auto nearest=[&](XY neighbor)->const PctCell* {
+    const double q=cfg.resolution,tolerance=cfg.point_resolution*0.5+1e-8;
+    const auto nearest=[&](XY neighbor)->const PctCell* {
       auto column=columns.find(neighbor);
       if(column==columns.end()||column->second.surfaces.empty())return nullptr;
       const auto& surfaces=column->second.surfaces;
@@ -300,24 +306,46 @@ struct Planner {
         return std::abs(a.ground-height)<std::abs(b.ground-height);
       });
     };
-    for(int axis=0;axis<2;++axis) {
-      const int coordinate=axis==0?key.first:key.second;
-      if(coordinate==std::numeric_limits<int>::min()||coordinate==std::numeric_limits<int>::max())continue;
-      XY minus=key,plus=key;
-      (axis==0?minus.first:minus.second)--;
-      (axis==0?plus.first:plus.second)++;
-      const auto* lower=nearest(minus);const auto* upper=nearest(plus);
-      if(!lower||!upper)continue;
-      const double before=height-lower->ground,after=upper->ground-height;
-      // 双侧同向且高度增量相符才计连续坡面；阶边一侧为踏面时仍由原阶高判定。
-      if(before*after>0&&std::abs(before-after)<=tolerance) {
-        const double grade=std::min(std::abs(before),std::abs(after))/q;
-        grade_sq+=grade*grade;
-      }
+    // 对称样本的坐标均值为零，正规方程只需求两个斜率分量与平均高度。
+    double xx=0.,xy=0.,yy=0.,xz=0.,yz=0.,sum=0.;
+    size_t count=1;
+    bool rises_on_both_sides=false;
+    for(auto [dx,dy]:slope_pairs) {
+      const auto* minus=nearest({key.first-dx,key.second-dy});
+      const auto* plus=nearest({key.first+dx,key.second+dy});
+      if(!minus||!plus)continue;
+      const double before=height-minus->ground,after=plus->ground-height;
+      rises_on_both_sides|=before*after>0.;
+      const double dz=(before+after)/(2.*q);
+      xx+=dx*dx;xy+=dx*dy;yy+=dy*dy;xz+=dx*dz;yz+=dy*dz;
+      sum+=after-before;
+      count+=2;
     }
-    return grade_sq;
+    // 两级踏面只有在阶沿跳高，中心地面两侧没有同向变化。
+    if(!rises_on_both_sides)return 0.;
+    const double determinant=xx*yy-xy*xy,trace=xx+yy;
+    double a=0.,b=0.;
+    if(determinant>0.) {
+      a=(yy*xz-xy*yz)/determinant;
+      b=(xx*yz-xy*xz)/determinant;
+    } else if(trace>0.) {
+      // 窄地面只有一个实测方向时只求该方向的斜率。
+      a=xz/trace;b=yz/trace;
+    }
+    // 阶沿和单格起伏保留其原高差，不转成超坡度格。
+    const double offset=sum/count;
+    if(std::abs(offset)>tolerance)return 0.;
+    for(auto [dx,dy]:slope_pairs) {
+      const auto* minus=nearest({key.first-dx,key.second-dy});
+      const auto* plus=nearest({key.first+dx,key.second+dy});
+      if(!minus||!plus)continue;
+      const double rise=(a*dx+b*dy)*q;
+      if(std::abs((minus->ground-height)-(offset-rise))>tolerance ||
+         std::abs((plus->ground-height)-(offset+rise))>tolerance)return 0.;
+    }
+    return a*a+b*b;
   }
-  bool transition(const Edge& edge,XY from,XY to) {
+  bool transition(const Edge& edge) {
     const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
     if(shared) {
       auto found=shared->edges.find(edge);
@@ -327,20 +355,6 @@ struct Planner {
     const double h=std::hypot(bx-ax,by-ay),dh=std::abs(edge[5]-edge[2]);
     const double step=edge[5]>=edge[2]?cfg.max_step:cfg.max_step_down;
     if(dh>std::max(step,std::tan(cfg.max_slope)*h)+1e-8)return false;
-    if(dh>std::tan(cfg.max_slope)*h+1e-8) {
-      // 连续实测斜面不能被逐格误解释成台阶；真正高度跳变两侧的踏面仍用阶高。
-      const int ex=to.first-from.first,ey=to.second-from.second;
-      const double signed_dh=edge[5]-edge[2],tolerance=cfg.point_resolution*0.5+1e-8;
-      auto measured_height=[&](int x,int y,double expected) {
-        auto col=columns.find({x,y});
-        if(col==columns.end())return false;
-        return std::any_of(col->second.surfaces.begin(),col->second.surfaces.end(),
-            [&](const PctCell& cell){return std::abs(cell.ground-expected)<=tolerance;});
-      };
-      if(measured_height(from.first,from.second,edge[2])&&measured_height(to.first,to.second,edge[5])&&
-         measured_height(from.first-ex,from.second-ey,edge[2]-signed_dh)&&
-         measured_height(to.first+ex,to.second+ey,edge[5]+signed_dh))return false;
-    }
     const double yaw=std::atan2(by-ay,bx-ax);
     // 两端与中点检查覆盖对角薄墙，保持真实足迹而非外包圆膨胀。
     for(int i=0;i<=2;++i){double t=i*0.5;
@@ -493,8 +507,7 @@ struct Planner {
       const bool last=b->layer==gl&&b->idx[2]==gx&&b->idx[1]==gy;
       const double ax=first?start_x:(a->idx[2]+minx+0.5)*q,ay=first?start_y:(a->idx[1]+miny+0.5)*q;
       const double bx=last?goal_x:(b->idx[2]+minx+0.5)*q,by=last?goal_y:(b->idx[1]+miny+0.5)*q;
-      return transition({ax,ay,a->height,bx,by,b->height},
-                        {a->idx[2]+minx,a->idx[1]+miny},{b->idx[2]+minx,b->idx[1]+miny});
+      return transition({ax,ay,a->height,bx,by,b->height});
     });
     astar.SetTraversalCost([&](const Node* a,const Node* b){
       const bool first=a->layer==sl&&a->idx[2]==sx&&a->idx[1]==sy;
@@ -766,7 +779,7 @@ struct SourceSearch {
       auto visit=[&](Layer& layer) {
         if(!layer.valid||std::abs(layer.ground-state.ground)>height_limit)return;
         const double bx=(x+0.5)*q,by=(y+0.5)*q;
-        if(!p.transition({ax,ay,state.ground,bx,by,layer.ground},{from.x,from.y},{x,y}))return;
+        if(!p.transition({ax,ay,state.ground,bx,by,layer.ground}))return;
         const double dz=(layer.ground-state.ground)/q;
         const double step=soft(x,y,layer)+p.clearance_cost({ax,ay,state.ground,bx,by,layer.ground});
         const double g=state.g+std::sqrt(dz*dz+offset[0]*offset[0]+offset[1]*offset[1])+step;

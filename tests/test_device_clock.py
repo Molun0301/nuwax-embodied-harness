@@ -179,7 +179,8 @@ def test_manager_sets_time_once_using_this_startup_offset(tmp_path, monkeypatch,
 
     monkeypatch.setattr(runtime.subprocess, "Popen", launch)
     owner = runtime.Runtime(tmp_path)
-    monkeypatch.setattr(owner, "status", Mock(side_effect=[{"running": False}, {"healthy": True}]))
+    monkeypatch.setattr(owner, "status", Mock(return_value={"running": False}))
+    monkeypatch.setattr(owner, "gateway_healthy", Mock(return_value=True))
     try:
         owner.start(tmp_path)
         if late:
@@ -291,7 +292,7 @@ def test_driver_links_clock_before_feedback(tmp_path, monkeypatch):
     try:
         simulation.start()
         assert link.is_symlink()
-        assert link.readlink() == platform_clock
+        assert os.readlink(link) == str(platform_clock)
         assert observed == [41]
     finally:
         simulation.close()

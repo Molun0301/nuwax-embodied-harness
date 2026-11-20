@@ -740,8 +740,11 @@ mod tests {
     #[test]
     fn recent_labels_remain_separate_and_global_consumes_real_obstacle() {
         let (_, base) = crate::native_test_helpers::fixture();
+        let q = f64::from(base.source_voxel_size_m());
         let map = base
-            .with_recent_obstacle_points(1, 1, 0, &[0], [(0, [0.5, 1., 0.04]), (1, [1., 1., 0.5])])
+            .with_recent_obstacle_points(1, 1, 0, &[0], [
+                (0, [0.5, 1., 0.04]), (1, [1.025, 1., 0.5]), (2, [1.025 + q, 1., 0.5]),
+            ])
             .unwrap();
         let mut input = NativeMap {
             resolution: 0.1,
@@ -755,7 +758,7 @@ mod tests {
         append_recent(&map, &mut input);
         assert_eq!(input.ground, vec![[0.5, 1., 0.04]]);
         assert_eq!(input.static_collision_ground, input.ground);
-        assert_eq!(input.obstacles.len(), 1);
+        assert_eq!(input.obstacles.len(), 2);
         assert!(input
             .bands
             .iter()

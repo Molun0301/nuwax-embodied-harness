@@ -34,6 +34,7 @@ def start_mapping(platform, args):
 
 def start_mapping_session(platform, name, *, continue_saved=False, timeout_sec=None):
     """普通建图、探索与新楼层共用同一会话及元数据流程。"""
+    platform.input_bridge.start()
     snap = platform.geometry.start_mapping(name, continue_saved=continue_saved, timeout_sec=timeout_sec)
     if not continue_saved:
         meta = platform.maps.read_meta(name)

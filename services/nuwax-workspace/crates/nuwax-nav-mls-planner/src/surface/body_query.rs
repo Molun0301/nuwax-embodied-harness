@@ -952,21 +952,21 @@ mod planning_snapshot_identity_tests {
     #[test]
     fn planning_snapshot_keeps_recent_owner_presence_refresh_clear_and_retention_guards() {
         let original = scene().with_observations(Some(Arc::new(observations())));
-        let recent = original.with_recent_obstacle_points(1, 100, 0, &[],
+        let recent = original.with_confirmed_recent_fixture(1, 100, 0, &[],
             [(0, [0.025, 0.025, 0.4])]).unwrap();
         assert!(original.same_geometry(&recent));
         assert!(!original.same_planning_query_view(&recent));
         assert!(!recent.same_planning_query_view(&original));
         assert!(recent.same_planning_query_view(&recent.clone()));
-        let changed = recent.with_recent_obstacle_points(2, 200, 0, &[],
+        let changed = recent.with_confirmed_recent_fixture(2, 200, 0, &[],
             [(0, [0.025, 0.025, 0.4])]).unwrap();
         assert!(!recent.same_planning_query_view(&changed), "same points do not alias a new recent owner");
-        let retained = recent.with_recent_obstacle_points(2, 200, 200, &[],
+        let retained = recent.with_confirmed_recent_fixture(2, 200, 200, &[],
             [(0, [0.025, 0.025, 0.4])]).unwrap();
         assert!(!recent.same_planning_query_view(&retained));
         assert!(!changed.same_planning_query_view(&retained));
         assert!(!recent.same_planning_query_view(&recent.clear_recent_obstacles()));
-        let empty_recent = original.with_recent_obstacle_points(1, 100, 0, &[], []).unwrap();
+        let empty_recent = original.with_confirmed_recent_fixture(1, 100, 0, &[], []).unwrap();
         assert!(!original.same_planning_query_view(&empty_recent), "None differs even from an empty recent frame");
         let mut next = original.observations().unwrap().as_ref().clone();
         refresh(&mut next, 200, 2, 0.02);

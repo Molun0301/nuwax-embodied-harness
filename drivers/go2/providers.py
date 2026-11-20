@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import logging
 import time
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
@@ -241,6 +242,11 @@ class Go2ProviderBundle(
             return None
         point_cloud = getter()
         return point_cloud.model_copy(deep=True) if point_cloud is not None else None
+
+    def point_cloud_consumer(self):
+        if self.assembly.data_plane is None:
+            return nullcontext()
+        return self.assembly.data_plane.point_cloud_consumer()
 
     def subscribe_point_cloud(self, callback: Callable[[PointCloudFrame], None]) -> Optional[int]:
         if self.assembly.data_plane is None:

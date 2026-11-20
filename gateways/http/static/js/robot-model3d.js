@@ -1,6 +1,7 @@
 import * as THREE from './three.module.min.js';
 
-const POLL_MS = 100;
+// 关节姿态由网关按最新关节与位姿算出连杆变换，没有现成的数据流，按页面常驻轮询上限每秒取一次。
+const POLL_MS = 1000;
 const MANIFEST_POLL_MS = 2000;
 const MAX_STATE_AGE_MS = 500;
 
@@ -249,12 +250,13 @@ export class RobotModelLayer {
     }
     this.state = state;
     this.stateReceivedAt = this.now();
-    // 请求开始计时覆盖网络传输耗时，不能把到达浏览器的旧数据重新续期。
-    this.stateExpiresAt = requestStarted + Math.min(MAX_STATE_AGE_MS, Math.max(0, Number(state.valid_for_sec) || 0) * 1000);
+    // 请求开始计时覆盖网络传输耗时，不能把到达浏览器的旧数据重新续期；
+    // 取到时有效的关节姿态保持到下一次取回，否则每秒一取会在两次之间退回参考姿态。
+    this.stateExpiresAt = requestStarted + POLL_MS + Math.min(MAX_STATE_AGE_MS, Math.max(0, Number(state.valid_for_sec) || 0) * 1000);
     clearTimeout(this._expiryTimer);
     if (state.mode === 'live' && this.now() < this.stateExpiresAt && this.poseMatches(state)) {
       this._expiryTimer = setTimeout(() => this.checkFreshness(), Math.max(1, this.stateExpiresAt - this.now()));
-      this._status({ available: true, mode: 'live', message: '真实外观 · 实时关节' });
+      this._status({ available: true, mode: 'live', message: '真实外观 · 关节每秒更新' });
     } else {
       this.useReference(!this.poseMatches(state) ? '地图位姿与关节时刻不匹配' : state.message || '关节状态已过期');
     }

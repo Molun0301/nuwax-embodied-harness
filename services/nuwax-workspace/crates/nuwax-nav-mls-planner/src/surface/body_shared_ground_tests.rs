@@ -232,7 +232,7 @@ fn measured_contact_members_do_not_require_a_connected_ground_anchor() {
     assert_eq!(view.query_ground([pose.0[0],pose.0[1]],0.0).state,GroundQueryState::Unknown);
     assert!(view.observations.as_ref().unwrap().get(floor).is_some());
     // The accepted floor does not grant contact to a new recent object in its column.
-    let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[point[0],point[1],0.35])]).unwrap();
+    let blocked=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[point[0],point[1],0.35])]).unwrap();
     assert_eq!(blocked.validate_body_pose(pose.0,pose.1),Err(SurfaceError::InsufficientClearance));
 }
 
@@ -247,7 +247,7 @@ fn unknown_motion_keeps_current_reference_and_factual_unknown_state() {
     map.validate_body_motion(pose,next,&[]).unwrap();
     assert_eq!(map.query_ground([4.35,0.05],0.1).state,GroundQueryState::Unknown);
     assert!(map.locate_support([4.35,0.05,0.1]).is_err());
-    let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[4.2,0.05,0.55])]).unwrap();
+    let blocked=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[4.2,0.05,0.55])]).unwrap();
     assert_eq!(blocked.validate_body_motion(pose,next,&[]),Err(SurfaceError::InsufficientClearance));
 }
 
@@ -311,7 +311,7 @@ fn recent_guide_and_body_share_measured_contact_when_center_ground_is_unknown() 
         .unwrap().with_body_envelope(envelope).unwrap().with_observations(Some(Arc::new(observations)));
     let pose=([0.025,0.025,0.4],[0.0,0.0,0.0,1.0]);
     assert_eq!(map.locate_support_from_body(pose.0,pose.1,0.4),Err(SurfaceError::MissingSupport));
-    let floor=map.with_recent_obstacle_points(1,100,0,&[0],[(0,point)]).unwrap();
+    let floor=map.with_confirmed_recent_fixture(1,100,0,&[0],[(0,point)]).unwrap();
     floor.validate_body_pose(pose.0,pose.1).unwrap();
     let bounds=[[-0.5,-0.5],[0.5,0.5]];
     assert!(floor.recent_obstacle_hints(bounds,pose).unwrap().is_empty(),
@@ -319,7 +319,7 @@ fn recent_guide_and_body_share_measured_contact_when_center_ground_is_unknown() 
     assert_eq!(floor.query_ground([pose.0[0],pose.0[1]],0.0).state,GroundQueryState::Unknown);
     for indices in [&[][..],&[0][..]] {
         let obstacle=[point[0],point[1],0.35];
-        let blocked=map.with_recent_obstacle_points(2,200,0,indices,[(0,obstacle)]).unwrap();
+        let blocked=map.with_confirmed_recent_fixture(2,200,0,indices,[(0,obstacle)]).unwrap();
         assert_eq!(blocked.validate_body_pose(pose.0,pose.1),Err(SurfaceError::InsufficientClearance));
         assert_eq!(blocked.recent_obstacle_hints(bounds,pose).unwrap().len(),1,
             "an independent volume or elevated plane still supplies a real detour obstacle");
@@ -395,7 +395,7 @@ fn recent_guide_shared_contact_cost_comparison() {
             x.rem_euclid(stride)==0 && y.rem_euclid(stride)==0).map(move|y|
             [(f64::from(x)+0.5)*0.05,(f64::from(y)+0.5)*0.05,-0.025])).collect();
         let ids:Vec<_>=(0..points.len() as u32).collect();
-        for seq in 1..=frames {map=map.with_recent_obstacle_points(seq,seq*100,10000,&ids,
+        for seq in 1..=frames {map=map.with_confirmed_recent_fixture(seq,seq*100,10000,&ids,
             points.iter().copied().enumerate().map(|(i,p)|(i as u32,p))).unwrap();}
         let pose=([0.025,0.025,0.4],[0.,0.,0.,1.]);let bounds=[[-0.6,-0.6],[0.6,0.6]];
         let old=map.legacy_recent_obstacle_hints(bounds,pose).unwrap();
@@ -481,7 +481,7 @@ fn same_coarse_measured_members_do_not_exempt_the_other_layer_or_live_obstacles(
             "the upper measured plane remains real collision for a body on the lower plane");
     }
     let body=[0.025,0.025,1.5*q+0.4];
-    let blocked=map.with_recent_obstacle_points(1,100,0,&[],[(0,[0.025,0.025,0.35])]).unwrap();
+    let blocked=map.with_confirmed_recent_fixture(1,100,0,&[],[(0,[0.025,0.025,0.35])]).unwrap();
     assert_eq!(blocked.validate_body_pose(body,attitude),Err(SurfaceError::InsufficientClearance));
     let unclassified=same_coarse_measured_map(&[0]);
     assert_eq!(unclassified.validate_body_pose([body[0],body[1],0.5*q+0.4],attitude),
@@ -880,7 +880,7 @@ fn ground_context_exact_members_keep_same_coarse_obstacle() {
 
     // Independent live geometry must survive even when all persistent fine
     // occupancy is precisely the allowed lower measured floor.
-    let recent = floor.with_recent_obstacle_points(1, 100, 0, &[],
+    let recent = floor.with_confirmed_recent_fixture(1, 100, 0, &[],
         [(0, [0.025, 0.025, 0.35])]).unwrap();
     for anchored in [true, false] {
         let reference = if anchored {
@@ -934,13 +934,13 @@ fn ground_context_recent_floor_box_and_refresh_pair() {
     let reference = Arc::new(LocalGroundReference { first: carried, changes: vec![] });
     assert_eq!(reference.first.reference_origin[2], -0.025, "this source has no ground zero");
     assert_eq!(reference.first.query_state, GroundQueryState::Unknown);
-    let floor = map.with_recent_obstacle_points(1, 100, 0, &[0], [(0, point)]).unwrap();
+    let floor = map.with_confirmed_recent_fixture(1, 100, 0, &[0], [(0, point)]).unwrap();
     assert!(floor.recent_obstacle_hints(bounds, a).unwrap().is_empty());
     for indices in [&[][..], &[0][..]] {
-        let blocked = floor.with_recent_obstacle_points(2, 200, 0, indices,
+        let blocked = floor.with_confirmed_recent_fixture(2, 200, 0, indices,
             [(0, [point[0], point[1], 0.35])]).unwrap();
-        let restored = blocked.with_recent_obstacle_points(3, 300, 0, &[0], [(0, point)]).unwrap();
-        let blocked_again = restored.with_recent_obstacle_points(4, 400, 0, indices,
+        let restored = blocked.with_confirmed_recent_fixture(3, 300, 0, &[0], [(0, point)]).unwrap();
+        let blocked_again = restored.with_confirmed_recent_fixture(4, 400, 0, indices,
             [(0, [point[0], point[1], 0.35])]).unwrap();
         let cleared = blocked_again.clear_recent_obstacles();
         assert_eq!(blocked.recent_obstacle_hints(bounds, a).unwrap().len(), 1);

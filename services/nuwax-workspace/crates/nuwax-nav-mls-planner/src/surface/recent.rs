@@ -2,6 +2,25 @@
 use super::*;
 use std::collections::BTreeMap;
 
+// rec1119 和 rec1400 的 1.5 米内稳定结构，采用同帧邻域后确认时延中位均为 0 ms。
+// 孤立体素仍等两帧，分别去掉 92% 和 90% 以上的静止段孤立近地候选。
+const RECENT_OBSTACLE_CONFIRMATION_FRAMES: usize = 2;
+
+fn has_obstacle_neighbour(key: [i32; 3], obstacles: &AHashSet<[i32; 3]>) -> bool {
+    let [x, y, z] = key;
+    for a in x.saturating_sub(1)..=x.saturating_add(1) {
+        for b in y.saturating_sub(1)..=y.saturating_add(1) {
+            for c in z.saturating_sub(1)..=z.saturating_add(1) {
+                let neighbour = [a, b, c];
+                if neighbour != key && obstacles.contains(&neighbour) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 #[path = "recent_columns_diagnostics.rs"]
 mod columns_diagnostics;
@@ -11,12 +30,25 @@ pub(super) struct RecentFrame {
     pub timestamp:u64,
     pub columns:BTreeMap<[i32;2],Vec<i32>>,
     pub surface_points:AHashMap<[i32;3],Vec<[f64;3]>>,
+    obstacles:AHashSet<[i32;3]>,
+    spatially_supported:Vec<[i32;3]>,
 }
 pub(super) struct RecentObstacles {
     pub size:f64,
     pub frames:Vec<Arc<RecentFrame>>,
+    pub confirmed:AHashSet<[i32;3]>,
 }
 impl SurfaceSnapshot {
+    #[cfg(test)]
+    pub(crate) fn with_confirmed_recent_fixture(&self, sequence: u64, timestamp: u64, retention: u64,
+        ground: &[u32], points: impl IntoIterator<Item=(u32,[f64;3])>) -> Result<Self,SurfaceError> {
+        let mut snapshot = self.with_recent_obstacle_points(sequence, timestamp, retention, ground, points)?;
+        // 碰撞几何夹具直接提供已确认的障碍，采样确认另用真实帧序列测试。
+        let recent = Arc::get_mut(snapshot.recent_obstacles.as_mut().unwrap()).unwrap();
+        recent.confirmed.extend(recent.frames.iter().flat_map(|frame| frame.obstacles.iter().copied()));
+        Ok(snapshot)
+    }
+
     /// 导出原生规划器使用的近期观测；实测地面保留原高度，其余占据按源体素输出。
     pub fn navigation_recent_samples(&self) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
         let mut ground = Vec::new();
@@ -27,7 +59,7 @@ impl SurfaceSnapshot {
                     for &z in heights {
                         if let Some(measured) = frame.surface_points.get(&[x, y, z]) {
                             ground.extend_from_slice(measured);
-                        } else {
+                        } else if recent.confirmed.contains(&[x, y, z]) {
                             obstacles.push(
                                 [x, y, z].map(|value| (f64::from(value) + 0.5) * recent.size),
                             );
@@ -92,9 +124,26 @@ impl SurfaceSnapshot {
             }
         }
         if frames.len()>=8 {frames.drain(..frames.len()-7);}
-        frames.push(Arc::new(RecentFrame{sequence:source_sequence,timestamp:source_timestamp_ns,columns,surface_points}));
+        let spatially_supported = obstacles.iter().copied()
+            .filter(|&key| has_obstacle_neighbour(key, &obstacles)).collect();
+        frames.push(Arc::new(RecentFrame{
+            sequence:source_sequence,timestamp:source_timestamp_ns,columns,surface_points,obstacles,
+            spatially_supported,
+        }));
+        let mut counts = AHashMap::new();
+        let mut confirmed = AHashSet::new();
+        for frame in &frames {
+            confirmed.extend(frame.spatially_supported.iter().copied());
+            for &key in &frame.obstacles {
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                if *count == RECENT_OBSTACLE_CONFIRMATION_FRAMES {
+                    confirmed.insert(key);
+                }
+            }
+        }
         let mut result=self.clone();
-        result.recent_obstacles=Some(Arc::new(RecentObstacles{size,frames}));
+        result.recent_obstacles=Some(Arc::new(RecentObstacles{size,frames,confirmed}));
         result.body_query_cache=Default::default();
         Ok(result)
     }
@@ -168,7 +217,7 @@ impl SurfaceSnapshot {
                     if points.iter().any(|&point|planar_recent_overlap(from,to,radius,height,point,point)) {
                         return Err(SurfaceError::InsufficientClearance);
                     }
-                } else if planar_recent_overlap(from,to,radius,height,
+                } else if recent.confirmed.contains(&key) && planar_recent_overlap(from,to,radius,height,
                     key.map(|v|f64::from(v)*size),key.map(|v|(f64::from(v)+1.0)*size)) {
                     return Err(SurfaceError::InsufficientClearance);
                 }
@@ -189,20 +238,58 @@ mod planar_tests {
         SurfaceSnapshot::from_points(&[(10.05,10.05,0.05)],config,0.1).unwrap()
     }
     #[test]
+    fn isolated_obstacle_requires_distinct_frames_and_expires_with_the_window() {
+        let point = [0.55, 0.05, 0.35];
+        let ground = [0.55, 0.05, 0.05];
+        let mut map = source().with_recent_obstacle_points(
+            1, 100, 1000, &[2], [(0, point), (1, point), (2, ground)],
+        ).unwrap();
+        assert_eq!(map.navigation_recent_samples(), (vec![ground], vec![]));
+        let from = [0., 0., 0.1];
+        let to = [1., 0., 0.1];
+        assert!(map.validate_planar_recent_motion(from, to).is_ok());
+        for sequence in 2..=RECENT_OBSTACLE_CONFIRMATION_FRAMES as u64 {
+            map = map.with_recent_obstacle_points(sequence, sequence * 100, 1000, &[], [(0, point)]).unwrap();
+        }
+        assert!(!map.navigation_recent_samples().1.is_empty());
+        assert_eq!(map.validate_planar_recent_motion(from, to), Err(SurfaceError::InsufficientClearance));
+        let expired = map.with_recent_obstacle_points(
+            RECENT_OBSTACLE_CONFIRMATION_FRAMES as u64 + 1, 1101, 1000, &[], [],
+        ).unwrap();
+        assert!(expired.navigation_recent_samples().1.is_empty());
+        assert!(expired.validate_planar_recent_motion(from, to).is_ok());
+    }
+    #[test]
+    fn diagonal_neighbours_observed_together_are_immediate_obstacles() {
+        let point = [0.55, 0.05, 0.35];
+        let neighbour = [0.65, 0.15, 0.45];
+        let from = [0., 0., 0.1];
+        let to = [1., 0., 0.1];
+        let frame = [(0, point), (1, neighbour)];
+        let measured = source();
+        let ground_neighbour = measured.with_recent_obstacle_points(1, 100, 1000, &[1], frame).unwrap();
+        assert_eq!(ground_neighbour.navigation_recent_samples(), (vec![neighbour], vec![]));
+        let cluster = measured.with_recent_obstacle_points(1, 100, 1000, &[], frame).unwrap();
+        assert_eq!(cluster.navigation_recent_samples().1.len(), 2);
+        assert_eq!(cluster.validate_planar_recent_motion(from, to), Err(SurfaceError::InsufficientClearance));
+        let expired = cluster.with_recent_obstacle_points(2, 1101, 1000, &[], []).unwrap();
+        assert!(expired.navigation_recent_samples().1.is_empty());
+    }
+    #[test]
     fn planar_recent_sweep_keeps_low_obstacles_and_uses_current_source() {
         let source=source();let from=[0.0,0.0,0.1];let to=[1.0,0.0,0.1];
         assert!(source.body_envelope().is_none());
         for point in [[0.5,0.0,0.15],[0.5,0.0,0.65],[0.5,0.249,0.35]] {
-            let blocked=source.with_recent_obstacle_points(1,1,0,&[],[(0,point)]).unwrap();
+            let blocked=source.with_confirmed_recent_fixture(1,1,0,&[],[(0,point)]).unwrap();
             assert!(blocked.validate_planar_recent_motion(from,from).is_ok());
             assert!(blocked.validate_planar_recent_motion(to,to).is_ok());
             assert_eq!(blocked.validate_planar_recent_motion(from,to),Err(SurfaceError::InsufficientClearance));
-            let clear=blocked.with_recent_obstacle_points(2,2,0,&[],[]).unwrap();
+            let clear=blocked.with_confirmed_recent_fixture(2,2,0,&[],[]).unwrap();
             clear.validate_planar_recent_motion(from,to).unwrap();
             assert!(blocked.validate_planar_recent_motion(from,to).is_err());
         }
         for point in [[0.5,0.0,-0.05],[0.5,0.0,0.95],[0.5,0.35,0.35]] {
-            source.with_recent_obstacle_points(1,1,0,&[],[(0,point)]).unwrap()
+            source.with_confirmed_recent_fixture(1,1,0,&[],[(0,point)]).unwrap()
                 .validate_planar_recent_motion(from,to).unwrap();
         }
     }
@@ -210,10 +297,10 @@ mod planar_tests {
     fn planar_recent_surface_points_keep_coordinates_and_height_dependent_sweep() {
         let source=source();let from=[0.0,0.0,0.1];let to=[1.0,0.0,0.6];
         for point in [[0.5,0.0,0.05],[0.5,0.0,0.2]] {
-            source.with_recent_obstacle_points(1,1,0,&[0],[(0,point)]).unwrap()
+            source.with_confirmed_recent_fixture(1,1,0,&[0],[(0,point)]).unwrap()
                 .validate_planar_recent_motion(from,to).unwrap();
         }
-        let blocked=source.with_recent_obstacle_points(1,1,0,&[0],[(0,[0.5,0.0,0.9])]).unwrap();
+        let blocked=source.with_confirmed_recent_fixture(1,1,0,&[0],[(0,[0.5,0.0,0.9])]).unwrap();
         assert_eq!(blocked.validate_planar_recent_motion(from,to),Err(SurfaceError::InsufficientClearance));
     }
 }

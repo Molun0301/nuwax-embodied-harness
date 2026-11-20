@@ -85,6 +85,7 @@ impl Fixture {
         config.set("person_follow", "autostart", false);
         config.set("geometry", "fine_cloud_cache_mib", 16i64);
         config.set("derived","robot_geometry_json",r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"会话进程测试"}"#);
+        config.set("derived", "standing_ground_z_m", -0.2);
         config.set("derived", "nav_profile", "pct-scan-3d");
         config.set("derived", "min_executable_linear_mps", 0.0);
         config.set("derived", "min_executable_angular_rps", 0.0);
@@ -260,6 +261,14 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
     }
+    /// 给新建图送满默认持续性确认所需的五帧和一秒源时间跨度。
+    async fn mapping_frames(&mut self) {
+        self.frame(now()).await;
+        for _ in 1..5 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.frame(now()).await;
+        }
+    }
     async fn map_ready(&mut self) {
         let start = tokio::time::Instant::now();
         loop {
@@ -284,9 +293,7 @@ impl Fixture {
     }
     async fn saved_map(&mut self, name: &str) {
         self.mapping(name).await;
-        let stamp = now();
-        self.frame(stamp).await;
-        self.frame(stamp + 100_000_000).await;
+        self.mapping_frames().await;
         self.map_ready().await;
         let saved = self.client.save_map(SaveMapRequest::default()).await;
         assert!(
@@ -1074,7 +1081,7 @@ async fn failed_start_and_load_preserve_current_unsaved_map() {
     let mut f = Fixture::start(false, false).await;
     f.saved_map("已存在").await;
     f.mapping("未保存").await;
-    f.frame(now()).await;
+    f.mapping_frames().await;
     f.map_ready().await;
     let before = f
         .client

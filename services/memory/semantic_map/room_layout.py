@@ -189,21 +189,16 @@ def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, di
         for start, end in wall.spans:
             _cut_links(lattice, (wall.point(start - 1), wall.point(end + 1)), free.shape)
     _, faces = cv2.connectedComponents(lattice, connectivity=4)
-    cores = open_area_labels(distance, door_cells / 2, minimum_cells)
-    proposals = grow_labels(cores, free & (cores == 0))
-    doors = []
-    for line in candidate_sections(free, distance, proposals, faces[::2, ::2], directions, door_cells):
-        _cut_links(lattice, line, free.shape)
-        doors.append(line)
-    _, faces = cv2.connectedComponents(lattice, connectivity=4)
     faces = faces[::2, ::2]
-    # 原划分中经过去射线仍保有面积的局部区域，为未闭合的结构面提供独立种子。
+    cores, expanded_sizes = open_area_labels(free, distance, door_cells / 2, minimum_cells)
+
+    # 用原有的大块净空证据识别以狭长区域为主的面，保留去射线后仍达面积线的原区域。
     areas = np.bincount(faces.ravel())
-    has_core = cores > 0
-    open_cells = np.bincount(faces[has_core], minlength=len(areas))
-    core_faces = np.unique(np.column_stack((faces[has_core], cores[has_core])), axis=0)[:, 0]
+    core_sizes = np.bincount(cores.ravel())
+    has_roomy_core = (cores > 0) & (core_sizes[cores] >= minimum_cells)
+    open_cells = np.bincount(faces[has_roomy_core], minlength=len(areas))
+    core_faces = np.unique(np.column_stack((faces[has_roomy_core], cores[has_roomy_core])), axis=0)[:, 0]
     core_count = np.bincount(core_faces, minlength=len(areas))
-    # 两个达面积线的开阔区只受实测门宽或墙约束。局部以开阔区为主时，狭窄探索边也不单独成区。
     incomplete = np.bincount(faces[unknown_edge != 0], minlength=len(areas)) > 0
     retained = incomplete & (core_count < 2) & (2 * open_cells < areas)
     legacy = np.where(retained[faces], previous, 0)
@@ -211,6 +206,15 @@ def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, di
     for first, second, links in ((seeds[:, :-1], seeds[:, 1:], lattice[::2, 1:-1:2]),
                                  (seeds[:-1, :], seeds[1:, :], lattice[1:-1:2, ::2])):
         links[(first > 0) & (second > 0) & (first != second)] = 0
+
+    # 对尚未分开的区域，门宽候选以原算法扩展后的整区面积为准。
+    _, faces = cv2.connectedComponents(lattice, connectivity=4)
+    qualified = np.where(expanded_sizes[cores] >= minimum_cells, cores, 0)
+    proposals = grow_labels(qualified, free & (qualified == 0))
+    doors = []
+    for line in candidate_sections(free, distance, proposals, qualified, faces[::2, ::2], directions, door_cells):
+        _cut_links(lattice, line, free.shape)
+        doors.append(line)
     _, faces = cv2.connectedComponents(lattice, connectivity=4)
     for a, b in doors:
         direction = (b - a) / np.linalg.norm(b - a)

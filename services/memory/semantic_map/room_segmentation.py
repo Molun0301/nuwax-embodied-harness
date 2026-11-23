@@ -194,8 +194,8 @@ class RoomSegmentationService:
         minimum_cells = max(1, int(math.ceil(self.min_area_m2 / resolution ** 2)))
         structural = trim_rays(free, (cells < 0).astype(np.uint8), resolution)
         distance = clearance(structural)
-        previous = legacy_candidates(free, clearance(free), self.doorway_width_m / (2 * resolution),
-                                     minimum_cells)
+        previous, _ = legacy_candidates(free, clearance(free), self.doorway_width_m / (2 * resolution),
+                                        minimum_cells)
         sizes = np.bincount(previous[structural != 0], minlength=int(previous.max()) + 1)
         previous[(structural == 0) | (sizes[previous] < minimum_cells)] = 0
         unknown_edge = cv2.dilate((cells < 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))

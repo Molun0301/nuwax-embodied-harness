@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEH 机器人控制台</title>
+<meta name="description" content="Nuwax Embodied Harness（NEH，具身运行框架）：机器人地图、感知、空间记忆与任务控制台。">
+<link rel="icon" href="/static/neh-icon.svg" type="image/svg+xml">
+<!-- 主题在首屏绘制前写入，避免暗色用户先看到一闪亮色；存储键与 neh-ui.js 的 THEME_KEY 相同。 -->
+<script>
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('nuwax-theme'); } catch (e) { saved = null; }
+    document.documentElement.dataset.theme = saved || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  })();
+</script>
+<link rel="stylesheet" href="/static/shared/neh-fonts.css">
+<link rel="stylesheet" href="/static/shared/neh-ui.css">
+<link rel="stylesheet" href="/static/next/app.css">
+</head>
+<body>
+<div class="n-app" id="app">
+  <nav class="n-rail" aria-label="页面">
+    <a class="n-rail-brand" href="#/monitor" title="NEH 机器人控制台"><img src="/static/neh-icon.svg" alt="NEH" width="36" height="36"></a>
+    <button class="n-rail-item" type="button" data-view="monitor" title="地图、机器人与当前任务"><span data-icon="radar"></span>监控</button>
+    <button class="n-rail-item" type="button" data-view="caps" title="智能体可用的全部能力，按参数填写后直接调用"><span data-icon="puzzle"></span>能力</button>
+    <button class="n-rail-item" type="button" data-view="logs" title="运行日志"><span data-icon="scroll-text"></span>日志</button>
+    <button class="n-rail-item" type="button" data-view="settings" title="配置与方案"><span data-icon="settings"></span>设置</button>
+    <button class="n-rail-item" type="button" data-view="system" title="业务状态、版本与更新、功能模块、安装记录"><span data-icon="server"></span>系统<span class="n-rail-dot" id="updateDot" title="有新版本" hidden></span></button>
+    <span class="n-rail-spacer"></span>
+    <button class="n-rail-item n-rail-item--desktop" type="button" id="themeBtn" title="切换亮色或暗色"></button>
+  </nav>
+
+  <div class="n-main">
+    <header class="n-topbar" id="topbar">
+      <div class="c-robot">
+        <span class="c-robot-name"><span class="n-dot" id="connDot"></span><span id="robotName">正在连接机器人</span></span>
+        <span class="c-robot-sub" id="robotSub">未加载地图</span>
+      </div>
+      <span class="n-topbar-sep c-topbar-sep2"></span>
+      <div class="c-activity" id="activity" data-tone="idle" role="status" aria-live="polite">
+        <span class="c-activity-icon" id="activityIcon"></span>
+        <div class="c-activity-main">
+          <div class="c-activity-text" id="activityText">空闲</div>
+          <div class="c-activity-meta" id="activityMeta"></div>
+        </div>
+        <span id="activityAction"></span>
+      </div>
+      <div class="c-vitals" id="vitals"></div>
+      <button class="c-iconbtn" type="button" id="alertBtn" title="需要注意的事件：警告、错误与已退出的服务"><span data-icon="bell"></span><span class="n-count-badge" id="alertCount" hidden>0</span></button>
+      <button class="c-estop" type="button" id="estop" title="立即停止所有运动，并取消导航、探索与运动任务（stop_all_motion）。不需要确认，任何页面都可按。"><span data-icon="octagon-x"></span>急停</button>
+      <div class="n-topbar-progress"><span id="topProgress" style="width:0"></span></div>
+    </header>
+
+    <div class="c-views">
+      <section class="c-view" id="view-monitor" data-view="monitor"></section>
+      <section class="c-view" id="view-caps" data-view="caps" hidden></section>
+      <section class="c-view" id="view-logs" data-view="logs" hidden></section>
+      <section class="c-view" id="view-settings" data-view="settings" hidden></section>
+      <section class="c-view" id="view-system" data-view="system" hidden></section>
+    </div>
+  </div>
+</div>
+
+<!-- 网关渲染页面时替换为实际几何执行链（lio_3d 或 slam_2d）与三维点云显示参数。 -->
+<script>
+  window.__NUWAX_GEOMETRY_PIPELINE__ = "__GEOMETRY_PIPELINE__";
+  window.__NUWAX_POINTCLOUD3D_CONFIG__ = "__POINTCLOUD3D_CONFIG__";
+</script>
+<script type="module" src="/static/next/js/main.js"></script>
+</body>
+</html>

@@ -325,6 +325,13 @@ def create_gateway_app(
     app.include_router(build_mcp_router(runtime, access_manager))
     app.include_router(build_event_router(runtime, access_manager))
     app.include_router(build_data_stream_router(runtime, access_manager))
+    # 控制台与管理服务恢复页共用的样式、组件、图标与字体；须挂在 /static 之前，否则被 /static 前缀先匹配。
+    app.mount(
+        "/static/shared",
+        GZipMiddleware(RevalidatedStaticFiles(directory=str(Path(__file__).resolve().parent.parent / "web" / "shared")),
+                       minimum_size=1024, compresslevel=1),
+        name="static-shared",
+    )
     static_dir = Path(__file__).resolve().parent / "http" / "static"
     if static_dir.is_dir():
         # 压缩仅作用于页面静态资源，避免缓冲视频和实时数据流。

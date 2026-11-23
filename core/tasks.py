@@ -202,7 +202,11 @@ class TaskRunner:
             elif error is not None:
                 state, message = TaskState.FAILED, str(error)
                 code = error.error_code if isinstance(error, GatewayError) else "internal_error"
-                if isinstance(error, GatewayError) and cap.name in {"find_target", "explore_and_find_target"}:
+                if cap.name == "execute_manipulation_task":
+                    stage = current.stage if current.stage != "running" else (
+                        "approaching" if cap.motion else "manipulating")
+                    result = {**(error.details if isinstance(error, GatewayError) else {}), "stage": stage}
+                elif isinstance(error, GatewayError) and cap.name in {"find_target", "explore_and_find_target"}:
                     result = dict(error.details)
             else:
                 state, message, code = TaskState.SUCCEEDED, "任务已完成。", None

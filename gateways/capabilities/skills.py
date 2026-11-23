@@ -7,7 +7,8 @@ from gateways.capabilities.navigation import explore_and_find_target, find_targe
 TEXT = {"type": "string"}
 TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
 THRESHOLD = {"type": "number", "minimum": 0, "maximum": 1}
-QUERY = {"query": TEXT, "camera_id": TEXT, "timeout_sec": TIMEOUT}
+QUERY = {"query": {**TEXT, "description": "目标物体的英文名词，检测器只认英文，如 apple、red cup。"},
+         "camera_id": TEXT, "timeout_sec": TIMEOUT}
 
 CAPABILITIES = [
     Capability("find_target", "识别目标、查询地图证据，前往低歧义候选并核对。",

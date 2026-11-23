@@ -2,16 +2,28 @@
 import json
 import threading
 import time
+from base64 import b64decode
+from io import BytesIO
+from threading import Event
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from math import pi
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from core.settings import ManipulationConfig
+from core.capability import Capability
 from core.tasks import TaskState
 from core.errors import GatewayError
+from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.base import utc_now
+from contracts.image import ImageEncoding, ImageFrame
+from contracts.naming import build_anchor_id, build_artifact_id, build_instance_id, build_memory_id
+from contracts.spatial_memory import InstanceLifecycleState, SemanticInstance
+from gateways.agent.router import build_agent_router
 from gateways.invoke import invoke
 from gateways.mcp.protocol import build_mcp_router
 from services.manipulation.http_backend import DeviceError, HttpManipulationBackend
@@ -61,6 +73,7 @@ def device():
 @pytest.fixture
 def runtime(device, platform_factory, tmp_path):
     config = isolated_platform_config(tmp_path / "操作平台")
+    config.geometry.enabled = False
     config.manipulation = ManipulationConfig(enabled=True, base_url=device.url, http_timeout_sec=.2,
         stop_timeout_sec=.25, poll_interval_sec=.01)
     return platform_factory(config=config)
@@ -108,6 +121,7 @@ def test_failed_model_or_missing_physical_success_cannot_pass(mode, device, runt
     device.mode = mode
     status = terminal(runtime, submit(runtime))
     assert status.state is TaskState.FAILED and status.error_code == "manipulation_device_error"
+    assert status.result == {"stage": "manipulating"}
     assert device.cancelled.is_set()
 
 
@@ -157,10 +171,15 @@ def test_real_mcp_catalog_and_execution_use_new_capability(device, runtime):
         catalog = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
         tool = next(item for item in catalog["result"]["tools"] if item["name"] == NAME)
         assert tool["inputSchema"]["properties"]["timeout_sec"]["maximum"] == 1800
+        assert tool["inputSchema"]["properties"]["goal_mode"]["enum"] == ["pick", "place", "transfer"]
+        for name in ("find_target", "explore_and_find_target", "inspect_target"):
+            tool = next(item for item in catalog["result"]["tools"] if item["name"] == name)
+            assert "apple、red cup" in tool["inputSchema"]["properties"]["query"]["description"]
         response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": NAME, "arguments": {"instruction": "苹果入盘"}}}).json()
         status = terminal(runtime, response["result"]["structuredContent"]["task"])
         assert status.state is TaskState.SUCCEEDED and status.motion is False
+        assert next(r for r in device.requests if r["op"] == "manipulate")["params"]["goal_mode"] == "transfer"
 
 
 @pytest.mark.parametrize("args", [{"instruction": " "}, {"instruction": "x", "timeout_sec": 0},
@@ -169,3 +188,155 @@ def test_invalid_instruction_and_limits_are_rejected_at_invoke(runtime, device, 
     with pytest.raises(GatewayError) as error:
         invoke(runtime, NAME, args, "test")
     assert error.value.error_code == "invalid_params" and not device.started.is_set()
+
+
+def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_observation(
+        runtime, device, monkeypatch):
+    from gateways.capabilities import manipulation
+
+    def pose(x, y, z):
+        return Pose(frame_id="map", position=Vector3(x=x, y=y, z=z), orientation=Quaternion(w=1))
+
+    now = utc_now()
+    target = SemanticInstance(instance_id=build_instance_id("apple"), anchor_id=build_anchor_id("apple"),
+        label="apple", map_name=runtime.memory.current_library, pose=pose(0, 0, .8), confidence=.9,
+        first_seen_ts=now, last_seen_ts=now)
+    runtime.memory.write(lambda store: store.put_live_instance(target, persist=True))
+    monkeypatch.setattr(runtime, "ensure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime.motion, "begin", lambda: 7)
+    monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: pose(1.5, 0, .9))
+    visits = []
+
+    def navigate(_platform, context, goal):
+        assert not device.started.is_set()
+        visits.append((context.task_id, goal))
+        context.progress(0, "succeeded", "已实际到达")
+        return {"goal_id": "goal", "arrival": "target"}
+
+    monkeypatch.setattr(manipulation, "navigate_to_pose", navigate)
+    picked = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=target.instance_id))
+    assert picked.state is TaskState.SUCCEEDED and picked.motion
+    assert visits == [(picked.task_id, {"x": .55, "y": 0, "z": .9, "frame_id": "map",
+                                        "yaw_rad": pi, "motion_generation": 7})]
+    assert device.requests[0]["params"]["goal_mode"] == "pick"
+    held = picked.result["held_object"]
+    assert held["instance_id"] == target.instance_id and held["label"] == "apple"
+    assert invoke(runtime, "get_robot_status", {}, "test")["held_object"] == held
+    moved = runtime.memory.get_semantic_instance(target.instance_id)
+    assert moved.lifecycle_state is InstanceLifecycleState.REMOVED
+    assert moved.metadata["moved_by_robot"] is True
+    assert moved.metadata["moved_by_robot_task_id"] == picked.task_id
+    assert moved.metadata["moved_by_robot_at"] == held["started_at"]
+
+    video = runtime.perception.video_runtime
+    calls = []
+    sample = object()
+    monkeypatch.setattr(video, "acquire", lambda reason, **args: calls.append(args["open_vocabulary_classes"]))
+    monkeypatch.setattr(video, "run_burst", lambda *args, **kwargs: (sample,) if kwargs["frame_count"] == 1 else ())
+    monkeypatch.setattr(video, "release", lambda reason: calls.append("release"))
+    monkeypatch.setattr(manipulation, "remember_sample", lambda _, value, **kwargs: calls.append(value))
+    placed = terminal(runtime, submit(runtime, goal_mode="place"))
+    assert placed.state is TaskState.SUCCEEDED and not placed.motion
+    assert placed.result["held_object"] is None
+    assert [r["params"]["goal_mode"] for r in device.requests if r["op"] == "manipulate"] == ["pick", "place"]
+    assert calls == [("apple",), sample, "release"]
+
+
+def test_missing_target_does_not_submit_device_operation(runtime, device, monkeypatch):
+    monkeypatch.setattr(runtime, "ensure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime.motion, "begin", lambda: 7)
+    result = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=build_instance_id("missing")))
+    assert result.state is TaskState.FAILED and result.result == {"stage": "approaching"}
+    assert not device.requests
+
+
+def _client(runtime):
+    app = FastAPI()
+    app.include_router(build_mcp_router(runtime))
+    app.include_router(build_agent_router(runtime.agent_tools))
+    return TestClient(app)
+
+
+def _tool(client, name, **arguments):
+    response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}})
+    return response.json()["result"]
+
+
+def test_wait_task_reports_running_snapshot_on_timeout_and_shared_terminal_snapshot(platform_factory):
+    runtime = platform_factory()
+    release = Event()
+
+    def work(_platform, _ctx, _args):
+        assert release.wait(2)
+        return {"value": 42}
+
+    runtime.capabilities.register(Capability("wait_fixture", "等待测试", {"type": "object"}, "task", work))
+    with _client(runtime) as client:
+        task = _tool(client, "wait_fixture")["structuredContent"]["task"]
+        try:
+            snapshot = _tool(client, "wait_task", task_id=task["task_id"], timeout_sec=.01)["structuredContent"]
+            assert snapshot["task"]["state"] == "running"
+        finally:
+            release.set()
+        response = _tool(client, "wait_task", task_id=task["task_id"], timeout_sec=2)["structuredContent"]
+        assert response["task"]["state"] == "succeeded" and response["task"]["result"] == {"value": 42}
+        assert client.get(f"/api/agent/tasks/{task['task_id']}/wait").json() == response
+
+
+def test_mcp_encodes_artifacts_and_preserves_http_references(platform_factory, monkeypatch, tmp_path):
+    config = isolated_platform_config(tmp_path / "图片平台")
+    config.geometry.enabled = False
+    runtime = platform_factory(config=config)
+    runtime.config.mcp.image_max_edge_px = 90
+    encoded = BytesIO()
+    Image.new("RGB", (180, 90), "red").save(encoded, "PNG")
+    png = encoded.getvalue()
+    camera = runtime.artifacts.save_image_frame(ImageFrame(camera_id="cam", frame_id="optical",
+        width_px=180, height_px=90, encoding=ImageEncoding.PNG, data=png))
+    monkeypatch.setattr(runtime.observation, "capture_observation", lambda **_: SimpleNamespace(
+        image_artifact=camera, camera_id="cam", observation=SimpleNamespace(frame_id="optical", metadata={})))
+
+    library = runtime.memory.current_library
+    evidence = [runtime.memory.save_photo(build_artifact_id("test"), png, map_name=library) for _ in range(5)]
+    samples = [{"artifact_ids": [photo.artifact_id]} for photo in evidence]
+    space = {"map_name": library, "observation_samples": samples}
+    monkeypatch.setattr(runtime.memory, "get_scene_space", lambda _: space)
+    monkeypatch.setattr(runtime.scene_mapping.graph, "image", lambda **_: {"artifact": evidence[0]})
+    with _client(runtime) as client:
+        captured = _tool(client, "capture_image")
+        image_block, = captured["content"][1:]
+        assert image_block["mimeType"] == "image/jpeg"
+        with Image.open(BytesIO(b64decode(image_block["data"]))) as image:
+            assert image.size == (90, 45) and image.format == "JPEG"
+        scene = _tool(client, "get_scene_space", scene_space_id="room")
+        assert len(scene["content"][1:]) == len(scene["structuredContent"]["images"]) == 4
+        http = client.post("/api/agent/invoke", json={"tool_name": "get_scene_space",
+            "arguments": {"scene_space_id": "room"}}).json()
+        assert http == {"scene_space": space}
+        graph = _tool(client, "render_scene_graph_image")
+        assert len(graph["content"][1:]) == 1
+
+
+def test_wait_task_returns_find_target_arrival_image(platform_factory, tmp_path):
+    from dataclasses import replace
+    from contracts.memory import SemanticMemoryEntry
+
+    config = isolated_platform_config(tmp_path / "到点图片")
+    config.geometry.enabled = False
+    runtime = platform_factory(config=config)
+    image = BytesIO()
+    Image.new("RGB", (40, 20)).save(image, "PNG")
+    library = runtime.memory.current_library
+    artifact = runtime.memory.save_photo(build_artifact_id("arrival"), image.getvalue(), map_name=library)
+    memory = SemanticMemoryEntry(memory_id=build_memory_id("scene"), title="到点", summary="到点观察",
+        map_name=library, metadata={"photo_refs": [artifact.model_dump(mode="json")]})
+    runtime.memory.write(lambda store: store.put("memory", memory))
+    result = {"observation_writeback": {"memory_id": memory.memory_id}, "navigation_candidate": {"map_name": library}}
+    cap = replace(runtime.capabilities.get("find_target"), motion=False, needs=(), handler=lambda *args: result)
+    task = runtime.tasks.submit(cap, {"query": "apple"}, "test")
+    with _client(runtime) as client:
+        response = _tool(client, "wait_task", task_id=task.task_id)
+    assert response["structuredContent"]["task"]["result"] == result
+    assert response["structuredContent"]["images"][0]["artifact_id"] == artifact.artifact_id
+    assert response["content"][1]["type"] == "image"

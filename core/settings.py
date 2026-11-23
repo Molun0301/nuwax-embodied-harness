@@ -464,6 +464,7 @@ class ManipulationConfig:
     http_timeout_sec: float = schema_default('manipulation.http_timeout_sec')
     stop_timeout_sec: float = 10.0
     poll_interval_sec: float = schema_default('manipulation.poll_interval_sec')
+    standoff_distance_m: float = schema_default('manipulation.standoff_distance_m')
 
     def __post_init__(self):
         import math
@@ -472,6 +473,11 @@ class ManipulationConfig:
             if not math.isfinite(value) or not 0 < value <= maximum:
                 raise ValueError("操作设备配置必须为有界正数: " + name)
 
+
+
+@dataclass
+class McpConfig:
+    image_max_edge_px: int = schema_default('mcp.image_max_edge_px')
 
 
 @dataclass
@@ -491,6 +497,7 @@ class NuwaxRobotBridgeConfig:
     perception: PerceptionConfig
     scene_mapping: SceneMappingConfig = field(default_factory=SceneMappingConfig)
     manipulation: ManipulationConfig = field(default_factory=ManipulationConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
 
 @dataclass
@@ -943,7 +950,9 @@ def load_config() -> NuwaxRobotBridgeConfig:
             http_timeout_sec=value('manipulation.http_timeout_sec'),
             stop_timeout_sec=10.0,
             poll_interval_sec=value('manipulation.poll_interval_sec'),
+            standoff_distance_m=value('manipulation.standoff_distance_m'),
         ),
+        mcp=McpConfig(image_max_edge_px=value('mcp.image_max_edge_px')),
     )
 
 

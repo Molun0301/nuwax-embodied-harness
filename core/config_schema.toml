@@ -3426,6 +3426,24 @@ panel = "操作设备"
 category = "外部设备"
 advanced = true
 
+[manipulation.standoff_distance_m]
+type = "float"
+default = 0.55
+description = "以抓取目标或放置台面中心生成操作站位的平面半径，单位为米。"
+consumers = ["core/settings.py:load_config"]
+apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+
+[mcp.image_max_edge_px]
+type = "integer"
+default = 768
+description = "模型上下文协议图片内容块的最长边像素数。"
+consumers = ["core/settings.py:load_config"]
+apply = "restart"
+panel = "网页与接口"
+category = "网关服务"
+
 [map_cloud.nominatim_url]
 type = "string"
 default = "https://nominatim.openstreetmap.org/search"

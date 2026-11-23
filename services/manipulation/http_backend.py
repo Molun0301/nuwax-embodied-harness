@@ -81,8 +81,9 @@ class HttpManipulationBackend:
             raise DeviceError("设备返回了不同任务或运行代次", code="manipulation_identity_mismatch", uncertain=True)
         return value
 
-    def start(self, binding, instruction, timeout_sec, max_steps):
-        value = self.control('manipulate', {'instruction': instruction, 'timeout_sec': timeout_sec, 'max_steps': max_steps}, binding)
+    def start(self, binding, instruction, timeout_sec, max_steps, goal_mode='transfer'):
+        value = self.control('manipulate', {'instruction': instruction, 'timeout_sec': timeout_sec,
+            'max_steps': max_steps, 'goal_mode': goal_mode}, binding)
         if value.get('accepted') is not True or not isinstance(value.get('task_id'), str) or not value['task_id']:
             raise DeviceError("操作受理回执缺少明确accepted/task_id", uncertain=True)
         return value

@@ -32,6 +32,14 @@ class InspectionPosePlanner:
         self._max_view_distance_m = max(0.1, float(max_view_distance_m))
         self._visibility_step_factor = max(0.1, float(visibility_step_factor))
 
+    def plan_manipulation_pose(self, *, target_pose, current_pose, distance_m, occupancy_grid, cost_map=None):
+        ring = (self._build_candidate_pose(target_pose, radius_m=distance_m, angle_deg=angle,
+                                          observer_body_pose=current_pose)
+                for angle in self._candidate_angles_deg)
+        reachable = (pose for pose in ring if self._evaluate_pose(
+            pose, occupancy_grid=occupancy_grid, cost_map=cost_map)[0])
+        return min(reachable, key=lambda pose: self._distance(current_pose, pose), default=None)
+
     def plan_for_target(
         self,
         *,

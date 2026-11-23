@@ -5,7 +5,7 @@ import heapq
 import math
 from typing import Dict, List, Optional
 from contracts.base import utc_now
-from contracts.geometry import Pose
+from contracts.geometry import Pose, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.spatial_memory import InstanceConfirmationState, InstanceDynamicState, InstanceLifecycleState, SemanticInstance
 from services.memory.object_extent import object_extent_payload
@@ -197,6 +197,27 @@ class InstancesMixin:
     def resolve_instance_id(self, instance_id):
         record = self.get_semantic_instance(instance_id)
         return record.instance_id if record is not None else instance_id
+
+    def plan_manipulation_pose(self, instance, current_pose, *, place, distance_m):
+        target = instance.pose
+        if place:
+            extent = object_extent_payload(instance)
+            if extent is not None:
+                target = target.model_copy(update={"position": Vector3(**extent["center"])})
+        return self._planner.plan_manipulation_pose(target_pose=target,
+            current_pose=self._as_memory_pose(current_pose), distance_m=distance_m,
+            occupancy_grid=self.current_grid())
+
+    def mark_instance_moved(self, instance, *, task_id, timestamp):
+        def mark(store):
+            self._require_library(store, instance.map_name)
+            current = store.get("instance", instance.instance_id)
+            removed = current.model_copy(update={"lifecycle_state": InstanceLifecycleState.REMOVED,
+                "metadata": {**current.metadata, "moved_by_robot": True,
+                             "moved_by_robot_task_id": task_id, "moved_by_robot_at": timestamp.isoformat()}})
+            store.put_live_instance(removed, persist=True)
+
+        self.write(mark)
 
     def ingest_perception_observation(self, *, map_name, perception_context, current_pose=None,
                                       image_bytes=None, frame_tree=None, admission=ADMISSION_AUTOMATIC, is_keyframe=True,

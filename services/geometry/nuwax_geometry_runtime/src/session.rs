@@ -184,6 +184,7 @@ pub struct SessionHandle {
     pose: watch::Receiver<Option<Pose>>,
     pose_update: watch::Receiver<Option<PoseUpdate>>,
     maps: watch::Receiver<Option<MapUpdate>>,
+    map_replays: watch::Receiver<()>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
     recent: Arc<parking_lot::Mutex<VecDeque<(clock::Instant, MappingFrame)>>>,
@@ -235,7 +236,8 @@ impl SessionHandle {
             router.clone(),
         ));
         let (nav_tx, nav_rx) = mpsc::unbounded_channel();
-        let nav = NavBridge::start(nav_tx).await?;
+        let (map_replay_tx, map_replays) = watch::channel(());
+        let nav = NavBridge::start(nav_tx, map_replay_tx).await?;
         let mut initial = GeometryState {
             phase: SessionPhase::Idle as i32,
             info: Some(RuntimeInfo {
@@ -286,6 +288,7 @@ impl SessionHandle {
             pose,
             pose_update,
             maps,
+            map_replays,
             lio: lio_rx,
             faults,
             recent,
@@ -387,6 +390,9 @@ impl SessionHandle {
     }
     pub fn map_rx(&self) -> watch::Receiver<Option<MapUpdate>> {
         self.maps.clone()
+    }
+    pub(crate) fn map_replay_rx(&self) -> watch::Receiver<()> {
+        self.map_replays.clone()
     }
     pub(crate) fn lio(&self) -> Result<Arc<Lio>, Status> {
         self.lio
@@ -1383,14 +1389,15 @@ pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
     let (_, pose) = watch::channel(None);
     let (_, pose_update) = watch::channel(None);
     let (_, maps) = watch::channel(None);
+    let (_, map_replays) = watch::channel(());
     let (_, lio) = watch::channel(None);
     let (faults, _) = mpsc::unbounded_channel();
-    SessionHandle { commands, state, route, pose, pose_update, maps, lio, faults, recent: Default::default() }
+    SessionHandle { commands, state, route, pose, pose_update, maps, map_replays, lio, faults, recent: Default::default() }
 }
 
 #[cfg(test)]
 pub(crate) fn test_output_session(mapper: Arc<Mapper>) -> (SessionHandle,
-    watch::Sender<Option<Pose>>, watch::Sender<Option<MapUpdate>>) {
+    watch::Sender<Option<Pose>>, watch::Sender<Option<MapUpdate>>, watch::Sender<()>) {
     let mut session = test_block_session(mapper);
     let (_, state) = watch::channel(GeometryState { info: Some(RuntimeInfo {
         map_frame_id: "map".into(), odom_frame_id: "odom".into(),
@@ -1398,6 +1405,7 @@ pub(crate) fn test_output_session(mapper: Arc<Mapper>) -> (SessionHandle,
     }), ..Default::default() });
     let (poses, pose) = watch::channel(None);
     let (maps, map) = watch::channel(None);
-    session.state = state; session.pose = pose; session.maps = map;
-    (session, poses, maps)
+    let (map_replays, replay) = watch::channel(());
+    session.state = state; session.pose = pose; session.maps = map; session.map_replays = replay;
+    (session, poses, maps, map_replays)
 }

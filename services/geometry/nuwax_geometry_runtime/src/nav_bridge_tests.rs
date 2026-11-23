@@ -519,3 +519,67 @@ async fn restart_fails_dispatched_goal_and_does_not_resend_it() {
     assert_eq!(capture.goals().len(), 1);
     bridge.shutdown().await;
 }
+
+#[tokio::test]
+async fn first_status_and_generation_change_republish_current_map_once() {
+    async fn wait_for_maps(capture: &Capture, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = capture.published.lock().unwrap().iter()
+                    .filter(|frame| matches!(frame.topic.channel(), "/map/occupancy" | "/nav/map3d"))
+                    .count();
+                if sent >= count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+    }
+
+    let mapper = crate::mapper::Mapper::start(813, Default::default()).unwrap();
+    mapper.feed(crate::mapper::tests::room_frame(813, 1_000_000_000));
+    mapper.snapshot().await.unwrap();
+    let (session, _poses, maps, map_replays) = crate::session::test_output_session(mapper.clone());
+    let mut replay_requests = map_replays.subscribe();
+    let capture = Arc::new(Capture::new());
+    let transport = LcmTransport::new(capture.clone());
+    let output = crate::outputs::Outputs::start_with_transport(session, transport.clone(), false);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let bridge = NavBridge::connect(Arc::new(move || Ok(transport.clone())), tx, map_replays)
+        .await.unwrap();
+
+    maps.send_replace(mapper.map_rx().borrow().clone());
+    wait_for_maps(&capture, 2).await;
+
+    for (goal, generation, replay, published) in [
+        ("首次状态", 42, true, 4),
+        ("同代状态", 42, false, 4),
+        ("代际变化", 9, true, 6),
+    ] {
+        capture.inject_ready_generation(goal, generation);
+        assert_eq!(next_status(&mut rx).await.goal_id, goal);
+        assert_eq!(replay_requests.has_changed().unwrap(), replay);
+        drop(replay_requests.borrow_and_update());
+        wait_for_maps(&capture, published).await;
+    }
+
+    bridge.shutdown().await;
+    output.shutdown().await;
+    mapper.shutdown().await.unwrap();
+
+    let frames = capture.published.lock().unwrap();
+    let occupancy: Vec<_> = frames.iter().filter(|frame| frame.topic.channel() == "/map/occupancy")
+        .map(|frame| schema::decode_occupancy_grid_body(&frame.payload).unwrap()).collect();
+    assert_eq!(occupancy.len(), 3);
+    assert!(occupancy.iter().all(|grid| grid == &occupancy[0]));
+    let maps_3d: Vec<_> = frames.iter().filter(|frame| frame.topic.channel() == "/nav/map3d")
+        .map(|frame| schema::decode_navigation_map_3d_body(&frame.payload).unwrap()).collect();
+    assert_eq!(maps_3d.len(), 3);
+    assert!(maps_3d[0].fine.is_some() && maps_3d[0].virtual_obstacles.is_some());
+    for (index, map) in maps_3d.iter().enumerate() {
+        assert_eq!(map.revision, index as i64 + 1);
+        let mut content = map.clone();
+        content.revision = maps_3d[0].revision;
+        assert_eq!(content, maps_3d[0]);
+    }
+}

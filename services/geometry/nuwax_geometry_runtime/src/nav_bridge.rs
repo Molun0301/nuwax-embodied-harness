@@ -7,7 +7,7 @@ use futures::StreamExt;
 use nuwax_codec::lcm::schema;
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
 use nuwax_transport::{LcmFrameStream, LcmTransport};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
 
 use crate::proto;
@@ -35,11 +35,13 @@ struct PendingGoal {
 impl NavBridge {
     pub async fn start(
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
+        map_replays: watch::Sender<()>,
     ) -> Result<Self, String> {
         let url = nuwax_config::transport()?.lcm_url.clone();
         Self::connect(
             Arc::new(move || LcmTransport::new_real(&url).map_err(|error| error.to_string())),
             status_tx,
+            map_replays,
         )
         .await
     }
@@ -49,12 +51,13 @@ impl NavBridge {
         transport: LcmTransport,
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
     ) -> Result<Self, String> {
-        Self::connect(Arc::new(move || Ok(transport.clone())), status_tx).await
+        Self::connect(Arc::new(move || Ok(transport.clone())), status_tx, watch::channel(()).0).await
     }
 
     async fn connect(
         create_transport: Arc<dyn Fn() -> Result<LcmTransport, String> + Send + Sync>,
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
+        map_replays: watch::Sender<()>,
     ) -> Result<Self, String> {
         let state_topic = topic("/nav/state")?;
         let goal_topic = topic("/nav/goal")?;
@@ -155,9 +158,12 @@ impl NavBridge {
                                     &waiting_message(&input_ready, stack_ready, &stack_reason)));
                             }
                         }
-                        let restarted = stack_generation.replace(state.runtime_generation)
-                            .is_some_and(|previous| previous != state.runtime_generation);
-                        if restarted && pending.is_none() {
+                        let previous = stack_generation.replace(state.runtime_generation);
+                        let new_generation = previous != Some(state.runtime_generation);
+                        if new_generation {
+                            map_replays.send_replace(());
+                        }
+                        if new_generation && previous.is_some() && pending.is_none() {
                             if let Some(mut goal) = active.take() {
                                 goal.status = proto::GoalStatus::Failed as i32;
                                 goal.message = "导航栈已重启，目标中断".into();

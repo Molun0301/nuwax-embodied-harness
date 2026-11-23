@@ -190,11 +190,17 @@ class SemanticMapState:
     def capture_scene_graph_state(self):
         with self._partition_lock:
             capture = self.capture_scene_mapping_state()
+            if self._partition is not None and not same_scope(self._partition.binding, capture["binding"]):
+                self._partition = None
+            if self._partition is None:
+                persisted = self.current_managed_scene_spaces(capture)
+                if persisted:
+                    self._publish_partition(capture, persisted)
             partition = self._partition
         capture["partition"] = partition
         all_spaces = capture["spaces"]
         capture["spaces"] = ()
-        if partition is not None and same_scope(partition.binding, capture["binding"]):
+        if partition is not None:
             # 区域轮廓随分区发布，名称和审核仍读取最新的记忆记录。
             spaces = tuple(space.model_copy(update={"boundary": partition.regions[space.scene_space_id].boundary})
                            for space in all_spaces if space.scene_space_id in partition.regions)

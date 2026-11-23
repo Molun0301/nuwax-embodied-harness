@@ -61,15 +61,34 @@ export function describeTask(task, { navRange, clockOffsetMs, now, pending, erro
   return view;
 }
 
+/* 业务没在运行时的说法（顶栏、活动页、舞台遮罩共用）：
+   updating 按管理任务的动作说“正在启动 / 停止 / 重启业务服务”“正在切换到新版本”等；failed 为启动失败，带原因；stopped 为已停止。
+   返回 {tone, icon, title, text, meta, actionLabel}。 */
+const JOB_DOING = { update: '正在切换到新版本', rollback: '正在切换到新版本', start: '正在启动业务服务', stop: '正在停止业务服务',
+  restart: '正在重启业务服务', modules: '正在调整功能模块', install: '正在安装', 'update-manager': '正在更新管理程序' };
+export function businessView(s) {
+  if (s.business === 'updating') {
+    const action = s.manager.activeJob?.action;
+    const title = JOB_DOING[action];
+    return { tone: 'busy', icon: 'download', title, text: title + (action === 'stop' ? '' : '，业务服务暂时停止'),
+      meta: action === 'stop' ? '停止后地图和机器人数据暂不可用，可在系统页重新启动' : '完成后页面自动恢复，已保存的地图与配置不受影响',
+      actionLabel: '查看进度' };
+  }
+  if (s.business === 'failed') {
+    const failure = s.manager.startFailure;
+    return { tone: 'bad', icon: 'circle-alert', title: '业务服务启动失败', text: '业务服务启动失败' + (failure.reason ? '：' + failure.reason : ''),
+      meta: '失败在“' + failure.stageTitle + '”，在系统页查看组件日志、回退或修改配置', actionLabel: '查看原因' };
+  }
+  return { tone: 'bad', icon: 'power', title: '业务服务已停止', text: '业务服务已停止，地图和机器人数据暂不可用',
+    meta: '可在系统页启动业务服务或查看原因', actionLabel: '打开系统页' };
+}
+
 /* 顶栏一句话状态：按“业务未运行 > 断连 > 服务退出 > 执行中任务 > 8 秒内急停 > 空闲”取第一条成立的。
    返回 {tone, icon, text, quote, meta[], action, progress, task}；meta 项为字符串或 {kind, ...}。 */
 export function deriveActivity(s, now, extra) {
   if (s.business !== 'running') {
-    const updating = s.business === 'updating';
-    return { tone: updating ? 'busy' : 'bad', icon: updating ? 'download' : 'power',
-      text: updating ? '正在切换到新版本，业务服务暂时停止' : '业务服务已停止，地图和机器人数据暂不可用',
-      meta: [updating ? '完成后页面自动恢复，已保存的地图与配置不受影响' : '可在系统页启动业务服务或查看原因'],
-      action: { kind: 'system', label: updating ? '查看进度' : '打开系统页' } };
+    const view = businessView(s);
+    return { tone: view.tone, icon: view.icon, text: view.text, meta: [view.meta], action: { kind: 'system', label: view.actionLabel } };
   }
   if (s.conn.status === 'lost') {
     return { tone: 'bad', icon: 'unplug', text: '与网关的连接已断开，正在重连',

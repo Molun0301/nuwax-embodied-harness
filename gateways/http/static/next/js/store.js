@@ -44,8 +44,8 @@ export function initialState() {
     geometry: { phase: 'idle', mapName: '', reason: '', connected: false },  // feeds：地图会话阶段与地图名
     metrics: { status: 'missing', cpuPercent: null, cpuThreads: null, memPercent: null, memUsedBytes: null, memTotalBytes: null },  // feeds
     services: null,                                     // feeds：监督者组件表 {名称: {title, state, state_title, pid, uptime_sec, exit_code, error, enabled, log_file}}
-    manager: { reachable: false, runtimeRunning: null, activeJob: null, updateAvailable: false },  // feeds：管理服务状态
-    business: 'running',                                // feeds：running / stopped / updating（只在断连时按管理服务判断）
+    manager: { reachable: false, runtimeRunning: null, activeJob: null, updateAvailable: false, startFailure: null },  // feeds：管理服务状态；startFailure 见 system-pages.js deriveStartFailure
+    business: 'running',                                // feeds：running / stopped / updating（有管理任务）/ failed（启动失败），只在断连时按管理服务判断
     tasks: { active: [], history: [], pending: new Set(), errors: new Map(), error: '', ready: false },  // tasks：统一任务表
     estop: null,                                        // 外壳：最近一次急停 {at, cancelled, issues[], error}
     volume: null,                                       // 外壳：{percent, error}；机器人没有音量能力时为 null

@@ -137,7 +137,7 @@ export function createShell({ store, stream, api, tasks, feeds }) {
     }
     $('topProgress').style.width = (a.tone === 'busy' && a.progress != null ? Math.round(a.progress * 100) : 0) + '%';
   }
-  store.subscribe(['business', 'conn', 'services', 'tasks', 'estop', 'geometry', 'clockOffsetMs'], renderActivity);
+  store.subscribe(['business', 'manager', 'conn', 'services', 'tasks', 'estop', 'geometry', 'clockOffsetMs'], renderActivity);
   // 用时与急停提示按秒刷新；没有任务、急停提示也已过期时不重绘。
   setInterval(() => {
     const s = store.get();

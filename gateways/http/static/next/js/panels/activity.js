@@ -2,7 +2,7 @@
    下面是需要注意（只收警告、错误与已退出的服务，不收网页请求日志）、最近结束，底部固定服务区。
    任务、需要注意、服务都读统一状态，不论网页还是智能体发起。 */
 import { icon, h, toast } from '/static/shared/neh-ui.js';
-import { describeTask, fmtClock, taskSource, normalizeTaskState } from '../status.js';
+import { describeTask, fmtClock, taskSource, normalizeTaskState, businessView } from '../status.js';
 
 // 定位建图或导航栈退出时不能导航（遥控移动不依赖定位）。
 const NAVIGATION_COMPONENTS = ['geometry', 'nav_stack'];
@@ -68,11 +68,13 @@ export function mountActivity(root, ctx) {
     const exitedNav = Object.entries(s.services || {}).filter(([name, item]) => NAVIGATION_COMPONENTS.includes(name) && item.state === 'exited');
     let key, build;
     if (s.business !== 'running') {
-      key = 'business:' + s.business;
+      key = 'business:' + s.business + ':' + (s.manager.activeJob?.action || '') + ':' + (s.manager.startFailure?.jobId || '');
+      const view = businessView(s);
       build = () => [h('div', { class: 'n-hl n-hl--bad c-hero' },
-        h('div', { class: 'c-hero-title' }, s.business === 'updating' ? '正在切换到新版本' : '业务服务已停止'),
+        h('div', { class: 'c-hero-title' }, view.title),
+        s.business === 'failed' && s.manager.startFailure.reason ? h('div', { class: 'n-meta c-wrap' }, s.manager.startFailure.reason) : null,
         h('div', { class: 'n-meta' }, '导航、探索与遥控暂不可用；已保存的地图、语义区域和配置不受影响。'),
-        h('div', {}, h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => go('system') }, '打开系统页')))];
+        h('div', {}, h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => go('system') }, view.actionLabel)))];
     } else if (s.tasks.active.length) {
       key = 'tasks';
       build = null;
@@ -167,7 +169,7 @@ export function mountActivity(root, ctx) {
   }
 
   function render() { renderFocus(); renderAttention(); renderRecent(); renderServices(); }
-  store.subscribe(['business', 'tasks', 'services', 'geometry', 'attention', 'clockOffsetMs'], render);
+  store.subscribe(['business', 'manager', 'tasks', 'services', 'geometry', 'attention', 'clockOffsetMs'], render);
   setInterval(() => { if (!root.hidden && store.get().tasks.active.length) renderFocus(); }, 1000);
   render();
   return { show(opts = {}) { if (opts.focus) setTimeout(() => root.querySelector('#' + opts.focus)?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 30); } };

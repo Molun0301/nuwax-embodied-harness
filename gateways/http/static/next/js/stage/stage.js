@@ -7,6 +7,7 @@ import { createMapView, PLANAR_PIPELINE, MAP_TOPICS } from './mapview.js';
 import { createItems } from './items.js';
 import { createRegions } from './regions.js';
 import { createGraph } from './graph.js';
+import { businessView } from '../status.js';
 
 const VIEWS = [['2d', '2D', 'grid-2x2', '二维栅格地图'], ['3d', '3D', 'box', '三维点云地图'], ['semantic', '语义地图', 'tag', '区域整块着色并编号'], ['graph', '关系图', 'network', '区域、连接口与物品的关系']]
   .filter(([id]) => !PLANAR_PIPELINE || id !== '3d');
@@ -308,14 +309,17 @@ export function createStage(root, ctx, { onPick }) {
       mode() !== 'graph' ? h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => go('monitor', 'map', { open: true }) }, '打开地图页') : null));
   }
   function renderHalt() {
-    const business = store.get().business;
-    halt.hidden = business === 'running';
+    const s = store.get();
+    halt.hidden = s.business === 'running';
     if (halt.hidden) return;
-    const updating = business === 'updating';
-    halt.replaceChildren(h('div', { class: 'n-float c-halt-card', html: icon(updating ? 'download' : 'power') },
-      h('div', { class: 'n-t2' }, updating ? '正在切换到新版本' : '业务服务已停止'),
-      h('div', { class: 'n-meta' }, updating ? '地图、视频与机器人数据会在业务重新启动后恢复。' : '地图、视频与机器人数据暂不可用。在系统页启动业务服务，或查看原因。'),
-      h('button', { class: 'n-btn n-btn--primary', type: 'button', onclick: () => go('system') }, updating ? '查看进度' : '打开系统页')));
+    const view = businessView(s);
+    const detail = s.business === 'updating' ? (s.manager.activeJob.action === 'stop' ? '地图、视频与机器人数据暂不可用，可在系统页重新启动。' : '地图、视频与机器人数据会在业务重新启动后恢复。')
+      : s.business === 'failed' ? (s.manager.startFailure.reason || '') + (s.manager.startFailure.reason ? '。' : '') + '在系统页查看组件日志、回退或修改配置。'
+      : '地图、视频与机器人数据暂不可用。在系统页启动业务服务，或查看原因。';
+    halt.replaceChildren(h('div', { class: 'n-float c-halt-card', html: icon(view.icon) },
+      h('div', { class: 'n-t2' }, view.title),
+      h('div', { class: 'n-meta' }, detail),
+      h('button', { class: 'n-btn n-btn--primary', type: 'button', onclick: () => go('system') }, view.actionLabel)));
   }
 
   /* ---------- 整体刷新 ---------- */
@@ -334,7 +338,7 @@ export function createStage(root, ctx, { onPick }) {
     renderCamera(info);
     renderEmpty(info);
   }
-  store.subscribe(['business'], () => { renderHalt(); render(); });
+  store.subscribe(['business', 'manager'], () => { renderHalt(); render(); });
   store.subscribe(['conn'], render);
   // 位姿、帧率每秒变化多次，状态条按 4 次每秒刷新。
   setInterval(() => { if (visible()) render(); }, 250);

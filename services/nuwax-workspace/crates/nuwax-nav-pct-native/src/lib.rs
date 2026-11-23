@@ -291,13 +291,14 @@ impl MultiGoalSearch<'_> {
         unsafe { pct_multi_goal_grounds(self.native.as_ptr(), point[0], point[1], heights.as_mut_ptr(), count) };
         heights
     }
-    pub fn cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
+    /// 原生规划认定不可达时返回空路线，其余失败继续传递给调用方。
+    pub fn cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<Option<RouteCost>, String> {
         self.cost_inner(start, goal, std::ptr::null())
     }
-    pub fn cost_cancellable(&mut self, start: [f64; 3], goal: [f64; 3], cancel: &AtomicBool) -> Result<RouteCost, String> {
+    pub fn cost_cancellable(&mut self, start: [f64; 3], goal: [f64; 3], cancel: &AtomicBool) -> Result<Option<RouteCost>, String> {
         self.cost_inner(start, goal, (cancel as *const AtomicBool).cast())
     }
-    fn cost_inner(&mut self, start: [f64; 3], goal: [f64; 3], cancel: *const c_void) -> Result<RouteCost, String> {
+    fn cost_inner(&mut self, start: [f64; 3], goal: [f64; 3], cancel: *const c_void) -> Result<Option<RouteCost>, String> {
         let mut result = RouteCost::default();
         let mut error = [0; 512];
         let now = Instant::now();
@@ -309,10 +310,13 @@ impl MultiGoalSearch<'_> {
         };
         let status = unsafe { pct_multi_goal_cost(self.native.as_ptr(), start.as_ptr(), goal.as_ptr(),
             &mut result, cancelled, cancel, error.as_mut_ptr(), error.len(), output) };
-        if status == 0 {
-            Ok(result)
-        } else {
-            Err(self.planner.planning_failure(status, native_error(&error), now, evidence, start.into(), goal.into()))
+        match status {
+            0 => Ok(Some(result)),
+            1 => {
+                self.planner.planning_failure(status, native_error(&error), now, evidence, start.into(), goal.into());
+                Ok(None)
+            }
+            _ => Err(native_error(&error)),
         }
     }
     pub fn stats(&self) -> MultiGoalStats {

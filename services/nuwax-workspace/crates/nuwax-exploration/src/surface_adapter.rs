@@ -108,6 +108,7 @@ struct FrozenSurfaceInput {
 struct SurfacePollDelta {
     next_goal_id: Option<u64>,
     deferred_route: Option<Option<DeferredFrontierRoute>>,
+    unreachable_cell: Option<[i32; 3]>,
     selected: Option<Option<SelectedGoal>>,
     last_snapshot: Option<Option<Weak<SurfaceSnapshot>>>,
     last_notification: Option<Option<u64>>,
@@ -132,6 +133,9 @@ impl SurfacePollDelta {
     fn commit(self, source: &mut SurfaceGoalSourceAdapter) {
         if let Some(value) = self.deferred_route {
             source.deferred_route = value;
+        }
+        if let Some(cell) = self.unreachable_cell {
+            source.record_failure(cell, std::iter::once(cell));
         }
         if let Some(value) = self.next_goal_id {
             source.next_goal_id = value;
@@ -518,9 +522,12 @@ impl SurfaceGoalSourceAdapter {
             start_body: deferred.map_or(current_body.0, |old| old.start_body),
             examined,
         };
-        let Some((travel, endpoint, yaw)) = frontier_route_cost(&mut search, current_body.0, body) else {
-            // 全图与目标窗口的层表示不同可能使精确核验失败；继续剩余候选，
-            // 不把单次表示差异记为导航失败，也不重算刚完成的批次。
+        let exact_route = frontier_route_cost(&mut search, current_body.0, body);
+        let Ok(Some((travel, endpoint, yaw))) = exact_route else {
+            // 仅记录原生规划明确不可达的前沿格，当前快照继续检查其余候选。
+            if matches!(exact_route, Ok(None)) {
+                delta.unreachable_cell = Some(candidate.frontier_cell);
+            }
             delta.deferred_route = Some(Some(continuation));
             delta.last_no_frontier = Some(false);
             return Ok(ExplorationPoll::Pending);
@@ -915,13 +922,13 @@ impl SurfaceGoalSourceAdapter {
         Ok(())
     }
 
-    fn record_failure(&mut self, selected: &SelectedGoal) -> u64 {
-        let index = self.failures.iter().position(|entry| entry.cells.contains(&selected.frontier_cell));
+    fn record_failure(&mut self, frontier_cell: [i32; 3], cells: impl IntoIterator<Item = [i32; 3]>) -> u64 {
+        let index = self.failures.iter().position(|entry| entry.cells.contains(&frontier_cell));
         let entry = if let Some(index) = index {
             &mut self.failures[index]
         } else {
             self.failures.push(FrontierFailure {
-                cells: selected.frontier_cells.iter().copied().collect(), failures: 0,
+                cells: cells.into_iter().collect(), failures: 0,
                 reintroduced: false,
             });
             self.failures.last_mut().expect("刚写入失败记录")
@@ -1033,7 +1040,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             }
             ExplorationGoalFeedback::Failed(reason) => {
                 if selected.frontier_valid {
-                    let failures = self.record_failure(&selected);
+                    let failures = self.record_failure(selected.frontier_cell, selected.frontier_cells.iter().copied());
                     if failures <= u64::from(self.max_navigation_retries) {
                         self.retry_support = Some(selected.support_xyz);
                     }
@@ -1249,14 +1256,13 @@ fn frontier_route_cost(
     search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
     start: [f64; 3],
     goal: [f64; 3],
-) -> Option<(f64, [f64; 3], f64)> {
+) -> Result<Option<(f64, [f64; 3], f64)>, String> {
     let started = std::time::Instant::now();
     let result = search.cost(start, goal);
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        ?start, ?goal, expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(),
+        ?start, ?goal, expanded = result.as_ref().ok().and_then(|route| route.as_ref()).map(|route| route.expanded), error = ?result.as_ref().err(),
         stats = ?search.stats(), "前沿选中目标完整路线查询完成");
-    let route = result.ok()?;
-    Some((route.cost, route.endpoint, route.yaw))
+    result.map(|route| route.map(|route| (route.cost, route.endpoint, route.yaw)))
 }
 
 fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
@@ -2267,7 +2273,7 @@ mod tests {
             std::sync::Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg.clone(), &[], &bands).unwrap());
         let mut guard = planner.lock().unwrap();
         let mut search = guard.multi_goal_search().unwrap();
-        assert!(frontier_route_cost(&mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4]).is_none());
+        assert!(frontier_route_cost(&mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4]).unwrap().is_none());
         let cells: Vec<_> = (-5..26).flat_map(|x| (-12..13).map(move |y|
             nuwax_nav_pct_native::Cell {x,y,ground:0.0,ceiling:f64::INFINITY}
         )).collect();
@@ -2276,10 +2282,25 @@ mod tests {
         let mut guard = planner.lock().unwrap();
         let mut search = guard.multi_goal_search().unwrap();
         let (cost, end, _) =
-            frontier_route_cost(&mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4]).unwrap();
+            frontier_route_cost(&mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4]).unwrap().unwrap();
         assert!(cost > 2.2);
         assert_eq!(end, [2.05, 0.05, 0.4]);
         assert!(search.stats().exact_expanded > 1);
+    }
+
+    #[test]
+    fn unreachable_route_excludes_its_cell_across_surface_updates() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut adapter = source(receiver.clone(), 0);
+        let first = goal(adapter.poll_goal(&state(0.4, 1)).unwrap());
+        let cell = adapter.selected.as_ref().unwrap().frontier_cell;
+        adapter.report_goal_feedback(&first.id, ExplorationGoalFeedback::Cancelled).unwrap();
+
+        SurfacePollDelta { unreachable_cell: Some(cell), ..Default::default() }.commit(&mut adapter);
+        receiver.observe(map()).unwrap();
+        goal(adapter.poll_goal(&state(0.4, 2)).unwrap());
+        assert_ne!(adapter.selected.as_ref().unwrap().frontier_cell, cell);
     }
 
     #[test]

@@ -119,14 +119,13 @@ def legacy_candidates(free, distance, radius, minimum_cells):
     replacement[missing] = np.arange(count, count + len(missing), dtype=np.int32)
     added = replacement[components]
     labels[added > 0] = added[added > 0]
-    return grow_labels(labels, free & (labels == 0))
+    return grow_labels(labels, free & (labels == 0)), core
 
 
-def open_area_labels(distance, radius, minimum_cells):
-    """按门宽一半和最小面积标记开阔连通块。"""
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (distance > radius + 0.5).astype(np.uint8), connectivity=4)
-    return np.where(stats[labels, cv2.CC_STAT_AREA] >= minimum_cells, labels, 0).astype(np.int32)
+def open_area_labels(free, distance, radius, minimum_cells):
+    """返回净空种子的编号和各编号扩展后的整区格数。"""
+    expanded, core = legacy_candidates(free, distance, radius, minimum_cells)
+    return np.where(core != 0, expanded, 0), np.bincount(expanded.ravel())
 
 
 def _interfaces(proposal, faces):
@@ -192,8 +191,10 @@ def _cross_section(free, points, directions, maximum, anchors, other_contacts):
     between = signs[:, :, 0] * signs[:, :, 1] < 0
     contact_projections = points @ vectors.T
     sample_projections = samples @ vectors.T
-    reaches_banks = ((sample_projections - before <= contact_projections.min(axis=0) + 2) &
-                     (sample_projections + after >= contact_projections.max(axis=0) - 2))
+    # 接触线离散在格边上，横切对两岸的覆盖最多容许一个栅格对角线的偏差。
+    bank_margin = math.sqrt(2)
+    reaches_banks = ((sample_projections - before <= contact_projections.min(axis=0) + bank_margin) &
+                     (sample_projections + after >= contact_projections.max(axis=0) - bank_margin))
     aligned = np.abs(vectors @ np.array([math.cos(axis), math.sin(axis)]))
     displacement = np.linalg.norm(samples - center, axis=1)
     other_distances = np.linalg.norm(samples[:, None, :] - other_contacts, axis=2)
@@ -207,11 +208,14 @@ def _cross_section(free, points, directions, maximum, anchors, other_contacts):
     return samples[i] - (before[i, j] + 0.6) * vectors[j], samples[i] + (after[i, j] + 0.6) * vectors[j]
 
 
-def candidate_sections(free, distance, proposal, faces, directions, maximum):
-    """为邻接候选各取一条短直横切线，保留原始自由格。"""
+def candidate_sections(free, distance, proposal, cores, faces, directions, maximum):
+    """为同一结构面内的邻接种子找短直横切线。"""
+    seeded = cores > 0
+    seed_faces = set(zip(faces[seeded].tolist(), cores[seeded].tolist()))
     groups = defaultdict(list)
     for face, a, b, points in _interfaces(proposal, faces):
-        groups[face, a, b].append(points)
+        if (face, a) in seed_faces and (face, b) in seed_faces:
+            groups[face, a, b].append(points)
     for (face, a, b), sections in groups.items():
         contacts = np.array([points.mean(axis=0) for points in sections])
         for index, points in enumerate(sections):

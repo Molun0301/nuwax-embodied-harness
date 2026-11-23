@@ -23,7 +23,7 @@ from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
 from contracts.occupancy_cells import PackedOccupancyCells
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb
-from services.memory.semantic_map.room_passages import trim_rays
+from services.memory.semantic_map.room_passages import clearance, open_area_labels, trim_rays
 from services.memory.semantic_map.room_segmentation import RoomSegmentationService
 
 
@@ -47,21 +47,28 @@ def load_grid(path):
 
 
 def baseline_service(revision):
-    folder = "services/memory/semantic_map/"
-    reference = revision + ":" + folder + "room_segmentation.py"
-    source = subprocess.check_output(["git", "show", reference], cwd=ROOT)
-    namespace = {"__name__": "room_segmentation_" + revision}
-    exec(compile(source, reference, "exec"), namespace)
-    if "partition_rooms" in namespace:
-        # 第一版与第二轮的内部签名不同，历史版本连同自己的墙线模块一起加载。
-        layout_ref = revision + ":" + folder + "room_layout.py"
-        old_layout = ModuleType("room_layout_" + revision)
-        sys.modules[old_layout.__name__] = old_layout
-        exec(compile(subprocess.check_output(["git", "show", layout_ref], cwd=ROOT),
-                     layout_ref, "exec"), vars(old_layout))
-        for function in ("partition_rooms", "close_furniture", "regularize_ring"):
-            namespace[function] = getattr(old_layout, function)
-    return namespace["RoomSegmentationService"]
+    """历史版本与同一提交中的划分模块一起加载。"""
+    package = "services.memory.semantic_map"
+    folder = package.replace(".", "/")
+    entries = ("room_passages", "room_layout", "room_segmentation")
+    paths = subprocess.check_output(
+        ["git", "ls-tree", "-r", "--name-only", revision, "--", folder], cwd=ROOT
+    ).decode().splitlines()
+    current = {package + "." + entry: sys.modules[package + "." + entry] for entry in entries}
+    try:
+        for entry in entries:
+            path = folder + "/" + entry + ".py"
+            if path not in paths:
+                continue
+            name = package + "." + entry
+            reference = revision + ":" + path
+            source = subprocess.check_output(["git", "show", reference], cwd=ROOT)
+            module = ModuleType(name)
+            sys.modules[name] = module
+            exec(compile(source, reference, "exec"), vars(module))
+        return sys.modules[package + ".room_segmentation"].RoomSegmentationService
+    finally:
+        sys.modules.update(current)
 
 
 def model_regions(scene, grid, origin):
@@ -183,12 +190,13 @@ def room_mapping(reference, labels, minimum_cells):
 
 
 def core_checks(free, labels, doorway, resolution, minimum_cells):
-    """独立检查两块达面积线的开阔区是否在同一自由连通域内被合并。"""
-    distance = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
-    _, cores = cv2.connectedComponents((distance > doorway / (2 * resolution) + 0.5).astype(np.uint8),
-                                      connectivity=4)
+    """按扩展后的候选面积认定资格，核对各候选种子落入的最终区域。"""
+    seeds, expanded_sizes = open_area_labels(free, clearance(free), doorway / (2 * resolution), minimum_cells)
+    cores = np.where(expanded_sizes[seeds] >= minimum_cells, seeds, 0)
     _, components = cv2.connectedComponents(free, connectivity=4)
-    mapping = room_mapping(cores, labels, minimum_cells)
+    mapping = room_mapping(cores, labels, 1)
+    for key, result in mapping.items():
+        result["expanded_cells"] = int(expanded_sizes[key])
     component_id = {key: int(components[cores == key][0]) for key in mapping}
     pairs = [(a, b) for a, b in combinations(mapping, 2) if component_id[a] == component_id[b]]
     merged = [(a, b) for a, b in pairs if mapping[a]["matched"] and
@@ -289,6 +297,7 @@ def main():
     parser.add_argument("--scene", type=Path, help="真值评估用的场景模型截面与坐标配准")
     parser.add_argument("--baseline", help="基线 Git（版本控制）提交")
     parser.add_argument("--first", help="第一版结构划分的提交")
+    parser.add_argument("--second", help="第二轮结构划分的提交")
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -303,9 +312,12 @@ def main():
         services["baseline"] = baseline_service(args.baseline)()
     if args.first:
         services["first"] = baseline_service(args.first)()
+    if args.second:
+        services["second"] = baseline_service(args.second)()
     services["current"] = current
     report = {"grid": str(args.grid), "scene": str(args.scene) if scene else None,
-              "baseline_revision": args.baseline, "first_revision": args.first, "opencv": cv2.__version__,
+              "baseline_revision": args.baseline, "first_revision": args.first, "second_revision": args.second,
+              "opencv": cv2.__version__,
               "numpy": np.__version__, "rooms_in_scene": len(truth), "algorithms": {}}
     free = (cells == 0).astype(np.uint8)
     trimmed = trim_rays(free, (cells < 0).astype(np.uint8), grid.resolution_m)
@@ -340,7 +352,8 @@ def main():
                                            "unmatched": len(candidates) - len(hits),
                                            "merges": len(hits) - len(set(hits))}
         report["algorithms"][name] = result
-        title = {"baseline": "Original", "first": "First version", "current": "Round 2"}[name]
+        title = {"baseline": "Original", "first": "First version", "second": "Round 2",
+                 "current": "Round 3" if args.second else "Current"}[name]
         images.append(paint(cells, masks, truth, title, inferred, cuts, rays))
     comparison = cv2.copyMakeBorder(np.hstack(images), 0, 25, 0, 0, cv2.BORDER_CONSTANT, value=(250, 250, 250))
     y = comparison.shape[0] - 8

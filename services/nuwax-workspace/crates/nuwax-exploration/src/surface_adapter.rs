@@ -7,9 +7,10 @@ use std::sync::{Arc, RwLock, Weak};
 use nuwax_nav_mls_planner::{SurfaceSnapshot, SurfaceFrontierIndex, SurfaceFrontierQuery, SurfaceFrontierCluster};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use nuwax_nav_stack::surface_oriented::PctPlanner;
+use nuwax_nav_stack::surface_oriented::{PctPlanner, position_within_tolerance};
 use nuwax_nav_types_messages::geometry::{Point3, Pose3, PoseStamped};
 use nuwax_nav_types_messages::visual::FrontierGoal;
+use nuwax_nav_types_messages::GoalOptions;
 
 use crate::{
     ExplorationBoundary, ExplorationGoalFeedback, ExplorationGoalSource, ExplorationPoll,
@@ -534,7 +535,8 @@ impl SurfaceGoalSourceAdapter {
             view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, observation_targets)
                 .map_err(ExploreError::SourceError)?);
         }
-        if self.excluded(candidate.frontier_cell)
+        if !frontier_outside_arrival(snapshot, current_body.0, robot_support, body, candidate.support_xyz)
+            || self.excluded(candidate.frontier_cell)
             || view.as_ref().is_some_and(|view| view.cells.is_empty()) {
             delta.deferred_route = Some(Some(continuation));
             delta.last_no_frontier = Some(false);
@@ -588,7 +590,7 @@ impl SurfaceGoalSourceAdapter {
         mut examined: std::collections::BTreeSet<[i32; 3]>,
     ) -> ExploreResult<Discovery> {
         let voxel = f64::from(snapshot.config().voxel_size);
-        let minimum_distance = f64::from(snapshot.config().goal_tolerance.max(snapshot.config().voxel_size));
+        let minimum_distance = minimum_frontier_distance(snapshot);
         let retry_matches = |point: [f64; 3]| {
             self.retry_support
                 .is_some_and(|retry| distance(retry, point) <= voxel * 0.25)
@@ -734,7 +736,9 @@ impl SurfaceGoalSourceAdapter {
             candidate.support_xyz = snapshot
                 .support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-            if self.excluded(candidate.frontier_cell) {
+            if !frontier_outside_arrival(snapshot, current_body.0, robot_support, body, candidate.support_xyz)
+                || self.excluded(candidate.frontier_cell)
+            {
                 continue;
             }
             candidate.travel_cost = settled.route.cost;
@@ -1099,6 +1103,27 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             last_error: self.last_error.clone(),
         }
     }
+}
+
+fn minimum_frontier_distance(snapshot: &SurfaceSnapshot) -> f64 {
+    // 三维探索子导航沿用默认到达容差，绑定后的候选也须落在其外。
+    GoalOptions::default()
+        .position_tolerance_m
+        .max(f64::from(snapshot.config().voxel_size))
+}
+
+fn frontier_outside_arrival(
+    snapshot: &SurfaceSnapshot,
+    robot_body: [f64; 3],
+    robot_support: [f64; 3],
+    target_body: [f64; 3],
+    target_support: [f64; 3],
+) -> bool {
+    // 倾斜机身的支撑点与导航到达使用的机体参考点在平面上可能不同。
+    distance(robot_support, target_support) > minimum_frontier_distance(snapshot)
+        && !position_within_tolerance(
+            robot_body, target_body, GoalOptions::default().position_tolerance_m, snapshot,
+        )
 }
 
 fn distance(left: [f64; 3], right: [f64; 3]) -> f64 {

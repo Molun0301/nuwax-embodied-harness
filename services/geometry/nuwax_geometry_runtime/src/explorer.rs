@@ -647,7 +647,11 @@ impl Explorer {
                         target.orientation.w,
                     ],
                 };
-                let options = frontier_goal_options(&frontier, self.surface_config.as_ref());
+                let options = frontier_goal_options(
+                    &frontier,
+                    self.surface_config.is_some(),
+                    self.surface_config.as_ref(),
+                );
                 if let (Some(mission), Some(route)) = (&self.mission, &route) {
                     let advice =
                         route

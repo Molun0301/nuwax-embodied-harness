@@ -947,7 +947,7 @@ pub(crate) fn vanishing_fixture() -> (Explorer, Arc<SurfaceSnapshot>) {
 }
 pub(crate) fn vanishing_pose() -> proto::Pose {
     from_mission(
-        &MissionPose { position: [0.75, 1.05, 0.55], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+        &MissionPose { position: [0.55, 1.05, 0.55], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
         "map",
     )
 }
@@ -966,6 +966,10 @@ fn surface_child_switches_when_its_frontier_vanishes_and_cancels_only_without_ne
     let (mut explorer, partial) = vanishing_fixture();
     let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial.clone()), Ok(())).unwrap();
     let (first_id, goal) = first.goal.expect("初始前沿应派发子目标");
+    let start = vanishing_pose().position.unwrap();
+    let target = goal.pose.as_ref().unwrap().position.as_ref().unwrap();
+    assert_eq!(goal.position_tolerance_m, Some(GoalOptions::default().position_tolerance_m));
+    assert!((target.x - start.x).hypot(target.y - start.y) > goal.position_tolerance_m.unwrap());
     let cell = goal_cell(&goal);
     // 同一张快照不重复核对；前沿仍在的新快照不换目标；前沿线前移、原前沿格已不是前沿，
     // 但0.75米内仍有前沿格时也不换目标。

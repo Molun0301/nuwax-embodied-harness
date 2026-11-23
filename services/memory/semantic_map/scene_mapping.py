@@ -424,29 +424,13 @@ class SceneMappingService:
                     request = self._request(space, capture, entries)
                     result = self._get_backend().decide(request)
                     ensure()
-                    # 内容变化时重新提取当前候选；不使用旧轮廓给新地图贴标签。
-                    try:
-                        current_capture = self.memory.capture_scene_mapping_state()
-                    except GatewayError as error:
-                        if error.error_code == "scene_map_library_mismatch":
-                            raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409) from error
-                        raise
-                    if not same_scope(current_capture["binding"], capture["binding"]):
-                        raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409)
-                    if current_capture["binding"]["map_revision"] != capture["binding"]["map_revision"]:
-                        candidates = self._segmenter.segment(current_capture["grid"], map_name=current_capture["library_name"],
-                            map_revision=current_capture["binding"]["map_revision"], existing_spaces=current_capture["spaces"])
-                        matching = next((candidate for candidate in candidates if candidate.scene_space_id == space.scene_space_id), None)
-                        if matching is None or not getattr(matching, "_geometry_unchanged", False):
-                            raise GatewayError("模型返回时区域边界已变化。", error_code="scene_geometry_changed", http_status=409)
                     updated = self._decision_space(space, result, entries, request, apply_labels=adopting)
-                    updated.metadata["map_binding"] = current_capture["binding"]
                     updated.metadata["decision_policy_inputs"] = policy_inputs
                     adopted = updated.metadata["last_decision"]["adopted"]
                     with self._lock:
                         ensure()
                         committed = self.memory.commit_scene_mapping_label(
-                            current_capture, updated, label=LABELS[updated.metadata["category"]] if adopted else None,
+                            capture, updated, label=LABELS[updated.metadata["category"]] if adopted else None,
                             source="model" if adopted else "model_candidate",
                             expected_revision=int(space.metadata["scene_revision"]),
                         )
@@ -458,6 +442,8 @@ class SceneMappingService:
                         label_candidates.append({"id": committed.scene_space_id,
                                            "reasons": updated.metadata["last_decision"]["adoption_blockers"]})
                 except GatewayError as exc:
+                    if exc.error_code == "scene_map_changed":
+                        raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409) from exc
                     if exc.error_code in ("scene_mapping_stopped", "scene_scope_changed", "memory_library_changed"):
                         raise
                     failures.append({"id": space.scene_space_id, "code": exc.error_code, "reason": str(exc)})

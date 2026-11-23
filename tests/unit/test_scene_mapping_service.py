@@ -60,6 +60,39 @@ def test_search_regions_match_graph_number_and_adopted_name(setup):
         graph.resolve_regions("R2")
     assert error.value.error_code == "scene_space_not_found"
 
+
+def test_explicit_region_naming_and_review_use_committed_partition(setup):
+    setup.service.run_once(apply_labels=False)
+    graph = setup.service.graph.query(kinds=["region"])
+    node, = graph["nodes"]
+    setup.view.revision += 1
+    saved = setup.service.update_label(scene_space_id=node["node_id"], map_name=setup.view.name,
+        expected_revision=node["properties"]["scene_revision"], label="厨房", requested_by="test")
+    assert saved.metadata["map_binding"] == graph["map_binding"]
+    edited = setup.memory.review_scene_space(saved.scene_space_id, map_name=setup.view.name,
+                                              primary_label="餐厅")
+    resolved, = setup.service.graph.resolve_regions("餐厅")
+    assert resolved.scene_space_id == edited.scene_space_id
+    assert resolved.metadata["map_binding"] == graph["map_binding"]
+
+
+def test_model_names_committed_region_while_live_grid_changes(setup):
+    for x in (2, 3):
+        remember(setup, x)
+
+    def change_live_grid():
+        setup.view.revision += 1
+        setup.view.cells[10:50, 30] = 100
+
+    setup.backend.winner = "kitchen"
+    setup.backend.hook = change_live_grid
+    result = setup.service.run_once(apply_labels=True)
+    identity, = result["applied_ids"]
+    space, = setup.service.graph.resolve_regions("茶水间")
+    assert space.scene_space_id == identity
+    assert space.metadata["map_binding"] == result["map_binding"]
+
+
 def test_unknown_never_adopted(setup):
     memory, backend, service = setup.memory, setup.backend, setup.service
     backend.winner = "unknown"

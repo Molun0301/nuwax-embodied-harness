@@ -1,4 +1,4 @@
-"""从已有流历史取同一采集时刻的几何输入，不用处理时刻的机体位置。"""
+"""用各帧的来源时间配准拍照前后的几何输入。"""
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -10,7 +10,8 @@ from contracts.pointcloud import PointCloudFrame
 from services.localization.frame_tree_ops import resolve_frame_transform
 
 _POSE_PAIR_WINDOW_NS = 200_000_000
-_POINT_CLOUD_PAIR_WINDOW_NS = 100_000_000
+# Go2 雷达约 15.4 帧/秒，单帧只扫一个扇区，约 10 帧铺满相机视野。
+_POINT_CLOUD_MERGE_WINDOW_NS = 350_000_000
 _LATEST_POSE_WINDOW_NS = 100_000_000
 # 按 1 米/秒和 1 弧度/秒估算，取 10 毫秒桶中心时几米内的误差为毫米至厘米级。
 _POINT_TIME_BUCKET_NS = 10_000_000
@@ -24,6 +25,10 @@ class ObservationGeometry:
     reason: str = "capture_pose_unavailable"
     sources: tuple = ()
     message: str = ""
+
+    @property
+    def point_batch_count(self) -> int:
+        return sum(source["point_batch_count"] for source in self.sources)
 
 
 def _stamp(payload, metadata):
@@ -100,7 +105,7 @@ def _pose_at_source_time(samples, stamp):
 
 
 def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, point_cloud_frames=None):
-    """用来源时间窗口插值图像位姿，并将最近整帧扫描按批次配准到地图系。"""
+    """插值图像位姿，并把窗口内的雷达扫描逐帧配准后合并。"""
     if stream_bus is None:
         return ObservationGeometry(reason="geometry_stream_unavailable")
     stamp = _stamp(image_frame, image_frame.metadata)
@@ -131,7 +136,7 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
         static.append(Transform(parent_frame_id=base, child_frame_id=body,
                                 timestamp=camera_edge.timestamp, authority="calibration_static"))
     tree = _pose_tree(pose, base, static)
-    selected = None
+    scans = []
     for frame in frames:
         cloud = frame.payload
         if frame.topic != "pointcloud.frame" or not isinstance(cloud, PointCloudFrame):
@@ -148,52 +153,70 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
             # 地图系点已完成坐标注册；复用本地图最近的既有点云，不重复搬动它。
             if cloud_stamp > stamp:
                 continue
-        elif abs(cloud_stamp-stamp) > _POINT_CLOUD_PAIR_WINDOW_NS:
+        elif abs(cloud_stamp-stamp) > _POINT_CLOUD_MERGE_WINDOW_NS:
             continue
-        key = (metadata.get("source_id") or getattr(sample, "sensor_id", None), cloud_stamp, cloud.frame_id)
         points = cloud.points_xyz_array
         if points is None:
             points = np.asarray([[p.x, p.y, p.z] for p in cloud.points], dtype=np.float64)
         if not len(points):
             continue
         rank = (abs(cloud_stamp-stamp), -cloud_stamp)
-        if selected is None or rank < selected[0]:
-            selected = (rank, cloud, points, key, sample, map_cloud)
-    if selected is None:
+        scans.append((rank, cloud, points, cloud_stamp, sample, map_cloud))
+    if not scans:
         return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable")
-    _, source_cloud, points, key, sample, map_cloud = selected
-    batch_count = 0
-    if not map_cloud:
-        if sample is not None and sample.time_offset_ns_le is not None:
-            offsets = np.frombuffer(sample.time_offset_ns_le, dtype="<u8").astype(np.int64)
-        elif source_cloud.metadata.get("offset_ns_array") is not None:
-            # 显示/感知原始数组保留逐点时间，不为几何配对创建标准字节载荷。
-            offsets = np.asarray(source_cloud.metadata["offset_ns_array"], dtype=np.int64)
-        else:
-            offsets = np.zeros(len(points), dtype=np.int64)
-        scan_stamp = int(sample.timestamp_ns) if sample is not None else key[1]
-        point_buckets = offsets // _POINT_TIME_BUCKET_NS
-        mapped = np.empty((len(points), 3), dtype=np.float64)
-        mixed = pose.mixed_correction
-        for bucket in np.unique(point_buckets):
-            center_offset = int(bucket) * _POINT_TIME_BUCKET_NS + _POINT_TIME_BUCKET_NS // 2
-            batch_pose = _pose_at_source_time(pose_samples, scan_stamp + center_offset)
-            if batch_pose is None:
-                return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable", message="点云批次时刻的位姿不可用")
-            transform = resolve_frame_transform(_pose_tree(batch_pose, base, static),
-                source_frame_id=source_cloud.frame_id, target_frame_id=pose.frame_id)
-            if transform is None:
-                return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable")
-            batch = point_buckets == bucket
-            mapped[batch] = np.asarray(points)[batch] @ transform.matrix[:3, :3].T+transform.matrix[:3, 3]
-            mixed |= batch_pose.mixed_correction or (
-                batch_pose.session_id, batch_pose.correction_seq) != (pose.session_id, pose.correction_seq)
-            batch_count += 1
-        points = mapped
+
+    # 仍由最接近图像时刻的帧决定使用地图系点云还是雷达扫描。
+    nearest = min(scans, key=lambda scan: scan[0])
+    use_map_cloud = nearest[-1]
+    selected = (nearest,) if use_map_cloud else (scan for scan in scans if not scan[-1])
+    registered, sources = [], []
+    mixed = pose.mixed_correction
+    message = ""
+    for _, source_cloud, points, cloud_stamp, sample, map_cloud in selected:
+        batch_count = 0
+        if not map_cloud:
+            if sample is not None and sample.time_offset_ns_le is not None:
+                offsets = np.frombuffer(sample.time_offset_ns_le, dtype="<u8").astype(np.int64)
+            elif source_cloud.metadata.get("offset_ns_array") is not None:
+                # 显示/感知原始数组保留逐点时间，不为几何配对创建标准字节载荷。
+                offsets = np.asarray(source_cloud.metadata["offset_ns_array"], dtype=np.int64)
+            else:
+                offsets = np.zeros(len(points), dtype=np.int64)
+            scan_stamp = int(sample.timestamp_ns) if sample is not None else cloud_stamp
+            point_buckets = offsets // _POINT_TIME_BUCKET_NS
+            mapped = np.empty((len(points), 3), dtype=np.float64)
+            scan_mixed = False
+            for bucket in np.unique(point_buckets):
+                center_offset = int(bucket) * _POINT_TIME_BUCKET_NS + _POINT_TIME_BUCKET_NS // 2
+                batch_pose = _pose_at_source_time(pose_samples, scan_stamp + center_offset)
+                if batch_pose is None:
+                    message = "点云批次时刻的位姿不可用"
+                    mapped = None
+                    break
+                transform = resolve_frame_transform(_pose_tree(batch_pose, base, static),
+                    source_frame_id=source_cloud.frame_id, target_frame_id=pose.frame_id)
+                if transform is None:
+                    mapped = None
+                    break
+                batch = point_buckets == bucket
+                mapped[batch] = np.asarray(points)[batch] @ transform.matrix[:3, :3].T+transform.matrix[:3, 3]
+                scan_mixed |= batch_pose.mixed_correction or (
+                    batch_pose.session_id, batch_pose.correction_seq) != (pose.session_id, pose.correction_seq)
+                batch_count += 1
+            if mapped is None:
+                continue
+            points = mapped
+            mixed |= scan_mixed
+        registered.append(points)
+        sources.append({"source_id": source_cloud.metadata.get("source_id") or getattr(sample, "sensor_id", None),
+                        "frame_id": source_cloud.frame_id, "source_timestamp_ns": cloud_stamp,
+                        "selected_point_count": len(points), "canonical_lidar": sample is not None,
+                        "point_batch_count": batch_count, "image_delta_ns": cloud_stamp-stamp})
+    if not registered:
+        return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable", message=message)
+    if not use_map_cloud:
         pose = pose.model_copy(update={"mixed_correction": mixed})
-    sources = ({"source_id": key[0], "frame_id": source_cloud.frame_id, "source_timestamp_ns": key[1],
-                "selected_point_count": len(points), "canonical_lidar": sample is not None,
-                "point_batch_count": batch_count, "image_delta_ns": key[1]-stamp},)
+    points = registered[0] if len(registered) == 1 else np.concatenate(registered)
     cloud = PointCloudFrame(frame_id=pose.frame_id, timestamp=image_frame.timestamp, point_count=len(points),
                             points_xyz_array=points, metadata={"source_timestamp_ns": stamp, "clock_id": clock})
     return ObservationGeometry(pose, tree, cloud, "", tuple(sources))

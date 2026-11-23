@@ -1,0 +1,57 @@
+/* 控制台页面（能力、日志、设置、系统）在 app.css 之外的补充样式；页面第一次打开时经 ctx.loadCss 加载。 */
+
+/* ---------- 日志 ---------- */
+.c-log-body { display: grid; grid-template-rows: auto auto auto; align-content: start; gap: 12px; padding: 14px 20px 24px; }
+.c-log-notice { padding: 8px 12px; border-radius: 8px; background: var(--warn-soft); color: var(--ink-2); font-size: var(--fs-12); }
+.c-logtable col.c-col-time { width: 118px; }
+.c-logtable col.c-col-level { width: 76px; }
+.c-logtable col.c-col-comp { width: 230px; }
+.c-logtable col.c-col-task { width: 128px; }
+.c-logtable col.c-col-chev { width: 34px; }
+.c-logtable td.c-log-time { color: var(--muted); white-space: nowrap; }
+.c-logtable td.c-col-chev { padding-left: 0; }
+.c-logtable tr.c-logrow[aria-selected="true"] td { background: var(--accent-soft); }
+.c-logtable tr[data-level="info"] .c-logmsg { color: var(--ink-2); }
+.c-logctx { margin-left: 10px; font: 11px/1 var(--mono); color: var(--faint); }
+.c-logtable .n-empty { padding: 40px 16px; }
+.c-log-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.c-log-comp { width: 200px; }
+.c-log-search { flex: 1 1 220px; max-width: 420px; min-width: 160px; }
+.c-log-idfilters { display: contents; }
+.c-log-idfilter { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--accent-soft); color: var(--accent-ink); font-size: var(--fs-12); }
+.c-log-idfilter .n-code { font-size: 11px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-log-idfilter button { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px; background: none; color: inherit; padding: 0; }
+.c-log-idfilter button:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.c-log-pre { max-height: none; white-space: pre-wrap; overflow-wrap: anywhere; }
+.c-logs .n-drawer-foot { flex-wrap: wrap; }
+@media (max-width: 1280px) { .c-logtable col.c-col-comp { width: 170px; } }
+@media (max-width: 1100px) { .c-logtable col.c-col-task { width: 0; } .c-logtable td:nth-child(5) > * { display: none; } }
+@media (max-width: 760px) {
+  .c-log-body { padding: 10px 10px 20px; }
+  .c-logtable col.c-col-comp, .c-logtable col.c-col-level { width: 0; }
+  .c-logtable td:nth-child(2) > *, .c-logtable td:nth-child(3) > * { display: none; }
+  .c-logtable col.c-col-time { width: 70px; }
+  .c-logtable td { padding: 7px 6px; }
+  .c-logctx { display: none; }
+  .c-log-comp { width: auto; flex: 1 1 140px; }
+  .c-logs .n-drawer { width: 100%; }
+}
+
+/* ---------- 能力 ---------- */
+.c-caphero > .c-back { flex: none; }
+.c-schema { margin-top: 2px; }
+.c-schema > summary { cursor: pointer; font-size: var(--fs-12); color: var(--accent-ink); width: max-content; }
+.c-schema > .c-console { margin-top: 6px; max-height: 240px; overflow: auto; }
+.c-caps-result .c-console { max-height: none; }
+@media (max-width: 760px) {
+  .c-caphero { flex-wrap: wrap; padding: 14px 16px; gap: 10px; }
+  .c-caphero > .c-back { flex-basis: 100%; justify-content: flex-start; }
+  .c-caphero .n-hero-icon { display: none; }
+  .c-caphero > .n-btn--primary { flex-basis: 100%; }
+  .c-caps-form { padding: 14px 16px 32px; }
+  /* 窄屏详情：标题区、参数与结果上下排，整页滚动 */
+  .c-caps.is-detail { display: block; overflow: auto; }
+  .c-caps.is-detail .c-caps-main { display: block; }
+  .c-caps.is-detail .c-caps-form { overflow: visible; }
+  .c-caps.is-detail .c-caps-result { display: block; max-height: none; border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
+}

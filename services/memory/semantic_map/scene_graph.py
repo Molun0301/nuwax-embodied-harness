@@ -241,6 +241,20 @@ class SceneGraphService:
             row["properties"]["bounds"] = {key: boundary.get(key) for key in ("min_corner", "max_corner", "area_m2")}
         return row
 
+    def resolve_regions(self, selector):
+        """采用场景图的当前名称、人工别名、区域标识和图上编号。"""
+        capture, index = self._capture()
+        name = str(selector).strip().casefold()
+        code = f"r{name}" if name.isdecimal() else name
+        selected = {node.record_id for node in index.nodes.values() if node.kind == "region"
+            and (name in {value.casefold() for value in (node.node_id, node.name, *node.aliases)}
+                 or code == node.properties["display_code"].casefold())}
+        regions = tuple(space for space in capture["spaces"] if space.scene_space_id in selected)
+        self._assert_capture(capture)
+        if not regions:
+            raise GatewayError(f"未找到场景空间：{selector}", error_code="scene_space_not_found", http_status=404)
+        return regions
+
     def query(self, *, query: str = "", node_id: Optional[str] = None, hops: int = 1,
               kinds: Optional[List[str]] = None, limit: int = 100, expected_graph_revision: Optional[str] = None):
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500 or not 0 <= hops <= 4 or len(query) > 200:

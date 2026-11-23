@@ -116,13 +116,19 @@ class MotionClient:
 
     def velocity(self, lease_id: int, vx: float, vy: float, wz: float) -> tuple[bool, Optional[MeasuredMotion]]:
         response = self._request(pb.GuardRequest(velocity=pb.VelocityRequest(lease_id=lease_id, vx_mps=vx, vy_mps=vy, wz_rps=wz)))
-        measured = None
+        return response.velocity.limited, self._measured_feedback(response)
+
+    def measured_motion(self) -> Optional[MeasuredMotion]:
+        return self._measured_feedback(self._request(pb.GuardRequest(status=pb.StatusRequest())))
+
+    @staticmethod
+    def _measured_feedback(response) -> Optional[MeasuredMotion]:
         if response.HasField("measured_motion"):
             value = response.measured_motion
-            measured = MeasuredMotion(value.source_id, value.source_timestamp_ns, value.received_monotonic_ns,
+            return MeasuredMotion(value.source_id, value.source_timestamp_ns, value.received_monotonic_ns,
                 value.valid_until_monotonic_ns, value.frame_id, tuple(value.body_linear_xyz), tuple(value.body_angular_xyz),
                 tuple(value.orientation_wxyz) if value.orientation_wxyz else None)
-        return response.velocity.limited, measured
+        return None
 
     def release(self, lease_id: int) -> None:
         try:

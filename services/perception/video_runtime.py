@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import logging
 import threading
 import time
+from typing import Optional
 
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import PerceptionRuntimeStatus
@@ -24,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 class _Burst:
     reason: str
     count: int
+    source_after_ns: Optional[int] = None
     samples: list = field(default_factory=list)
     frames: set = field(default_factory=set)
 
@@ -169,12 +171,13 @@ class PerceptionVideoRuntime:
             frame_tree=tree if inputs is not None else sample.frame_tree, image_bytes=sample.image_bytes,
             inputs=inputs, complete=True)
 
-    def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
+    def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
         with self._perception_service.point_cloud_consumer():
-            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec)
+            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec,
+                                   source_after_ns=source_after_ns)
 
-    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
-        burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count)
+    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
+        burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count, source_after_ns)
         with self._condition:
             settings = self._reasons[reason]
             self._bursts.append(burst)
@@ -269,7 +272,9 @@ class PerceptionVideoRuntime:
                     "track_count": len(context.observation.tracks),
                     "stage_status": context.metadata.get("stage_status", {})}))
         with self._condition:
-            bursts = [burst for burst in self._bursts if burst.reason in group["reasons"]]
+            stamp = self._frame_stamp(sample)
+            bursts = [burst for burst in self._bursts if burst.reason in group["reasons"]
+                      and (burst.source_after_ns is None or stamp > burst.source_after_ns)]
         if bursts:
             sample = self.complete_sample(sample)
         if decision.should_process:

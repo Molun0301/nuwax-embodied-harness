@@ -10,7 +10,7 @@ from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
 
 from contracts.spatial_memory import NavigationCandidate, SceneSpace
-from core import components
+from core import clock, components
 from core.capability import Capability
 from core.errors import GatewayError
 from core.target_query import coerce_optional_str_list, normalize_query, target_label_matches_query
@@ -128,6 +128,7 @@ class _TargetSearch:
         self.backend = args.get("detector_backend")
         self.reason = f"{capability}:{ctx.task_id}"
         self.map_name = args.get("map_name") or platform.geometry_state.snapshot().map_name
+        self.regions = ()
         self.threshold = args.get("verify_similarity_threshold", .55)
         self.rejected = set()
         self.capability = capability
@@ -172,7 +173,7 @@ class _TargetSearch:
         return sample, self.observe_sample(sample, frame_count=len(samples), remember=remember, source=source)
 
     def observe_sample(self, sample, *, frame_count=1, remember=True, source="target_search"):
-        evidence = self._build_target_detection_evidence(self.query, sample.context)
+        evidence = self._build_target_detection_evidence(self.query, sample)
         written = None
         if remember and evidence["has_detection_evidence"]:
             try:
@@ -194,7 +195,7 @@ class _TargetSearch:
         result = self.platform.memory.verify_arrival_observation(self.query, perception_context=sample.context,
             current_pose=sample.pose, navigation_candidate=candidate, similarity_threshold=self.threshold,
             expected_map_name=self.map_name, goal_id=goal_id)
-        evidence = self._build_target_detection_evidence(self.query, sample.context)
+        evidence = self._build_target_detection_evidence(self.query, sample)
         if result.verified and not evidence["has_detection_evidence"]:
             result = result.model_copy(update={"verified": False,
                 "reason": "当前场景缺少目标检测证据，已拒绝开放词汇找物命中。",
@@ -206,7 +207,8 @@ class _TargetSearch:
     def search_state(self, sample):
         verification = self.verify(sample)
         candidates = tuple(candidate for candidate in self.platform.memory.resolve_navigation_candidates(
-            self.query, camera_id=self.camera_id, map_name=self.map_name, limit=5, object_target=True)
+            self.query, camera_id=self.camera_id, map_name=self.map_name, limit=5, object_target=True,
+            regions=self.regions)
             if candidate.record_id not in self.rejected)
         diagnostics = [self._build_target_candidate_diagnostic(candidate) for candidate in candidates]
         self.candidate_diagnostics.update((item["record_id"], item) for item in diagnostics)
@@ -314,7 +316,8 @@ class _TargetSearch:
         raise GatewayError("未找到具备目标检测和地图投影证据的目标：" + self.query,
             error_code="target_not_found_with_evidence", http_status=404, details=details)
 
-    def _build_target_detection_evidence(self, query: str, perception_context) -> Dict[str, Any]:
+    def _build_target_detection_evidence(self, query: str, sample) -> Dict[str, Any]:
+        perception_context = sample.context
         evidence: Dict[str, Any] = {
             "has_detection_evidence": False,
             "matched_labels": [],
@@ -336,6 +339,9 @@ class _TargetSearch:
             labels.extend(coerce_optional_str_list(attributes.get("aliases")))
             if any(target_label_matches_query(query, label) for label in labels):
                 matched_detections.append(detection)
+        if self.regions and matched_detections:
+            matched_detections = list(self.platform.memory.detections_in_regions(matched_detections,
+                context=perception_context, pose=sample.pose, frame_tree=sample.frame_tree, regions=self.regions))
         if not matched_detections:
             return evidence
         matched_detections.sort(key=lambda item: item.score, reverse=True)
@@ -499,7 +505,7 @@ class _ExplorationSearchContext:
                                             detector_backend_name=self.search.backend)
         if sample is not None and sample is not self.previous:
             self.previous = sample
-            if self.search._build_target_detection_evidence(self.search.query, sample.context)["has_detection_evidence"]:
+            if self.search._build_target_detection_evidence(self.search.query, sample)["has_detection_evidence"]:
                 self.sample = sample
                 raise _SearchHit()
 
@@ -507,6 +513,8 @@ class _ExplorationSearchContext:
 def find_target(platform, ctx, args):
     search = _TargetSearch(platform, ctx, args, "find_target")
     search.prepare_map()
+    if "region" in args:
+        search.regions = platform.scene_mapping.graph.resolve_regions(args["region"])
     with search.acquired():
         ctx.progress(.05, "search_prepare", "准备查找目标。")
         sample, refresh = search.refresh(source="find_target_precheck")
@@ -521,13 +529,30 @@ def find_target(platform, ctx, args):
         return result
 
 
+def _inspection_samples(search):
+    # 导航到达和归零回执不等于实测停稳。只接收停稳确认后的原始图像。
+    ctx = search.ctx
+    started = clock.source_now_ns()
+    while True:
+        ctx.check()
+        motion = search.platform.motion.measured_motion()
+        if (motion is not None and motion.source_timestamp_ns >= started
+                and math.hypot(*motion.linear_xyz[:2]) < .02 and abs(motion.angular_xyz[2]) < .02):
+            break
+        ctx.wait(.05)
+    count = search.platform.config.perception.instance_association.confirmation_min_observations
+    samples = search.runtime.run_burst(ctx, reason=search.reason, frame_count=count, interval_sec=.12,
+                                       source_after_ns=motion.source_timestamp_ns)
+    return [(sample, search._find_scene_object(search.query, sample.context)) for sample in samples]
+
+
+@rpc_errors
 def inspect_target(platform, ctx, args):
     search = _TargetSearch(platform, ctx, args, "inspect_target")
     with search.acquired():
-        ctx.progress(.05, "inspect_observe", "开始检查目标。")
-        sample, _ = search.refresh(remember=False)
-        matched = search._find_scene_object(search.query, sample.context)
-        if matched is None and args.get("auto_navigate", False):
+        ctx.progress(.05, "inspect_observe", "等待停稳后连拍检查目标。")
+        samples = _inspection_samples(search)
+        if not any(matched is not None for _, matched in samples) and args.get("auto_navigate", False):
             ctx.progress(.3, "inspect_navigate", "当前画面未找到目标，尝试导航到命名位置。")
             target = platform.navigation_memory.resolve(search.query, camera_id=search.camera_id)
             pose = target.pose
@@ -535,17 +560,22 @@ def inspect_target(platform, ctx, args):
                 "tolerance_position_m": 0.35,
                 "yaw_rad": pose.yaw, "frame_id": pose.frame_id, "motion_generation": args["motion_generation"]},
                 region=target.region)
-            sample, _ = search.refresh(frame_count=5, interval_sec=.12, remember=False)
-            matched = search._find_scene_object(search.query, sample.context)
-        if matched is None:
+            ctx.progress(.4, "inspect_observe", "已到达检查位置，等待停稳后连拍。")
+            samples = _inspection_samples(search)
+        last_match = next((pos for pos in reversed(range(len(samples))) if samples[pos][1] is not None), None)
+        if last_match is None:
             raise GatewayError("未在当前场景中找到目标：" + search.query,
                                error_code="target_not_found", http_status=404)
-        entry = remember_sample(platform, sample, title="检查结果：" + search.query,
-            summary=sample.context.scene_summary.headline, tags=[search.query, matched.label],
-            metadata={"source": "inspect_target"})
+        match_sample, matched = samples[last_match]
+        entries = []
+        for sample, match in samples:
+            ctx.check()
+            entries.append(remember_sample(platform, sample, title="检查结果：" + search.query,
+                summary=sample.context.scene_summary.headline, tags=[search.query, match.label] if match else None,
+                metadata={"source": "inspect_target"}))
         ctx.progress(1.0, "completed", "目标检查完成。")
-        return {"query": search.query, "matched_object": matched, "perception_context": sample.context,
-                "semantic_memory": entry}
+        return {"query": search.query, "matched_object": matched, "perception_context": match_sample.context,
+                "semantic_memory": entries[last_match], "frame_count": len(samples)}
 
 
 def explore_and_find_target(platform, ctx, args):

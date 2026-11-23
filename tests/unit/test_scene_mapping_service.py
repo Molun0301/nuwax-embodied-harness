@@ -43,6 +43,23 @@ def remember(setup,x=2,*,timestamp=None):
     setup.memory.write(lambda store:store.put('memory',entry))
     return entry
 
+
+def test_search_regions_match_graph_number_and_adopted_name(setup):
+    setup.service.run_once(apply_labels=False)
+    region, = setup.service.get_map()["regions"]
+    setup.service.update_label(scene_space_id=region["scene_space_id"],
+        map_name=setup.view.name, expected_revision=region["metadata"]["scene_revision"],
+        label="厨房", requested_by="test")
+
+    graph = setup.service.graph
+    node, = graph.query(kinds=["region"])["nodes"]
+    for selector in ("厨房", node["node_id"], node["properties"]["display_code"], 1):
+        match, = graph.resolve_regions(selector)
+        assert match.scene_space_id == node["node_id"]
+    with pytest.raises(GatewayError) as error:
+        graph.resolve_regions("R2")
+    assert error.value.error_code == "scene_space_not_found"
+
 def test_unknown_never_adopted(setup):
     memory, backend, service = setup.memory, setup.backend, setup.service
     backend.winner = "unknown"

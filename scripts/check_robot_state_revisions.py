@@ -87,11 +87,16 @@ class RobotStateRevisionChecks(unittest.TestCase):
 
     def test_volatile_updates_keep_complete_latest_state_without_extra_web_publications(self):
         for sequence in range(1000):
-            state = self.robot_state.model_copy(update={"metadata": {"sequence": sequence}})
+            state = self.robot_state.model_copy(update={"metadata": {
+                "sequence": sequence, "source_timestamp_ns": 1_000_000_000 + sequence,
+            }})
             self.ingest(state)
         self.assertEqual(len(self.streams.frames), 1)
         self.assertEqual(self.service.get_latest_snapshot().robot_state.metadata["sequence"], 999)
         self.assertEqual(self.store.read(StateNamespace.ROBOT_STATE, "synthetic").value.metadata["sequence"], 999)
+        self.assertEqual(
+            self.service.get_latest_snapshot().robot_state.metadata["source_timestamp_ns"], 1_000_000_999,
+        )
 
     def test_stream_snapshot_replay_and_wire_keep_owner_revision_without_digest_fields(self):
         from gateways.ws.data_streams import _encode_ws_frame, _format_sse_payload

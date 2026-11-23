@@ -1,9 +1,8 @@
 /* 日志页：一行工具栏（等级按钮带数量、组件、搜索、隐藏网页请求记录、暂停滚动、导出），表格铺满，点一行在右侧抽屉看完整记录。
    数据沿用原日志页（console-logs.js，06 第 6 节）：首屏 /api/logs，before 游标翻页，实时 logs.entry 追加（独立连接，日志洪峰不挤主连接），
-   缺口时重读最近一页；页面可见时每 3 秒补取独立组件写入文件的日志，不可见时停止、恢复可见立即取一次；导出 /api/logs/export。
+   离开本页时关闭实时连接、回来时先重读首屏再接上；缺口时重读最近一页；页面可见时每 3 秒补取独立组件写入文件的日志，不可见时停止、恢复可见立即取一次；导出 /api/logs/export。
    本地最多保留 5000 条，超出时优先保留符合当前筛选的记录。 */
-import { icon, h, toast, menu } from '/static/shared/neh-ui.js';
-import { copyText } from '/static/shared/settings-editor.js';
+import { icon, h, toast, menu, copyText } from '/static/shared/neh-ui.js';
 import { createStream } from '../stream.js';
 
 const CACHE_LIMIT = 5000;
@@ -77,7 +76,7 @@ export function mount(root, ctx) {
   const rowNodes = new Map();
   const st = { levels: new Set(['error', 'warning', 'info']), component: '', query: '', task: '', request: '', hideWeb: true,
     paused: false, pending: 0, displayLimit: PAGE_SIZE, nextBefore: null, hasMore: false, loading: false, request_seq: 0,
-    note: '', gapNote: '', selected: null, visible: false, opened: false, renderTimer: null, filterTimer: null, gapReload: null };
+    note: '', gapNote: '', selected: null, visible: false, renderTimer: null, filterTimer: null, gapReload: null };
 
   const toolbar = h('div', { class: 'n-toolbar' });
   const notice = h('div', { class: 'c-log-notice', hidden: true });
@@ -224,17 +223,21 @@ export function mount(root, ctx) {
     } catch (error) { toast('日志导出失败：' + error.message, { tone: 'bad' }); }
   }
 
-  /* ---------- 实时日志：独立连接，缺口时重读最近一页 ---------- */
-  const stream = createStream({ topics: ['logs.entry'], queued: ['logs.entry'] });
-  stream.on('logs.entry', frame => addEntries([fromFrame(frame)]));
-  let initialReplay = true;
-  stream.onReplay(() => { initialReplay = false; });
-  stream.onGap(({ kind }) => {
-    // 首次连接的回放缺口由首屏读取覆盖，不另行提示。
-    if (kind === 'replay' && initialReplay) return;
-    st.gapNote = '实时日志有缺口，已重读最近 ' + PAGE_SIZE + ' 条匹配的记录；更早的记录请加载或导出。';
-    if (!st.gapReload) st.gapReload = reload().finally(() => { st.gapReload = null; });
-  });
+  /* ---------- 实时日志：独立连接，离开本页时关闭，回来时先重读首屏再接上；缺口时重读最近一页 ---------- */
+  let stream = null;
+  function openStream() {
+    stream = createStream({ topics: ['logs.entry'], queued: ['logs.entry'] });
+    stream.on('logs.entry', frame => addEntries([fromFrame(frame)]));
+    let initialReplay = true;
+    stream.onReplay(() => { initialReplay = false; });
+    stream.onGap(({ kind }) => {
+      // 连接刚打开时的回放缺口由刚重读的首屏覆盖，不另行提示。
+      if (kind === 'replay' && initialReplay) return;
+      st.gapNote = '实时日志有缺口，已重读最近 ' + PAGE_SIZE + ' 条匹配的记录；更早的记录请加载或导出。';
+      if (!st.gapReload) st.gapReload = reload().finally(() => { st.gapReload = null; });
+    });
+    stream.connect();
+  }
 
   /* ---------- 表格 ---------- */
   function selectedText() {
@@ -321,12 +324,16 @@ export function mount(root, ctx) {
 
   syncToolbar();
   return {
+    // 筛选、暂停、已读取的记录与选中项都保留；回来时重读首屏（翻页游标从头算），读完再接实时流。
     show() {
       st.visible = true;
-      if (!st.opened) { st.opened = true; stream.connect(); void reload(); }
-      else if (!st.loading) void load(false, true);
+      void reload().then(() => { if (st.visible && !stream) openStream(); });
       scheduleRender();
     },
-    hide() { st.visible = false; },
+    hide() {
+      st.visible = false;
+      stream?.close();
+      stream = null;
+    },
   };
 }

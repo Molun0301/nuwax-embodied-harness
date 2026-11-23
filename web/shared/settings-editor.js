@@ -3,7 +3,7 @@
    分组、次序、开关位置与名称全部来自配置模式（panel / category / switch / advanced / title / unit / summary / apply）。
    每项一行属性表：名称与键名 | 控件 | 说明。板块与子类标题栏的开关切换即单独保存；其余项进入待保存列表，由底部保存条统一提交。
    宿主传入 request(path, {method, body, timeout})（控制台为 ctx.api.manager，写请求自动带 X-NEH-CSRF），失败时抛出带原因的错误。 */
-import { icon, h, toast, confirmDialog, menu, block, sub } from './neh-ui.js';
+import { icon, h, toast, confirmDialog, menu, block, sub, copyText } from './neh-ui.js';
 
 const SINGLE_COLOR_KEYS = new Set(['gateway.pointcloud3d_color', 'gateway.pointcloud3d_ground_color',
   'gateway.pointcloud3d_structure_color', 'gateway.pointcloud3d_object_color']);
@@ -17,22 +17,6 @@ const SPATIAL_KEYS = new Set(['geometry.lio_backend', 'geometry.mapping_backend'
   'navigation.traversability_max_step_height_m', 'navigation.traversability_max_slope_deg']);
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 const TIMEOUT = 60000;
-
-/* 复制文字：设备多经局域网 http 地址打开，不是安全来源时浏览器不提供剪贴板接口，退回原生复制命令（沿用原日志页做法）。 */
-export async function copyText(text) {
-  try {
-    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
-  } catch (e) { /* 权限被拒时继续尝试原生复制 */ }
-  const focused = document.activeElement;
-  const area = h('textarea', { readonly: true, 'aria-hidden': 'true', style: 'position:fixed;left:-9999px' });
-  area.value = text;
-  document.body.append(area);
-  let copied = false;
-  try { area.select(); copied = document.execCommand('copy') === true; } catch (e) { copied = false; }
-  area.remove();
-  focused?.focus?.({ preventScroll: true });
-  return copied;
-}
 
 const titleOf = f => f.title || f.zh_name || f.key;
 const numeric = f => f.type === 'int' || f.type === 'float';

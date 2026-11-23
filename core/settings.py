@@ -425,6 +425,8 @@ class SceneMappingConfig:
     base_url: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_BASE_URL')
     model: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_MODEL')
     api_key: str = field(default_factory=lambda: schema_default('semantic_map.NUWAX_SCENE_MAPPING_API_KEY'), repr=False)
+    api_key_file: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_API_KEY_FILE')
+    extra_body: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_EXTRA_BODY')
     timeout_sec: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_TIMEOUT_SEC')
     interval_sec: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_INTERVAL_SEC')
     min_area_m2: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_MIN_AREA_M2')

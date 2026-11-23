@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import copy
 import heapq
+import threading
+from dataclasses import dataclass
 from datetime import timezone
 
 from contracts.base import utc_now
-from contracts.spatial_memory import SceneSpaceReviewStatus
+from contracts.maps import OccupancyGrid
+from contracts.spatial_memory import SceneSpace, SceneSpaceReviewStatus
 from core.errors import GatewayError
 from services.memory.semantic_map.inputs import algorithm_grid, algorithm_pose, map_binding, same_scope
 
@@ -14,10 +17,19 @@ MANAGED_KEY = "scene_mapping_managed"
 PROTECTED = {SceneSpaceReviewStatus.REVIEWED, SceneSpaceReviewStatus.CORRECTED, SceneSpaceReviewStatus.REJECTED}
 
 
+@dataclass(frozen=True)
+class _ScenePartition:
+    grid: OccupancyGrid
+    binding: dict
+    regions: dict[str, SceneSpace]
+
+
 class SemanticMapState:
     def __init__(self, memory, geometry_state):
         self.core = memory
         self.geometry = geometry_state
+        self._partition_lock = threading.Lock()
+        self._partition = None
 
     def capture_scene_mapping_state(self, *, include_decision_inputs=True):
         state = self.geometry.snapshot()
@@ -83,7 +95,34 @@ class SemanticMapState:
                 store.put("scene_space", space)
             written = self.core.record_scene_space_graphs((*result, *retired), map_name=capture["library_name"])
             return list(written[:len(result)])
-        return self._writer(capture, write)
+        if not retire_missing:
+            return self._writer(capture, write)
+        # 图查询同时看到分区快照和同一批写入的区域记录。
+        with self._partition_lock:
+            written = self._writer(capture, write)
+            self._publish_partition(capture, written)
+            return written
+
+    def _publish_partition(self, capture, spaces):
+        self._partition = _ScenePartition(capture["grid"], capture["binding"],
+                                          {space.scene_space_id: space for space in spaces})
+
+    def restore_scene_partition(self, capture, spaces):
+        """重启后复用已提交且仍与当前栅格一致的分区。"""
+        with self._partition_lock:
+            if self._partition is None:
+                self._publish_partition(capture, spaces)
+
+    def clear_scene_partition(self, map_name):
+        with self._partition_lock:
+            if self._partition is not None and self._partition.binding["map_name"] != map_name:
+                self._partition = None
+
+    def assert_scene_graph_capture(self, capture):
+        self._assert_scene_mapping_capture(capture, require_content=False)
+        with self._partition_lock:
+            if capture["partition"] is not self._partition:
+                raise GatewayError("语义任务依据的分区已改变。", error_code="scene_map_changed", http_status=409)
 
     def current_managed_scene_spaces(self, capture, *, include_stale=False):
         result = []
@@ -149,7 +188,17 @@ class SemanticMapState:
                                               expected_revision=expected_revision, requested_by=requested_by)
 
     def capture_scene_graph_state(self):
-        capture = self.capture_scene_mapping_state()
+        with self._partition_lock:
+            capture = self.capture_scene_mapping_state()
+            partition = self._partition
+        capture["partition"] = partition
+        all_spaces = capture["spaces"]
+        capture["spaces"] = ()
+        if partition is not None and same_scope(partition.binding, capture["binding"]):
+            # 区域轮廓随分区发布，名称和审核仍读取最新的记忆记录。
+            spaces = tuple(space.model_copy(update={"boundary": partition.regions[space.scene_space_id].boundary})
+                           for space in all_spaces if space.scene_space_id in partition.regions)
+            capture.update(grid=partition.grid, binding=partition.binding, spaces=spaces)
         snapshot = capture["memory_snapshot"]
         instances = snapshot.model_map("instance")
         entries = capture["entries"]
@@ -174,7 +223,7 @@ class SemanticMapState:
                 if deadline > now:
                     deadlines.append(deadline)
         capture["valid_until"] = min(deadlines) if deadlines else None
-        capture.update(space_total=len(capture["spaces"]), instance_total=len(instances), instance_truncated=len(instances) > len(selected),
+        capture.update(space_total=len(all_spaces), instance_total=len(instances), instance_truncated=len(instances) > len(selected),
                        entries=entries)
         return capture
 

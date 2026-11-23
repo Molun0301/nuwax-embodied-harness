@@ -83,7 +83,8 @@ class SceneMappingService:
             if self._backend is None:
                 self._backend = create_scene_decision_backend(backend=self.config.backend,
                     base_url=self.config.base_url, model=self.config.model,
-                    api_key=self.config.api_key, timeout_sec=self.config.timeout_sec)
+                    api_key=self.config.api_key, api_key_file=self.config.api_key_file,
+                    extra_body=self.config.extra_body, timeout_sec=self.config.timeout_sec)
             return self._backend
 
     def capture(self):
@@ -95,7 +96,8 @@ class SceneMappingService:
                     "running": self._thread is not None and self._thread.is_alive(),
                     "busy": self._active_jobs > 0, "stop_requested": self._stop.is_set(),
                     "backend": self.config.backend, "model": self.config.model,
-                    "credential_configured": bool(self.config.api_key),
+                    "credential_configured": bool(self.config.api_key_file if self.config.backend == "openai_vision"
+                                                  else self.config.api_key),
                     "auto_apply": self.config.auto_apply, "cycles": self._cycles,
                     "last_finished_at": self._last_finished_at, "last_error": self._last_error,
                     "last_result": self._last_result,
@@ -219,7 +221,9 @@ class SceneMappingService:
             for region in regions)
         if unchanged:
             self.memory._assert_scene_mapping_capture(capture)
-            return capture, [old_by_id[region.scene_space_id] for region in regions]
+            written = [old_by_id[region.scene_space_id] for region in regions]
+            self.memory.restore_scene_partition(capture, written)
+            return capture, written
         revisions = {space.scene_space_id: int(space.metadata.get("scene_revision", 0)) for space in capture["spaces"]}
         written = self.memory.commit_scene_mapping_spaces(capture, regions, expected_revisions=revisions, retire_missing=True)
         return capture, written
@@ -566,7 +570,10 @@ def _consistent_visual_votes(result, images, winner):
         return False
     try:
         for view in views:
-            probabilities = {key: float(value["probabilities"]["entailment"]) for key, value in view["nli"].items()}
+            if result.score_kind == "choice_probability":
+                probabilities = view["probabilities"]
+            else:
+                probabilities = {key: float(value["probabilities"]["entailment"]) for key, value in view["nli"].items()}
             if set(probabilities) != set(CATEGORIES) or any(not math.isfinite(v) or not 0 <= v <= 1 for v in probabilities.values()):
                 return False
             if max(probabilities, key=probabilities.get) != winner:

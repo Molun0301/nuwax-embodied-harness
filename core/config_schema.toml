@@ -1654,9 +1654,9 @@ category = "语义地图"
 
 [semantic_map.NUWAX_SCENE_MAPPING_BACKEND]
 type = "string"
-choices = ["openjev_http", "jev_api"]
+choices = ["openjev_http", "jev_api", "openai_vision"]
 default = "openjev_http"
-description = "选择本地 OpenJev 服务或 Jev 远程接口。"
+description = "选择本地 OpenJev、Jev 远程接口或 OpenAI 兼容视觉接口。"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1667,7 +1667,7 @@ category = "语义地图"
 [semantic_map.NUWAX_SCENE_MAPPING_BASE_URL]
 type = "string"
 default = "http://127.0.0.1:8791"
-description = "语义决策服务的根地址或以 /v1 结尾的地址。默认值对应本地后端，远程后端使用其服务地址。"
+description = "语义决策服务的基础地址。OpenAI 兼容视觉后端在此地址后追加 /chat/completions。"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1687,6 +1687,29 @@ consumers = [
 apply = "restart"
 panel = "记忆与语义"
 category = "区域划分与命名"
+
+[semantic_map.NUWAX_SCENE_MAPPING_API_KEY_FILE]
+type = "string"
+default = ""
+description = "OpenAI 兼容视觉后端的密钥文件路径，可用 ~ 表示用户主目录。配置只填写路径。"
+consumers = [
+    "core/settings.py:_load_scene_mapping_config",
+]
+apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
+
+[semantic_map.NUWAX_SCENE_MAPPING_EXTRA_BODY]
+type = "string"
+default = "{}"
+description = "OpenAI 兼容视觉后端的额外请求字段。填写 JSON 对象，字段原样合入请求体。"
+consumers = [
+    "core/settings.py:_load_scene_mapping_config",
+]
+apply = "restart"
+panel = "记忆与语义"
+category = "语义地图"
+advanced = true
 
 [semantic_map.NUWAX_SCENE_MAPPING_ENABLED]
 type = "boolean"

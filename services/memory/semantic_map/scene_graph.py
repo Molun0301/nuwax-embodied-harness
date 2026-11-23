@@ -49,6 +49,7 @@ class SceneGraphService:
 
     def _geometry_changed(self, state):
         with self._lock:
+            self.memory.clear_scene_partition(state.map_name)
             if state.map_name != self._library_name:
                 self._geometry = self._index = None
                 self._geometry_key = self._index_key = None
@@ -67,13 +68,13 @@ class SceneGraphService:
             binding = capture["binding"]
             self._library_name = capture["library_name"]
             records = capture["memory_snapshot"].records
-            source_key = (binding_value(binding), *(records[kind] for kind in ("scene_space", "memory", "instance")))
+            source_key = (binding_value(binding), tuple(space.scene_space_id for space in capture["spaces"]),
+                          *(records[kind] for kind in ("scene_space", "memory", "instance")))
             if self._index is not None and source_key == self._index_key and self._within_deadline(self._index.valid_until):
                 self._assert_capture(capture)
                 return capture, self._index
             spaces = sorted((space for space in capture["spaces"]
                 if same_scope(space.metadata.get("map_binding", {}), binding)
-                and space.metadata["map_binding"].get("map_revision") == binding["map_revision"]
                 and str(space.review_status.value) not in ("stale", "rejected")), key=lambda value: value.scene_space_id)
             from services.memory.semantic_map.scene_revisions import graph_geometry_value
             geometry_key = (binding_value(binding), tuple(graph_geometry_value(space) for space in spaces))
@@ -94,7 +95,7 @@ class SceneGraphService:
         return valid_until is None or utc_now().timestamp() < valid_until
 
     def _assert_capture(self, capture):
-        self.memory._assert_scene_mapping_capture(capture)
+        self.memory.assert_scene_graph_capture(capture)
         if not self._within_deadline(capture.get("valid_until")):
             raise GatewayError("物品状态在图查询期间已过期，请重新读取。", error_code="scene_graph_changed", http_status=409)
 

@@ -9,7 +9,7 @@ import time
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
 
-from contracts.spatial_memory import NavigationCandidate
+from contracts.spatial_memory import NavigationCandidate, SceneSpace
 from core import components
 from core.capability import Capability
 from core.errors import GatewayError
@@ -68,10 +68,11 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
             if navigation.status in {GoalStatus.CANCELLED, GoalStatus.REPLACED, GoalStatus.STOPPED}:
                 finished = True
                 raise Cancelled(navigation.message or "导航已被取消或更新的命令停止")
-            if (region is not None and navigation.no_feasible_path
+            if (region is not None and (navigation.status == GoalStatus.FAILED or navigation.no_feasible_path)
                     and platform.navigation_memory.contains(region, platform.geometry_state.pose())):
                 finished = True
-                platform.geometry.cancel_goal(goal_id, timeout_sec=ctx.remaining())
+                if not navigation.status.terminal:
+                    platform.geometry.cancel_goal(goal_id, timeout_sec=ctx.remaining())
                 return {"goal_id": goal_id, "arrival": "region"}
             if navigation.status == GoalStatus.FAILED:
                 finished = True
@@ -601,7 +602,7 @@ def explore_and_find_target(platform, ctx, args):
 
 @rpc_errors
 def navigate_to_named_location(platform, ctx, args):
-    """命名地点沿用普通导航，并共享连拍复核、记录、写回和失败降权。"""
+    """按名导航，场景空间按位姿核对，其他目标按画面核对。"""
     ctx.progress(0.0, "running", "任务正在执行。", target_label=args["target_name"])
     target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
     pose = target.pose
@@ -611,6 +612,13 @@ def navigate_to_named_location(platform, ctx, args):
         region=target.region)
     if not args.get("verify_on_arrival", True):
         return {**navigation, "target_name": target.target_name}
+    if isinstance(target.candidate, SceneSpace):
+        verified = platform.navigation_memory.contains(target.candidate, platform.geometry_state.pose())
+        verification = {"verified": verified, "method": "inside_region"}
+        if not verified:
+            raise GatewayError("当前位置不在目标区域内", error_code="arrival_verification_failed",
+                http_status=409, details=verification)
+        return {**navigation, "target_name": target.target_name, "verification": verification}
     search = _TargetSearch(platform, ctx, {**args, "query": target.target_name}, "navigate_to_named_location")
     with search.acquired():
         try:
@@ -658,9 +666,9 @@ CAPABILITIES = [
     Capability("navigate_to_named_location", "导航到记忆中的命名地点或区域，可在到达后核对。",
         schema({"target_name": {"type": "string", "description": "要前往的记忆地点或语义区域名称。"},
                 "camera_id": {"type": "string", "description": "到达复核使用的相机标识。留空时由感知服务选择相机。"},
-                "verify_on_arrival": {"type": "boolean", "description": "到达后是否拍摄并核对目标。留空时进行复核。"},
+                "verify_on_arrival": {"type": "boolean", "description": "到达后是否核对：语义区域按机器人是否在区域内核对，其它目标拍照核对。留空时进行核对。"},
                 "verify_similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1,
-                                                "description": "复核通过所需的最低相似度（0～1）。留空时为 0.55。"},
+                                                "description": "拍照核对通过所需的最低相似度（0～1），语义区域目标不用。留空时为 0.55。"},
                 "timeout_sec": {**TIMEOUT, "description": "任务总时限（秒）。留空时为 900 秒。"}}, ("target_name",)),
         "task", navigate_to_named_location, needs=("nav_stack", "geometry"), motion=True, timeout_sec=900),
     Capability("cancel_navigation", "取消指定目标或当前目标，不等待停稳。",

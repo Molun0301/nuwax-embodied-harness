@@ -94,7 +94,7 @@ impl Outputs {
         let follow = nuwax_config::person_follow()?.autostart;
         Ok(Self::start_with_transport(session, transport, follow))
     }
-    fn start_with_transport(session: SessionHandle, transport: LcmTransport, follow: bool) -> Self {
+    pub(crate) fn start_with_transport(session: SessionHandle, transport: LcmTransport, follow: bool) -> Self {
         let (stop, mut stopped) = oneshot::channel();
         let recent_transport = transport.clone();
         let recent_session = session.clone();
@@ -158,6 +158,7 @@ impl Outputs {
         let task = tokio::spawn(async move {
             let routes = session.route_rx();
             let mut maps = session.map_rx();
+            let mut map_replays = session.map_replay_rx();
             let mut output = MapOutput::default();
             let mut follow_sent: Option<(u64, u64)> = None;
             let mut occupancy = OccupancyRate {
@@ -167,33 +168,40 @@ impl Outputs {
             };
             loop {
                 let due = occupancy.due_at();
-                let (id, result) = tokio::select! {
+                let replay = tokio::select! {
                     _=&mut stopped=>break,
                     _=async { clock::sleep_until(due.unwrap()).await }, if due.is_some()=>{
                         let id = routes.borrow().as_ref().map_or(0, |route| route.id);
                         let map = occupancy.take_due(clock::Instant::now()).unwrap();
-                        (id, publish_occupancy(&transport, &map).await)
+                        if let Err(reason) = publish_occupancy(&transport, &map).await {
+                            session.report_output_error(id, reason);
+                        }
+                        continue;
                     },
                     changed=maps.changed()=>{
                         if changed.is_err(){break;}
-                        let id = routes.borrow().as_ref().map_or(0, |route| route.id);
-                        let map=maps.borrow_and_update().clone();
-                        let result = if let Some(map)=map {
-                            match publish_map(&transport, &session, &map, &mut output, &mut occupancy).await {
-                                Ok(Some((sealed, changed))) if follow && changed => {
-                                    publish_follow(&transport, &session, &sealed, &mut follow_sent).await
-                                }
-                                Ok(_) => Ok(()),
-                                Err(reason) => Err(reason),
-                            }
-                        } else {
-                            follow_sent = None;
-                            // 地图撤下后不再补发撤下前的栅格。
-                            occupancy.pending = None;
-                            output.clear(&transport).await
-                        };
-                        (id, result)
+                        false
                     },
+                    Ok(())=map_replays.changed()=>true,
+                };
+                let id = routes.borrow().as_ref().map_or(0, |route| route.id);
+                // 补发只读当前地图，保留普通地图更新或撤图的通知。
+                let has_map = if replay { maps.borrow().is_some() } else { maps.borrow_and_update().is_some() };
+                let result = if has_map {
+                    match publish_map(&transport, &session, replay, &mut output, &mut occupancy).await {
+                        Ok(Some((sealed, changed))) if follow && changed => {
+                            publish_follow(&transport, &session, &sealed, &mut follow_sent).await
+                        }
+                        Ok(_) => Ok(()),
+                        Err(reason) => Err(reason),
+                    }
+                } else if replay {
+                    continue;
+                } else {
+                    follow_sent = None;
+                    // 地图撤下后不再补发撤下前的栅格。
+                    occupancy.pending = None;
+                    output.clear(&transport).await
                 };
                 if let Err(reason) = result {
                     session.report_output_error(id, reason);
@@ -214,7 +222,7 @@ impl Outputs {
 async fn publish_map(
     transport: &LcmTransport,
     session: &SessionHandle,
-    _map: &proto::MapUpdate,
+    replay: bool,
     output: &mut MapOutput,
     occupancy: &mut OccupancyRate,
 ) -> Result<Option<(Arc<nuwax_map_chunks::SealedMap>, bool)>, String> {
@@ -249,7 +257,8 @@ async fn publish_map(
     } else {
         1
     };
-    let send_mask = output.mask_due(id, publication.forbidden.as_ref(), tokio::time::Instant::now());
+    // 新进程尚无本会话掩码，补发时要随地图携带。
+    let send_mask = replay || output.mask_due(id, publication.forbidden.as_ref(), tokio::time::Instant::now());
     let mut virtual_obstacles = publication
         .forbidden.as_ref().filter(|_| send_mask)
         .map(|mask| {
@@ -467,7 +476,7 @@ mod pose_output_tests {
         mapper.feed(crate::mapper::tests::room_frame(812, 1_000_000_000));
         mapper.snapshot().await.unwrap();
         let map = mapper.map_rx().borrow().clone();
-        let (session, poses, maps) = crate::session::test_output_session(mapper.clone());
+        let (session, poses, maps, _map_replays) = crate::session::test_output_session(mapper.clone());
         let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
         let backend = Arc::new(BlockMap { entered: Default::default(), release: Default::default(), tf: sender });
         let output = Outputs::start_with_transport(session, LcmTransport::new(backend.clone()), false);

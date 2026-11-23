@@ -27,6 +27,7 @@ SOURCE_FILES = (
     "scripts/__init__.py", "core/config.py", "core/config_schema.toml", "core/robot_geometry.py",
     "contracts/pgo_options.py", "contracts/pgo_options.json", "contracts/pointlio_options.py", "contracts/pointlio_options.json", "scripts/import_legacy_config.py",
     "drivers/go2/robot_geometry.urdf", "drivers/go2/robot_geometry_reference.json",
+    "services/__init__.py", "services/model_providers.py",
     "services/navigation/proto/motion_guard_socket_relative.txt",
     "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
     "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py",

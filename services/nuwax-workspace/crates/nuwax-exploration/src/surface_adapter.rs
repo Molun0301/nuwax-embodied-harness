@@ -535,7 +535,7 @@ impl SurfaceGoalSourceAdapter {
             view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, observation_targets)
                 .map_err(ExploreError::SourceError)?);
         }
-        if !frontier_outside_arrival(snapshot, current_body.0, robot_support, body, candidate.support_xyz)
+        if !frontier_outside_arrival(snapshot, current_body.0, body)
             || self.excluded(candidate.frontier_cell)
             || view.as_ref().is_some_and(|view| view.cells.is_empty()) {
             delta.deferred_route = Some(Some(continuation));
@@ -736,7 +736,7 @@ impl SurfaceGoalSourceAdapter {
             candidate.support_xyz = snapshot
                 .support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
-            if !frontier_outside_arrival(snapshot, current_body.0, robot_support, body, candidate.support_xyz)
+            if !frontier_outside_arrival(snapshot, current_body.0, body)
                 || self.excluded(candidate.frontier_cell)
             {
                 continue;
@@ -1106,7 +1106,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
 }
 
 fn minimum_frontier_distance(snapshot: &SurfaceSnapshot) -> f64 {
-    // 三维探索子导航沿用默认到达容差，绑定后的候选也须落在其外。
+    // 初筛按三维探索子导航的默认到达尺度判断支撑点距离。
     GoalOptions::default()
         .position_tolerance_m
         .max(f64::from(snapshot.config().voxel_size))
@@ -1115,15 +1115,14 @@ fn minimum_frontier_distance(snapshot: &SurfaceSnapshot) -> f64 {
 fn frontier_outside_arrival(
     snapshot: &SurfaceSnapshot,
     robot_body: [f64; 3],
-    robot_support: [f64; 3],
     target_body: [f64; 3],
-    target_support: [f64; 3],
 ) -> bool {
-    // 倾斜机身的支撑点与导航到达使用的机体参考点在平面上可能不同。
-    distance(robot_support, target_support) > minimum_frontier_distance(snapshot)
-        && !position_within_tolerance(
-            robot_body, target_body, GoalOptions::default().position_tolerance_m, snapshot,
-        )
+    !position_within_tolerance(
+        robot_body,
+        target_body,
+        GoalOptions::default().position_tolerance_m,
+        snapshot,
+    )
 }
 
 fn distance(left: [f64; 3], right: [f64; 3]) -> f64 {

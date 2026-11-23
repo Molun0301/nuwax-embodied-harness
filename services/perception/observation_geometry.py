@@ -119,9 +119,15 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
     if camera_edge is None:
         return ObservationGeometry(pose=pose, reason="capture_camera_calibration_unavailable")
     base = camera_edge.parent_frame_id
-    dynamic_bodies = {t.child_frame_id for t in original_tree.transforms if t.authority != "calibration_static"}
-    if not any(frame_ids_semantically_equal(base, body) for body in dynamic_bodies):
+    dynamic_bodies = [t.child_frame_id for t in original_tree.transforms if t.authority != "calibration_static"]
+    body = base if base in dynamic_bodies else next(
+        (body for body in dynamic_bodies if frame_ids_semantically_equal(base, body)), None)
+    if body is None:
         return ObservationGeometry(pose=pose, reason="capture_reference_frame_unavailable")
+    if body != base:
+        # 相机和雷达的静态外参可能挂在同一机身的不同名称下。
+        static.append(Transform(parent_frame_id=base, child_frame_id=body,
+                                timestamp=camera_edge.timestamp, authority="calibration_static"))
     tree = _pose_tree(pose, base, static)
     selected = None
     for frame in frames:

@@ -29,7 +29,8 @@ class _ApproachContext:
 def _map_cloud_chunks(platform, ctx):
     if platform.config.geometry.pipeline != "lio_3d":
         return
-    chunk = platform.geometry.get_dense_cloud_chunk(timeout_sec=ctx.remaining())
+    page_points = 65_536
+    chunk = platform.geometry.get_dense_cloud_chunk(max_points=page_points, timeout_sec=ctx.remaining())
     count = chunk.total_points
     while chunk.offset_points < count:
         yield chunk.xyz_f32_le
@@ -38,6 +39,7 @@ def _map_cloud_chunks(platform, ctx):
             break
         ctx.check()
         chunk = platform.geometry.get_dense_cloud_chunk(expected_epoch=chunk.epoch, offset_points=offset,
+                                                         max_points=page_points,
                                                          timeout_sec=ctx.remaining())
 
 

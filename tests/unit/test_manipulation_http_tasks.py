@@ -227,7 +227,8 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     points = np.array([(x / 8, y / 8, .9) for x in range(-4, 1) for y in range(-16, 17)], dtype="<f4")
     read_offsets = []
 
-    def cloud(*, expected_epoch="", offset_points=0, timeout_sec=None):
+    def cloud(*, expected_epoch="", offset_points=0, max_points, timeout_sec=None):
+        assert max_points == 65_536
         read_offsets.append((expected_epoch, offset_points))
         part = points[:80] if offset_points == 0 else points[offset_points:]
         return SimpleNamespace(epoch="table", offset_points=offset_points,

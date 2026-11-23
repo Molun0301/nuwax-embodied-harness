@@ -4,6 +4,7 @@ from math import atan2
 from contracts.base import utc_now
 from core.capability import Capability
 from core.errors import GatewayError
+from gateways.capabilities.common import rpc_errors
 from gateways.capabilities.memory import remember_sample
 from gateways.capabilities.navigation import navigate_to_pose
 from services.manipulation.http_backend import DeviceError
@@ -25,6 +26,22 @@ class _ApproachContext:
         self.context.progress(value, "approaching", message, navigation_stage=stage, **data)
 
 
+def _map_cloud_chunks(platform, ctx):
+    if platform.config.geometry.pipeline != "lio_3d":
+        return
+    chunk = platform.geometry.get_dense_cloud_chunk(timeout_sec=ctx.remaining())
+    count = chunk.total_points
+    while chunk.offset_points < count:
+        yield chunk.xyz_f32_le
+        offset = chunk.offset_points + len(chunk.xyz_f32_le) // 12
+        if offset >= count:
+            break
+        ctx.check()
+        chunk = platform.geometry.get_dense_cloud_chunk(expected_epoch=chunk.epoch, offset_points=offset,
+                                                         timeout_sec=ctx.remaining())
+
+
+@rpc_errors
 def _approach(platform, ctx, args, mode):
     instance = platform.memory.get_semantic_instance(args["target_instance_id"])
     if instance is None:
@@ -32,7 +49,7 @@ def _approach(platform, ctx, args, mode):
     current = platform.geometry_state.wait_for_pose(ctx)
     config = platform.config.manipulation
     pose = platform.memory.plan_manipulation_pose(instance, current, place=mode == "place",
-        distance_m=config.standoff_distance_m)
+        distance_m=config.standoff_distance_m, cloud_chunks=_map_cloud_chunks(platform, ctx))
     if pose is None:
         raise GatewayError("目标周围没有可达操作站位。", error_code="navigation_failed", http_status=409)
     q = pose.orientation

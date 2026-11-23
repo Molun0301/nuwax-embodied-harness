@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from math import pi
 
 import pytest
+import numpy as np
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -21,6 +22,7 @@ from core.errors import GatewayError
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.base import utc_now
 from contracts.image import ImageEncoding, ImageFrame
+from contracts.maps import OccupancyGrid
 from contracts.naming import build_anchor_id, build_artifact_id, build_instance_id, build_memory_id
 from contracts.spatial_memory import InstanceLifecycleState, SemanticInstance
 from gateways.agent.router import build_agent_router
@@ -217,7 +219,21 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     runtime.memory.write(lambda store: store.put_live_instance(target, persist=True))
     monkeypatch.setattr(runtime, "ensure", lambda *args, **kwargs: None)
     monkeypatch.setattr(runtime.motion, "begin", lambda: 7)
-    monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: pose(1.5, 0, .9))
+    monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: pose(-1.5, 0, .9))
+    grid = OccupancyGrid(map_id="house", frame_id="map", width=33, height=33,
+                         resolution_m=.125, origin=pose(-2.0625, -2.0625, 0), data=[0] * (33 * 33))
+    monkeypatch.setattr(runtime.memory, "current_grid", lambda: grid)
+    runtime.config.geometry.pipeline = "lio_3d"
+    points = np.array([(x / 8, y / 8, .9) for x in range(-4, 1) for y in range(-16, 17)], dtype="<f4")
+    read_offsets = []
+
+    def cloud(*, expected_epoch="", offset_points=0, timeout_sec=None):
+        read_offsets.append((expected_epoch, offset_points))
+        part = points[:80] if offset_points == 0 else points[offset_points:]
+        return SimpleNamespace(epoch="table", offset_points=offset_points,
+                               total_points=len(points), xyz_f32_le=part.tobytes())
+
+    monkeypatch.setattr(runtime.geometry, "get_dense_cloud_chunk", cloud)
     visits = []
 
     def navigate(_platform, context, goal):
@@ -232,6 +248,7 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     assert visits == [(picked.task_id, {"x": .58, "y": 0, "z": .9, "frame_id": "map",
                                         "yaw_rad": pi, "motion_generation": 7,
                                         "tolerance_position_m": .08, "tolerance_yaw_rad": .15})]
+    assert read_offsets == [("", 0), ("table", 80)]
     assert device.requests[0]["params"]["goal_mode"] == "pick"
     held = picked.result["held_object"]
     assert held["instance_id"] == target.instance_id and held["label"] == "apple"

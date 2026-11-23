@@ -198,7 +198,7 @@ class InstancesMixin:
         record = self.get_semantic_instance(instance_id)
         return record.instance_id if record is not None else instance_id
 
-    def plan_manipulation_pose(self, instance, current_pose, *, place, distance_m):
+    def plan_manipulation_pose(self, instance, current_pose, *, place, distance_m, cloud_chunks=()):
         target = instance.pose
         if place:
             extent = object_extent_payload(instance)
@@ -206,7 +206,7 @@ class InstancesMixin:
                 target = target.model_copy(update={"position": Vector3(**extent["center"])})
         return self._planner.plan_manipulation_pose(target_pose=target,
             current_pose=self._as_memory_pose(current_pose), distance_m=distance_m,
-            occupancy_grid=self.current_grid())
+            occupancy_grid=self.current_grid(), cloud_chunks=cloud_chunks)
 
     def mark_instance_moved(self, instance, *, task_id, timestamp):
         def mark(store):

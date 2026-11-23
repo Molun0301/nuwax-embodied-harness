@@ -1,6 +1,6 @@
 /* 舞台：地图占满主区域，控件贴边。左上视图切换；右上“图层与图例”与画中画视频；左下状态条（详情）；右下相机组；
    正上方操作提示；业务未运行时整块遮罩。地图核心、视频、语义区域、关系图、记忆物品分别在同目录模块里。 */
-import { icon, h, popover, closePopovers } from '/static/shared/neh-ui.js';
+import { icon, h, popover, closePopovers, toast } from '/static/shared/neh-ui.js';
 import { createMetrics, fmtRate, fmtDelay } from './metrics.js';
 import { createVideo } from './video.js';
 import { createMapView, PLANAR_PIPELINE, MAP_TOPICS } from './mapview.js';
@@ -44,13 +44,14 @@ export function createStage(root, ctx, { onPick }) {
   const statusDetail = h('div', { class: 'n-float c-status-detail', hidden: true });
   const camera = h('div', { class: 'n-float c-camera' });
   const halt = h('div', { class: 'c-halt', hidden: true });
+  const hudBox = h('div', { class: 'c-bc', hidden: true });
   root.append(mapLayer, stageVideo, emptyCard,
     h('div', { class: 'c-tl' }, h('div', { class: 'n-float c-viewseg' }, viewSeg)),
     hintBox,
     h('div', { class: 'c-tr' }, layersBtn, layersPanel, pip),
     h('div', { class: 'c-bl' }, statusDetail, statusBar),
     h('div', { class: 'c-br' }, camera),
-    h('div', { class: 'c-bc', hidden: true }),
+    hudBox,
     halt);
 
   /* ---------- 模块 ---------- */
@@ -208,7 +209,9 @@ export function createStage(root, ctx, { onPick }) {
     onclick: () => { ui.detailOpen = !ui.detailOpen; render(); } });
   const layoutSeg = h('div', { class: 'n-seg c-status-seg-ctl', role: 'group', 'aria-label': '关系图布局' },
     [['relations', '按关系排布'], ['spatial', '按地图位置']].map(([id, label]) => h('button', { type: 'button', dataset: { layout: id }, onclick: () => graph.setLayout(id) }, label)));
-  const layoutWrap = h('div', { class: 'c-status-seg', 'data-optional': '' }, layoutSeg);
+  const graphSearch = h('input', { class: 'n-input c-graph-search', type: 'search', placeholder: '搜索节点', 'aria-label': '搜索关系图节点' });
+  graphSearch.addEventListener('input', () => graph.setQuery(graphSearch.value));
+  const layoutWrap = h('div', { class: 'c-status-seg', 'data-optional': '' }, layoutSeg, graphSearch);
   statusBar.append(h('div', { class: 'c-status-seg' }, statusDot, statusName, statusText), poseSeg, layoutWrap, detailBtn);
   function renderStatus(info) {
     const graphMode = mode() === 'graph';
@@ -262,13 +265,22 @@ export function createStage(root, ctx, { onPick }) {
   const zoomValue = h('div', { class: 'c-zoom n-num' });
   const resetBtn = camBtn('scan', '', () => map.reset());
   const fitBtn = camBtn('scan', '适配全图', () => graph.fit());
+  // 生成整张关系图图像：完成后轻提示里点“打开”在新标签页查看。
+  const imageBtn = camBtn('download', '生成关系图图像', async () => {
+    imageBtn.disabled = true;
+    try {
+      const uri = await graph.exportImage();
+      if (uri) toast('关系图图像已生成', { action: { label: '打开', run: () => window.open(uri, '_blank', 'noopener') }, duration: 8000 });
+    } catch (error) { toast('生成关系图图像失败：' + error.message, { tone: 'bad' }); }
+    finally { imageBtn.disabled = false; }
+  });
   const mapCamera = [followBtn, centerBtn, h('div', { class: 'n-float-sep c-camera-sep' }), camBtn('plus', '放大', () => map.zoom(1.25)), zoomValue,
     camBtn('minus', '缩小', () => map.zoom(0.8)), resetBtn];
-  camera.append(...mapCamera, fitBtn);
+  camera.append(...mapCamera, imageBtn, fitBtn);
   function renderCamera(info) {
     const graphMode = mode() === 'graph';
     for (const node of mapCamera) node.hidden = graphMode;
-    fitBtn.hidden = !graphMode;
+    fitBtn.hidden = imageBtn.hidden = !graphMode;
     if (graphMode) return;
     const follow = info.cameraMode === 'follow';
     followBtn.setAttribute('aria-pressed', String(follow));
@@ -335,6 +347,13 @@ export function createStage(root, ctx, { onPick }) {
     map, items, regions, graph, video,
     /* 舞台正上方的操作提示：content 为元素，null 清除。 */
     hint(content) { hintBox.hidden = !content; hintBox.replaceChildren(...(content ? [content] : [])); },
+    /* 舞台正下方的浮层（运动页的遥控面板）：content 为元素，null 清除。 */
+    hud(content) { hudBox.hidden = !content; hudBox.replaceChildren(...(content ? [content] : [])); },
+    /* 导航选点时舞台显示十字光标。 */
+    setPicking(value) { root.dataset.picking = String(Boolean(value)); },
+    /* 画面与地图互换（运动页“视频放到主画面”）。 */
+    swapVideo() { if (!ui.swapped) { ui.pipHidden = false; swap(); } },
+    canvas, mapLayer, root, setView,
     show() { ui.shown = true; map.refresh(); video.refresh(); render(); },
     hide() { ui.shown = false; closePopovers(); setLayersOpen(false); map.refresh(); },
     resize() { map.refresh(); video.refresh(); },

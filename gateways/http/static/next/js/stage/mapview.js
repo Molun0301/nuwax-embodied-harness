@@ -1237,6 +1237,15 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
       requestMapDraw(false);
     },
     centerRobot() { if (state.viewMode === '3d') window.pointcloud3d?.centerOnRobot(); else centerFreeMapOnRobot(); },
+    /* 在二维地图上查看某一点：自由视角并以该点为中心（物品“在地图中查看”，调用方先切到二维视图）。 */
+    focusPoint(x, y, highlight) {
+      setMap2dCameraMode('free');
+      state.mapFreeView.center = { x, y };
+      if (highlight) state.highlightTarget = highlight;
+      requestMapDraw(false);
+      emit();
+    },
+    setHighlight(value) { state.highlightTarget = value; requestMapDraw(false); },
     setPointStyle(style) { state.pointStyle = style; window.pointcloud3d?.setPointStyle(style); emit(); },
     /* 舞台重新可见或尺寸变化时调用。 */
     refresh() {

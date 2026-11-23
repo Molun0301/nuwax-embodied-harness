@@ -239,6 +239,55 @@ def _cut_links(lattice, barrier, shape):
         lattice[rows, cols] = 0
 
 
+def _apply_wall_edges(lattice, walls, free, resolution, door_cells):
+    supported = [_bridge_wall_gaps(wall, free, junctions, door_cells, resolution)
+                 for wall, junctions in zip(walls, _wall_junctions(walls, resolution))]
+    supported += _stitch_wide_openings(supported, free, resolution, door_cells)
+    for wall, junctions in zip(supported, _wall_junctions(supported, resolution)):
+        _extend_wall_ends(wall, junctions, door_cells, resolution, free)
+        for start, end in wall.spans:
+            _cut_links(lattice, (wall.point(start - 1), wall.point(end + 1)), free.shape)
+    return supported
+
+
+def _restore_wall_support(walls, occupied, resolution):
+    """沿已测方向找回霍夫抽样未选中的短墙迹。"""
+    rows, cols = np.nonzero(occupied)
+    points = np.column_stack((cols + 0.5, rows + 0.5))
+    lateral = max(1.3, 0.14 / resolution)
+    gap = max(2, 0.16 / resolution)
+    for wall in walls:
+        near = np.abs(points @ wall.normal - wall.offset) <= lateral
+        along = np.sort(points[near] @ wall.direction)
+        sections = np.split(along, np.flatnonzero(np.diff(along) > gap) + 1)
+        spans = wall.spans + [[section[0] - 0.5, section[-1] + 0.5] for section in sections
+                              if len(section) >= 3 and section[-1] - section[0] >= 2]
+        combined = []
+        for start, end in sorted(spans):
+            if combined and start <= combined[-1][1] + 1:
+                combined[-1][1] = max(end, combined[-1][1])
+            else:
+                combined.append([start, end])
+        yield _WallLine(wall.direction, wall.normal, wall.offset, combined)
+
+
+def _split_supported_faces(lattice, faces, walls, free, occupied, resolution, door_cells, minimum_cells):
+    """用恢复的墙迹细分现有面，只有各自达到最小面积的分隔才成为房间。"""
+    recovered = list(_restore_wall_support(walls, occupied, resolution))
+    refined_lattice = lattice.copy()
+    _apply_wall_edges(refined_lattice, recovered, free, resolution, door_cells)
+    _, refined = cv2.connectedComponents(refined_lattice, connectivity=4)
+    children = refined[::2, ::2]
+    counts = np.bincount(children.ravel())
+    # 新切边只会细分原连通面，每个子区域有唯一的原区域。
+    parents = np.zeros(len(counts), dtype=np.int32)
+    parents[children] = faces
+    rooms = np.flatnonzero(counts[1:] >= minimum_cells) + 1
+    last_face = int(faces.max())
+    split = np.bincount(parents[rooms], minlength=last_face + 1) >= 2
+    return np.where(split[faces], children + last_face, faces)
+
+
 def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, distance, previous, unknown_edge):
     """沿墙线和直门线切分四邻接自由格。"""
     directions, walls = _wall_lines(occupied, resolution)
@@ -248,13 +297,7 @@ def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, di
     lattice[::2, 1:-1:2] = free[:, :-1] & free[:, 1:]
     lattice[1:-1:2, ::2] = free[:-1, :] & free[1:, :]
     door_cells = doorway_width / resolution
-    supported = [_bridge_wall_gaps(wall, free, junctions, door_cells, resolution)
-                 for wall, junctions in zip(walls, _wall_junctions(walls, resolution))]
-    supported += _stitch_wide_openings(supported, free, resolution, door_cells)
-    for wall, junctions in zip(supported, _wall_junctions(supported, resolution)):
-        _extend_wall_ends(wall, junctions, door_cells, resolution, free)
-        for start, end in wall.spans:
-            _cut_links(lattice, (wall.point(start - 1), wall.point(end + 1)), free.shape)
+    supported = _apply_wall_edges(lattice, walls, free, resolution, door_cells)
     _, faces = cv2.connectedComponents(lattice, connectivity=4)
     faces = faces[::2, ::2]
     cores, expanded_sizes = open_area_labels(free, distance, door_cells / 2, minimum_cells)
@@ -287,7 +330,9 @@ def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, di
         direction = (b - a) / np.linalg.norm(b - a)
         normal = np.array([-direction[1], direction[0]])
         supported.append(_WallLine(direction, normal, a @ normal, [[a @ direction, b @ direction]]))
-    return faces[::2, ::2].copy(), directions, supported, doors
+    labels = _split_supported_faces(lattice, faces[::2, ::2], walls, free, occupied,
+                                    resolution, door_cells, minimum_cells)
+    return labels, directions, supported, doors
 
 
 def _legacy_seeds(previous, faces):

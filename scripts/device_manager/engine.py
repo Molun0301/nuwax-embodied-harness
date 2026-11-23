@@ -855,13 +855,23 @@ class Engine:
         existing = probe(candidate, "prepare", values=existing)
         model_settings = []
         if "perception" in plan["modules"]:
-            model_settings.append(("perception.yolo_world_model", "yolov8s-worldv2.pt"))
+            model_settings.append(("perception.yolo_world_model", "yolov8s-worldv2.pt", None))
         if "memory" in plan["modules"]:
-            model_settings.extend((("memory.text_embedding_model", "BAAI__bge-small-zh-v1.5"), ("memory.image_embedding_model", "openai__clip-vit-base-patch32")))
+            from services.model_providers import (
+                resolve_text_embedding_provider_spec,
+                resolve_vision_language_provider_spec,
+            )
+
+            model_settings.extend((
+                ("memory.text_embedding_model", "BAAI__bge-small-zh-v1.5", resolve_text_embedding_provider_spec),
+                ("memory.image_embedding_model", "openai__clip-vit-base-patch32", resolve_vision_language_provider_spec),
+            ))
         from .downloads import apply_model_overrides, uses_default_model
         model_overrides = {}
-        for key, name in model_settings:
+        for key, name, resolve_provider in model_settings:
             value = existing.get(key, "")
+            if resolve_provider is not None and resolve_provider(value).provider_kind == "cloud":
+                continue
             if allow_pending_models and uses_default_model(value):
                 value = str(self.home / "data/models" / name)
             selected = Path(value) if value else None

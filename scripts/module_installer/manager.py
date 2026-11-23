@@ -436,9 +436,21 @@ def _prepare_models(request: InstallRequest, prefix: Path, run, values) -> None:
         run([python, "-c", "import os; from clip.clip import _download, _MODELS; "
              "_download(_MODELS['ViT-B/32'], os.path.expanduser('~/.cache/clip'))"])
     if "memory" in request.modules:
+        from services.model_providers import (
+            resolve_text_embedding_provider_spec,
+            resolve_vision_language_provider_spec,
+        )
+
         arguments = []
-        for kind, directory in (("text", "BAAI__bge-small-zh-v1.5"), ("image", "openai__clip-vit-base-patch32")):
-            configured = Path(values[f"memory.{kind}_embedding_model"])
+        for kind, directory, resolve_provider in (
+            ("text", "BAAI__bge-small-zh-v1.5", resolve_text_embedding_provider_spec),
+            ("image", "openai__clip-vit-base-patch32", resolve_vision_language_provider_spec),
+        ):
+            model = values[f"memory.{kind}_embedding_model"]
+            if resolve_provider(model).provider_kind == "cloud":
+                arguments.append("--skip-" + kind)
+                continue
+            configured = Path(model)
             target = configured if configured.is_absolute() else request.root / configured
             if target.resolve() != (output / directory).resolve():
                 if not target.is_dir():

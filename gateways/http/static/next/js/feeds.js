@@ -2,8 +2,11 @@
    - 健康 /api/health：首屏读一次，页面可见时每 3 秒重读（顶栏要随时知道有没有服务退出）；
    - 实时主题 robot.state（机器人名称、电量、运动可用）、geometry.state（地图会话阶段与地图名）、system.metrics（处理器与内存）；
    - 管理服务 /api/manager/status：页面可见时每 30 秒读一次（“系统”上的新版本圆点）；与网关断开时每 5 秒读一次，
-     能读到且业务未运行时，顶栏改为“业务服务已停止 / 正在切换版本”；
+     能读到且业务未运行时，顶栏按进行中管理任务的动作写“正在启动 / 停止 / 重启业务服务”“正在切换到新版本”等，
+     没有进行中的任务时再读任务列表，最近一次任务在启动阶段失败的写“业务服务启动失败”（deriveStartFailure），否则写“已停止”；
    - 需要注意：/api/feedback/stream 中警告与错误级运行事件（与 MCP 通知同一投影，06 第 5 节），加上监督者报告的已退出服务。 */
+import { deriveStartFailure } from '/static/shared/system-pages.js';
+
 const HEALTH_INTERVAL_MS = 3000, MANAGER_INTERVAL_MS = 30000, MANAGER_LOST_INTERVAL_MS = 5000, ATTENTION_KEEP = 50;
 
 export function startFeeds({ store, stream, api }) {
@@ -82,18 +85,22 @@ export function startFeeds({ store, stream, api }) {
   async function readManager() {
     try {
       const status = await api.manager('status');
+      // 业务没运行且没有进行中的任务时，才需要任务列表判断是不是启动失败。
+      const startFailure = status.runtime?.running === false && !status.active_job ? deriveStartFailure(status, (await api.manager('jobs')).jobs) : null;
       set({ manager: { reachable: true, runtimeRunning: status.runtime?.running ?? null, activeJob: status.active_job || null,
-        updateAvailable: Boolean(status.update?.available) } });
+        updateAvailable: Boolean(status.update?.available), startFailure } });
     } catch (_) {
       merge('manager', { reachable: false });
     }
     syncBusiness();
   }
-  // 网关连着时业务一定在运行；断开后能读到管理服务才判断业务是否停止或正在切换版本。
+  // 网关连着时业务一定在运行；断开后能读到管理服务才判断业务是否停止、启动失败或有管理任务在进行。
   function syncBusiness() {
     const { conn, manager } = store.get();
     let business = 'running';
-    if (conn.status === 'lost' && manager.reachable) business = manager.activeJob ? 'updating' : manager.runtimeRunning === false ? 'stopped' : 'running';
+    if (conn.status === 'lost' && manager.reachable) {
+      business = manager.activeJob ? 'updating' : manager.runtimeRunning === false ? (manager.startFailure ? 'failed' : 'stopped') : 'running';
+    }
     if (store.get().business !== business) set({ business });
   }
   function scheduleManager() {

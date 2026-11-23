@@ -1,13 +1,15 @@
 /* 接口调用：能力经与智能体相同的 /api/capabilities/<名>/invoke；管理服务经 /api/manager/*。
    失败时抛出带后端原因的错误（error.code 为后端错误码）。 */
 
-export async function invoke(name, args = {}) {
+/* init 可带 signal（需要超时的调用自行中止）。 */
+export async function invoke(name, args = {}, init = {}) {
   const response = await fetch('/api/capabilities/' + encodeURIComponent(name) + '/invoke', { method: 'POST',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arguments: args }) });
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arguments: args }), ...init });
   const value = await response.json();
   if (!response.ok) {
     const error = new Error(value.error?.message || '服务返回 ' + response.status);
     error.code = value.error?.code || '';
+    error.status = response.status;
     throw error;
   }
   return value;

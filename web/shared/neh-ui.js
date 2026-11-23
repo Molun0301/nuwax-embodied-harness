@@ -41,6 +41,23 @@ export function toast(message, opts = {}) {
   setTimeout(() => el.remove(), opts.duration || 4200);
 }
 
+/* 复制文字：优先剪贴板接口；不可用或被拒时用隐藏文本框加原生复制（设备常经 http 地址打开，非安全来源没有剪贴板接口）。
+   返回是否复制成功。 */
+export async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
+  } catch (e) { /* 权限被拒时继续尝试原生复制 */ }
+  const focused = document.activeElement;
+  const area = h('textarea', { readonly: true, 'aria-hidden': 'true', style: 'position:fixed;left:-9999px' });
+  area.value = text;
+  document.body.append(area);
+  let copied = false;
+  try { area.select(); copied = document.execCommand('copy') === true; } catch (e) { copied = false; }
+  area.remove();
+  focused?.focus?.({ preventScroll: true });
+  return copied;
+}
+
 /* 确认框：返回 Promise<boolean>。danger 为真时确认按钮用红色实心，标题图标标红。 */
 export function confirmDialog({ title, text, items, confirmText = '确认', danger = false, extra, icon: ic }) {
   return new Promise(resolve => {

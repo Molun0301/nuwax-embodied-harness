@@ -169,6 +169,8 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     sync() { emitLayer(); if (interested()) void load(); },
     setLayer(value) { state.layer = value; this.sync(); },
     setPanelOpen(value) { state.panelOpen = value; this.sync(); },
+    /* 启停持续识别后写入后台返回的状态（与原控制台相同，不再另读一次）。 */
+    setService(value) { state.service = value; scheduleStatus(); changed(); },
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     color,
     get layer() { return state.layer; },

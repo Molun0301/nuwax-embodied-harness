@@ -10,7 +10,7 @@ export const NODE_KINDS = { region: '区域', passage: '连接口', object: '物
 /* svg：关系图视图的 <svg>；binding()、mode()、requestDraw() 同语义区域；onSelect(node) 为点选节点。 */
 export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSelect }) {
   const state = { graph: null, selected: null, route: null, layer: false, layout: 'relations', request: null, generation: 0,
-    positions: new Map(), layoutKey: '', contextKey: '', view: null, drag: null, timer: null, error: '' };
+    positions: new Map(), layoutKey: '', contextKey: '', view: null, needsFit: false, query: '', drag: null, timer: null, error: '' };
   const listeners = new Set();
   const changed = () => { for (const fn of listeners) fn(); };
   const el = (tag, attrs = {}) => { const n = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v)); return n; };
@@ -90,14 +90,23 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
     }
     for (const p of points) state.positions.set(p.id, p);
   }
+  /* 适配全图：按屏幕像素留边，上下避开浮在画面上的视图切换与状态条，左右给节点名称留位置；
+     关系图视图隐藏时（尺寸为 0）记下待适配，显示出来后再算。 */
+  const FIT_PAD = { top: 76, bottom: 76, left: 56, right: 56 };
   function fit() {
+    const width = svg.clientWidth, height = svg.clientHeight;
+    if (!width || !height) { state.needsFit = true; return; }
+    state.needsFit = false;
     const points = [...state.positions.values()];
     if (!points.length) state.view = { x: 0, y: 0, w: 800, h: 600 };
     else {
       const xs = points.map(p => p.x), ys = points.map(p => p.y);
-      // 四周多留边距：关系图在舞台里，上方有视图切换、下方有状态条与相机组浮在画面上。
-      const x = Math.min(...xs) - 110, y = Math.min(...ys) - 120;
-      state.view = { x, y, w: Math.max(160, Math.max(...xs) - x + 130), h: Math.max(160, Math.max(...ys) - y + 140) };
+      const minX = Math.min(...xs), minY = Math.min(...ys), spanX = Math.max(Math.max(...xs) - minX, 1), spanY = Math.max(Math.max(...ys) - minY, 1);
+      const innerW = Math.max(width - FIT_PAD.left - FIT_PAD.right, 40), innerH = Math.max(height - FIT_PAD.top - FIT_PAD.bottom, 40);
+      // 节点很少时不放得过大：每单位最多 2 像素。
+      const scale = Math.min(innerW / spanX, innerH / spanY, 2);
+      const x = minX - FIT_PAD.left / scale - (innerW / scale - spanX) / 2, y = minY - FIT_PAD.top / scale - (innerH / scale - spanY) / 2;
+      state.view = { x, y, w: width / scale, h: height / scale };
     }
     applyView();
   }
@@ -122,6 +131,9 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
     if (!graph) { svg.replaceChildren(); return; }
     layout(graph.nodes, graph.edges);
     const fragment = document.createDocumentFragment();
+    // 搜索：名称、别名或编号不匹配的节点变淡（与原关系图面板相同）。
+    const query = state.query.trim().toLowerCase();
+    const matched = new Set(graph.nodes.filter(n => !query || (n.name + ' ' + (n.aliases || []).join(' ') + ' ' + (n.properties.display_code || '')).toLowerCase().includes(query)).map(n => n.node_id));
     const routeNodes = new Set([...(state.route?.region_ids || []), ...(state.route?.passages || []).map(p => p.node_id)]);
     for (const e of graph.edges) {
       const a = state.positions.get(e.source), b = state.positions.get(e.target);
@@ -132,7 +144,7 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
       const p = state.positions.get(n.node_id);
       if (!p) continue;
       const group = el('g', { transform: `translate(${p.x},${p.y})`, class: 'c-gnode', role: 'button', tabindex: 0,
-        'aria-label': `${NODE_KINDS[n.kind]}：${n.name}`, 'aria-pressed': String(state.selected === n.node_id), 'data-kind': n.kind, 'data-node-id': n.node_id });
+        'aria-label': `${NODE_KINDS[n.kind]}：${n.name}`, 'aria-pressed': String(state.selected === n.node_id), 'data-kind': n.kind, 'data-node-id': n.node_id, 'data-dimmed': Boolean(query) && !matched.has(n.node_id) });
       const radius = n.kind === 'region' ? 17 : n.kind === 'passage' ? 6 : 9;
       group.append(el('rect', { class: 'c-gnode-hit', x: -12, y: -12, width: 24, height: 36, fill: 'transparent' }));
       group.append(n.kind === 'passage' ? el('path', { d: 'M 0 -7 L 7 0 L 0 7 L -7 0 Z', class: 'c-gnode-shape' }) : el('circle', { r: radius, class: 'c-gnode-shape' }));
@@ -149,7 +161,7 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
       fragment.append(group);
     }
     svg.replaceChildren(fragment);
-    if (!state.view) fit(); else applyView();
+    if (!state.view || state.needsFit) fit(); else applyView();
   }
   function select(id) {
     const node = state.graph?.nodes.find(n => n.node_id === id);
@@ -188,6 +200,15 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
     }
     ctx.restore();
   }
+  /* 生成关系图图像（整图或某节点附近），返回图像地址；关系图已换新时返回 null。 */
+  async function exportImage(nodeId) {
+    const version = state.graph?.graph_revision;
+    if (!version) throw new Error('关系图还没有读取。');
+    try {
+      const result = await api.invoke('render_scene_graph_image', { ...(nodeId ? { node_id: nodeId } : {}), expected_graph_revision: version, width: 1280 });
+      return version === state.graph?.graph_revision ? result.artifact.uri : null;
+    } catch (error) { if (error.status === 409) schedule(); throw error; }
+  }
   function contextChanged() {
     const b = binding(), key = bindingKey(b) + ':' + Boolean(b?.available);
     if (key === state.contextKey) return;
@@ -218,17 +239,20 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
   });
   svg.addEventListener('pointerup', () => { state.drag = null; });
   svg.addEventListener('pointercancel', () => { state.drag = null; });
-  new ResizeObserver(() => applyView()).observe(svg);
+  new ResizeObserver(() => { if (state.needsFit) fit(); else applyView(); }).observe(svg);
   window.addEventListener('pointcloud3d:ready', notifyLayer);
   window.addEventListener('pointcloud3d:scene-graph-select', event => select(event.detail?.node_id));
   stream.on('memory.scene_spaces', () => { state.generation += 1; state.route = null; state.error = ''; schedule(); });
   stream.on('memory.instances', () => { state.generation += 1; schedule(); });
 
   return {
-    load, render, draw2d, fit, select, contextChanged,
+    load, render, draw2d, fit, select, contextChanged, exportImage,
+    /* 关系图修订冲突（409）后重新读取。 */
+    reload: schedule,
     sync() { notifyLayer(); render(); if (interested()) void load(); },
     setLayer(value) { state.layer = value; this.sync(); },
     setLayout(value) { state.layout = value; render(); changed(); },
+    setQuery(value) { state.query = value; render(); },
     setRoute(route) { state.route = route; render(); notifyLayer(); },
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     get layer() { return state.layer; },

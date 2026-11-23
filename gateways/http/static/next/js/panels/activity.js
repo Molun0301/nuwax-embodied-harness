@@ -2,7 +2,7 @@
    下面是需要注意（只收警告、错误与已退出的服务，不收网页请求日志）、最近结束，底部固定服务区。
    任务、需要注意、服务都读统一状态，不论网页还是智能体发起。 */
 import { icon, h, toast } from '/static/shared/neh-ui.js';
-import { describeTask, fmtDuration, fmtClock, taskSource, normalizeTaskState } from '../status.js';
+import { describeTask, fmtClock, taskSource, normalizeTaskState, businessView } from '../status.js';
 
 // 定位建图或导航栈退出时不能导航（遥控移动不依赖定位）。
 const NAVIGATION_COMPONENTS = ['geometry', 'nav_stack'];
@@ -17,69 +17,8 @@ export function mountActivity(root, ctx) {
   let capabilities = null;
   api.capabilities().then(list => { capabilities = new Map(list.map(cap => [cap.name, cap])); render(); }).catch(() => {});
 
-  /* ---------- 焦点：执行中的任务 ---------- */
-  // 任务块按秒刷新用时与进度：结构（标题、按钮、取消状态）不变时只改文字，避免重建吞掉点击。
-  const cards = new Map();
-  function taskView(task) {
-    const s = store.get();
-    return describeTask(task, { navRange: tasks.navRange, clockOffsetMs: s.clockOffsetMs, now: Date.now(), pending: s.tasks.pending, errors: s.tasks.errors, capabilities });
-  }
-  function taskStats(task, view) {
-    const exploration = task.data?.exploration;
-    const pct = view.progress == null ? null : Math.round(view.progress * 100);
-    const stats = [];
-    if (view.kind === 'nav' && Number.isFinite(Number(task.data?.remaining_distance_m))) stats.push([Number(task.data.remaining_distance_m).toFixed(1) + ' 米', '剩余']);
-    if (view.kind === 'explore' && Number.isFinite(Number(exploration?.traveled_distance_m))) stats.push([Number(exploration.traveled_distance_m).toFixed(1) + ' 米', '已行驶']);
-    if (view.kind === 'explore' && Number.isFinite(Number(exploration?.frontier_count))) stats.push([String(exploration.frontier_count), '剩余边界']);
-    stats.push([fmtDuration(view.elapsedMs), '用时']);
-    if (pct != null) stats.push([pct + '%', '进度']);
-    return { pct, stats };
-  }
-  function taskCard(task) {
-    const view = taskView(task);
-    const key = [view.kind, view.target, view.cancelling, view.cancelError, view.title].join('|');
-    const existing = cards.get(task.task_id);
-    if (existing && existing.key === key) { existing.update(task); return existing.el; }
-    const title = view.kind === 'nav' ? (view.target ? '导航到「' + view.target + '」' : '导航') : view.kind === 'explore' ? '自动探索' + (view.target ? '「' + view.target + '」' : '') : view.title;
-    const stage = h('div', { class: 'n-meta' });
-    const bar = h('span', {});
-    const progress = h('div', { class: 'n-progress' }, bar);
-    const statsBox = h('div', { class: 'c-hero-stats' });
-    const actions = [];
-    // 探索任务一经受理即可暂停与停止；探索尚未启动时不带编号，由后端按当前探索任务处理。
-    if (view.kind === 'explore') actions.push(h('button', { class: 'n-btn n-btn--sm', type: 'button', disabled: view.cancelling, onclick: () => pauseExploration(cards.get(task.task_id).task) }, '暂停并保存'));
-    actions.push(h('button', { class: 'n-btn n-btn--sm', type: 'button', disabled: view.cancelling, onclick: () => tasks.stop(cards.get(task.task_id).task) }, view.cancelling ? '正在取消…' : view.stopLabel));
-    const el = h('div', { class: 'n-hl c-hero', dataset: { task: task.task_id } },
-      h('div', { class: 'c-hero-head' }, h('div', { class: 'c-hero-main' }, h('div', { class: 'c-hero-title' }, title), stage), h('span', { class: 'c-src' }, view.source + '发起')),
-      progress, statsBox,
-      view.cancelError ? h('div', { class: 'n-meta', style: 'color:var(--bad)' }, '取消失败：' + view.cancelError) : null,
-      h('div', { class: 'c-card-actions' }, actions));
-    const card = { el, key, task, update(next) {
-      card.task = next;
-      const { pct, stats } = taskStats(next, taskView(next));
-      stage.textContent = stageText(next);
-      progress.classList.toggle('n-progress--indeterminate', pct == null);
-      bar.style.width = (pct ?? 0) + '%';
-      statsBox.replaceChildren(...stats.map(([value, label]) => h('span', {}, h('b', { class: 'n-num' }, value), label)));
-    } };
-    card.update(task);
-    cards.set(task.task_id, card);
-    return el;
-  }
-  function stageText(task) {
-    const state = normalizeTaskState(task.state);
-    if (state === 'cancelling') return task.message || '正在取消';
-    return task.stage !== 'running' && task.message ? task.message.replace(/。$/, '') : '已受理，正在执行';
-  }
-  async function pauseExploration(task) {
-    const explorationId = task.data?.exploration_id;
-    try {
-      const reply = await api.invoke('pause_exploration', explorationId ? { exploration_id: explorationId } : {});
-      toast(reply.checkpoint_pending ? '暂停已受理，正在停止探索并保存地图与进度' : '探索尚未开始，已结束任务，没有可保存的进度', { tone: 'info' });
-    } catch (error) {
-      toast('暂停探索失败：' + error.message, { tone: 'bad' });
-    }
-  }
+  /* ---------- 焦点：执行中的任务（任务块与导航、探索页共用） ---------- */
+  const taskCards = ctx.taskCards;
 
   /* ---------- 焦点：空闲时去哪里 ---------- */
   const ask = h('input', { class: 'n-input c-ask', placeholder: '输入区域、物品或地点名称', autocomplete: 'off', 'aria-label': '目的地名称' });
@@ -129,18 +68,16 @@ export function mountActivity(root, ctx) {
     const exitedNav = Object.entries(s.services || {}).filter(([name, item]) => NAVIGATION_COMPONENTS.includes(name) && item.state === 'exited');
     let key, build;
     if (s.business !== 'running') {
-      key = 'business:' + s.business;
+      key = 'business:' + s.business + ':' + (s.manager.activeJob?.action || '') + ':' + (s.manager.startFailure?.jobId || '');
+      const view = businessView(s);
       build = () => [h('div', { class: 'n-hl n-hl--bad c-hero' },
-        h('div', { class: 'c-hero-title' }, s.business === 'updating' ? '正在切换到新版本' : '业务服务已停止'),
+        h('div', { class: 'c-hero-title' }, view.title),
+        s.business === 'failed' && s.manager.startFailure.reason ? h('div', { class: 'n-meta c-wrap' }, s.manager.startFailure.reason) : null,
         h('div', { class: 'n-meta' }, '导航、探索与遥控暂不可用；已保存的地图、语义区域和配置不受影响。'),
-        h('div', {}, h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => go('system') }, '打开系统页')))];
+        h('div', {}, h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => go('system') }, view.actionLabel)))];
     } else if (s.tasks.active.length) {
       key = 'tasks';
-      build = () => {
-        const list = s.tasks.active.slice().sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0));
-        for (const id of cards.keys()) if (!list.some(task => task.task_id === id)) cards.delete(id);
-        return list.map(taskCard);
-      };
+      build = null;
     } else if (exitedNav.length) {
       key = 'blocked';
       build = () => [h('div', { class: 'c-hero' }, h('div', {}, h('div', { class: 'c-hero-title' }, '暂时不能导航'),
@@ -155,14 +92,16 @@ export function mountActivity(root, ctx) {
         noMap ? null : h('div', { class: 'n-search', html: icon('navigation', 'n-icon--sm') }, ask), noMap ? null : suggestions,
         quickActions(noMap))];
     }
-    // 任务块按秒刷新（用时）；空闲表单只在状态变化时重建，避免打断输入。
-    if (key === focusKey && key !== 'tasks') return;
+    // 任务块按秒刷新（用时）并原地更新；空闲表单只在状态变化时重建，避免打断输入。
+    if (key === 'tasks') {
+      focusKey = key;
+      taskCards.place(focusBox, s.tasks.active.slice().sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0)), 'activity');
+      return;
+    }
+    if (key === focusKey) return;
     focusKey = key;
     const active = document.activeElement;
-    const nodes = build();
-    // 已在页面上的任务块原地保留（只调整顺序），新块插入。
-    if (key !== 'tasks' || nodes.some((node, index) => focusBox.children[index] !== node) || focusBox.children.length !== nodes.length) focusBox.replaceChildren(...nodes);
-    if (key !== 'tasks') cards.clear();
+    focusBox.replaceChildren(...build());
     if (active === ask && ask.isConnected) ask.focus();
   }
 
@@ -230,7 +169,7 @@ export function mountActivity(root, ctx) {
   }
 
   function render() { renderFocus(); renderAttention(); renderRecent(); renderServices(); }
-  store.subscribe(['business', 'tasks', 'services', 'geometry', 'attention', 'clockOffsetMs'], render);
+  store.subscribe(['business', 'manager', 'tasks', 'services', 'geometry', 'attention', 'clockOffsetMs'], render);
   setInterval(() => { if (!root.hidden && store.get().tasks.active.length) renderFocus(); }, 1000);
   render();
   return { show(opts = {}) { if (opts.focus) setTimeout(() => root.querySelector('#' + opts.focus)?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 30); } };

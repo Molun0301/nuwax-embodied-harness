@@ -131,6 +131,9 @@ class TaskRunner:
     def _update(self, task_id: str, **changes) -> TaskStatus:
         with self._lock:
             current = self._statuses[task_id]
+            if "data" in changes and "target_label" in current.data:
+                # 目标名属于整个任务，其他进度数据按当前阶段替换。
+                changes["data"]["target_label"] = current.data["target_label"]
             if all(getattr(current, key) == value for key, value in changes.items()):
                 return current
             status = replace(current, **changes)

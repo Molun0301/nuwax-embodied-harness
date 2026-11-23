@@ -299,6 +299,7 @@ def main():
     parser.add_argument("--first", help="第一版结构划分的提交")
     parser.add_argument("--second", help="第二轮结构划分的提交")
     parser.add_argument("--third", help="第三轮结构划分的提交")
+    parser.add_argument("--fourth", help="第四轮结构划分的提交")
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -317,10 +318,12 @@ def main():
         services["second"] = baseline_service(args.second)()
     if args.third:
         services["third"] = baseline_service(args.third)()
+    if args.fourth:
+        services["fourth"] = baseline_service(args.fourth)()
     services["current"] = current
     report = {"grid": str(args.grid), "scene": str(args.scene) if scene else None,
               "baseline_revision": args.baseline, "first_revision": args.first, "second_revision": args.second,
-              "third_revision": args.third, "opencv": cv2.__version__,
+              "third_revision": args.third, "fourth_revision": args.fourth, "opencv": cv2.__version__,
               "numpy": np.__version__, "rooms_in_scene": len(truth), "algorithms": {}}
     free = (cells == 0).astype(np.uint8)
     trimmed = trim_rays(free, (cells < 0).astype(np.uint8), grid.resolution_m)
@@ -356,7 +359,12 @@ def main():
                                            "merges": len(hits) - len(set(hits))}
         report["algorithms"][name] = result
         title = {"baseline": "Original", "first": "First version", "second": "Round 2", "third": "Round 3",
-                 "current": "Round 4" if args.third else "Round 3" if args.second else "Current"}[name]
+                 "fourth": "Round 4", "current": "Current"}[name]
+        if name == "current":
+            for revision, caption in ((args.fourth, "Round 5"), (args.third, "Round 4"), (args.second, "Round 3")):
+                if revision:
+                    title = caption
+                    break
         images.append(paint(cells, masks, truth, title, inferred, cuts, rays))
     comparison = cv2.copyMakeBorder(np.hstack(images), 0, 25, 0, 0, cv2.BORDER_CONSTANT, value=(250, 250, 250))
     y = comparison.shape[0] - 8

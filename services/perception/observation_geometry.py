@@ -12,6 +12,8 @@ from services.localization.frame_tree_ops import resolve_frame_transform
 _POSE_PAIR_WINDOW_NS = 200_000_000
 _POINT_CLOUD_PAIR_WINDOW_NS = 100_000_000
 _LATEST_POSE_WINDOW_NS = 100_000_000
+# 按 1 米/秒和 1 弧度/秒估算，取 10 毫秒桶中心时几米内的误差为毫米至厘米级。
+_POINT_TIME_BUCKET_NS = 10_000_000
 
 
 @dataclass(frozen=True)
@@ -170,17 +172,19 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
         else:
             offsets = np.zeros(len(points), dtype=np.int64)
         scan_stamp = int(sample.timestamp_ns) if sample is not None else key[1]
+        point_buckets = offsets // _POINT_TIME_BUCKET_NS
         mapped = np.empty((len(points), 3), dtype=np.float64)
         mixed = pose.mixed_correction
-        for offset in np.unique(offsets):
-            batch_pose = _pose_at_source_time(pose_samples, scan_stamp+int(offset))
+        for bucket in np.unique(point_buckets):
+            center_offset = int(bucket) * _POINT_TIME_BUCKET_NS + _POINT_TIME_BUCKET_NS // 2
+            batch_pose = _pose_at_source_time(pose_samples, scan_stamp + center_offset)
             if batch_pose is None:
                 return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable", message="点云批次时刻的位姿不可用")
             transform = resolve_frame_transform(_pose_tree(batch_pose, base, static),
                 source_frame_id=source_cloud.frame_id, target_frame_id=pose.frame_id)
             if transform is None:
                 return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable")
-            batch = offsets == offset
+            batch = point_buckets == bucket
             mapped[batch] = np.asarray(points)[batch] @ transform.matrix[:3, :3].T+transform.matrix[:3, 3]
             mixed |= batch_pose.mixed_correction or (
                 batch_pose.session_id, batch_pose.correction_seq) != (pose.session_id, pose.correction_seq)

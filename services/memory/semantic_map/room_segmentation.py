@@ -12,6 +12,7 @@ import numpy as np
 from contracts.geometry import Pose, Vector3
 from contracts.naming import build_scene_space_id
 from services.memory.semantic_map.room_layout import close_furniture, partition_rooms, regularize_ring
+from services.memory.semantic_map.room_passages import beam_disk, clearance, grow_labels, legacy_candidates, trim_rays
 from services.memory.semantic_map.scene_revisions import geometry_value, semantic_geometry_value
 from contracts.occupancy_cells import PackedOccupancyCells
 from contracts.maps import OccupancyGrid
@@ -189,16 +190,29 @@ class RoomSegmentationService:
         free = (cells == 0).astype(np.uint8)
         if not np.any(free):
             return []
-        distance = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+        resolution = grid.resolution_m
+        minimum_cells = max(1, int(math.ceil(self.min_area_m2 / resolution ** 2)))
+        structural = trim_rays(free, (cells < 0).astype(np.uint8), resolution)
+        distance = clearance(structural)
+        previous = legacy_candidates(free, clearance(free), self.doorway_width_m / (2 * resolution),
+                                     minimum_cells)
+        sizes = np.bincount(previous[structural != 0], minlength=int(previous.max()) + 1)
+        previous[(structural == 0) | (sizes[previous] < minimum_cells)] = 0
+        unknown_edge = cv2.dilate((cells < 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
         occupied = (cells >= 70).astype(np.uint8)
-        labels, directions, walls = partition_rooms(free, occupied, grid.resolution_m, self.doorway_width_m)
-        wall_evidence = cv2.dilate(occupied, np.ones((5, 5), dtype=np.uint8))
-        minimum_cells = max(1, int(math.ceil(self.min_area_m2 / (grid.resolution_m ** 2))))
-        return self._spaces(labels, distance, cells, wall_evidence, directions, walls, origin,
-                            grid, map_name, map_revision, minimum_cells, existing_spaces)
+        footprint_labels, directions, walls, doors = partition_rooms(
+            structural, occupied, resolution, self.doorway_width_m, minimum_cells, distance, previous, unknown_edge)
+        eligible = np.bincount(footprint_labels.ravel()) >= minimum_cells
+        room_seeds = np.where(eligible[footprint_labels], footprint_labels, 0)
+        # 射线可能和低于最小面积的零散块相连，沿原图自由格找到最近的有效房间。
+        labels = grow_labels(room_seeds, (free != 0) & (room_seeds == 0))
+        wall_evidence = cv2.dilate(occupied & cv2.dilate(structural, np.ones((5, 5), dtype=np.uint8)),
+                                   np.ones((5, 5), dtype=np.uint8))
+        return self._spaces(labels, footprint_labels, eligible, distance, cells, wall_evidence,
+                            directions, walls, doors, origin, grid, map_name, map_revision, existing_spaces)
 
-    def _spaces(self, labels, distance, occupancy, wall_evidence, directions, walls, origin,
-                grid, map_name, map_revision, minimum_cells, existing_spaces):
+    def _spaces(self, labels, footprint_labels, eligible, distance, occupancy, wall_evidence,
+                directions, walls, doors, origin, grid, map_name, map_revision, existing_spaces):
         resolution = grid.resolution_m
         flat = labels.ravel()
         order = np.argsort(flat, kind="stable")
@@ -208,20 +222,24 @@ class RoomSegmentationService:
         label_to_space = {}
         boundary_work_cells = 0
         pad = round(min(0.6, self.doorway_width_m / 2) / resolution)
+        disk = beam_disk(resolution)
         for value, start, size in zip(values, starts, sizes):
-            if value == 0 or size < minimum_cells:
+            if value == 0 or not eligible[value]:
                 continue
             cells = order[start:start + size]
             ys, xs = np.divmod(cells, labels.shape[1])
             left, bottom, right, top = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
             mask = labels[bottom:top, left:right] == value
-            x0, y0 = max(0, left - pad), max(0, bottom - pad)
-            x1, y1 = min(labels.shape[1], right + pad), min(labels.shape[0], top + pad)
-            boundary_work_cells += (x1 - x0) * (y1 - y0)
+            geometry_cells = footprint_labels[ys, xs] == value
+            gx, gy = xs[geometry_cells], ys[geometry_cells]
+            x0, y0 = max(0, int(gx.min()) - pad), max(0, int(gy.min()) - pad)
+            x1 = min(labels.shape[1], int(gx.max()) + 1 + pad)
+            y1 = min(labels.shape[0], int(gy.max()) + 1 + pad)
+            boundary_work_cells += max((x1 - x0) * (y1 - y0), (right - left) * (top - bottom))
             if boundary_work_cells > self.max_cells * 8:
                 raise ValueError("区域轮廓计算超过处理预算。")
             local_occupancy = occupancy[y0:y1, x0:x1]
-            footprint = close_furniture(labels[y0:y1, x0:x1] == value, local_occupancy, pad)
+            footprint = close_furniture(footprint_labels[y0:y1, x0:x1] == value, local_occupancy, pad)
             rings = _cell_rings(footprint, x0, y0)
             outer, arcs = regularize_ring(max(rings, key=_signed_area), directions, walls, resolution, wall_evidence)
             polygon = [Vector3(x=x, y=y, z=origin[2]) for x, y in
@@ -235,8 +253,15 @@ class RoomSegmentationService:
                 hole = np.s_[hy:hy + hh, hx:hx + hw]
                 interior = np.zeros(footprint[hole].shape, dtype=np.uint8)
                 cv2.fillPoly(interior, [(local_ring - [hx, hy]).astype(np.int32)], 1)
-                if np.any((interior != 0) & ~footprint[hole] & (local_occupancy[hole] <= 0)):
-                    excluded_holes.append([list(_world(x, y, origin, resolution)) for x, y in ring])
+                excluded = (interior != 0) & ~footprint[hole]
+                occupied_by_room = np.any(excluded & (local_occupancy[hole] == 0) &
+                                          (footprint_labels[y0:y1, x0:x1][hole] > 0))
+                # 射线之间的窄未知裂缝不形成建筑内环，原始行程仍排除未知格。
+                unknown = (excluded & (local_occupancy[hole] < 0)).astype(np.uint8)
+                unknown_room = np.any(cv2.erode(unknown, disk, borderType=cv2.BORDER_CONSTANT, borderValue=0))
+                if occupied_by_room or unknown_room:
+                    fitted, _ = regularize_ring(ring, directions, walls, resolution, wall_evidence)
+                    excluded_holes.append([list(_world(x, y, origin, resolution)) for x, y in fitted])
             arc_geometry = [{"center": list(_world(*center, origin, resolution)), "radius_m": radius * resolution}
                             for center, radius, _, _ in arcs]
             # 最大净空格是代表点，几何重心落进障碍或凹区时不拿它当采样位置。
@@ -254,6 +279,10 @@ class RoomSegmentationService:
                     max_corner=Vector3(x=max(p.x for p in polygon), y=max(p.y for p in polygon), z=origin[2] + 0.5),
                     area_m2=int(size) * resolution ** 2, confidence=0.0,
                     metadata={_GEOMETRY_KEY: geometry, "holes": excluded_holes, "arcs": arc_geometry,
+                              "door_lines": [list(map(list, (_world(*a, origin, resolution), _world(*b, origin, resolution))))
+                                             for a, b in doors
+                                             if cv2.pointPolygonTest(np.asarray(outer, dtype=np.float32),
+                                                                     tuple((a + b) / 2), True) >= -3],
                               "centroid_kind": "free_cell_representative", "height_range_source": "slice_association_tolerance"}),
                 inspection_poses=[representative], primary_label=None, review_status=SceneSpaceReviewStatus.CANDIDATE,
                 metadata={**scope, "source": "room_segmentation", "map_revision": map_revision,
@@ -284,10 +313,15 @@ class RoomSegmentationService:
                 continue
             if abs(geometry["origin"][2] - origin[2]) > 1e-6:
                 continue
-            points = old.boundary.polygon_points
-            if not points:
+            if not old.boundary.polygon_points:
                 continue
-            x, y = _local(np.array([p.x for p in points]), np.array([p.y for p in points]), origin, resolution)
+            runs = np.asarray(geometry["row_runs"], dtype=np.int64)
+            first, last = int(runs[:, 1].min()), int(runs[:, 2].max())
+            lower, upper = int(runs[0, 0]), int(runs[-1, 0]) + 1
+            # 采用行程的范围，轮廓剪去射线条以后编号匹配仍包含所有已归属格。
+            wx, wy = _world(np.array([first, first, last, last]), np.array([lower, upper, lower, upper]),
+                            geometry["origin"], geometry["resolution_m"])
+            x, y = _local(wx, wy, origin, resolution)
             left, right = max(0, int(np.floor(x.min()))), min(labels.shape[1], int(np.ceil(x.max())))
             bottom, top = max(0, int(np.floor(y.min()))), min(labels.shape[0], int(np.ceil(y.max())))
             if left >= right or bottom >= top:
@@ -299,7 +333,6 @@ class RoomSegmentationService:
             wx, wy = _world(xx + 0.5, yy + 0.5, origin, resolution)
             ox, oy = _local(wx, wy, geometry["origin"], geometry["resolution_m"])
             ox, oy = np.floor(ox).astype(np.int64), np.floor(oy).astype(np.int64)
-            runs = np.asarray(geometry["row_runs"], dtype=np.int64)
             # 对坐标对排序查询，避免把负列或不同图宽错当成同一线性地址。
             dtype = np.dtype([("row", np.int64), ("col", np.int64)])
             keys = np.empty(len(runs), dtype=dtype)

@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from itertools import combinations
 from pathlib import Path
 import statistics
 import subprocess
 import sys
 import time
+from types import ModuleType
 
 import cv2
 import numpy as np
@@ -21,6 +23,7 @@ from contracts.geometry import Pose, Vector3
 from contracts.maps import OccupancyGrid
 from contracts.occupancy_cells import PackedOccupancyCells
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+from services.memory.semantic_map.room_passages import trim_rays
 from services.memory.semantic_map.room_segmentation import RoomSegmentationService
 
 
@@ -44,10 +47,20 @@ def load_grid(path):
 
 
 def baseline_service(revision):
-    reference = revision + ":services/memory/semantic_map/room_segmentation.py"
+    folder = "services/memory/semantic_map/"
+    reference = revision + ":" + folder + "room_segmentation.py"
     source = subprocess.check_output(["git", "show", reference], cwd=ROOT)
-    namespace = {"__name__": "baseline_room_segmentation"}
+    namespace = {"__name__": "room_segmentation_" + revision}
     exec(compile(source, reference, "exec"), namespace)
+    if "partition_rooms" in namespace:
+        # 第一版与第二轮的内部签名不同，历史版本连同自己的墙线模块一起加载。
+        layout_ref = revision + ":" + folder + "room_layout.py"
+        old_layout = ModuleType("room_layout_" + revision)
+        sys.modules[old_layout.__name__] = old_layout
+        exec(compile(subprocess.check_output(["git", "show", layout_ref], cwd=ROOT),
+                     layout_ref, "exec"), vars(old_layout))
+        for function in ("partition_rooms", "close_furniture", "regularize_ring"):
+            namespace[function] = getattr(old_layout, function)
     return namespace["RoomSegmentationService"]
 
 
@@ -115,11 +128,13 @@ def measure(service, grid, cells, origin, directions, repeats):
     if directions is None:
         # 无场景模型时从占据观测取共同方向，供两套边界使用。
         occupied = (cells > 0).astype(np.uint8)
-        lines = cv2.HoughLinesP(occupied, 1, np.pi / 180, 10, minLineLength=10, maxLineGap=3)
+        minimum = max(5, round(0.6 / grid.resolution_m))
+        lines = cv2.HoughLinesP(occupied, 1, np.pi / 180, minimum,
+                                minLineLength=minimum, maxLineGap=max(1, round(0.15 / grid.resolution_m)))
         delta = lines[:, 0, 2:] - lines[:, 0, :2] if lines is not None else np.empty((0, 2))
         directions = dominant_angles(np.arctan2(delta[:, 1], delta[:, 0]), np.linalg.norm(delta, axis=1))
-    aligned = 0.0
-    total = 0.0
+    aligned = outer_aligned = 0.0
+    total = outer_total = 0.0
     for space, paths in zip(spaces, rings):
         for index, ring in enumerate(paths):
             delta = np.roll(ring, -1, axis=0) - ring
@@ -133,12 +148,87 @@ def measure(service, grid, cells, origin, directions, repeats):
                     radial = np.abs(np.linalg.norm(ring - arc["center"], axis=1) - arc["radius_m"])
                     curved |= ((radial <= grid.resolution_m) &
                                (np.roll(radial, -1) <= grid.resolution_m))
-            aligned += float(lengths[straight | curved].sum())
-            total += float(lengths.sum())
+            matched_length = float(lengths[straight | curved].sum())
+            edge_length = float(lengths.sum())
+            aligned += matched_length
+            total += edge_length
+            if index == 0:
+                outer_aligned += matched_length
+                outer_total += edge_length
     result = {"room_count": len(spaces), "aligned_boundary_fraction": aligned / total if total else 0.0,
+              "outer_aligned_fraction": outer_aligned / outer_total if outer_total else 0.0,
+              "directions_deg": np.rad2deg(directions).tolist(),
               "time_median_s": statistics.median(timings), "time_max_s": max(timings),
               "covered_free_cells": sum(round(s.boundary.area_m2 / grid.resolution_m ** 2) for s in spaces)}
-    return result, masks
+    labels = np.zeros(cells.shape, dtype=np.int32)
+    for index, space in enumerate(spaces, 1):
+        for row, first, last in space.boundary.metadata["room_geometry"]["row_runs"]:
+            labels[row, first:last] = index
+    cuts = {tuple(tuple(p) for p in line) for space in spaces
+            for line in space.boundary.metadata.get("door_lines", ())}
+    return result, masks, labels, cuts
+
+
+def room_mapping(reference, labels, minimum_cells):
+    """逐个记录达面积线的参考区域实际落入哪一区，以及保留了多少面积。"""
+    sizes = np.bincount(reference.ravel())
+    decisions = {}
+    for room in np.flatnonzero(sizes[1:] >= minimum_cells) + 1:
+        overlap = np.bincount(labels[reference == room], minlength=2)
+        best = int(np.argmax(overlap[1:])) + 1
+        fraction = float(overlap[best] / sizes[room])
+        decisions[int(room)] = {"matched": best if fraction > 0.5 else 0,
+                                "overlap_fraction": fraction, "cells": int(sizes[room])}
+    return decisions
+
+
+def core_checks(free, labels, doorway, resolution, minimum_cells):
+    """独立检查两块达面积线的开阔区是否在同一自由连通域内被合并。"""
+    distance = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+    _, cores = cv2.connectedComponents((distance > doorway / (2 * resolution) + 0.5).astype(np.uint8),
+                                      connectivity=4)
+    _, components = cv2.connectedComponents(free, connectivity=4)
+    mapping = room_mapping(cores, labels, minimum_cells)
+    component_id = {key: int(components[cores == key][0]) for key in mapping}
+    pairs = [(a, b) for a, b in combinations(mapping, 2) if component_id[a] == component_id[b]]
+    merged = [(a, b) for a, b in pairs if mapping[a]["matched"] and
+              mapping[a]["matched"] == mapping[b]["matched"]]
+    return {"qualified_cores": mapping, "connected_narrow_pairs": pairs, "merged_pairs": merged,
+            "unassigned_cores": [key for key, value in mapping.items() if not value["matched"]]}
+
+
+def visible_doors(labels, resolution, maximum):
+    """由已输出的相邻格界面拟合窄口投影，供三个版本的图示统一标注。"""
+    touches = {}
+    for dx, dy in ((1, 0), (0, 1)):
+        rows, cols = labels.shape[0] - dy, labels.shape[1] - dx
+        a, b = labels[:rows, :cols], labels[dy:, dx:]
+        y, x = np.nonzero((a != b) & (a > 0) & (b > 0))
+        for row, col in zip(y, x):
+            pair = tuple(sorted((a[row, col], b[row, col])))
+            touches.setdefault(pair, []).append((2 * col + dx, 2 * row + dy))
+    lines = []
+    for points in touches.values():
+        points = np.asarray(points)
+        offset = points.min(axis=0) - 1
+        local = points - offset
+        width, height = local.max(axis=0) + 2
+        image = np.zeros((height, width), dtype=np.uint8)
+        image[local[:, 1], local[:, 0]] = 1
+        count, groups = cv2.connectedComponents(cv2.dilate(image, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))),
+                                                connectivity=8)
+        for group in range(1, count):
+            section = points[groups[local[:, 1], local[:, 0]] == group] / 2 + 0.5
+            if len(section) < 2 or len(section) * resolution > maximum * 1.6:
+                continue
+            center = section.mean(axis=0)
+            _, _, axes = np.linalg.svd(section - center, full_matrices=False)
+            projections = (section - center) @ axes[0]
+            span = (projections.max() - projections.min() + 1) * resolution
+            if 0.15 <= span <= maximum:
+                lines.append((center + (projections.min() - .5) * axes[0],
+                              center + (projections.max() + .5) * axes[0]))
+    return lines
 
 
 def match_truth(truth, masks, support, area_per_cell):
@@ -163,9 +253,11 @@ def match_truth(truth, masks, support, area_per_cell):
             for i, (name, target) in enumerate(truth)}
 
 
-def paint(cells, masks, truth, heading):
+def paint(cells, masks, truth, heading, inferred=(), cuts=(), rays=None):
     background = np.where(cells < 0, 165, np.where(cells == 0, 242, 30)).astype(np.uint8)
     picture = cv2.cvtColor(background, cv2.COLOR_GRAY2BGR)
+    if rays is not None:
+        picture[rays] = (168, 157, 140)
     for index, mask in enumerate(masks, 1):
         hue = np.uint8([[[(37 * index) % 180, 135, 230]]])
         shade = cv2.cvtColor(hue, cv2.COLOR_HSV2BGR)[0, 0]
@@ -176,6 +268,10 @@ def paint(cells, masks, truth, heading):
     for _, mask in truth:
         outlines, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(picture, outlines, -1, (20, 20, 210), 1)
+    for lines, color in ((inferred, (220, 103, 0)), (cuts, (0, 80, 225))):
+        for a, b in lines:
+            first, last = np.rint(np.array([a, b]) - 0.5).astype(np.int32)
+            cv2.line(picture, tuple(first), tuple(last), color, 2, cv2.LINE_AA)
     picture = cv2.copyMakeBorder(cv2.flip(picture, 0), 28, 0, 0, 0, cv2.BORDER_CONSTANT, value=(250, 250, 250))
     for index, mask in enumerate(masks, 1):
         distance = cv2.distanceTransform(mask[::-1].astype(np.uint8), cv2.DIST_L2, 3)
@@ -192,6 +288,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--scene", type=Path, help="真值评估用的场景模型截面与坐标配准")
     parser.add_argument("--baseline", help="基线 Git（版本控制）提交")
+    parser.add_argument("--first", help="第一版结构划分的提交")
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -200,27 +297,58 @@ def main():
     origin = np.array([grid.origin.position.x, grid.origin.position.y])
     scene = json.loads(args.scene.read_text()) if args.scene else None
     truth, directions = model_regions(scene, grid, origin) if scene else ([], None)
-    services = {"current": RoomSegmentationService()}
+    current = RoomSegmentationService()
+    services = {}
     if args.baseline:
-        services = {"baseline": baseline_service(args.baseline)(), **services}
+        services["baseline"] = baseline_service(args.baseline)()
+    if args.first:
+        services["first"] = baseline_service(args.first)()
+    services["current"] = current
     report = {"grid": str(args.grid), "scene": str(args.scene) if scene else None,
-              "baseline_revision": args.baseline, "opencv": cv2.__version__,
+              "baseline_revision": args.baseline, "first_revision": args.first, "opencv": cv2.__version__,
               "numpy": np.__version__, "rooms_in_scene": len(truth), "algorithms": {}}
-    images = [paint(cells, [], truth, "Input / model (red)")]
+    free = (cells == 0).astype(np.uint8)
+    trimmed = trim_rays(free, (cells < 0).astype(np.uint8), grid.resolution_m)
+    rays = (free != 0) & (trimmed == 0)
+    report["removed_rays"] = int(rays.sum())
+    images = [paint(cells, [], truth, "Input (rays tinted)", rays=rays)]
     support = np.ones_like(cells, dtype=bool)
     area_per_cell = grid.resolution_m ** 2
     for name, service in services.items():
-        result, masks = measure(service, grid, cells, origin, directions, args.repeats)
+        result, masks, labels, doors = measure(service, grid, cells, origin, directions, args.repeats)
+        minimum_cells = math.ceil(current.min_area_m2 / area_per_cell)
+        result["core_pairs"] = core_checks(trimmed, labels, current.doorway_width_m, grid.resolution_m,
+                                           minimum_cells)
+        result["removed_rays_assigned"] = int(np.count_nonzero(labels[rays]))
+        result["removed_rays_in_footprints"] = int(np.count_nonzero(np.logical_or.reduce(masks, axis=0) & rays)) if masks else 0
+        inferred = visible_doors(np.where(trimmed, labels, 0), grid.resolution_m, current.doorway_width_m)
+        cuts = [(np.asarray(line) - origin) / grid.resolution_m for line in doors]
+        result["door_lines_estimated"] = len(inferred)
+        result["door_lines_applied"] = len(cuts)
         result["full_footprint"] = match_truth(truth, masks, support, area_per_cell) if scene else None
         result["observed_footprint"] = match_truth(truth, masks, cells >= 0, area_per_cell) if scene else None
         if name == "baseline":
             baseline_masks = masks
+            baseline_labels = np.where(trimmed, labels, 0)
         if name == "current" and args.baseline:
             comparison_truth = [(str(i), mask) for i, mask in enumerate(baseline_masks, 1)]
             result["baseline_overlap"] = match_truth(comparison_truth, masks, support, area_per_cell)
+        if args.baseline:
+            candidates = room_mapping(baseline_labels, labels, minimum_cells)
+            hits = [match["matched"] for match in candidates.values() if match["matched"]]
+            result["retained_baseline"] = {"regions": candidates, "distinct_regions": len(set(hits)),
+                                           "unmatched": len(candidates) - len(hits),
+                                           "merges": len(hits) - len(set(hits))}
         report["algorithms"][name] = result
-        images.append(paint(cells, masks, truth, name))
-    cv2.imwrite(str(args.output / "comparison.png"), np.hstack(images))
+        title = {"baseline": "Original", "first": "First version", "current": "Round 2"}[name]
+        images.append(paint(cells, masks, truth, title, inferred, cuts, rays))
+    comparison = cv2.copyMakeBorder(np.hstack(images), 0, 25, 0, 0, cv2.BORDER_CONSTANT, value=(250, 250, 250))
+    y = comparison.shape[0] - 8
+    cv2.line(comparison, (8, y - 4), (28, y - 4), (220, 103, 0), 2)
+    cv2.putText(comparison, "Estimated from shared free cells", (35, y), cv2.FONT_HERSHEY_SIMPLEX, .42, (30, 30, 30))
+    cv2.line(comparison, (278, y - 4), (298, y - 4), (0, 80, 225), 2)
+    cv2.putText(comparison, "Applied narrow cut", (305, y), cv2.FONT_HERSHEY_SIMPLEX, .42, (30, 30, 30))
+    cv2.imwrite(str(args.output / "comparison.png"), comparison)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(report, ensure_ascii=False))
 

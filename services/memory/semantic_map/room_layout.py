@@ -7,6 +7,8 @@ import math
 import cv2
 import numpy as np
 
+from services.memory.semantic_map.room_passages import candidate_sections, grow_labels, open_area_labels
+
 
 @dataclass
 class _WallLine:
@@ -171,10 +173,9 @@ def _cut_links(lattice, barrier, shape):
         lattice[rows, cols] = 0
 
 
-def partition_rooms(free, occupied, resolution, doorway_width):
-    """相邻面只在有结构证据处断开，保持每个房间的自由格四连通。"""
-    visible = occupied & cv2.dilate(free, np.ones((5, 5), dtype=np.uint8))
-    directions, walls = _wall_lines(visible, resolution)
+def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, distance, previous, unknown_edge):
+    """沿墙线和直门线切分四邻接自由格。"""
+    directions, walls = _wall_lines(occupied, resolution)
     height, width = free.shape
     lattice = np.zeros((2 * height, 2 * width), dtype=np.uint8)
     lattice[::2, ::2] = free
@@ -188,7 +189,45 @@ def partition_rooms(free, occupied, resolution, doorway_width):
         for start, end in wall.spans:
             _cut_links(lattice, (wall.point(start - 1), wall.point(end + 1)), free.shape)
     _, faces = cv2.connectedComponents(lattice, connectivity=4)
-    return faces[::2, ::2].copy(), directions, supported
+    cores = open_area_labels(distance, door_cells / 2, minimum_cells)
+    proposals = grow_labels(cores, free & (cores == 0))
+    doors = []
+    for line in candidate_sections(free, distance, proposals, faces[::2, ::2], directions, door_cells):
+        _cut_links(lattice, line, free.shape)
+        doors.append(line)
+    _, faces = cv2.connectedComponents(lattice, connectivity=4)
+    faces = faces[::2, ::2]
+    # 原划分中经过去射线仍保有面积的局部区域，为未闭合的结构面提供独立种子。
+    areas = np.bincount(faces.ravel())
+    has_core = cores > 0
+    open_cells = np.bincount(faces[has_core], minlength=len(areas))
+    core_faces = np.unique(np.column_stack((faces[has_core], cores[has_core])), axis=0)[:, 0]
+    core_count = np.bincount(core_faces, minlength=len(areas))
+    # 两个达面积线的开阔区只受实测门宽或墙约束。局部以开阔区为主时，狭窄探索边也不单独成区。
+    incomplete = np.bincount(faces[unknown_edge != 0], minlength=len(areas)) > 0
+    retained = incomplete & (core_count < 2) & (2 * open_cells < areas)
+    legacy = np.where(retained[faces], previous, 0)
+    seeds = _legacy_seeds(legacy, faces)
+    for first, second, links in ((seeds[:, :-1], seeds[:, 1:], lattice[::2, 1:-1:2]),
+                                 (seeds[:-1, :], seeds[1:, :], lattice[1:-1:2, ::2])):
+        links[(first > 0) & (second > 0) & (first != second)] = 0
+    _, faces = cv2.connectedComponents(lattice, connectivity=4)
+    for a, b in doors:
+        direction = (b - a) / np.linalg.norm(b - a)
+        normal = np.array([-direction[1], direction[0]])
+        supported.append(_WallLine(direction, normal, a @ normal, [[a @ direction, b @ direction]]))
+    return faces[::2, ::2].copy(), directions, supported, doors
+
+
+def _legacy_seeds(previous, faces):
+    combinations = np.column_stack((previous[previous > 0], faces[previous > 0]))
+    pairs, counts = np.unique(combinations, axis=0, return_counts=True)
+    dominant = np.zeros(int(previous.max()) + 1, dtype=np.int32)
+    for label, face in pairs[np.argsort(counts)]:
+        dominant[label] = face
+    used = np.bincount(dominant[1:], minlength=int(faces.max()) + 1)
+    active = (previous > 0) & (dominant[previous] == faces) & (used[dominant[previous]] > 1)
+    return grow_labels(np.where(active, previous, 0), active | ((faces > 0) & (used[faces] > 1)))
 
 
 def close_furniture(mask, cells, radius):
@@ -241,6 +280,71 @@ def _sample_arc(arc, tolerance):
     return center + radius * np.column_stack((np.cos(angle), np.sin(angle)))
 
 
+def _aligned_frontier(polygon, directions, resolution):
+    """把没有墙朝向的探索边界沿两条主方向闭合，控制拐角偏移。"""
+    if len(directions) < 2:
+        return polygon
+    primary = directions[0]
+    transverse = np.abs(_angle_difference(directions, primary + np.pi / 2))
+    secondary = directions[transverse.argmin()]
+    if transverse.min() > np.deg2rad(15):
+        return polygon
+    axes = np.array([[np.cos(primary), np.sin(primary)], [np.cos(secondary), np.sin(secondary)]])
+    points = np.asarray(polygon)
+    delta = np.roll(points, -1, axis=0) - points
+    lengths = np.linalg.norm(delta, axis=1)
+    theta = np.arctan2(delta[:, 1], delta[:, 0])
+    aligned = np.min(np.abs(_angle_difference(theta[:, None], directions)), axis=1) <= np.deg2rad(4)
+    coordinates = delta @ np.linalg.inv(axes)
+    output = []
+    for start, length, line, uv in zip(points, lengths, aligned, coordinates):
+        output.append(start)
+        if line or length * resolution < 0.15:
+            continue
+        # 两侧交替的折线保持开间面积，单步偏移不超过约半米。
+        axis = int(np.argmax(np.abs(uv)))
+        major, minor = uv[axis] * axes[axis], uv[1 - axis] * axes[1 - axis]
+        count = max(1, round(np.linalg.norm(minor) * resolution / 0.65))
+        for step in range(count):
+            fraction = step / count
+            corner = start + fraction * (major + minor) + major / (2 * count)
+            output.extend((corner, corner + minor / count))
+    points = np.asarray(output)
+    # 拟合生成的共线短段合并成连续墙边。
+    before = points - np.roll(points, 1, axis=0)
+    after = np.roll(points, -1, axis=0) - points
+    signed_area = before[:, 0] * after[:, 1] - before[:, 1] * after[:, 0]
+    dot = np.sum(before * after, axis=1)
+    keep = (dot <= 0) | (np.abs(signed_area) > dot * math.tan(np.deg2rad(0.5)))
+    return points[keep].tolist()
+
+
+def _simple_ring(polygon):
+    """拆开拟合交点，取主环，去掉拐角折回生成的小环。"""
+    points = np.asarray(polygon)
+    while True:
+        edges = np.roll(points, -1, axis=0) - points
+        for index, edge in enumerate(edges[:-2]):
+            later = np.arange(index + 2, len(edges) - (index == 0))
+            delta = points[later] - points[index]
+            other = edges[later]
+            cross = edge[0] * other[:, 1] - edge[1] * other[:, 0]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = (delta[:, 0] * other[:, 1] - delta[:, 1] * other[:, 0]) / cross
+                u = (delta[:, 0] * edge[1] - delta[:, 1] * edge[0]) / cross
+            crossing = np.flatnonzero((t > 1e-6) & (t < 1 - 1e-6) & (u > 1e-6) & (u < 1 - 1e-6))
+            if crossing.size:
+                first = int(crossing[0])
+                end = int(later[first])
+                junction = points[index] + t[first] * edge
+                rings = (np.vstack((junction, points[index + 1:end + 1])),
+                         np.vstack((junction, points[end + 1:], points[:index + 1])))
+                points = max(rings, key=lambda ring: abs(cv2.contourArea(ring.astype(np.float32))))
+                break
+        else:
+            return points.tolist()
+
+
 def regularize_ring(ring, directions, walls, resolution, wall_evidence):
     """用带证据的直线和圆弧描述外边界，保留凹角。"""
     points = np.asarray(ring, dtype=float)
@@ -248,7 +352,11 @@ def regularize_ring(ring, directions, walls, resolution, wall_evidence):
     contour = points.astype(np.float32)
     # 细长区域用自身短边约束拟合精度，保留窄走廊的两侧。
     width = min(cv2.minAreaRect(contour)[1])
-    epsilon = min(max(1.0, 0.19 / resolution), 0.24 * width)
+    x, y = (points.astype(int) - 1).T
+    height, cols = wall_evidence.shape
+    near_wall = wall_evidence[np.clip(y, 0, height - 1), np.clip(x, 0, cols - 1)]
+    complete = np.mean(near_wall) >= 0.65
+    epsilon = min(max(1.0, (0.19 if complete else 0.35) / resolution), 0.24 * width)
     simplified = cv2.approxPolyDP(contour, epsilon, True)[:, 0]
     raw_indices = {tuple(p): i for i, p in enumerate(points)}
     indices = {raw_indices[tuple(point)] for point in simplified}
@@ -324,4 +432,6 @@ def regularize_ring(ring, directions, walls, resolution, wall_evidence):
             polygon.append(before[-1].tolist())
         if len(after) == 2:
             polygon.append(after[0].tolist())
-    return polygon, arcs
+    if not complete and not arcs:
+        polygon = _aligned_frontier(polygon, directions, resolution)
+    return _simple_ring(polygon), arcs

@@ -51,13 +51,13 @@ pub(crate) fn home_goal_options() -> GoalOptions {
 
 pub(crate) fn frontier_goal_options(
     goal: &nuwax_nav_types_messages::visual::FrontierGoal,
-    surface: bool,
     config: Option<&SurfaceNavigationConfig>,
 ) -> GoalOptions {
     let mut options = GoalOptions::default();
-    if surface {
-        options.allow_reverse = config
-            .and_then(|config| config.follower.kinematics())
+    if let Some(config) = config {
+        // 选点与到达使用同一尺度，避免把尚未移动的近前沿标为已到达。
+        options.position_tolerance_m = f64::from(config.geometry.goal_tolerance);
+        options.allow_reverse = config.follower.kinematics()
             .is_some_and(|motion| motion.max_reverse_mps > 0.0);
         if goal
             .metadata

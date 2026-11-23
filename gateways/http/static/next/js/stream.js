@@ -117,7 +117,13 @@ export function createStream({ topics, params = {}, immediate = [], queued = [],
     ws.addEventListener('close', () => {
       if (!isCurrent()) return;
       acceptsMessages = false;
-      if (primary) { probe.current = null; setConn({ status: 'lost', rttMs: null, waitingMs: null }); }
+      if (primary) {
+        // 时钟差只对本次连接有效（与原控制台按连接纪元判断一致），断开即作废。
+        probe.current = null;
+        probe.samples = [];
+        setConn({ status: 'lost', rttMs: null, waitingMs: null });
+        store.set({ clockOffsetMs: null });
+      }
       emit('close');
       reconnectAttempt += 1;
       scheduleReconnect(ws, myEpoch);
@@ -237,6 +243,10 @@ export function createStream({ topics, params = {}, immediate = [], queued = [],
       old.close();
       connect();
     },
+    /* 去掉主题：只影响之后重连时的订阅（如三维增量点云握手成功后不再订阅全量点云快照）。 */
+    drop(list) { for (const topic of list) wanted.delete(topic); },
+    /* 把二进制解出的帧当作普通帧接收（续传游标、合并与分发同文本帧）。 */
+    receive: receiveFrame,
     setParam(key, value) { query[key] = value; },
     send(message) { if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message)); },
     latest(topic) { return latest[topic] || null; },

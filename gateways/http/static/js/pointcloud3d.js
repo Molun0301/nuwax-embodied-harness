@@ -616,7 +616,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._container.appendChild(this._renderer.domElement);
 
     this._scene = new THREE.Scene();
-    this._scene.background = new THREE.Color(0x0f172a);
+    this._scene.background = new THREE.Color(0x0c1a20);
 
     this._camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 500);
     this._camera.position.set(0, -10, 8);

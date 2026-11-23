@@ -3440,7 +3440,7 @@ advanced = true
 [manipulation.poll_interval_sec]
 type = "float"
 default = 0.2
-description = "查询同一设备任务状态的间隔秒数。"
+description = "按单调墙钟查询同一设备任务状态的间隔，单位为秒。"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -3453,6 +3453,24 @@ advanced = true
 type = "float"
 default = 0.55
 description = "以抓取目标或放置台面中心生成操作站位的平面半径，单位为米。"
+consumers = ["core/settings.py:load_config"]
+apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+
+[manipulation.approach_position_tolerance_m]
+type = "float"
+default = 0.06
+description = "前往操作站位时的导航位置到达容差，单位为米。"
+consumers = ["core/settings.py:load_config"]
+apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+
+[manipulation.approach_yaw_tolerance_rad]
+type = "float"
+default = 0.12
+description = "前往操作站位时的导航偏航到达容差，单位为弧度。"
 consumers = ["core/settings.py:load_config"]
 apply = "restart"
 panel = "操作设备"

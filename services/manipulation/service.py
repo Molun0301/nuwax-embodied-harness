@@ -99,7 +99,8 @@ class ManipulationService:
                     return {**binding.fields(), "device_task_id": task_id, "device_status": result}
                 if state in {"failed", "cancelled", "idle"}:
                     raise DeviceError("设备操作未成功：" + str(result.get("error") or state))
-                context.wait(self.config.poll_interval_sec)
+                # 仿真暂停时仍要查询设备终态；行为期限由上下文检查。
+                context.cancelled.wait(self.config.poll_interval_sec)
         finally:
             if task_id is not None and not complete:
                 self.backend.cancel(binding, task_id, timeout=self.config.http_timeout_sec)

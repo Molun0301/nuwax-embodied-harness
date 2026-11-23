@@ -30,14 +30,17 @@ def _approach(platform, ctx, args, mode):
     if instance is None:
         raise GatewayError("当前记忆库中没有目标实例。", http_status=404)
     current = platform.geometry_state.wait_for_pose(ctx)
+    config = platform.config.manipulation
     pose = platform.memory.plan_manipulation_pose(instance, current, place=mode == "place",
-        distance_m=platform.config.manipulation.standoff_distance_m)
+        distance_m=config.standoff_distance_m)
     if pose is None:
         raise GatewayError("目标周围没有可达操作站位。", error_code="navigation_failed", http_status=409)
     q = pose.orientation
     yaw = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
     navigate_to_pose(platform, _ApproachContext(ctx), {"x": pose.position.x, "y": pose.position.y,
         "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
+        "tolerance_position_m": config.approach_position_tolerance_m,
+        "tolerance_yaw_rad": config.approach_yaw_tolerance_rad,
         "motion_generation": args["motion_generation"]})
     return instance
 

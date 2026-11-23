@@ -467,6 +467,8 @@ class ManipulationConfig:
     stop_timeout_sec: float = 10.0
     poll_interval_sec: float = schema_default('manipulation.poll_interval_sec')
     standoff_distance_m: float = schema_default('manipulation.standoff_distance_m')
+    approach_position_tolerance_m: float = schema_default('manipulation.approach_position_tolerance_m')
+    approach_yaw_tolerance_rad: float = schema_default('manipulation.approach_yaw_tolerance_rad')
 
     def __post_init__(self):
         import math
@@ -953,6 +955,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
             stop_timeout_sec=10.0,
             poll_interval_sec=value('manipulation.poll_interval_sec'),
             standoff_distance_m=value('manipulation.standoff_distance_m'),
+            approach_position_tolerance_m=value('manipulation.approach_position_tolerance_m'),
+            approach_yaw_tolerance_rad=value('manipulation.approach_yaw_tolerance_rad'),
         ),
         mcp=McpConfig(image_max_edge_px=value('mcp.image_max_edge_px')),
     )

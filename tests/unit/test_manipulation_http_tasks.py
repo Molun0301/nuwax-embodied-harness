@@ -125,6 +125,19 @@ def test_failed_model_or_missing_physical_success_cannot_pass(mode, device, runt
     assert device.cancelled.is_set()
 
 
+def test_device_failure_reaches_terminal_when_simulation_clock_is_paused(device, runtime, monkeypatch):
+    from core import clock
+
+    device.mode = "failed"
+    with monkeypatch.context() as paused:
+        paused.setattr(clock, "uses_device_clock", lambda: True)
+        paused.setattr(clock, "_device_sample", lambda: (20_000_000_000, 1.0, True))
+        status = terminal(runtime, submit(runtime))
+    assert device.polls == 2
+    assert status.state is TaskState.FAILED and status.error_code == "manipulation_device_error"
+    assert "policy failure" in status.message
+
+
 def test_cancel_sends_device_cancel_without_waiting_for_pause(device, runtime):
     device.mode = "never_pause"
     task = submit(runtime)
@@ -217,7 +230,8 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     picked = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=target.instance_id))
     assert picked.state is TaskState.SUCCEEDED and picked.motion
     assert visits == [(picked.task_id, {"x": .55, "y": 0, "z": .9, "frame_id": "map",
-                                        "yaw_rad": pi, "motion_generation": 7})]
+                                        "yaw_rad": pi, "motion_generation": 7,
+                                        "tolerance_position_m": .06, "tolerance_yaw_rad": .12})]
     assert device.requests[0]["params"]["goal_mode"] == "pick"
     held = picked.result["held_object"]
     assert held["instance_id"] == target.instance_id and held["label"] == "apple"

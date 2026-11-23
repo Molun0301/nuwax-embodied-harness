@@ -119,15 +119,81 @@ def _bridge_wall_gaps(line, free, junctions, door_cells, resolution):
     return _WallLine(line.direction, line.normal, line.offset, active)
 
 
-def _two_free_sides(line, free, start, stop, offset):
+def _two_free_sides(line, free, start, stop, offset, reach=0):
     height, width = free.shape
     samples = line.point(np.linspace(start, stop, 7)[1:-1, None])
+    offsets = offset + np.arange(int(max(0, reach - offset)) + 1)
     for sign in (-1, 1):
-        x, y = np.floor(samples + sign * offset * line.normal).astype(int).T
+        coordinates = samples[:, None] + sign * offsets[None, :, None] * line.normal
+        x, y = np.floor(coordinates).astype(int).transpose(2, 0, 1)
         valid = (0 <= x) & (x < width) & (0 <= y) & (y < height)
-        if np.count_nonzero(free[y[valid], x[valid]]) < 4:
+        observed = np.zeros_like(valid)
+        observed[valid] = free[y[valid], x[valid]]
+        if np.count_nonzero(observed.any(axis=1)) < 4:
             return False
     return True
+
+
+def _stitch_wide_openings(walls, free, resolution, door_cells):
+    """用有横墙支撑的相向墙端接续宽开口，保留实测墙段。"""
+    anchored = []
+    tolerance = max(2, 0.45 / resolution)
+    for wall, junctions in zip(walls, _wall_junctions(walls, resolution)):
+        for span in wall.spans:
+            start, end = span
+            before = [j for j in junctions if start - tolerance <= j <= start + 2]
+            after = [j for j in junctions if end - 2 <= j <= end + tolerance]
+            if before or after:
+                start_anchor = min(before, key=lambda j: abs(j - start)) if before else None
+                end_anchor = min(after, key=lambda j: abs(j - end)) if after else None
+                anchored.append((wall, span, start_anchor, end_anchor))
+
+    options = []
+    side_offset = max(1, 0.24 / resolution)
+    side_reach = door_cells / 2
+    max_slope = math.tan(math.radians(7))
+    for i, (lower, lower_span, start_anchor, _) in enumerate(anchored):
+        if start_anchor is None:
+            continue
+        lo, hi = lower_span
+        start = lower.point(hi)
+        for j, (upper, upper_span, _, end_anchor) in enumerate(anchored):
+            if end_anchor is None or lower is upper or not np.array_equal(lower.direction, upper.direction):
+                continue
+            first, last = upper_span
+            end = upper.point(first)
+            delta = end - start
+            gap = delta @ lower.direction
+            offset = abs(delta @ lower.normal)
+            if gap * resolution < 2.5 or offset > min(door_cells, max_slope * gap):
+                continue
+            lengths = hi - lo, last - first
+            if sum(lengths) < 0.55 * gap or min(lengths) < 0.12 * gap:
+                continue
+            # 在门宽一半的范围内检查实测墙两侧，容纳同一墙在栅格里的双边回波。
+            if not (_two_free_sides(lower, free, hi - min(lengths[0], 3 * side_offset), hi, side_offset, side_reach)
+                    and _two_free_sides(upper, free, first, first + min(lengths[1], 3 * side_offset),
+                                        side_offset, side_reach)):
+                continue
+            direction = delta / np.linalg.norm(delta)
+            normal = np.array([-direction[1], direction[0]])
+            line = _WallLine(direction, normal, start @ normal, [[start @ direction, end @ direction]])
+            if _two_free_sides(line, free, *line.spans[0], side_offset, side_reach):
+                options.append((offset / gap, gap, i, j, line))
+
+    joined = []
+    used_starts, used_ends = set(), set()
+    for _, _, i, j, line in sorted(options, key=lambda option: option[:4]):
+        if i in used_ends or j in used_starts:
+            continue
+        used_ends.add(i)
+        used_starts.add(j)
+        _, lower_span, start_anchor, _ = anchored[i]
+        _, upper_span, _, end_anchor = anchored[j]
+        lower_span[0] = min(lower_span[0], start_anchor)
+        upper_span[1] = max(upper_span[1], end_anchor)
+        joined.append(line)
+    return joined
 
 
 def _extend_wall_ends(wall, junctions, doorway, resolution, free):
@@ -184,6 +250,7 @@ def partition_rooms(free, occupied, resolution, doorway_width, minimum_cells, di
     door_cells = doorway_width / resolution
     supported = [_bridge_wall_gaps(wall, free, junctions, door_cells, resolution)
                  for wall, junctions in zip(walls, _wall_junctions(walls, resolution))]
+    supported += _stitch_wide_openings(supported, free, resolution, door_cells)
     for wall, junctions in zip(supported, _wall_junctions(supported, resolution)):
         _extend_wall_ends(wall, junctions, door_cells, resolution, free)
         for start, end in wall.spans:

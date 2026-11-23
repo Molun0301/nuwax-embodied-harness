@@ -99,13 +99,16 @@ class HTTPSceneDecisionBackend:
                     confidence = answer.get("confidence")
                     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
                         raise ValueError("选择置信度无效")
+                    scores = answer["probabilities"]
                     raw = response
                 else:
                     answer = json.loads(response["choices"][0]["message"]["content"])
+                    total = sum(answer["probabilities"].values())
+                    scores = {category: score / total for category, score in answer["probabilities"].items()}
                     raw = answer
-                result = SceneDecisionResult(category_scores=answer["probabilities"], score_kind="choice_probability",
+                result = SceneDecisionResult(category_scores=scores, score_kind="choice_probability",
                                              model_id=response["model"], raw=raw, metadata={"backend": self._backend})
-                if result.category_scores[answer["choice"]] < max(result.category_scores.values()) - 1e-6:
+                if self._backend == "jev_api" and result.category_scores[answer["choice"]] < max(result.category_scores.values()) - 1e-6:
                     raise ValueError("选择项不是最大概率项")
             if set(result.category_scores) != set(request.categories):
                 raise ValueError("返回类别与请求不一致")

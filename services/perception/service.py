@@ -44,7 +44,7 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import capture_geometry, contract_pose, _stamp
+from services.perception.observation_geometry import ObservationGeometry, capture_geometry, contract_pose, _stamp
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -596,7 +596,15 @@ class PerceptionService:
     ) -> PerceptionContext:
         """消费标准图像并产出 detector/tracker 级快速观测结果。"""
 
+        from contracts.image import CameraInfo, ImageFrame
+
         with self._operation():
+            if not isinstance(image_frame, ImageFrame):
+                raise TypeError("PerceptionService.process_image_fast 仅接受标准 ImageFrame。")
+            if camera_info is not None and not isinstance(camera_info, CameraInfo):
+                raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
+            # 固定原图像对应的几何，检测占用时间不再影响点云配对。
+            geometry = self._capture_geometry(image_frame)
             # vis-three-fixes AC2.4a：同上 process_image，记录 pipeline_lock_wait_ms。
             requested_at = perf_counter()
             with self._pipeline_lock:
@@ -611,6 +619,7 @@ class PerceptionService:
                     source_name=source_name,
                     detection_metadata=detection_metadata,
                     open_vocabulary_classes=open_vocabulary_classes,
+                    geometry=geometry,
                     lock_wait_ms=(acquired_at - requested_at) * 1000.0,
                 )
             if overlay_publication is not None:
@@ -627,16 +636,10 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
+        geometry: ObservationGeometry,
         lock_wait_ms: Optional[float] = None,
     ) -> Tuple[PerceptionContext, Optional[PreparedStreamPublication]]:
         """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
-
-        from contracts.image import CameraInfo, ImageFrame
-
-        if not isinstance(image_frame, ImageFrame):
-            raise TypeError("PerceptionService.process_image_fast 仅接受标准 ImageFrame。")
-        if camera_info is not None and not isinstance(camera_info, CameraInfo):
-            raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
 
         source_frame = image_frame
         cacheable = not detection_metadata and open_vocabulary_classes is None
@@ -785,7 +788,8 @@ class PerceptionService:
         if stage_status["detector"] in {"completed", "fallback"}:
             self._fast_frame_cache[context.camera_id] = (
                 source_frame, input_signature if cacheable else None, cache_key, context,
-                image_frame.model_copy(deep=True), camera_info.model_copy(deep=True) if camera_info is not None else None)
+                image_frame.model_copy(deep=True), camera_info.model_copy(deep=True) if camera_info is not None else None,
+                geometry)
             if len(self._fast_frame_cache) > 8:
                 self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
         return context, self._prepare_detection_overlay_frame(context)
@@ -795,13 +799,13 @@ class PerceptionService:
         with self._pipeline_lock:
             cached = self._fast_frame_cache.get(context.camera_id)
             if cached is not None and cached[3].observation.observation_id == context.observation.observation_id:
-                return cached[4], cached[5]
+                return cached[4:]
         return None
 
     def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
                                       stop_event=None):
         """完成同帧几何与关键帧抓图，返回结果后结束感知操作。"""
-        with self._operation(), self.point_cloud_consumer():
+        with self._operation():
             return self._complete_observation_geometry(
                 context, inputs, store_artifact=store_artifact,
                 stop_event=stop_event)
@@ -811,8 +815,7 @@ class PerceptionService:
         """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
         if inputs is None:
             return context, None, None
-        image_frame, camera_info = inputs
-        geometry = self._capture_geometry(image_frame)
+        image_frame, camera_info, geometry = inputs
         if stop_event is not None and stop_event.is_set():
             return context, None, None
         if camera_info is None:

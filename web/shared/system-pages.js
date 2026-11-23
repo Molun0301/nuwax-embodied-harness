@@ -6,8 +6,7 @@
    - mountSystem(root, opts) → {show(), hide(), refresh()}；mountWizard(root, opts) → {destroy()}。
    业务启停、回退、模块调整都走“生成计划 → 提交任务 → 读任务进度”（plan / jobs），版本更新走一步更新接口 update；
    页面可见时每 10 秒读业务状态，有进行中的任务时每 2 秒读任务进度，不可见时都停止。 */
-import { icon, h, toast, confirmDialog, block as uiBlock, sub as uiSub } from './neh-ui.js';
-import { copyText } from './settings-editor.js';
+import { icon, h, toast, confirmDialog, block as uiBlock, sub as uiSub, copyText } from './neh-ui.js';
 
 /* ================= 管理服务请求 ================= */
 let csrf = '';

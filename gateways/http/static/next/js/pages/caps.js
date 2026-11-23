@@ -2,8 +2,7 @@
    行为沿用原能力页（capability-panel.js，06 第 8 节）：经 list_capabilities 取全部能力，按 input_schema 生成表单，
    留空的字段不发送；motion 为真或名称以 delete_ 开头的能力先确认；任务类按任务流显示状态与进度、可取消，结束后显示结果；
    失败显示后端原因与错误码。新增能力不改网页即出现。地址 #/caps/<能力名> 打开该能力。 */
-import { icon, h, toast, confirmDialog, sub as subBlock } from '/static/shared/neh-ui.js';
-import { copyText } from '/static/shared/settings-editor.js';
+import { icon, h, toast, confirmDialog, sub as subBlock, copyText } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, normalizeTaskState, taskKind } from '../status.js';
 
 // 类型用含义贴切的图标：查询看一眼（眼睛），动作立即生效（闪电），任务要花时间（沙漏）。

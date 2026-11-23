@@ -304,7 +304,8 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
     async def api_manager_config(request: Request, path: str) -> Response:
         from gateways.settings import manager_request
         if path not in {"session", "config", "config/profiles", "config/activate", "config/restart",
-                        "status", "settings", "releases", "update"} and not path.startswith("jobs/"):
+                        "status", "settings", "releases", "update", "plan", "jobs", "modules", "hardware",
+                        "password", "login", "logout"} and not path.startswith("jobs/"):
             raise GatewayError("设置接口不存在", error_code="not_found", http_status=404)
         payload = await request.json() if request.method != "GET" else None
         target = path + ("?" + request.url.query if request.url.query else "")

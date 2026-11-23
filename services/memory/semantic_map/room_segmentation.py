@@ -1,4 +1,4 @@
-"""从已知自由栅格提取几何空间候选；不推断场景语义或运动可达性。"""
+"""从占据栅格提取建筑结构与自由格归属。"""
 from __future__ import annotations
 
 import uuid
@@ -11,6 +11,7 @@ import numpy as np
 
 from contracts.geometry import Pose, Vector3
 from contracts.naming import build_scene_space_id
+from services.memory.semantic_map.room_layout import close_furniture, partition_rooms, regularize_ring
 from services.memory.semantic_map.scene_revisions import geometry_value, semantic_geometry_value
 from contracts.occupancy_cells import PackedOccupancyCells
 from contracts.maps import OccupancyGrid
@@ -157,7 +158,7 @@ def _row_runs(mask, left, bottom):
 
 
 class RoomSegmentationService:
-    """用自由空间形状与窄连接产生待识别区域，输入和处理规模都有界。"""
+    """用墙与门洞划分待识别区域。"""
 
     def __init__(self, min_area_m2: float = 2.0, doorway_width_m: float = 1.2, max_cells: int = 2000000):
         if not math.isfinite(min_area_m2) or min_area_m2 <= 0:
@@ -183,70 +184,22 @@ class RoomSegmentationService:
             raise ValueError("栅格分辨率必须有限。")
         origin = _planar_origin(grid.origin)
         data = np.frombuffer(grid.data.raw, dtype=np.int8) if isinstance(grid.data, PackedOccupancyCells) else np.asarray(grid.data, dtype=np.int8)
-        # 只接受明确自由值零；不把未知或低概率的未确认格推广为自由格。
-        free = (data.reshape(grid.height, grid.width) == 0).astype(np.uint8)
+        cells = data.reshape(grid.height, grid.width)
+        # 只有明确自由格参与位姿归属。
+        free = (cells == 0).astype(np.uint8)
         if not np.any(free):
             return []
         distance = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
-        radius = self.doorway_width_m / (2 * grid.resolution_m)
-        # 中心到非自由格中心的距离包含半格；按格边净宽选择形态种子。
-        core = (distance > radius + 0.5).astype(np.uint8)
-        count, labels = cv2.connectedComponents(core, connectivity=4)
-        if count > 1:
-            # 宽空间恢复到边缘后仍剩下的长窄连通区，成为独立几何候选。
-            # 用距离场替代巨大形态核，处理量不随门宽参数平方增长。
-            to_core = cv2.distanceTransform(1 - core, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-            residual = ((free != 0) & (to_core > radius + 1.0)).astype(np.uint8)
-        else:
-            residual = free.copy()
-        extra_count, extra, stats, _ = cv2.connectedComponentsWithStats(residual, connectivity=4)
+        occupied = (cells >= 70).astype(np.uint8)
+        labels, directions, walls = partition_rooms(free, occupied, grid.resolution_m, self.doorway_width_m)
+        wall_evidence = cv2.dilate(occupied, np.ones((5, 5), dtype=np.uint8))
         minimum_cells = max(1, int(math.ceil(self.min_area_m2 / (grid.resolution_m ** 2))))
-        extra_ids = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= minimum_cells)
-        extra_ids = extra_ids[extra_ids != 0]
-        extra_replacement = np.zeros(extra_count, dtype=np.int32)
-        extra_replacement[extra_ids] = np.arange(count, count + len(extra_ids), dtype=np.int32)
-        added = extra_replacement[extra]
-        labels[added > 0] = added[added > 0]
-        count += len(extra_ids)
-        # 对没有任何种子的独立自由连通域单独保留，避免遗漏窄形环境。
-        component_count, components = cv2.connectedComponents(free, connectivity=4)
-        seeded = np.zeros(component_count, dtype=bool)
-        seeded[np.unique(components[labels > 0])] = True
-        missing = np.flatnonzero(~seeded)
-        missing = missing[missing != 0]
-        replacement = np.zeros(component_count, dtype=np.int32)
-        replacement[missing] = np.arange(count, count + len(missing), dtype=np.int32)
-        added = replacement[components]
-        labels[added > 0] = added[added > 0]
-        labels = self._expand(labels, free)
-        return self._spaces(labels, distance, grid.resolution_m, origin, grid, map_name, map_revision, minimum_cells, existing_spaces)
+        return self._spaces(labels, distance, cells, wall_evidence, directions, walls, origin,
+                            grid, map_name, map_revision, minimum_cells, existing_spaces)
 
-    @staticmethod
-    def _expand(labels, free):
-        """四邻接多源扩展只穿过真实自由格，不能横穿墙或未知区。"""
-        padded = np.pad(labels, 1)
-        available = np.pad((free != 0) & (labels == 0), 1).ravel()
-        flat = padded.ravel()
-        stride = padded.shape[1]
-        frontier = (labels > 0) & (cv2.dilate((labels == 0).astype(np.uint8), np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)) != 0)
-        ys, xs = np.nonzero(frontier)
-        initial = (ys + 1) * stride + xs + 1
-        queue = np.empty(free.size, dtype=np.int64)
-        tail = len(initial)
-        queue[:tail] = initial
-        head = 0
-        while head < tail:
-            cell = int(queue[head])
-            head += 1
-            for neighbor in (cell - stride, cell + stride, cell - 1, cell + 1):
-                if available[neighbor]:
-                    available[neighbor] = False
-                    flat[neighbor] = flat[cell]
-                    queue[tail] = neighbor
-                    tail += 1
-        return padded[1:-1, 1:-1].copy()
-
-    def _spaces(self, labels, distance, resolution, origin, grid, map_name, map_revision, minimum_cells, existing_spaces):
+    def _spaces(self, labels, distance, occupancy, wall_evidence, directions, walls, origin,
+                grid, map_name, map_revision, minimum_cells, existing_spaces):
+        resolution = grid.resolution_m
         flat = labels.ravel()
         order = np.argsort(flat, kind="stable")
         values, starts, sizes = np.unique(flat[order], return_index=True, return_counts=True)
@@ -254,20 +207,38 @@ class RoomSegmentationService:
         spaces = []
         label_to_space = {}
         boundary_work_cells = 0
+        pad = round(min(0.6, self.doorway_width_m / 2) / resolution)
         for value, start, size in zip(values, starts, sizes):
             if value == 0 or size < minimum_cells:
                 continue
             cells = order[start:start + size]
             ys, xs = np.divmod(cells, labels.shape[1])
             left, bottom, right, top = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-            boundary_work_cells += (right - left) * (top - bottom)
+            mask = labels[bottom:top, left:right] == value
+            x0, y0 = max(0, left - pad), max(0, bottom - pad)
+            x1, y1 = min(labels.shape[1], right + pad), min(labels.shape[0], top + pad)
+            boundary_work_cells += (x1 - x0) * (y1 - y0)
             if boundary_work_cells > self.max_cells * 8:
                 raise ValueError("区域轮廓计算超过处理预算。")
-            mask = labels[bottom:top, left:right] == value
-            rings = _cell_rings(mask, left, bottom)
-            outer = max(rings, key=_signed_area)
-            world_rings = [[list(_world(x, y, origin, resolution)) for x, y in ring] for ring in rings]
-            polygon = [Vector3(x=x, y=y, z=origin[2]) for x, y in world_rings[rings.index(outer)]]
+            local_occupancy = occupancy[y0:y1, x0:x1]
+            footprint = close_furniture(labels[y0:y1, x0:x1] == value, local_occupancy, pad)
+            rings = _cell_rings(footprint, x0, y0)
+            outer, arcs = regularize_ring(max(rings, key=_signed_area), directions, walls, resolution, wall_evidence)
+            polygon = [Vector3(x=x, y=y, z=origin[2]) for x, y in
+                       (_world(gx, gy, origin, resolution) for gx, gy in outer)]
+            excluded_holes = []
+            for ring in rings:
+                if _signed_area(ring) >= 0:
+                    continue
+                local_ring = np.asarray(ring, dtype=np.int32) - [x0, y0]
+                hx, hy, hw, hh = cv2.boundingRect(local_ring.astype(np.int32))
+                hole = np.s_[hy:hy + hh, hx:hx + hw]
+                interior = np.zeros(footprint[hole].shape, dtype=np.uint8)
+                cv2.fillPoly(interior, [(local_ring - [hx, hy]).astype(np.int32)], 1)
+                if np.any((interior != 0) & ~footprint[hole] & (local_occupancy[hole] <= 0)):
+                    excluded_holes.append([list(_world(x, y, origin, resolution)) for x, y in ring])
+            arc_geometry = [{"center": list(_world(*center, origin, resolution)), "radius_m": radius * resolution}
+                            for center, radius, _, _ in arcs]
             # 最大净空格是代表点，几何重心落进障碍或凹区时不拿它当采样位置。
             best = int(np.argmax(distance[ys, xs]))
             px, py = _world(float(xs[best]) + 0.5, float(ys[best]) + 0.5, origin, resolution)
@@ -282,13 +253,13 @@ class RoomSegmentationService:
                     min_corner=Vector3(x=min(p.x for p in polygon), y=min(p.y for p in polygon), z=origin[2] - 0.5),
                     max_corner=Vector3(x=max(p.x for p in polygon), y=max(p.y for p in polygon), z=origin[2] + 0.5),
                     area_m2=int(size) * resolution ** 2, confidence=0.0,
-                    metadata={_GEOMETRY_KEY: geometry, "holes": [ring for ring, local in zip(world_rings, rings) if _signed_area(local) < 0],
+                    metadata={_GEOMETRY_KEY: geometry, "holes": excluded_holes, "arcs": arc_geometry,
                               "centroid_kind": "free_cell_representative", "height_range_source": "slice_association_tolerance"}),
                 inspection_poses=[representative], primary_label=None, review_status=SceneSpaceReviewStatus.CANDIDATE,
                 metadata={**scope, "source": "room_segmentation", "map_revision": map_revision,
                           "geometry_only": True,
                           "navigation_reachability": "unverified", "inspection_pose_kind": "geometric_candidate",
-                          "semantic_reidentification_required": True, "segmentation_method": "clearance_seeds_free_space_growth"})
+                          "semantic_reidentification_required": True, "segmentation_method": "structural_wall_layout"})
             label_to_space[int(value)] = len(spaces)
             spaces.append(space)
         self._match_existing(spaces, labels, label_to_space, resolution, origin, scope, existing_spaces)

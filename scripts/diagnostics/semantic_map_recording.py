@@ -115,8 +115,8 @@ def verify_regions(regions, grid, trajectory):
         holes = boundary.metadata.get('holes', [])
         geometry_area = abs(ring_area(polygon)) - sum(abs(ring_area(hole)) for hole in holes)
         exact_area = count * grid.resolution_m ** 2
-        area_error = abs(geometry_area - exact_area)
-        area_ok = math.isclose(boundary.area_m2, exact_area, abs_tol=1e-7) and area_error < 1e-6
+        # 区域面积是精确自由格面积，结构轮廓可以覆盖家具占地。
+        area_ok = math.isclose(boundary.area_m2, exact_area, abs_tol=1e-7)
         area_mismatches += not area_ok
         representative_ok = pose_in_scene_space(boundary.centroid, region)
         invalid_representatives += not representative_ok
@@ -124,7 +124,7 @@ def verify_regions(regions, grid, trajectory):
         if not finite:
             issues.append({'region': number, 'issue': 'non_finite_polygon'})
         summaries.append({'number': number, 'id': region.scene_space_id, 'area_m2': exact_area,
-                          'polygon_area_error_m2': area_error, 'polygon_vertex_count': len(polygon),
+                          'polygon_area_m2': geometry_area, 'polygon_vertex_count': len(polygon),
                           'hole_count': len(holes), 'free_cell_count': count,
                           'representative': boundary.centroid.position.model_dump(),
                           'representative_inside': representative_ok,

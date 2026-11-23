@@ -126,7 +126,7 @@ export function mount(root, opts) {
       { label: '复制当前方案…', icon: 'copy', run: () => idle() && askName('复制方案', '复制「' + c.profile + '」已保存的设置。', '复制', name => profileOp('POST', 'config/profiles', { name, source: c.profile }, '已复制为「' + name + '」', name)) });
     if (c.profile !== c.selected_profile) items.push({ label: '设为运行方案…', icon: 'play', run: async () => {
       if (!idle()) return;
-      if (await confirmDialog({ title: '把「' + c.profile + '」设为运行方案', text: '业务服务会停止并按这个方案重新启动，正在执行的任务会被中断，网页连接会短暂断开。', confirmText: '切换并重启业务' }))
+      if (await confirmDialog({ title: '把「' + c.profile + '」设为运行方案', text: '业务服务会停止并按这个方案重新启动，正在执行的任务会被中断，网页连接会断开约 1 分钟后自动恢复。', confirmText: '切换并重启业务' }))
         profileOp('POST', 'config/activate', { name: c.profile }, '已切换运行方案，业务按「' + c.profile + '」重新启动', c.profile, 180000);
     } });
     items.push('-', { label: '删除方案…', icon: 'trash-2', danger: true, run: async () => {
@@ -148,7 +148,11 @@ export function mount(root, opts) {
       state.profile = next;
       await load();
       toast(message);
-    } catch (error) { toast('方案操作没有完成：' + error.message, { tone: 'bad', duration: 8000 }); }
+    } catch (error) {
+      // 经网关端口打开时，设为运行方案的请求里业务（连同网关）会被停止，连接中断是预期结果；之后由顶栏的断连与业务状态接手。
+      if (path === 'config/activate' && error.network) toast('业务正在按「' + payload.name + '」重新启动，网页连接会断开约 1 分钟后自动恢复', { tone: 'info', duration: 10000 });
+      else toast('方案操作没有完成：' + error.message, { tone: 'bad', duration: 8000 });
+    }
   }
 
   /* ---------- 读取 ---------- */
@@ -214,7 +218,7 @@ export function mount(root, opts) {
   function control(f) {
     const v = current(f);
     if (f.readonly) return h('div', { class: 'n-set-control' }, h('input', { class: 'n-input', value: inputText(f.value), disabled: true }),
-      h('span', { class: 'n-set-default n-set-readonly' }, f.key === 'gateway.port' ? '业务端口在“系统 › 管理选项”中修改' : '只读'));
+      h('span', { class: 'n-set-default n-set-readonly' }, f.key === 'gateway.port' ? '业务端口在首次安装时确定，网页里不能修改' : '只读'));
     if (f.type === 'bool') {
       const input = h('input', { type: 'checkbox', checked: v === 'true' });
       const lab = h('span', { class: 'n-meta' }, v === 'true' ? '开' : '关');

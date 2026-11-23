@@ -21,7 +21,8 @@ from scripts.neh_source import SourceError, source_allowed
 from .common import atomic_json, digest_file
 
 
-SOURCE_DIRECTORIES = ("scripts/device_manager", "scripts/module_installer")
+# web/shared 是控制台与管理服务恢复页共用的界面文件，管理包带一份副本。
+SOURCE_DIRECTORIES = ("scripts/device_manager", "scripts/module_installer", "web/shared")
 SOURCE_FILES = (
     "scripts/__init__.py", "core/config.py", "core/config_schema.toml", "core/robot_geometry.py",
     "contracts/pgo_options.py", "contracts/pgo_options.json", "contracts/pointlio_options.py", "contracts/pointlio_options.json", "scripts/import_legacy_config.py",
@@ -33,7 +34,7 @@ SOURCE_FILES = (
     "scripts/systemd/check_lcm_multicast.sh",
 )
 REQUIRED_FILES = (
-    "scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html",
+    "scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html", "scripts/device_manager/static/next.html",
     "scripts/device_manager/common.py", "scripts/device_manager/source_package.py",
     "scripts/module_installer/catalog.py", "scripts/module_installer/builds.py",
     "scripts/module_installer/manager.py", "core/config.py", "core/config_schema.toml", "scripts/neh_bootstrap.py",

@@ -174,14 +174,17 @@ class Streams:
                 LOGGER.exception("读取 Geometry 点云共享内存失败。")
 
     def apply_telemetry_settings(self, config):
+        was_enabled = self.platform.config.gateway.telemetry_enabled
         self._stop_telemetry()
         self.platform.config.gateway = config
-        if self._running:
+        # 性能监控保持关闭时，其他采集设置只更新配置。
+        if self._running and (was_enabled or config.telemetry_enabled):
             self._start_telemetry()
 
     def _start_telemetry(self):
         config = self.platform.config.gateway
         if not config.telemetry_enabled:
+            self.stream_bus.publish("system.metrics", source="telemetry", payload={"status": "disabled"})
             return
         from services.telemetry import SystemMetricsCollector
         collector = SystemMetricsCollector(keywords=config.telemetry_process_keywords,

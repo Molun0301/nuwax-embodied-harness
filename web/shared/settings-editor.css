@@ -1,0 +1,21 @@
+/* 共用设置编辑器（settings-editor.js）的补充样式；主体样式（n-settings、n-prop、n-set-*、n-savebar）在 neh-ui.css。
+   控制台设置页与恢复页设置页各自加载本文件。 */
+.n-set-colorrow { display: flex; gap: 6px; align-items: center; }
+.n-set-colorrow > .n-input, .n-set-colorrow > .n-input-group { flex: 1; min-width: 0; }
+.n-set-color { width: 32px; height: 32px; flex: none; padding: 2px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); cursor: pointer; }
+.n-set-colorrow .n-set-color { width: 28px; height: 28px; }
+
+/* 结构化参数逐项填写：占满一行，按算法分组 */
+.n-set-options { grid-column: 1 / -1; margin: 2px 0 6px; }
+.n-set-options > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; height: 28px; color: var(--accent-ink); font-size: var(--fs-12); font-weight: 500; }
+.n-set-options > summary::-webkit-details-marker { display: none; }
+.n-set-options > summary .n-icon { width: 14px; height: 14px; transition: transform .15s; }
+.n-set-options[open] > summary .n-icon { transform: rotate(90deg); }
+.n-set-options-group { display: grid; gap: 8px; padding: 10px 0 4px; }
+.n-set-options-group + .n-set-options-group { border-top: 1px dashed var(--line); }
+.n-set-options-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px 20px; }
+
+/* 板块、子类标题栏的开关：保存失败时在开关旁写出原因 */
+.n-set-switch { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.n-set-switch-err { color: var(--bad); font-size: var(--fs-12); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.n-savebar .n-set-save-err { color: #FF9C8F; }

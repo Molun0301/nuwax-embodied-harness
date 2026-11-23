@@ -1,10 +1,23 @@
-/* 系统页（车道 P 实现）。本批只占位，挂载约定见 shell.js：mount(root, ctx) 返回 {show(sub, opts), hide()}。 */
-import { icon, h } from '/static/shared/neh-ui.js';
+/* 系统页：挂载共用系统页模块（web/shared/system-pages.js），恢复页挂载同一模块。
+   服务进程表取外壳已有的数据：组件来自 /api/health 的监督者组件表（store.services），处理器与内存按进程号取 system.metrics。 */
+import { mountSystem, managerRequest } from '/static/shared/system-pages.js';
 
-export function mount(root) {
-  root.append(h('div', { class: 'n-page--full' },
-    h('div', { class: 'n-toolbar' }, h('h1', {}, '系统')),
-    h('div', { class: 'n-page-body' }, h('div', { class: 'n-empty', html: icon('server') },
-      h('div', { class: 'n-empty-title' }, '系统页在下一批实现'), h('div', {}, '业务状态与启停、服务、版本更新与回退、功能模块、安装与更新记录。')))));
-  return { show() {}, hide() {} };
+export function mount(root, ctx) {
+  ctx.loadCss('/static/shared/system-pages.css');
+  let processes = ctx.stream.latest('system.metrics')?.payload?.processes || [];
+  const page = mountSystem(root, {
+    mode: 'console',
+    request: managerRequest,
+    openSettings: panel => ctx.go('settings', panel || ''),
+    openLogs: () => ctx.go('logs'),
+    services(push) {
+      const send = () => push({ components: ctx.store.get().services, processes, telemetry: ctx.store.get().metrics.status });
+      ctx.stream.on('system.metrics', frame => { processes = frame.payload?.processes || []; send(); });
+      ctx.store.subscribe(['services', 'metrics'], send);
+      send();
+    },
+    // 驱动、定位执行链与控制方式来自控制台已读到的数据。
+    device: () => [['控制方式', ctx.store.get().robot.controlMode || '未知'], ['定位执行链', window.__NUWAX_GEOMETRY_PIPELINE__ || '未知']],
+  });
+  return { show() { page.show(); }, hide() { page.hide(); } };
 }

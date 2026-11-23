@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEH 设备管理</title>
+<meta name="description" content="Nuwax Embodied Harness（NEH，具身运行框架）设备管理：业务启停、版本更新与回退、功能模块、设置与首次安装。">
+<!-- 主题在首屏绘制前写入，存储键与控制台相同（nuwax-theme）。 -->
+<script>
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('nuwax-theme'); } catch (e) { saved = null; }
+    document.documentElement.dataset.theme = saved || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  })();
+</script>
+<link rel="stylesheet" href="/manager-assets/shared/neh-fonts.css">
+<link rel="stylesheet" href="/manager-assets/shared/neh-ui.css">
+<link rel="stylesheet" href="/manager-assets/shared/system-pages.css">
+<link rel="stylesheet" href="/manager-assets/shared/settings-editor.css">
+<link rel="stylesheet" href="/manager-assets/recovery.css">
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="/manager-assets/recovery.js"></script>
+</body>
+</html>

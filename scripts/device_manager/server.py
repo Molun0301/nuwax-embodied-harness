@@ -15,7 +15,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import MANAGER_DEVELOPMENT, MANAGER_VERSION
+from . import MANAGER_DEVELOPMENT, MANAGER_VERSION, PACKAGE_ROOT
 from .auth import Authentication
 from .common import ManagerError, atomic_json, process_identity, read_json
 
@@ -47,6 +47,8 @@ class ManagerServer(ThreadingHTTPServer):
         self._engine = engine
         self.authentication = Authentication(engine)
         self.static_root = Path(static_root or Path(__file__).parent / "static").resolve()
+        # 与控制台共用的界面文件（设计系统、设置编辑器、系统页模块）；管理包带一份副本，挂在 /manager-assets/shared/。
+        self.shared_root = (PACKAGE_ROOT / "web/shared").resolve()
         self.sessions, self.attempts = {}, {}
         self.session_lock = threading.Lock()
         self.bind_host = address[0].lower()
@@ -281,12 +283,21 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path
             if path.startswith("/api/manager/"):
                 self._manager(path[len("/api/manager/" ):], urllib.parse.parse_qs(parsed.query))
-            elif path in ("/", "/index.html", "/app.css", "/app.js") or path.startswith("/manager-assets/"):
+            elif path in ("/", "/index.html", "/app.css", "/app.js", "/next") or path.startswith("/manager-assets/"):
                 if self.command not in ("GET", "HEAD"):
                     raise ManagerError("method_not_allowed", "不支持的请求方法。", 405)
-                filename = "index.html" if path == "/" else path[len("/manager-assets/"): ] if path.startswith("/manager-assets/") else path[1:]
-                target = (self.server.static_root / urllib.parse.unquote(filename)).resolve()
-                if self.server.static_root not in target.parents or not target.is_file():
+                if path == "/next" and self._business_ready():
+                    self._redirect("/console-next")
+                    return
+                root = self.server.static_root
+                if path == "/next":
+                    filename = "next.html"
+                elif path.startswith("/manager-assets/shared/"):
+                    root, filename = self.server.shared_root, path[len("/manager-assets/shared/"):]
+                else:
+                    filename = "index.html" if path == "/" else path[len("/manager-assets/"): ] if path.startswith("/manager-assets/") else path[1:]
+                target = (root / urllib.parse.unquote(filename)).resolve()
+                if root not in target.parents or not target.is_file():
                     raise ManagerError("not_found", "页面资源不存在。", 404)
                 self._send(200, target.read_bytes(), mimetypes.guess_type(str(target))[0] or "application/octet-stream")
             else:
@@ -309,6 +320,21 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         except Exception:
             self._send(500, {"error": {"code": "internal_error", "message": "管理请求失败，请查看设备本地状态。"}})
+
+    def _business_ready(self):
+        """统一入口：业务在运行、网关就绪、且本会话能打开控制台时进控制台；否则留在恢复页（未登录时由恢复页要求密码）。"""
+        runtime = self.server.engine.runtime.status()
+        if not (runtime["running"] and runtime["healthy"]):
+            return False
+        _, session = self._session()
+        return not self.server.authentication.enabled() or bool(session and session["authenticated"])
+
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def _manager(self, path, query):
         engine, auth = self.server.engine, self.server.authentication

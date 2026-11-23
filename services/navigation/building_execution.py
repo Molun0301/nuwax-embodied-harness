@@ -179,6 +179,7 @@ def navigate_to_floor(platform, ctx, args, *, navigate):
     topology = building(platform, args["building_id"])
     source = current_floor(platform, topology)
     target = floor(topology, args.get("floor_id", source.floor_id))
+    ctx.progress(0.0, "running", "任务正在执行。", target_label=target.floor_id)
     route = transfer(platform, ctx, topology, target, args["motion_generation"], navigate=navigate)
     localized = load_floor(platform, ctx, target) if not route else None
     ctx.progress(0.0, "navigating_final", "前往目标楼层内的目标位姿。", floor_id=target.floor_id)

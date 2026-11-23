@@ -84,8 +84,15 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
                 LOGGER.exception("取消导航目标失败：%s", goal_id)
 
 
+def _navigate_to_pose_task(platform, ctx, args):
+    ctx.progress(0.0, "running", "任务正在执行。",
+                 target_label=f"坐标 ({args['x']:.1f}, {args['y']:.1f})")
+    return navigate_to_pose(platform, ctx, args)
+
+
 @rpc_errors
 def navigate_to_place(platform, ctx, args):
+    ctx.progress(0.0, "running", "任务正在执行。", target_label=args["query_text"])
     state = platform.geometry_state.snapshot()
     reference = platform.maps.read_meta(state.map_name).get("georeference")
     if reference is None:
@@ -595,6 +602,7 @@ def explore_and_find_target(platform, ctx, args):
 @rpc_errors
 def navigate_to_named_location(platform, ctx, args):
     """命名地点沿用普通导航，并共享连拍复核、记录、写回和失败降权。"""
+    ctx.progress(0.0, "running", "任务正在执行。", target_label=args["target_name"])
     target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
     pose = target.pose
     navigation = navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
@@ -642,7 +650,7 @@ CAPABILITIES = [
                                       "description": "指定朝向时允许的偏航误差（弧度）。留空时为 0.3 弧度。"},
                 "allow_reverse": {"type": "boolean", "description": "是否允许倒车。留空时沿用导航配置。"},
                 "timeout_sec": TIMEOUT}, ("x", "y")),
-        "task", navigate_to_pose, needs=("nav_stack", "geometry"), motion=True),
+        "task", _navigate_to_pose_task, needs=("nav_stack", "geometry"), motion=True),
     Capability("navigate_to_place", "通过开放街道地图地名查找并导航。",
         schema({"query_text": {"type": "string", "minLength": 1, "description": "要检索的地名或地址。"},
                 "timeout_sec": TIMEOUT}, ("query_text",)),

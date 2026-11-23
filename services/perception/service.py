@@ -55,7 +55,8 @@ from services.perception.trackers import Basic2DTrackerBackend
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
 _INPUT_LOG_LIMITER = LogRateLimiter()
-_POINT_CLOUD_CACHE_FRAMES = 10
+# 15 帧/秒约保留 1.3 秒，覆盖合并窗口并为后台补几何预留时间。
+_POINT_CLOUD_CACHE_FRAMES = 20
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -1525,7 +1526,7 @@ class PerceptionService:
         return transforms
 
     def _cache_point_cloud(self, frame):
-        """使用方只留采集时刻最新的十帧，不改变总线快照保留规则。"""
+        """按采集时刻保留最新点云，供后台补几何使用。"""
         with self._point_cloud_lock:
             frames = sorted((*self._point_cloud_frames, frame), key=lambda item: _stamp(item.payload, item.payload.metadata))
             self._point_cloud_frames = tuple(frames[-_POINT_CLOUD_CACHE_FRAMES:])

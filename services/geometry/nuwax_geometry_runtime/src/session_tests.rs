@@ -156,7 +156,7 @@ async fn correction_stop_reason_is_forwarded_without_changing_mapping_phase() {
 #[tokio::test]
 async fn frame_tree_edges_share_timestamp_during_concurrent_pose_updates() {
     let mapper = Mapper::start(714, MapperConfig::default()).unwrap();
-    let (session, poses, _) = test_output_session(mapper.clone());
+    let (session, poses, ..) = test_output_session(mapper.clone());
     poses.send_replace(Some(pose_from_isometry(
         nalgebra::Isometry3::identity(), "map", 1,
     )));

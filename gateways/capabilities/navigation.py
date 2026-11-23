@@ -9,7 +9,7 @@ import time
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
 
-from contracts.spatial_memory import NavigationCandidate
+from contracts.spatial_memory import NavigationCandidate, SceneSpace
 from core import components
 from core.capability import Capability
 from core.errors import GatewayError
@@ -68,10 +68,11 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
             if navigation.status in {GoalStatus.CANCELLED, GoalStatus.REPLACED, GoalStatus.STOPPED}:
                 finished = True
                 raise Cancelled(navigation.message or "导航已被取消或更新的命令停止")
-            if (region is not None and navigation.no_feasible_path
+            if (region is not None and (navigation.status == GoalStatus.FAILED or navigation.no_feasible_path)
                     and platform.navigation_memory.contains(region, platform.geometry_state.pose())):
                 finished = True
-                platform.geometry.cancel_goal(goal_id, timeout_sec=ctx.remaining())
+                if not navigation.status.terminal:
+                    platform.geometry.cancel_goal(goal_id, timeout_sec=ctx.remaining())
                 return {"goal_id": goal_id, "arrival": "region"}
             if navigation.status == GoalStatus.FAILED:
                 finished = True
@@ -594,7 +595,7 @@ def explore_and_find_target(platform, ctx, args):
 
 @rpc_errors
 def navigate_to_named_location(platform, ctx, args):
-    """命名地点沿用普通导航，并共享连拍复核、记录、写回和失败降权。"""
+    """按名导航，场景空间按位姿核对，其他目标按画面核对。"""
     target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
     pose = target.pose
     navigation = navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
@@ -603,6 +604,13 @@ def navigate_to_named_location(platform, ctx, args):
         region=target.region)
     if not args.get("verify_on_arrival", True):
         return {**navigation, "target_name": target.target_name}
+    if isinstance(target.candidate, SceneSpace):
+        verified = platform.navigation_memory.contains(target.candidate, platform.geometry_state.pose())
+        verification = {"verified": verified, "method": "inside_region"}
+        if not verified:
+            raise GatewayError("当前位置不在目标区域内", error_code="arrival_verification_failed",
+                http_status=409, details=verification)
+        return {**navigation, "target_name": target.target_name, "verification": verification}
     search = _TargetSearch(platform, ctx, {**args, "query": target.target_name}, "navigate_to_named_location")
     with search.acquired():
         try:

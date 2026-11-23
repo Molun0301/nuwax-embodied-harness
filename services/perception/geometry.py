@@ -15,6 +15,13 @@ from services.perception.self_body import SelfBodyRegion, is_self_body
 from services.perception.support_points import select_object_support
 
 
+def _projection_degraded(detections, metadata, reason):
+    key = "geometry_projection_degradation_reason"
+    detections = tuple(item.model_copy(update={"attributes": {**item.attributes, key: reason}})
+                       for item in detections)
+    return detections, {**metadata, key: reason}
+
+
 class DetectionGeometryAugmentor:
     """基于点云为二维检测结果补充几何样本。"""
 
@@ -64,9 +71,9 @@ class DetectionGeometryAugmentor:
         }
         calibration_reason = self._camera_geometry_error(image_frame, camera_info)
         if calibration_reason:
-            return detections_2d, {**metadata, "geometry_projection_degradation_reason": calibration_reason}
+            return _projection_degraded(detections_2d, metadata, calibration_reason)
         if point_cloud is None or (not point_cloud.points and point_cloud.points_xyz_array is None):
-            return detections_2d, {**metadata, "geometry_projection_degradation_reason": "point_cloud_unavailable"}
+            return _projection_degraded(detections_2d, metadata, "point_cloud_unavailable")
 
         image_ts = image_frame.timestamp
         cloud_ts = point_cloud.timestamp
@@ -88,7 +95,7 @@ class DetectionGeometryAugmentor:
             map_frame_id=str(current_pose.frame_id or "").strip() or None if current_pose is not None else None,
         )
         if prepared is None:
-            return detections_2d, {**metadata, "geometry_projection_degradation_reason": "no_projectable_points"}
+            return _projection_degraded(detections_2d, metadata, "no_projectable_points")
 
         projected_pixels, camera_points, map_points, map_frame_id = prepared
         if self._self_region_applies(self_region, image_frame):

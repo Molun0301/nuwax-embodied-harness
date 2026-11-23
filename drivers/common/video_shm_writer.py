@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 import struct
 import threading
-import time
 from typing import Union
 import uuid
+
+from core.clock import source_now_ns
 
 
 SHM_MAGIC = 0x4E55_5741_5856_4944
@@ -43,9 +44,10 @@ class VideoShmWriter:
             # 序号为零时读取方不采用；写完后一次发布新的非零序号。
             struct.pack_into("<Q", self._mm, 16, 0)
             self._mm[offset : offset + len(jpeg_data)] = jpeg_data
+            # 视频帧与雷达点云、定位位姿使用同一来源时钟。
             struct.pack_into(
                 "<IHHQI", self._mm, 24,
-                len(jpeg_data), width, height, time.time_ns(), active_buffer,
+                len(jpeg_data), width, height, source_now_ns(), active_buffer,
             )
             struct.pack_into("<Q", self._mm, 16, sequence)
             self._sequence = sequence

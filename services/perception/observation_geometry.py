@@ -1,6 +1,7 @@
 """用各帧的来源时间配准拍照前后的几何输入。"""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from typing import Optional
 
 import numpy as np
 
@@ -104,19 +105,14 @@ def _pose_at_source_time(samples, stamp):
     return None
 
 
-def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, point_cloud_frames=None):
-    """插值图像位姿，并把窗口内的雷达扫描逐帧配准后合并。"""
-    if stream_bus is None:
-        return ObservationGeometry(reason="geometry_stream_unavailable")
-    stamp = _stamp(image_frame, image_frame.metadata)
-    clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
-    frames = stream_bus.replay(topics=("localization.pose", "pointcloud.frame"))
-    if point_cloud_frames is not None:
-        frames = tuple(frame for frame in frames if frame.topic == "localization.pose") + tuple(point_cloud_frames)
-    pose_samples = sorted(((_stamp(f.payload, f.metadata), contract_pose(f.payload)) for f in frames
-                           if f.topic == "localization.pose" and (map_name is None or f.metadata.get("map_name") == map_name)),
-                          key=lambda item: item[0])
-    pose = _pose_at_source_time(pose_samples, stamp)
+def _pose_samples(frames, map_name):
+    return tuple(sorted(((_stamp(f.payload, f.metadata), contract_pose(f.payload)) for f in frames
+                         if f.topic == "localization.pose" and (map_name is None or f.metadata.get("map_name") == map_name)),
+                        key=lambda item: item[0]))
+
+
+def _capture_reference(image_frame, transforms, pose_samples):
+    pose = _pose_at_source_time(pose_samples, _stamp(image_frame, image_frame.metadata))
     if pose is None:
         return ObservationGeometry(message="图像时刻的位姿不可用")
     pose = pose.model_copy(update={"timestamp": image_frame.timestamp})
@@ -136,7 +132,12 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
         static.append(Transform(parent_frame_id=base, child_frame_id=body,
                                 timestamp=camera_edge.timestamp, authority="calibration_static"))
     tree = _pose_tree(pose, base, static)
-    scans = []
+    return ObservationGeometry(pose, tree, reason="")
+
+
+def _matching_clouds(image_frame, frames, map_frame_id, map_name):
+    stamp = _stamp(image_frame, image_frame.metadata)
+    clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
     for frame in frames:
         cloud = frame.payload
         if frame.topic != "pointcloud.frame" or not isinstance(cloud, PointCloudFrame):
@@ -144,10 +145,9 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
         metadata = cloud.metadata
         if map_name is not None and frame.metadata.get("map_name") != map_name:
             continue
-        map_cloud = cloud.frame_id == pose.frame_id and not metadata.get("canonical_lidar_frame")
+        map_cloud = cloud.frame_id == map_frame_id and not metadata.get("canonical_lidar_frame")
         if clock and metadata.get("clock_id") != clock and not map_cloud:
             continue
-        sample = metadata.get("canonical_lidar_frame")
         cloud_stamp = _stamp(cloud, metadata)
         if map_cloud:
             # 地图系点已完成坐标注册；复用本地图最近的既有点云，不重复搬动它。
@@ -155,6 +155,73 @@ def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, p
                 continue
         elif abs(cloud_stamp-stamp) > _POINT_CLOUD_MERGE_WINDOW_NS:
             continue
+        yield cloud_stamp, cloud, map_cloud
+
+
+@dataclass(frozen=True)
+class GeometryCapture:
+    """同一图像的原始测量快照，投影线程只消费封存的输入。"""
+
+    reference: ObservationGeometry
+    pose_samples: tuple
+    clouds: tuple
+    map_name: Optional[str]
+
+    @classmethod
+    def before_detection(cls, stream_bus, image_frame, transforms, map_name, point_cloud_frames):
+        if stream_bus is None:
+            return cls(ObservationGeometry(reason="geometry_stream_unavailable"), (), (), map_name)
+        poses = _pose_samples(stream_bus.replay(topics=("localization.pose",)), map_name)
+        reference = _capture_reference(image_frame, transforms, poses)
+        if reference.frame_tree is None:
+            return cls(reference, poses, (), map_name)
+        stamp = _stamp(image_frame, image_frame.metadata)
+        clouds = tuple(row for row in _matching_clouds(image_frame, point_cloud_frames, reference.pose.frame_id, map_name)
+                       if row[0] <= stamp)
+        return cls(reference, poses, clouds, map_name)
+
+    def after_detection(self, stream_bus, image_frame, point_cloud_frames):
+        if self.reference.frame_tree is None:
+            return self
+        stamp = _stamp(image_frame, image_frame.metadata)
+        clouds = tuple(row for row in _matching_clouds(image_frame, point_cloud_frames,
+                                                        self.reference.pose.frame_id, self.map_name)
+                       if row[0] > stamp)
+        poses = dict(self.pose_samples)
+        for time, pose in _pose_samples(stream_bus.replay(topics=("localization.pose",)), self.map_name):
+            if time > stamp:
+                poses[time] = pose
+        return replace(self, pose_samples=tuple(sorted(poses.items())), clouds=self.clouds + clouds)
+
+    def project(self, image_frame):
+        return _project_geometry(image_frame, self.reference, self.pose_samples, self.clouds)
+
+
+def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, point_cloud_frames=None):
+    """用同一份可用帧重建几何，供独立配对调用使用。"""
+    if stream_bus is None:
+        return ObservationGeometry(reason="geometry_stream_unavailable")
+    frames = stream_bus.replay(topics=("localization.pose", "pointcloud.frame"))
+    poses = _pose_samples(frames, map_name)
+    reference = _capture_reference(image_frame, transforms, poses)
+    if reference.frame_tree is None:
+        return reference
+    clouds = _matching_clouds(image_frame, frames if point_cloud_frames is None else point_cloud_frames,
+                              reference.pose.frame_id, map_name)
+    return _project_geometry(image_frame, reference, poses, clouds)
+
+
+def _project_geometry(image_frame, reference, pose_samples, clouds):
+    if reference.frame_tree is None:
+        return reference
+    pose, tree = reference.pose, reference.frame_tree
+    base = tree.transforms[0].child_frame_id
+    static = tree.transforms[1:]
+    stamp = _stamp(image_frame, image_frame.metadata)
+    clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
+    scans = []
+    for cloud_stamp, cloud, map_cloud in clouds:
+        sample = cloud.metadata.get("canonical_lidar_frame")
         points = cloud.points_xyz_array
         if points is None:
             points = np.asarray([[p.x, p.y, p.z] for p in cloud.points], dtype=np.float64)

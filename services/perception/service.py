@@ -44,7 +44,7 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import ObservationGeometry, capture_geometry, contract_pose, _stamp
+from services.perception.observation_geometry import GeometryCapture, contract_pose, _stamp
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -185,22 +185,22 @@ class PerceptionService:
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
         with self._operation(), self.point_cloud_consumer():
+            capture = self._begin_geometry_capture(image_frame) if camera_info is not None else None
             return self._run_full_pipeline(
-                image_frame, camera_info, image_artifact=image_artifact,
+                image_frame, camera_info, capture=capture, image_artifact=image_artifact,
                 requested_by=requested_by, detector_backend_name=detector_backend_name,
                 source_name=source_name, detection_metadata=detection_metadata,
                 open_vocabulary_classes=open_vocabulary_classes,
             )
 
-    def _run_full_pipeline(self, image_frame, camera_info=None, **kwargs):
+    def _run_full_pipeline(self, image_frame, camera_info, *, capture, **kwargs):
         requested_at = perf_counter()
-        cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame) if camera_info is not None else None
         with self._full_pipeline_lock:
             with self._context_condition:
                 self._ensure_open()
             acquired_at = perf_counter()
             context, scene_publication = self._process_image_locked(
-                image_frame, camera_info, cached_geometry_inputs=cached_geometry_inputs,
+                image_frame, camera_info, capture=capture,
                 lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
             )
         # 场景事件在完整分析锁内预留顺序；同步订阅不延长模型串行区。
@@ -232,7 +232,7 @@ class PerceptionService:
         image_frame,
         camera_info=None,
         *,
-        cached_geometry_inputs,
+        capture,
         image_artifact=None,
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
@@ -280,10 +280,12 @@ class PerceptionService:
                 detector_spec.backend_kind,
                 detection_bundle.metadata,
             )
+            if capture is not None:
+                capture = self._seal_geometry_capture(image_frame, capture)
             stage_started_at = perf_counter()
             detection_bundle = self._apply_self_body_filter(
                 detection_bundle, image_frame=image_frame, camera_info=camera_info,
-                frame_tree=cached_geometry_inputs[1] if cached_geometry_inputs is not None else None,
+                frame_tree=capture.reference.frame_tree if capture is not None else None,
             )
             stage_duration_ms["self_body"] = self._elapsed_ms(stage_started_at)
 
@@ -317,6 +319,7 @@ class PerceptionService:
         )
 
         stage_started_at = perf_counter()
+        cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame, capture) if capture is not None else None
         detection_bundle = self._augment_detection_geometry(
             detection_bundle,
             image_frame=image_frame,
@@ -505,6 +508,7 @@ class PerceptionService:
                 },
             )
         camera_info = self._camera_info_from_video_frame(image_frame)
+        capture = self._begin_geometry_capture(image_frame) if camera_info is not None else None
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
             image_frame,
@@ -519,6 +523,7 @@ class PerceptionService:
         return self._run_full_pipeline(
             image_frame,
             camera_info,
+            capture=capture,
             image_artifact=image_artifact,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
@@ -544,7 +549,7 @@ class PerceptionService:
         三角测量观测跟随 YOLO 节奏。
         """
 
-        with self._operation():
+        with self._operation(), self.point_cloud_consumer():
             return self._detect_current_frame_fast(
                 camera_id=camera_id, requested_by=requested_by,
                 detector_backend_name=detector_backend_name, detection_metadata=detection_metadata,
@@ -569,14 +574,16 @@ class PerceptionService:
                 },
             )
         camera_info = self._camera_info_from_video_frame(image_frame)
+        capture = self._begin_geometry_capture(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
             image_frame,
             source_name=source_name,
         )
-        return self.process_image_fast(
+        return self._process_image_fast(
             image_frame,
             camera_info,
+            capture=capture,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=source_name,
@@ -599,33 +606,29 @@ class PerceptionService:
 
         from contracts.image import CameraInfo, ImageFrame
 
-        with self._operation():
+        with self._operation(), self.point_cloud_consumer():
             if not isinstance(image_frame, ImageFrame):
                 raise TypeError("PerceptionService.process_image_fast 仅接受标准 ImageFrame。")
             if camera_info is not None and not isinstance(camera_info, CameraInfo):
                 raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
-            # 固定原图像对应的几何，检测占用时间不再影响点云配对。
-            geometry = self._capture_geometry(image_frame)
-            # vis-three-fixes AC2.4a：同上 process_image，记录 pipeline_lock_wait_ms。
-            requested_at = perf_counter()
-            with self._pipeline_lock:
-                with self._context_condition:
-                    self._ensure_open()
-                acquired_at = perf_counter()
-                context, overlay_publication = self._process_image_fast_locked(
-                    image_frame,
-                    camera_info,
-                    requested_by=requested_by,
-                    detector_backend_name=detector_backend_name,
-                    source_name=source_name,
-                    detection_metadata=detection_metadata,
-                    open_vocabulary_classes=open_vocabulary_classes,
-                    geometry=geometry,
-                    lock_wait_ms=(acquired_at - requested_at) * 1000.0,
-                )
-            if overlay_publication is not None:
-                self._stream_bus.dispatch_prepared(overlay_publication)
-            return context
+            return self._process_image_fast(
+                image_frame, camera_info, capture=self._begin_geometry_capture(image_frame),
+                requested_by=requested_by, detector_backend_name=detector_backend_name, source_name=source_name,
+                detection_metadata=detection_metadata, open_vocabulary_classes=open_vocabulary_classes,
+            )
+
+    def _process_image_fast(self, image_frame, camera_info, *, capture, **kwargs):
+        requested_at = perf_counter()
+        with self._pipeline_lock:
+            with self._context_condition:
+                self._ensure_open()
+            context, overlay_publication = self._process_image_fast_locked(
+                image_frame, camera_info, capture=capture,
+                lock_wait_ms=(perf_counter() - requested_at) * 1000.0, **kwargs,
+            )
+        if overlay_publication is not None:
+            self._stream_bus.dispatch_prepared(overlay_publication)
+        return context
 
     def _process_image_fast_locked(
         self,
@@ -637,7 +640,7 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
-        geometry: ObservationGeometry,
+        capture: GeometryCapture,
         lock_wait_ms: Optional[float] = None,
     ) -> Tuple[PerceptionContext, Optional[PreparedStreamPublication]]:
         """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
@@ -679,6 +682,7 @@ class PerceptionService:
             detector_spec.backend_kind,
             detection_bundle.metadata,
         )
+        capture = self._seal_geometry_capture(image_frame, capture)
         stage_started_at = perf_counter()
         detection_bundle = self._apply_self_body_filter(
             detection_bundle, image_frame=image_frame, camera_info=camera_info, frame_tree=None,
@@ -790,7 +794,7 @@ class PerceptionService:
             self._fast_frame_cache[context.camera_id] = (
                 source_frame, input_signature if cacheable else None, cache_key, context,
                 image_frame.model_copy(deep=True), camera_info.model_copy(deep=True) if camera_info is not None else None,
-                geometry)
+                capture)
             if len(self._fast_frame_cache) > 8:
                 self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
         return context, self._prepare_detection_overlay_frame(context)
@@ -816,9 +820,10 @@ class PerceptionService:
         """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
         if inputs is None:
             return context, None, None
-        image_frame, camera_info, geometry = inputs
+        image_frame, camera_info, capture = inputs
         if stop_event is not None and stop_event.is_set():
             return context, None, None
+        geometry = self._capture_geometry(image_frame, capture)
         if camera_info is None:
             detections = tuple(context.observation.detections_2d)
             metadata = {"geometry_projection_degradation_reason": "camera_info_missing"}
@@ -1531,19 +1536,30 @@ class PerceptionService:
             frames = sorted((*self._point_cloud_frames, frame), key=lambda item: _stamp(item.payload, item.payload.metadata))
             self._point_cloud_frames = tuple(frames[-_POINT_CLOUD_CACHE_FRAMES:])
 
-    def _capture_geometry(self, image_frame):
+    def _begin_geometry_capture(self, image_frame):
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
-        transforms = () if snapshot is None else self._geometry_transforms()
         with self._point_cloud_lock:
             cloud_frames = self._point_cloud_frames
-        geometry = capture_geometry(self._stream_bus, image_frame, transforms=transforms,
-            map_name=None if snapshot is None else snapshot.map_name, point_cloud_frames=cloud_frames)
-        self._frame_tree = geometry.frame_tree
-        return geometry
+        transforms = () if snapshot is None else self._geometry_transforms()
+        capture = GeometryCapture.before_detection(self._stream_bus, image_frame, transforms,
+            None if snapshot is None else snapshot.map_name, cloud_frames)
+        self._frame_tree = capture.reference.frame_tree
+        return capture
 
-    def _capture_cached_geometry_inputs(self, image_frame):
-        """单次完整识别在模型等待前保留已有几何输入。"""
-        geometry = self._capture_geometry(image_frame)
+    def _seal_geometry_capture(self, image_frame, capture):
+        with self._point_cloud_lock:
+            cloud_frames = self._point_cloud_frames
+        return capture.after_detection(self._stream_bus, image_frame, cloud_frames)
+
+    def _capture_geometry(self, image_frame, capture=None):
+        """投影已封存的几何，或直接配对当前可用的帧。"""
+        if capture is None:
+            capture = self._begin_geometry_capture(image_frame)
+            capture = self._seal_geometry_capture(image_frame, capture)
+        return capture.project(image_frame)
+
+    def _capture_cached_geometry_inputs(self, image_frame, capture=None):
+        geometry = self._capture_geometry(image_frame, capture)
         return geometry.point_cloud, geometry.frame_tree, geometry.pose
 
     def self_body_filter_status(self) -> Dict[str, Any]:
@@ -1586,11 +1602,9 @@ class PerceptionService:
                 },
             )
 
-        if cached_geometry_inputs is not None:
-            point_cloud_frame, frame_tree, current_pose = cached_geometry_inputs
-        else:
-            geometry = self._capture_geometry(image_frame)
-            point_cloud_frame, frame_tree, current_pose = geometry.point_cloud, geometry.frame_tree, geometry.pose
+        if cached_geometry_inputs is None:
+            cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame)
+        point_cloud_frame, frame_tree, current_pose = cached_geometry_inputs
 
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,

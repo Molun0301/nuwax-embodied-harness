@@ -46,6 +46,8 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
         "/api/health",
         "/api/tasks",
         "/api/memory/instances",
+        "/api/perception/runtime",
+        "/api/manager/status",
         "/mcp",
         "/api/logs",
         "/console",
@@ -75,12 +77,17 @@ def _resolve_client_host(request: Request) -> str:
     return "-"
 
 
-def _should_rate_limit_http_request(path: str, status_code: int, duration_ms: float) -> bool:
+def _should_rate_limit_http_request(path: str, status_code: int, duration_ms: float, *, method: str = "GET") -> bool:
     if status_code >= 400:
         return False
     if duration_ms >= _HTTP_SLOW_REQUEST_THRESHOLD_MS:
         return False
-    return path in _LOW_VALUE_HTTP_PATHS or any(path.startswith(prefix) for prefix in _LOW_VALUE_HTTP_PREFIXES)
+    # 更新页定时轮询管理设置和任务详情，这两类路径仅将读取请求按低价值记录。
+    return (
+        path in _LOW_VALUE_HTTP_PATHS
+        or any(path.startswith(prefix) for prefix in _LOW_VALUE_HTTP_PREFIXES)
+        or (method == "GET" and (path == "/api/manager/settings" or path.rpartition("/")[0] == "/api/manager/jobs"))
+    )
 
 
 class RequestLoggingMiddleware:
@@ -160,7 +167,7 @@ class RequestLoggingMiddleware:
                     if (
                         (waiting_for_video or manager_probe_absent)
                         and duration_ms < _HTTP_SLOW_REQUEST_THRESHOLD_MS
-                    ) or _should_rate_limit_http_request(path, status_code, duration_ms):
+                    ) or _should_rate_limit_http_request(path, status_code, duration_ms, method=method):
                         extra["low_value_request"] = True
                         extra["slow_request_threshold_ms"] = _HTTP_SLOW_REQUEST_THRESHOLD_MS
                         self._request_log_limiter.log(

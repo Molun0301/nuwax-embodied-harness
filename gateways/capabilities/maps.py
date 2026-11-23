@@ -141,49 +141,60 @@ def georeference_schema():
             "schema_version": {
                 "type": "integer",
                 "const": MAP_GEOREFERENCE_SCHEMA_VERSION,
+                "description": "地理参考的格式版本，固定为 1。",
             },
-            "map_name": {"type": "string", "minLength": 1},
-            "map_frame_id": {"type": "string", "minLength": 1},
-            "source_crs": {"type": "string", "const": MAP_GEOREFERENCE_SOURCE_CRS},
+            "map_name": {"type": "string", "minLength": 1, "description": "地理参考所属的地图名称。"},
+            "map_frame_id": {"type": "string", "minLength": 1, "description": "右手系且 Z 轴向上的地图坐标系标识。"},
+            "source_crs": {"type": "string", "const": MAP_GEOREFERENCE_SOURCE_CRS,
+                           "description": "经纬度坐标参考系，固定为 EPSG:4326。"},
             "projected_crs": {
                 "type": "string",
                 "const": MAP_GEOREFERENCE_PROJECTED_CRS,
+                "description": "平面投影坐标参考系，固定为 EPSG:3857。",
             },
             "axis_convention": {
                 "type": "string",
                 "const": MAP_GEOREFERENCE_AXIS_CONVENTION,
+                "description": "投影坐标的轴向约定，X 向东、Y 向北、Z 向上。",
             },
             "anchor_lat_deg": {
                 "type": "number",
                 "minimum": -MAP_GEOREFERENCE_MAX_LATITUDE_DEG,
                 "maximum": MAP_GEOREFERENCE_MAX_LATITUDE_DEG,
+                "description": "地理参考锚点的纬度（度）。",
             },
-            "anchor_lng_deg": {"type": "number", "minimum": -180.0, "maximum": 180.0},
-            "anchor_easting_m": {"type": "number"},
-            "anchor_northing_m": {"type": "number"},
+            "anchor_lng_deg": {"type": "number", "minimum": -180.0, "maximum": 180.0,
+                               "description": "地理参考锚点的经度（度）。"},
+            "anchor_easting_m": {"type": "number", "description": "锚点的投影东向坐标（米）。"},
+            "anchor_northing_m": {"type": "number", "description": "锚点的投影北向坐标（米）。"},
             "map_origin_x_m": {
                 "type": "number",
                 "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
                 "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "description": "锚点在地图坐标系中的 X 坐标（米）。",
             },
             "map_origin_y_m": {
                 "type": "number",
                 "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
                 "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "description": "锚点在地图坐标系中的 Y 坐标（米）。",
             },
             "map_from_projected_yaw_rad": {
                 "type": "number",
                 "minimum": -math.pi,
                 "exclusiveMaximum": math.pi,
+                "description": "投影坐标系到地图坐标系的逆时针偏航角（弧度）。",
             },
             "altitude_policy": {
                 "type": "string",
                 "const": MAP_GEOREFERENCE_ALTITUDE_POLICY,
+                "description": "高度策略，固定使用地图平面高度。",
             },
             "map_plane_z_m": {
                 "type": "number",
                 "minimum": -MAP_GEOREFERENCE_MAX_COORDINATE_M,
                 "maximum": MAP_GEOREFERENCE_MAX_COORDINATE_M,
+                "description": "地名导航目标使用的地图平面 Z 坐标（米）。",
             },
         },
         required=(
@@ -209,34 +220,41 @@ def georeference_schema():
 def forbidden_schema():
     zone = ForbiddenZone.model_json_schema()
     definitions = zone.pop("$defs", {})
-    result = schema({"map_name": TEXT, "zones": {"type": "array", "items": zone}}, ("map_name", "zones"))
+    result = schema({"map_name": MAP_NAME, "zones": {"type": "array", "items": zone,
+                    "description": "要保存的完整禁行区列表。传空列表会清空该地图的禁行区。"}}, ("map_name", "zones"))
     result["$defs"] = definitions
     return result
 
 
-TEXT = {"type": "string"}
-TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
-SEED = {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}
+MAP_NAME = {"type": "string", "description": "地图目录中的地图名称。"}
+TIMEOUT = {"type": "number", "exclusiveMinimum": 0, "description": "任务总时限（秒）。留空时为 900 秒。"}
+SEED = {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3,
+        "description": "重定位的初始位姿猜测，依次为 X、Y（米）和偏航角（弧度）。留空时不提供初始位姿。"}
 CAPABILITIES = [
     Capability("list_maps", "列出地图目录和当前会话。", schema(), "query", list_maps),
     Capability("get_active_map", "读取地图会话、位姿、导航、探索与重定位状态。", schema(), "query", get_active_map),
     Capability("start_mapping", "开始新图或同名续建。",
-               schema({"map_name": TEXT, "continue_saved": {"type": "boolean"}}, ("map_name",)),
+               schema({"map_name": {"type": "string", "description": "要新建或续建的地图名称。"},
+                       "continue_saved": {"type": "boolean", "description": "是否续建同名已保存地图。留空时开始新图。"}}, ("map_name",)),
                "action", start_mapping, needs=("geometry",), normalize_names=("map_name",)),
     Capability("end_map_session", "结束地图会话并返回空闲。", schema(), "action", end_map_session),
     Capability("save_map", "保存当前地图或另存为新名字。",
-               schema({"map_name": TEXT, "georeference": georeference_schema(), "timeout_sec": TIMEOUT}),
+               schema({"map_name": {"type": "string", "description": "保存后的地图名称。留空时使用当前会话名称。"},
+                       "georeference": {**georeference_schema(), "description": "经纬度与地图坐标间的转换定义。留空时沿用现有地理参考。"},
+                       "timeout_sec": {**TIMEOUT, "description": "发出保存请求前的任务时限（秒）。留空时为 900 秒，已发出的保存会完成收尾。"}}),
                "task", save_map, needs=("geometry",), timeout_sec=900, normalize_names=("map_name",)),
     Capability("load_map", "加载地图并执行重定位。",
-               schema({"map_name": TEXT, "timeout_sec": TIMEOUT}, ("map_name",)),
+               schema({"map_name": MAP_NAME, "timeout_sec": TIMEOUT}, ("map_name",)),
                "task", load_map, needs=("geometry",), timeout_sec=900, normalize_names=("map_name",)),
     Capability("relocalize_active_map", "在已加载地图上重定位。",
                schema({"planar_seed": SEED, "timeout_sec": TIMEOUT}),
                "task", relocalize, needs=("geometry",), timeout_sec=900),
     Capability("delete_map", "删除地图及同目录的记忆库。",
-               schema({"map_name": TEXT, "timeout_sec": TIMEOUT}, ("map_name",)), "action", delete_map,
+               schema({"map_name": MAP_NAME, "timeout_sec": {**TIMEOUT,
+                       "description": "删除当前地图前结束会话的调用时限（秒）。留空时不指定该时限。"}}, ("map_name",)), "action", delete_map,
                normalize_names=("map_name",)),
-    Capability("list_forbidden_zones", "读取地图禁行区。", schema({"map_name": TEXT}), "query",
+    Capability("list_forbidden_zones", "读取地图禁行区。",
+               schema({"map_name": {"type": "string", "description": "要读取禁行区的地图名称。留空时使用当前会话地图。"}}), "query",
                list_forbidden_zones, normalize_names=("map_name",)),
     Capability("replace_forbidden_zones", "整体替换禁行区，下次规划生效。",
                forbidden_schema(),

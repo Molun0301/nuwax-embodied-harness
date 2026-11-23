@@ -16,6 +16,8 @@ max = 5.0
 special_values = [""]
 default = ""
 description = "显式声明执行器平面速度上限（米/秒）。须与偏航上限和运动形式同时填写。三项留空时，Go2 使用官方速度上限。"
+title = "最大平移速度"
+unit = "米/秒"
 consumers = [
     "core/config.py:derived_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_linear_mps",
@@ -32,6 +34,8 @@ max = 12.566370614359172
 special_values = [""]
 default = ""
 description = "显式声明执行器偏航上限（弧度/秒），最大为 4π。须与平面上限和运动形式同时填写。"
+title = "最大转向角速度"
+unit = "弧度/秒"
 consumers = [
     "core/config.py:derived_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_yaw_rps",
@@ -45,6 +49,7 @@ type = "string"
 choices = ["", "omnidirectional"]
 default = ""
 description = "执行器的基本运动方式，目前只支持 omnidirectional（可前后左右平移和原地转向）。须与两项速度上限同时填写，供三维导航使用。"
+title = "运动方式"
 consumers = [
     "core/config.py:derived_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_motion_model",
@@ -74,6 +79,8 @@ type = "float"
 special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的前后偏移（米）。留空时按模型或驱动计算。"
+title = "外包中心前后偏移"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_x_m",
@@ -87,6 +94,8 @@ type = "float"
 special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的左右偏移（米）。留空时按模型或驱动计算。"
+title = "外包中心左右偏移"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_y_m",
@@ -100,6 +109,8 @@ type = "float"
 special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的上下偏移（米）。留空时按模型或驱动计算。"
+title = "外包中心上下偏移"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_z_m",
@@ -113,6 +124,8 @@ type = "string"
 choices = ["customrobot", "go2", "g1", "raspi_lidar_robot", "unitree_sim"]
 default = "customrobot"
 description = "活动方案的机器人驱动。安装或导入时保留实际机器人型号。"
+title = "机器人驱动"
+summary = true
 consumers = [
     "core/config.py:derived_values",
     "core/settings.py:load_config",
@@ -129,6 +142,8 @@ min_exclusive = true
 special_values = [""]
 default = ""
 description = "手填机体上下高度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+title = "机体高度"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.height_m",
@@ -144,6 +159,8 @@ min_exclusive = true
 special_values = [""]
 default = ""
 description = "手填机体前后长度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+title = "机体长度"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.length_m",
@@ -208,6 +225,7 @@ advanced = true
 type = "string"
 default = ""
 description = "机器人描述模型（URDF）路径。留空时采用驱动提供的模型或手填外形。"
+title = "机器人模型路径"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_path",
@@ -236,6 +254,8 @@ min_exclusive = true
 special_values = [""]
 default = ""
 description = "手填机体左右宽度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
+title = "机体宽度"
+unit = "米"
 consumers = [
     "core/robot_geometry.py:RobotGeometryConfig.from_values",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.width_m",
@@ -288,6 +308,7 @@ advanced = true
 type = "string"
 default = "artifacts"
 description = "制品目录，受管安装将相对路径解析到持久数据根。"
+title = "制品目录"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -326,6 +347,9 @@ type = "integer"
 min = 1
 default = 7
 description = "图片等制品保存超过此天数后自动清理（至少1天）。数量和总容量上限另行控制。"
+title = "制品保留天数"
+unit = "天"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -361,6 +385,7 @@ advanced = true
 type = "string"
 default = "#cbd5e1"
 description = "三维点云显示的基础色，格式为 #RRGGBB。"
+title = "点云基础色"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -372,6 +397,7 @@ category = "点云显示"
 type = "string"
 default = "#38bdf8"
 description = "三维点云显示的地面色，格式为 #RRGGBB。"
+title = "地面色"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -383,8 +409,9 @@ category = "点云显示"
 type = "array"
 items = "string"
 length = 5
-default = ["#38bdf8", "#22d3ee", "#4ade80", "#facc15", "#fb7185"]
+default = ["#1e3a44", "#2f5a63", "#4f8288", "#86b3b0", "#cfe6e0"]
 description = "点云按高度着色的五种颜色，按低到高排列，每个元素格式为 #RRGGBB。"
+title = "高度着色"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -396,6 +423,7 @@ category = "点云显示"
 type = "string"
 default = "#fbbf24"
 description = "三维点云显示的物体色，格式为 #RRGGBB。"
+title = "物体色"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -409,6 +437,8 @@ min = 0.1
 max = 20.0
 default = 1.35
 description = "网页点云渲染的点大小倍率。"
+title = "点大小倍率"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -422,6 +452,8 @@ min = 0.01
 max = 2.0
 default = 0.1
 description = "点云显示的空间采样间隔（米）。"
+title = "显示采样间隔"
+unit = "米"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -433,6 +465,7 @@ category = "点云显示"
 type = "string"
 default = "#f8fafc"
 description = "三维点云显示的结构色，格式为 #RRGGBB。"
+title = "结构色"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -446,6 +479,8 @@ min = 1024
 max = 65535
 default = 8766
 description = "网关监听端口。设备管理程序保存业务端口并在合成配置中写入此键。"
+title = "网关端口"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -457,6 +492,7 @@ category = "网关服务"
 type = "string"
 default = ""
 description = "外部客户端访问网关和制品的地址。留空时，受管安装按业务端口生成本机回环访问地址。"
+title = "外部访问地址"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -480,6 +516,8 @@ advanced = true
 type = "boolean"
 default = true
 description = "默认开启性能监控，定时采集整机与项目相关进程的 CPU 和内存占用，在控制台显示。"
+title = "性能监控"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -504,6 +542,9 @@ type = "float"
 min = 0.5
 default = 2.0
 description = "两次采集之间的秒数，最小0.5。算力较弱的设备可调大以降低开销。"
+title = "采集间隔"
+unit = "秒"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -541,6 +582,8 @@ type = "integer"
 min = 1
 default = 4
 description = "到点复核默认连续检测的帧数。调用方指定帧数时以调用方为准。"
+title = "到点复核帧数"
+unit = "帧"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -553,6 +596,8 @@ type = "float"
 min = 0.05
 default = 0.08
 description = "到点复核帧间隔（秒）"
+title = "到点复核帧间隔"
+unit = "秒"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -656,6 +701,7 @@ advanced = true
 type = "string"
 default = "simple_scene"
 description = "场景描述模式。simple_scene 使用本地规则，openai_vision 选择云端视觉，hybrid_scene 在有可用云端模型时组合两者。"
+title = "场景描述模式"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -706,6 +752,8 @@ type = "float"
 min = 0.05
 default = 1.0
 description = "持续视频感知保存两个关键帧之间的最短时间（秒）。"
+title = "关键帧最短间隔"
+unit = "秒"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -717,6 +765,7 @@ category = "关键帧记忆"
 type = "boolean"
 default = true
 description = "启用关键帧记忆"
+title = "关键帧写入记忆"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -730,6 +779,8 @@ type = "float"
 min = 0.0
 default = 0.75
 description = "关键帧平移阈值（米）"
+title = "关键帧平移阈值"
+unit = "米"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -742,6 +793,8 @@ type = "float"
 min = 0.0
 default = 20.0
 description = "关键帧转向阈值（度）"
+title = "关键帧转向阈值"
+unit = "度"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -753,6 +806,7 @@ category = "关键帧记忆"
 type = "string"
 default = ""
 description = "兼容 OpenAI 接口的视觉服务访问密钥，留空表示未配置。"
+title = "云端视觉密钥"
 sensitive = true
 consumers = [
     "core/settings.py:load_config",
@@ -790,6 +844,7 @@ advanced = true
 type = "string"
 default = "https://api.openai.com/v1"
 description = "OpenAI API 基础地址"
+title = "云端视觉接口地址"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -801,6 +856,7 @@ category = "云端视觉"
 type = "boolean"
 default = false
 description = "启用兼容 OpenAI 接口的云端视觉模型分析画面。需同时配置服务地址、密钥和模型。"
+title = "云端视觉"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -826,6 +882,7 @@ advanced = true
 type = "string"
 default = ""
 description = "云端视觉服务模型标识，启用云端视觉时由使用方填写。"
+title = "云端视觉模型"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -901,6 +958,7 @@ advanced = true
 type = "string"
 default = "disabled_segmentation"
 description = "分割提供者类型。disabled_segmentation 为默认，detection_attributes 可复用检测属性。实际路由和是否允许框回退共同决定结果。"
+title = "分割提供者"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -986,6 +1044,7 @@ advanced = true
 type = "boolean"
 default = false
 description = "启用现有分割路由。网关当前可复用检测属性的分割结果，或按设置返回检测框。"
+title = "分割"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1076,6 +1135,7 @@ advanced = true
 type = "string"
 default = "primary"
 description = "分割路由标识。常见值为 primary、low_latency、passthrough、bbox_only 和 disabled。"
+title = "分割路由"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1117,6 +1177,7 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "检测框与投影到画面内的机器人部件外接框的交并比阈值。与自体覆盖率条件任一满足即判为自体。"
+title = "自体框交并比阈值"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1130,6 +1191,7 @@ min = 0.05
 max = 1.0
 default = 0.5
 description = "检测掩膜被机器人部件凸包并集覆盖的比例阈值。没有掩膜时按检测框计算覆盖率。"
+title = "自体覆盖比例阈值"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1142,6 +1204,8 @@ type = "float"
 min = 0.0
 default = 6.0
 description = "运动学投影区域向外扩展的像素数，用于补偿投影和标定误差。"
+title = "投影外扩像素"
+unit = "像素"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1153,6 +1217,7 @@ category = "画面自体过滤"
 type = "boolean"
 default = true
 description = "是否启用机器人自体检测过滤。过滤器根据机器人模型、关节状态和相机配置判定自体并公开过滤状态。"
+title = "过滤机体识别结果"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1190,6 +1255,7 @@ advanced = true
 type = "string"
 default = "front_camera"
 description = "持续感知默认使用的相机标识。"
+title = "持续识别相机"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1227,6 +1293,9 @@ type = "float"
 min = 0.05
 default = 0.5
 description = "持续视频感知两次检测之间的间隔（秒，至少0.05）。越小越及时，计算负担越大。"
+title = "持续识别间隔"
+unit = "秒"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1238,6 +1307,7 @@ category = "持续识别"
 type = "string"
 default = "bytetrack"
 description = "目标跟踪后端。bytetrack 或 byte_track 使用 ByteTrack（多目标跟踪算法），其余现行名称选择基础二维跟踪。"
+title = "目标跟踪后端"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1276,6 +1346,7 @@ type = "integer"
 min = 2
 default = 2
 description = "多视角三角化估计物品位置所需的最少观察射线数，至少2。"
+title = "三角化最少观察数"
 consumers = [
     "core/settings.py:_build_deferred_projection_config",
 ]
@@ -1313,6 +1384,8 @@ type = "array"
 items = "string"
 default = ["person", "door", "chair", "table", "shelf", "cabinet", "box", "bag", "backpack", "bottle", "cup", "bench", "stairs", "charger", "dock", "traffic cone", "fire hydrant"]
 description = "开放词汇检测的目标类别列表。"
+title = "检测类别"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1326,6 +1399,7 @@ min = 0.0
 max = 1.0
 default = 0.25
 description = "检测结果的最低置信度（0～1），低于此值的目标不输出。调高可减少误检。"
+title = "最低置信度"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1337,6 +1411,7 @@ category = "目标检测"
 type = "string"
 default = ""
 description = "检测模型运行设备，例如 cpu、cuda:0。留空时由模型后端自动选择。"
+title = "模型运行设备"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1361,6 +1436,7 @@ advanced = true
 type = "boolean"
 default = false
 description = "默认关闭 YOLO-World（开放词汇目标检测模型）。启用后注册该后端，用于识别画面中的物品。"
+title = "视觉目标检测"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1412,6 +1488,7 @@ advanced = true
 type = "string"
 default = "runtime_data/models/yolov8s-worldv2.pt"
 description = "YOLO-World（开放词汇检测模型）权重路径，受管安装按已下载或显式提供的模型写入持久路径。"
+title = "检测模型权重"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1436,6 +1513,7 @@ type = "integer"
 min = 1
 default = 3
 description = "确认物体需要的不同源观察标识数量。同帧重放、同帧精化和同源多相机不会重复确认。"
+title = "确认物体所需观察数"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1448,6 +1526,8 @@ type = "float"
 min = 1.0
 default = 60.0
 description = "自动感知新物体需在此秒数内积累指定次数的独立源观察，否则丢弃。显式记忆直接确认。"
+title = "物体确认时间窗"
+unit = "秒"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1538,6 +1618,7 @@ advanced = true
 type = "string"
 default = ""
 description = "阿里云 DashScope（模型服务）的在线向量服务密钥，留空表示未配置。"
+title = "在线向量服务密钥"
 sensitive = true
 consumers = [
     "core/settings.py:load_config",
@@ -1550,6 +1631,7 @@ category = "向量模型"
 type = "string"
 default = "https://dashscope.aliyuncs.com/api/v1"
 description = "记忆嵌入服务基础地址"
+title = "向量服务地址"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1587,6 +1669,7 @@ advanced = true
 type = "string"
 default = "runtime_data/models/openai__clip-vit-base-patch32"
 description = "记忆图像向量模型路径或后端标识。受管安装选装记忆时使用本地 clip-vit-base-patch32。"
+title = "图像向量模型"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1611,6 +1694,8 @@ advanced = true
 type = "string"
 default = "runtime_data/models/BAAI__bge-small-zh-v1.5"
 description = "记忆文本向量模型路径或后端标识。受管安装选装记忆时使用本地 bge-small-zh-v1.5。"
+title = "文本向量模型"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -1622,6 +1707,7 @@ category = "向量模型"
 type = "string"
 default = ""
 description = "Jev 远程接口的访问密钥，本地后端不需要。页面不显示已保存的值，留空保存会保留原值。"
+title = "远程语义接口密钥"
 sensitive = true
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
@@ -1634,6 +1720,7 @@ category = "语义地图"
 type = "boolean"
 default = true
 description = "候选名称达到分数、分数差和视角数门槛时自动写入区域。关闭后只保留为候选。手动命名优先。"
+title = "达标名称自动写入区域"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1645,6 +1732,7 @@ category = "语义地图"
 type = "boolean"
 default = false
 description = "网关启动后自动开始后台语义处理。需同时开启语义地图。"
+title = "语义处理自动启动"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1657,6 +1745,8 @@ type = "string"
 choices = ["openjev_http", "jev_api"]
 default = "openjev_http"
 description = "选择本地 OpenJev 服务或 Jev 远程接口。"
+title = "语义决策后端"
+summary = true
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1668,6 +1758,7 @@ category = "语义地图"
 type = "string"
 default = "http://127.0.0.1:8791"
 description = "语义决策服务的根地址或以 /v1 结尾的地址。默认值对应本地后端，远程后端使用其服务地址。"
+title = "语义决策服务地址"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1681,6 +1772,8 @@ min = 0.05
 max = 20.0
 default = 1.2
 description = "宽度小于此值的通道视为门口，用来把相连空间分成不同房间（米）。"
+title = "门口宽度上限"
+unit = "米"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1692,6 +1785,7 @@ category = "区域划分与命名"
 type = "boolean"
 default = false
 description = "开启语义地图（区域划分与命名）。保存设置不会启动模型服务。"
+title = "语义地图"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1776,6 +1870,8 @@ min = 0.01
 max = 1000000.0
 default = 2.0
 description = "面积小于此值的空间不划为房间（平方米）。"
+title = "房间最小面积"
+unit = "平方米"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1789,6 +1885,7 @@ min = 1
 max = 100
 default = 2
 description = "自动采纳名称至少需要的有效观察视角数。"
+title = "命名所需观察视角数"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1802,6 +1899,7 @@ min = 0.0
 max = 1.0
 default = 0.15
 description = "首选名称与次选名称的分数至少相差多少才自动采纳（0～1）。"
+title = "首选与次选名称分差"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1815,6 +1913,7 @@ min = 0.0
 max = 1.0
 default = 0.85
 description = "自动采纳名称所需的最低支持分数（0～1）。这是采纳门槛，不代表准确率。"
+title = "命名最低分数"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1826,6 +1925,7 @@ category = "区域划分与命名"
 type = "string"
 default = "AlexWortega/openjev:qwen3.5-4b-nli-v2"
 description = "语义决策模型标识。默认值对应本地后端，远程后端使用其模型标识。"
+title = "语义决策模型"
 consumers = [
     "core/settings.py:_load_scene_mapping_config",
 ]
@@ -1852,6 +1952,8 @@ type = "string"
 choices = ["none", "library_pgo", "native_pgo", "relocalization"]
 default = "none"
 description = "三维地图位姿校正策略，选项为关闭、库内位姿图优化、原生位姿图优化、重定位。"
+title = "位姿校正策略"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.correction_backend",
@@ -1877,6 +1979,7 @@ advanced = true
 type = "boolean"
 default = true
 description = "监督者是否允许按需启动几何运行时。"
+title = "按需启动定位建图"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.external_enabled",
@@ -1891,6 +1994,8 @@ min = 32
 max = 4096
 default = 256
 description = "自动模式下单个精细点云写入器的缓存上限（MiB，二进制兆字节）。在线建图和位姿图优化重放的缓存各自受限。"
+title = "精细点云自动缓存上限"
+unit = "MiB"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_auto_max_mib",
 ]
@@ -1905,6 +2010,8 @@ max = 4096
 special_values = ["auto"]
 default = "auto"
 description = "精细点云写入器的缓存预算（MiB，二进制兆字节）。选择 auto 时按需增大，到自动上限后按固定预算处理。在线建图和位姿图优化重放各使用独立缓存。"
+title = "精细点云缓存预算"
+unit = "MiB"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_mib",
 ]
@@ -1917,6 +2024,8 @@ type = "string"
 choices = ["device", "fastlio2", "pointlio"]
 default = "device"
 description = "三维定位采用设备里程计、FastLIO2（快速激光惯性定位）或 Point-LIO（逐点激光惯性定位）。未指定后端时，安装按选定的原生定位模块优先填充 Point-LIO；已有后端配置沿用。"
+title = "三维定位方式"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "drivers/go2/settings.py:load_go2_data_plane_config",
@@ -2001,6 +2110,7 @@ advanced = true
 type = "string"
 default = "runtime_data/maps"
 description = "地图目录，网关和几何运行时共享，承载地图的保存、读取、激活和删除。"
+title = "地图目录"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.map_catalog_root",
@@ -2014,6 +2124,7 @@ type = "string"
 choices = ["voxel", "raytracing"]
 default = "voxel"
 description = "三维链的建图后端，使用体素窗口或射线追踪。二维链固定使用二维建图工作进程。"
+title = "建图后端"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_backend",
@@ -2055,6 +2166,8 @@ min = 0.0
 min_exclusive = true
 default = 0.12
 description = "在线去动态判定空闲和动态回波的体素边长（米）。精细地图另用自身的体素边长。"
+title = "去动态体素边长"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_resolution_m",
 ]
@@ -2068,6 +2181,8 @@ min = 0
 max = 2147483647
 default = 1
 description = "在线去动态合并射线证据的最近帧数。0 或 1 表示只用当前帧。较长窗口增加覆盖，也会保留更久的历史命中。"
+title = "去动态窗口帧数"
+unit = "帧"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_dynamic_sliding_window_size",
 ]
@@ -2092,6 +2207,8 @@ min = 1
 max = 2147483647
 default = 5
 description = "同一粗格确认所需的最少命中帧数，每帧只计一次。"
+title = "确认所需命中帧数"
+unit = "帧"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_frames"]
 apply = "restart"
 panel = "建图与定位"
@@ -2113,6 +2230,8 @@ type = "float"
 min = 0.0
 default = 1.0
 description = "同一粗格确认所需的首末命中最短源时间间隔（秒）。"
+title = "确认最短时间跨度"
+unit = "秒"
 consumers = ["services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_confirmation_span_s"]
 apply = "restart"
 panel = "建图与定位"
@@ -2268,6 +2387,7 @@ advanced = true
 type = "string"
 default = ""
 description = "网关建图诊断录制目录。留空时使用地图目录同级的 mapping_recordings。"
+title = "建图录制目录"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_dir",
@@ -2280,6 +2400,7 @@ category = "建图录制"
 type = "boolean"
 default = true
 description = "是否在网关记录建图诊断输入。"
+title = "建图录制"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_enabled",
@@ -2294,6 +2415,8 @@ type = "integer"
 min = 0
 default = 17179869184
 description = "网关建图诊断录制容量上限（字节）。"
+title = "建图录制容量上限"
+unit = "字节"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_max_bytes",
@@ -2308,6 +2431,8 @@ min = 0.0
 min_exclusive = true
 default = 0.05
 description = "三维链实时生成的占据栅格分辨率（米/格），二维链沿用二维会话配置。"
+title = "占据栅格分辨率"
+unit = "米/格"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_resolution",
 ]
@@ -2360,6 +2485,8 @@ type = "string"
 choices = ["lio_3d", "slam_2d"]
 default = "lio_3d"
 description = "选择完整的三维激光定位或二维扫描执行链。导航方案和二维建图后端由执行链确定。"
+title = "执行链"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pipeline",
@@ -2412,6 +2539,8 @@ min = 64
 max = 1048576
 default = 1024
 description = "原始扫描和最终位姿共用的磁盘预算（MiB，二进制兆字节）。达到上限时停止辅助记录，在线建图继续。"
+title = "原始扫描磁盘预算"
+unit = "MiB"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_max_mib",
 ]
@@ -2478,6 +2607,8 @@ advanced = true
 type = "float"
 default = 0.04
 description = "腿足摆动盒底部与实际站立地面之间的最小间距（米）"
+title = "摆动盒离地间距"
+unit = "米"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
 panel = "建图与定位"
@@ -2487,6 +2618,8 @@ category = "点云自体过滤"
 type = "float"
 default = 0.6
 description = "点云自体过滤在各活动关节参考位置两侧的采样角偏移（弧度，移动关节为米）。"
+title = "关节摆动采样角"
+unit = "弧度或米"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
 panel = "建图与定位"
@@ -2496,6 +2629,8 @@ category = "点云自体过滤"
 type = "float"
 default = 0.03
 description = "点云自体过滤的腿足摆动包围盒在每侧外扩的距离（米）。"
+title = "摆动盒外扩距离"
+unit = "米"
 consumers = ["core/config.py:derived_values"]
 apply = "restart"
 panel = "建图与定位"
@@ -2518,6 +2653,7 @@ advanced = true
 type = "boolean"
 default = true
 description = "允许监督者按需启动导航栈。"
+title = "按需启动导航"
 consumers = [
     "core/settings.py:load_config",
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.autostart",
@@ -2570,6 +2706,8 @@ type = "float"
 min = 0.01
 default = 0.8
 description = "局部规划沿全局路线向前取参考路段的长度（米）。"
+title = "局部参考路段长度"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.local_horizon_m",
 ]
@@ -2582,6 +2720,8 @@ type = "string"
 default = "sampling"
 choices = ["sampling", "scan"]
 description = "三维局部执行。sampling 采用采样控制，适合传感器噪声较大、低速的平台；scan 使用样条局部规划，适合高质量雷达与准确速度反馈的平台。"
+title = "局部规划器"
+summary = true
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.local_planner",
 ]
@@ -2595,6 +2735,9 @@ min = 0.0
 min_exclusive = true
 default = 0.15
 description = "局部路线希望与障碍保持的距离，也是目标贴着障碍时停点要求的净空（米）"
+title = "障碍净空"
+unit = "米"
+summary = true
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.obstacle_clearance_m",
 ]
@@ -2609,6 +2752,8 @@ max = 1.0
 special_values = [""]
 default = ""
 description = "允许下的最大台阶高度（米，0～1），0表示不下台阶。留空沿用能力标定或共同台阶高度。填写值不能超过能力标定。"
+title = "最大下台阶高度"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_down_m",
 ]
@@ -2623,6 +2768,8 @@ max = 1.0
 special_values = [""]
 default = ""
 description = "允许上的最大台阶高度（米，0～1），0表示不上台阶。留空沿用能力标定或共同台阶高度。填写值不能超过能力标定。"
+title = "最大上台阶高度"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_up_m",
 ]
@@ -2663,6 +2810,8 @@ min = 0.0
 min_exclusive = true
 default = 0.1
 description = "三维导航地形索引的分辨率（米）。越小越精细，计算量越大。"
+title = "地形索引分辨率"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.surface_voxel_size_m",
 ]
@@ -2677,6 +2826,9 @@ max = 90.0
 max_exclusive = true
 default = 18.0
 description = "三维曲面导航的最大坡度（度），填写能力标定后按标定值使用。"
+title = "最大坡度"
+unit = "度"
+summary = true
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_slope_deg",
 ]
@@ -2689,6 +2841,8 @@ type = "float"
 min = 0.0
 default = 0.15
 description = "三维导航的共同台阶高度上限（米）。导航能力标定和上、下台阶独立设置按现行优先关系覆盖此值。"
+title = "台阶高度上限"
+unit = "米"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_step_height_m",
 ]
@@ -2702,6 +2856,8 @@ min = 0.0
 min_exclusive = true
 default = 5.0
 description = "终点转向或平移连续无进展时结束目标的时限（秒）。"
+title = "终点无进展时限"
+unit = "秒"
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.terminal_stall_timeout_sec",
 ]
@@ -2727,6 +2883,8 @@ type = "string"
 choices = ["", "unitree_sdk2py", "motion_control"]
 default = ""
 description = "运动守卫执行端。留空时不启用守卫。Go2 安装使用 unitree_sdk2py，标准接入可选 motion_control。"
+title = "运动守卫执行端"
+summary = true
 consumers = [
     "services/navigation/motion_safety_guard/__main__.py:run",
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
@@ -2751,6 +2909,8 @@ advanced = true
 type = "boolean"
 default = true
 description = "允许按需启动人物跟随进程，并允许几何运行时发布供跟随使用的地图点云。"
+title = "按需启动人员跟随"
+summary = true
 consumers = [
     "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:PersonFollow.autostart",
 ]
@@ -2762,6 +2922,7 @@ switch = "按需启动人员跟随"
 type = "string"
 default = ""
 description = "Go2 数据面使用的 DDS（数据分发服务）网卡。运动守卫优先采用此项，留空时使用通用 Go2 网卡。"
+title = "数据面网卡"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
@@ -2774,6 +2935,7 @@ category = "Go2 数据接入"
 type = "boolean"
 default = true
 description = "是否启用 Go2 数据面，当前安装器为 Go2 方案开启。"
+title = "Go2数据接入"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -2786,6 +2948,7 @@ switch = "Go2 数据接入"
 type = "string"
 default = ""
 description = "Go2 高级客户端的 DDS（数据分发服务）网卡。守卫在数据面网卡为空时也采用此项，空值由 SDK（软件开发工具包）选择。"
+title = "高级客户端网卡"
 consumers = [
     "core/settings.py:load_config",
     "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
@@ -2798,6 +2961,7 @@ category = "Go2 数据接入"
 type = "boolean"
 default = true
 description = "Go2 数据面是否直接订阅设备的 DDS（数据分发服务）输入。"
+title = "直订设备数据"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -2821,6 +2985,7 @@ advanced = true
 type = "boolean"
 default = true
 description = "是否直接订阅 Go2 雷达点云。Go2 安装选中几何模块时开启。"
+title = "直接订阅雷达点云"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -2956,6 +3121,7 @@ advanced = true
 type = "boolean"
 default = true
 description = "是否启用 Go2 厂商官方状态连接。"
+title = "Go2官方连接"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -2985,6 +3151,8 @@ min = 0.0
 min_exclusive = true
 default = 1.0
 description = "Go2 官方最大线速度（米/秒）"
+title = "官方最大线速度"
+unit = "米/秒"
 consumers = [
     "core/config.py:derived_values",
     "drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
@@ -3001,6 +3169,8 @@ min = 0.0
 min_exclusive = true
 default = 0.8
 description = "Go2 官方最大偏航角速度（弧度/秒）"
+title = "官方最大转向速度"
+unit = "弧度/秒"
 consumers = [
     "core/config.py:derived_values",
     "drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
@@ -3029,6 +3199,7 @@ advanced = true
 type = "string"
 default = "192.168.123.161"
 description = "Go2 视频连接使用的机器人网络地址。"
+title = "Go2 视频连接地址"
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -3040,6 +3211,8 @@ category = "视频输入"
 type = "boolean"
 default = true
 description = "允许监督者在 Go2 方案中启动视频进程。未安装感知模块时按安装结果关闭。"
+title = "摄像头视频"
+summary = true
 consumers = [
     "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
@@ -3065,6 +3238,7 @@ advanced = true
 type = "boolean"
 default = true
 description = "设置 Go2 音量时是否自动打开机身音量控制开关。"
+title = "音量开关自动启用"
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -3114,6 +3288,8 @@ type = "integer"
 min = 0
 default = 5
 description = "日志轮转保留的历史文件数量。网关立即生效，独立进程下次启动生效。"
+title = "保留历史文件数"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3128,6 +3304,7 @@ category = "文件与轮转"
 type = "string"
 default = "runtime_data/logs"
 description = "日志目录。受管安装的相对默认值以持久数据根解析。"
+title = "日志目录"
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3156,6 +3333,8 @@ type = "string"
 choices = ["text", "json"]
 default = "text"
 description = "终端输出的日志显示为普通文本或JSON。日志文件始终按JSON逐行保存。"
+title = "终端日志格式"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3184,6 +3363,8 @@ type = "string"
 choices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = "INFO"
 description = "全局日志级别。网关立即生效，独立进程下次启动生效。Rust 诊断过滤可临时覆盖。"
+title = "全局日志级别"
+summary = true
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3315,6 +3496,8 @@ type = "integer"
 min = 0
 default = 20971520
 description = "单个日志文件的轮转容量（字节）。网关立即生效，独立进程下次启动生效。"
+title = "单个日志文件容量"
+unit = "字节"
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3329,6 +3512,7 @@ category = "文件与轮转"
 type = "boolean"
 default = false
 description = "容器中继的启用状态标记，在中继健康接口中显示。"
+title = "容器中继"
 consumers = [
     "core/settings.py:load_config",
     "gateways/app.py:create_relay_app_from_env",
@@ -3384,6 +3568,8 @@ advanced = true
 type = "string"
 default = ""
 description = "外部操作设备的基础地址。启用外部操作时填写服务地址。"
+title = "操作设备地址"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -3395,6 +3581,8 @@ category = "外部设备"
 type = "boolean"
 default = false
 description = "显式启用配置的外部操作设备。未发现实际任务能力时不公开工具。"
+title = "外部操作设备"
+summary = true
 consumers = [
     "core/settings.py:load_config",
 ]
@@ -3430,6 +3618,7 @@ advanced = true
 type = "string"
 default = "https://nominatim.openstreetmap.org/search"
 description = "按地名查询经纬度时使用的OpenStreetMap Nominatim（地名检索服务）搜索地址，可改为自建或代理服务。"
+title = "地名检索服务地址"
 consumers = [
     "services/navigation/places.py:PlaceLookup.__init__",
 ]
@@ -3441,6 +3630,7 @@ category = "跨楼层与地名"
 type = "string"
 default = "http://127.0.0.1:18910"
 description = "unitree-sim/1 设备管理服务地址。安装时从该设备读取实际标定与命令策略。"
+title = "仿真设备服务地址"
 consumers = ["drivers/unitree_sim/device.py:Device", "drivers/unitree_sim/configuration.py:configure"]
 apply = "restart"
 panel = "机器人"
@@ -3451,6 +3641,8 @@ type = "string"
 choices = ["go2", "g1"]
 default = "go2"
 description = "设备当前机器人型号。Go2 使用 NEH 自带外形；G1 须在 robot.model_path 指定外形文件。"
+title = "仿真机器人型号"
+summary = true
 consumers = ["drivers/unitree_sim/assembly.py:UnitreeSimAssembly", "drivers/unitree_sim/configuration.py:configure"]
 apply = "restart"
 panel = "机器人"

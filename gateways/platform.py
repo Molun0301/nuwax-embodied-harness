@@ -113,11 +113,22 @@ def build_platform(config) -> Platform:
     platform.events = EventBus()
     platform.robot = create_active_robot_assembly(config)
     platform.capabilities = CapabilityTable()
-    for module, group in ((system, "系统与任务"), (maps, "地图"), (motion, "运动"), (navigation, "导航"),
-                          (exploration, "探索"), (building, "跨楼层"), (cleanup, "地图清理"), (memory, "记忆与语义"),
-                          (perception_caps, "感知"), (skills_caps, "找目标"), (follow, "跟随"), (manipulation, "操作")):
+    for module, group, group_icon in (
+        (system, "系统与任务", "list-checks"),
+        (maps, "地图", "map"),
+        (motion, "运动", "move"),
+        (navigation, "导航", "navigation"),
+        (exploration, "探索", "compass"),
+        (building, "跨楼层", "building-2"),
+        (cleanup, "地图清理", "eraser"),
+        (memory, "记忆与语义", "brain"),
+        (perception_caps, "感知", "scan-eye"),
+        (skills_caps, "找目标", "scan-search"),
+        (follow, "跟随", "person-standing"),
+        (manipulation, "操作", "hand-grab"),
+    ):
         for cap in module.CAPABILITIES:
-            platform.capabilities.register(replace(cap, group=group))
+            platform.capabilities.register(replace(cap, group=group, group_icon=group_icon))
     platform.tasks = TaskRunner(platform)
     home = os.environ.get("NUWAX_INSTALL_HOME", config.base_dir)
     platform.motion = MotionClient(motion_guard_socket(home))

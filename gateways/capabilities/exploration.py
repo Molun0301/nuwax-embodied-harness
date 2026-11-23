@@ -261,32 +261,48 @@ def resume_exploration(platform, ctx, args):
         "motion_generation": args["motion_generation"]})
 
 
-NUMBER = {"type": "number"}
-TEXT = {"type": "string"}
-TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
-CHECKPOINT = {"type": "string", "minLength": 1}
-POINT = schema({"x": NUMBER, "y": NUMBER}, ("x", "y"))
+EXPLORATION_ID = {"type": "string", "description": "探索编号。留空时处理当前探索，含尚在准备的探索任务。"}
+TIMEOUT = {"type": "number", "exclusiveMinimum": 0,
+           "description": "任务总时限（秒，含准备和收尾）。留空时为 900 秒。"}
+CHECKPOINT = {"type": "string", "minLength": 1, "description": "要恢复的探索检查点标识。"}
+POINT = schema({"x": {"type": "number", "description": "边界端点在地图中的 X 坐标（米）。"},
+                "y": {"type": "number", "description": "边界端点在地图中的 Y 坐标（米）。"}}, ("x", "y"))
 CONDITIONS = schema({"max_coverage_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100,
     "description": "地图覆盖率停止条件（百分比），仅二维建图生效。"},
-    "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
-    "max_duration_ms": {"type": "integer", "minimum": 1},
-    "max_goals": {"type": "integer", "minimum": 1}})
+    "no_frontier_timeout_ms": {"type": "integer", "minimum": 1,
+                               "description": "没有可探索前沿时最多等待的毫秒数。留空时为 5000 毫秒。"},
+    "max_duration_ms": {"type": "integer", "minimum": 1,
+                        "description": "探索时限（毫秒）。留空时由 max_duration_sec 或任务剩余时间确定。"},
+    "max_goals": {"type": "integer", "minimum": 1,
+                  "description": "探索目标数量上限。留空时不按目标数量结束。"}})
+CONDITIONS["description"] = "按覆盖率、等待时间、探索时限或目标数量结束探索。留空时使用各项默认行为。"
 RETURN_POLICY = ExplorationReturnPolicy.model_json_schema()
-EXPLORE_SCHEMA = schema({"map_name": TEXT,
-    "boundary_line_segments": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": POINT}},
+RETURN_POLICY["properties"]["maximum_distance_m"]["description"] = "探索和返航的总行程上限（米）。留空时不设上限。"
+RETURN_POLICY["properties"]["reserve_distance_m"]["description"] = "为返航额外保留的路程（米）。留空时为 0 米。"
+RETURN_POLICY["properties"]["return_on_completion"]["description"] = "正常探索结束后是否返回起点。留空时不自动返回。"
+EXPLORE_SCHEMA = schema({"map_name": {"type": "string", "description": "探索使用的地图名称。留空时沿用当前会话地图。"},
+    "boundary_line_segments": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": POINT},
+                               "description": "探索边界线段列表，每条由两个地图坐标点组成。留空时不添加边界。"},
     "stop_conditions": CONDITIONS, "return_policy": RETURN_POLICY,
-    "max_navigation_retries": {"type": "integer", "minimum": 0, "default": 1},
-    "blacklist_radius_m": {"type": "number", "minimum": 0, "default": 0.75},
-    "max_duration_sec": TIMEOUT, "timeout_sec": TIMEOUT, "save_map": {"type": "boolean"}})
+    "max_navigation_retries": {"type": "integer", "minimum": 0, "default": 1,
+                               "description": "单个探索目标导航失败后的最大重试次数。留空时重试 1 次。"},
+    "blacklist_radius_m": {"type": "number", "minimum": 0, "default": 0.75,
+                           "description": "避开失败目标附近区域的半径（米）。留空时为 0.75 米。"},
+    "max_duration_sec": {"type": "number", "exclusiveMinimum": 0,
+                         "description": "探索时限（秒）。若同时填写毫秒时限则采用后者，均留空时按任务剩余时间计算。"},
+    "timeout_sec": TIMEOUT,
+    "save_map": {"type": "boolean", "description": "探索完成后是否保存地图。留空时保存。"}})
 CAPABILITIES = [
     Capability("explore_area_v2", "探索区域并按请求保存地图。", EXPLORE_SCHEMA, "task", explore_area,
                needs=("nav_stack", "geometry"), motion=True, timeout_sec=900, normalize_names=("map_name",)),
     Capability("stop_exploration", "停止探索并取消对应任务，保留建图会话。",
-               schema({"exploration_id": TEXT}), "action", stop_exploration),
+               schema({"exploration_id": EXPLORATION_ID}), "action", stop_exploration),
     Capability("pause_exploration", "由原探索任务保存地图与恢复进度后暂停。",
-               schema({"exploration_id": TEXT}), "action", pause_exploration),
+               schema({"exploration_id": EXPLORATION_ID}), "action", pause_exploration),
     Capability("list_exploration_checkpoints", "列出探索检查点及其地图是否存在。",
-               schema({"limit": {"type": "integer", "minimum": 1}}), "query", list_exploration_checkpoints),
+               schema({"limit": {"type": "integer", "minimum": 1,
+                                 "description": "最多返回的检查点数量。留空时最多返回 50 个。"}}),
+               "query", list_exploration_checkpoints),
     Capability("resume_exploration", "加载检查点地图、重定位并恢复探索。",
                schema({"checkpoint_id": CHECKPOINT, "timeout_sec": TIMEOUT}, ("checkpoint_id",)),
                "task", resume_exploration, needs=("nav_stack", "geometry"), motion=True, timeout_sec=900),

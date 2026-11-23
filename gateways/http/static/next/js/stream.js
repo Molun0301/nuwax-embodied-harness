@@ -213,12 +213,27 @@ export function createStream({ topics, params = {}, immediate = [], queued = [],
     probe.current = null;
     probe.due = now + 5000;
   }
-  if (primary) setInterval(measureLatency, 1000);
+  const latencyTimer = primary ? setInterval(measureLatency, 1000) : null;
+
+  /* 关闭：断开连接、不再重连，清掉定时器、待分发的帧与全部订阅（页面自开的连接离开时调用）。 */
+  function close() {
+    epoch += 1;   // 旧连接之后的事件全部作废，关闭事件不触发重连
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    if (flushFrame) { cancelAnimationFrame(flushFrame); flushFrame = null; }
+    clearInterval(latencyTimer);
+    const old = socket;
+    socket = null;
+    old?.close();
+    pending = {};
+    for (const topic of pendingQueued.keys()) pendingQueued.set(topic, []);
+    for (const set of Object.values(hooks)) set.clear();
+  }
 
   function hook(kind) { return fn => { hooks[kind].add(fn); return () => hooks[kind].delete(fn); }; }
   return {
     connect,
     reconnectNow,
+    close,
     /* 按主题订阅帧：fn(frame)；frame.payload 为载荷，frame.cursor 为游标。 */
     on(topic, fn) {
       if (!hooks.frame.has(topic)) hooks.frame.set(topic, new Set());

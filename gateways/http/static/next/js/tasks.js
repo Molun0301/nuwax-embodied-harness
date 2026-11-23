@@ -12,7 +12,6 @@ const ACTIVE_KEEP = 50, HISTORY_KEEP = 200, HISTORY_LIST = 20, BOOTSTRAP_QUEUE_L
 export function createTasks({ store, stream, api }) {
   const active = new Map(), history = new Map();
   const pending = new Set(), errors = new Map();
-  const labels = new Map();      // 本页提交的任务：task_id → {target}
   const navRange = new Map();    // 导航任务见过的最大剩余距离，折算进度用
   const listeners = new Set();
   let snapshotSequence = 0, ready = false, bootstrapQueue = [], loadPromise = null, reloadPending = false, loadError = '', dirty = false;
@@ -109,10 +108,6 @@ export function createTasks({ store, stream, api }) {
   stream.onFlush(() => { if (dirty) { dirty = false; publish(); } });
   stream.onOpen(({ reconnect }) => { if (reconnect) void load(); });
   stream.onGap(({ topics }) => { if (!topics || topics.has('tasks.state')) void load(); });
-  api.onTaskSubmitted((task, name, args) => {
-    const target = args.target_name || args.query_text || args.map_name || (name === 'navigate_to_pose' ? '地图上选的点' : '');
-    if (target) labels.set(task.task_id, { target });
-  });
 
   /* 取消或停止：导航与其它任务调用 cancel_task；探索调用 stop_exploration（探索尚未启动时不带编号）。
      发出后按钮显示“正在取消”，失败时写出后端原因。 */
@@ -138,7 +133,6 @@ export function createTasks({ store, stream, api }) {
     stop,
     /* 每次任务快照变化：fn(task)，用于跟随本页提交的任务进度。 */
     onUpdate(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    labels,
     navRange,
     get(taskId) { return active.get(taskId) || history.get(taskId) || null; },
     state: normalizeTaskState,

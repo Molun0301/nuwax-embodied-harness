@@ -34,7 +34,7 @@ export function mount(root, ctx) {
   function peekText() {
     const s = store.get();
     if (s.business !== 'running') return '业务服务未运行';
-    const a = deriveActivity(s, Date.now(), { labels: ctx.tasks.labels, navRange: ctx.tasks.navRange, capabilities: null });
+    const a = deriveActivity(s, Date.now(), { navRange: ctx.tasks.navRange, capabilities: null });
     return a.tone === 'idle' ? '让机器人去哪里？' : a.text + (a.quote ? '「' + a.quote + '」' : '');
   }
   function renderTabs() {

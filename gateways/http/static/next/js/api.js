@@ -1,8 +1,6 @@
 /* 接口调用：能力经与智能体相同的 /api/capabilities/<名>/invoke；管理服务经 /api/manager/*。
    失败时抛出带后端原因的错误（error.code 为后端错误码）。 */
 
-const submitListeners = new Set();
-
 export async function invoke(name, args = {}) {
   const response = await fetch('/api/capabilities/' + encodeURIComponent(name) + '/invoke', { method: 'POST',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arguments: args }) });
@@ -12,11 +10,8 @@ export async function invoke(name, args = {}) {
     error.code = value.error?.code || '';
     throw error;
   }
-  // 任务类能力返回任务快照；记下本页提交的参数，顶栏与面板据此写出目标名称。
-  if (value.task) for (const fn of submitListeners) fn(value.task, name, args);
   return value;
 }
-export function onTaskSubmitted(fn) { submitListeners.add(fn); return () => submitListeners.delete(fn); }
 
 // 能力目录只取一次，供各页面共用；失败后下次调用重新读取。
 let catalog = null;

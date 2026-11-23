@@ -24,18 +24,14 @@ export function fmtDuration(ms) {
 }
 export function fmtClock(ms) { return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }); }
 export function fmtGB(bytes) { const n = Number(bytes); return Number.isFinite(n) && n >= 0 ? (n / 1024 ** 3).toFixed(1) : '--'; }
-export function fmtRemaining(minutes) {
-  const m = Math.round(minutes);
-  if (m < 60) return '约 ' + m + ' 分';
-  return '约 ' + Math.floor(m / 60) + ' 小时' + (m % 60 ? ' ' + (m % 60) + ' 分' : '');
-}
 
 /* 任务呈现：类别、目标、进度（null 为不确定）、距离、用时、取消方式。
-   labels 为本页提交时记下的目标名；navRange 为导航任务见过的最大剩余距离，用来折算进度。 */
-export function describeTask(task, { labels, navRange, clockOffsetMs, now, pending, errors, capabilities }) {
+   目标名统一取任务快照的 data.target_label（导航由后端写入，不论谁发起），探索取 data.map_name；
+   navRange 为导航任务见过的最大剩余距离，用来折算进度。 */
+export function describeTask(task, { navRange, clockOffsetMs, now, pending, errors, capabilities }) {
   const kind = taskKind(task);
   const data = task.data || {};
-  const target = labels.get(task.task_id)?.target || (kind === 'explore' ? data.map_name || '' : '');
+  const target = data.target_label || (kind === 'explore' ? data.map_name || '' : '');
   const elapsedMs = Math.max(0, now + (clockOffsetMs || 0) - Number(task.created_at || 0) * 1000);
   const state = normalizeTaskState(task.state);
   const view = { task, kind, target, source: taskSource(task), elapsedMs, progress: null, distance: '', title: '',
@@ -127,14 +123,3 @@ export function idleDetail(geometry) {
 export function batteryTone(percent) { return percent == null ? '' : percent <= 10 ? 'bad' : percent <= 20 ? 'warn' : ''; }
 export function latencyTone(ms) { return ms != null && ms > 200 ? 'warn' : ''; }
 export function loadTone(percent) { return percent != null && percent >= 90 ? 'warn' : ''; }
-
-/* 电量剩余时间：设备不上报，按最近 30 分钟内的掉电速度估算；
-   至少 5 分钟且掉了 2 个百分点才估算，充电或数据不足时不显示。 */
-export const BATTERY_WINDOW_MS = 30 * 60e3;
-export function batteryRemainingMinutes(samples) {
-  if (samples.length < 2) return null;
-  const first = samples[0], last = samples[samples.length - 1];
-  const minutes = (last.t - first.t) / 60e3, drop = first.pct - last.pct;
-  if (minutes < 5 || drop < 2) return null;
-  return last.pct / (drop / minutes);
-}

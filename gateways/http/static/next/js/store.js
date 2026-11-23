@@ -40,7 +40,7 @@ export function initialState() {
     route: { view: 'monitor', sub: '' },               // 外壳：当前视图与视图内子页（监控页为右侧面板页签）
     conn: { status: 'connecting', rttMs: null, waitingMs: null },   // stream：主实时连接 connecting / open / lost 与往返延迟
     clockOffsetMs: null,                                // stream：设备时钟减浏览器时钟（毫秒），由往返测量估算
-    robot: { name: '', model: '', controlMode: 'unknown', battery: null, batteryRemainingMin: null, canMove: null, warning: '' },  // feeds
+    robot: { name: '', model: '', controlMode: 'unknown', battery: null, canMove: null, warning: '' },  // feeds
     geometry: { phase: 'idle', mapName: '', reason: '', connected: false },  // feeds：地图会话阶段与地图名
     metrics: { status: 'missing', cpuPercent: null, cpuThreads: null, memPercent: null, memUsedBytes: null, memTotalBytes: null },  // feeds
     services: null,                                     // feeds：监督者组件表 {名称: {title, state, state_title, pid, uptime_sec, exit_code, error, enabled, log_file}}

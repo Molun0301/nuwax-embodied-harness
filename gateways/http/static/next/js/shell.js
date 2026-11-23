@@ -2,7 +2,7 @@
    页面模块约定：export function mount(root, ctx) 返回 {show(sub, opts), hide()}；监控页随外壳加载，其余页面第一次打开时加载。 */
 import { icon, h, toast, popover, setTheme, currentTheme } from '/static/shared/neh-ui.js';
 import * as ui from '/static/shared/neh-ui.js';
-import { deriveActivity, fmtGB, fmtRemaining, batteryTone, latencyTone, loadTone, ESTOP_NOTICE_MS } from './status.js';
+import { deriveActivity, fmtGB, batteryTone, latencyTone, loadTone, ESTOP_NOTICE_MS } from './status.js';
 import * as monitorPage from './pages/monitor.js';
 
 export const VIEWS = ['monitor', 'caps', 'logs', 'settings', 'system'];
@@ -88,7 +88,7 @@ export function createShell({ store, stream, api, tasks, feeds }) {
   store.subscribe(['robot', 'geometry', 'conn', 'business'], renderRobot);
 
   /* ---------- 一句话状态 ---------- */
-  const extra = { labels: tasks.labels, navRange: tasks.navRange, capabilities: null };
+  const extra = { navRange: tasks.navRange, capabilities: null };
   api.capabilities().then(list => { extra.capabilities = new Map(list.map(cap => [cap.name, cap])); renderActivity(); }).catch(() => {});
   let actionKey = '', currentAction = null;
   // 进度条常驻复用：每秒刷新时不重建，不确定进度的动画才不会每秒从头开始。
@@ -152,21 +152,22 @@ export function createShell({ store, stream, api, tasks, feeds }) {
       h('span', { class: 'c-stat-label' }, label), h('span', { class: 'c-stat-value n-num' }, value, opts.extra ? h('small', {}, opts.extra) : null));
   }
   function renderVitals() {
-    const { robot, conn, metrics, volume } = store.get();
+    const { robot, conn, metrics, volume, business } = store.get();
     const lost = conn.status === 'lost';
     const battery = robot.battery;
-    const remaining = robot.batteryRemainingMin != null ? fmtRemaining(robot.batteryRemainingMin) : null;
+    // 断开或业务未运行时处理器、内存不再更新，不留断开前的旧数。
+    const stale = lost || business !== 'running';
+    const cpu = stale ? null : metrics.cpuPercent, mem = stale ? null : metrics.memPercent;
     const latency = lost ? '已断开' : conn.waitingMs != null ? '等待 ' + (conn.waitingMs / 1000).toFixed(1) + ' 秒'
       : conn.rttMs != null ? conn.rttMs + ' 毫秒' : '--';
     const off = metrics.status === 'disabled';
     const offTitle = '性能监控未开启，可在 设置 → 性能监控 开启';
     const items = [
-      stat('电量', battery != null ? battery + '%' : '--', { extra: remaining, tone: batteryTone(battery),
-        title: battery == null ? '机器人没有上报电量' : '电量 ' + battery + '%' + (remaining ? '，按最近的耗电速度' + remaining.replace('约 ', '约可用 ') : '') }),
+      stat('电量', battery != null ? battery + '%' : '--', { tone: batteryTone(battery), title: battery == null ? '机器人没有上报电量' : '机器人电量' }),
       stat('连接延迟', latency, { tone: lost ? 'bad' : latencyTone(conn.waitingMs ?? conn.rttMs), title: '网页到网关的往返时间' }),
-      stat('处理器', off ? '未开启' : metrics.cpuPercent != null ? Math.round(metrics.cpuPercent) + '%' : '--', { optional: true, tone: loadTone(metrics.cpuPercent),
+      stat('处理器', off && !stale ? '未开启' : cpu != null ? Math.round(cpu) + '%' : '--', { optional: true, tone: loadTone(cpu),
         title: off ? offTitle : '设备处理器占用' + (metrics.cpuThreads ? '，' + metrics.cpuThreads + ' 线程' : '') }),
-      stat('内存', off ? '未开启' : metrics.memPercent != null ? Math.round(metrics.memPercent) + '%' : '--', { optional: true, tone: loadTone(metrics.memPercent),
+      stat('内存', off && !stale ? '未开启' : mem != null ? Math.round(mem) + '%' : '--', { optional: true, tone: loadTone(mem),
         title: off ? offTitle : metrics.memTotalBytes ? '设备内存 ' + fmtGB(metrics.memUsedBytes) + ' / ' + fmtGB(metrics.memTotalBytes) + ' GB' : '设备内存占用' }),
     ];
     if (volume) {
@@ -178,7 +179,7 @@ export function createShell({ store, stream, api, tasks, feeds }) {
     }
     $('vitals').replaceChildren(...items);
   }
-  store.subscribe(['robot', 'conn', 'metrics', 'volume'], renderVitals);
+  store.subscribe(['robot', 'conn', 'metrics', 'volume', 'business'], renderVitals);
 
   /* 音量：机器人有 get_volume 与 set_volume 时显示；打开页面读一次，拖动松手后设置（与原控制台相同）。 */
   function volumeState(reply) { return { percent: reply.volume == null ? null : Math.round(reply.volume * 100), error: reply.last_error || '' }; }

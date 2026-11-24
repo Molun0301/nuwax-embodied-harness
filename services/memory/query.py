@@ -468,9 +468,13 @@ class QueryMixin:
         if candidate.semantic_instance is not None:
             return (MemoryRecordKind.OBJECT_INSTANCE.value, candidate.semantic_instance.anchor_id or candidate.semantic_instance.instance_id)
         if candidate.observation_event is not None:
-            if candidate.observation_event.linked_instance_ids:
-                return (MemoryRecordKind.OBSERVATION_EVENT.value, 'instance', *candidate.observation_event.linked_instance_ids)
-            return (MemoryRecordKind.OBSERVATION_EVENT.value, 'anchor', candidate.observation_event.anchor_id or '', candidate.observation_event.semantic_region_id or '', candidate.observation_event.topo_node_id or '', *candidate.observation_event.visual_labels)
+            event = candidate.observation_event
+            if event.linked_instance_ids:
+                return (MemoryRecordKind.OBSERVATION_EVENT.value, 'instance', *event.linked_instance_ids)
+            temporary_instance = event.metadata.get('short_term_instance_id')
+            if temporary_instance:
+                return (MemoryRecordKind.OBSERVATION_EVENT.value, 'instance', temporary_instance)
+            return (MemoryRecordKind.OBSERVATION_EVENT.value, 'anchor', event.anchor_id or '', event.semantic_region_id or '', event.topo_node_id or '', *event.visual_labels)
         if candidate.scene_space is not None:
             return (MemoryRecordKind.SCENE_SPACE.value, candidate.scene_space.scene_space_id)
         return (candidate.record_kind.value, candidate.point.point_id)

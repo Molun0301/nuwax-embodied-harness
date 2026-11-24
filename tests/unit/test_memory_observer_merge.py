@@ -42,6 +42,24 @@ class Sequence:
         return outcomes[0].instance
 
 
+def test_query_keeps_distinct_temporary_instances_at_the_same_anchor(tmp_path):
+    from contracts.naming import build_anchor_id, build_observation_event_id
+    from contracts.spatial_memory import ObservationEvent
+
+    anchor = build_anchor_id("nightstand")
+    with integration.memory_at(tmp_path, pose=integration.position(0, 0, 0)) as (memory, _):
+        for x, identity in ((-7.7, "old"), (-4.4, "placed"), (-4.4, "placed")):
+            event = ObservationEvent(event_id=build_observation_event_id("apple"), title="观察到 apple",
+                summary="apple", pose=integration.position(x, 2.5, .7), frame_id="map",
+                map_name="house", anchor_id=anchor, visual_labels=["apple"],
+                metadata={"short_term_instance_id": identity})
+            memory.write(lambda store: store.put("observation", event))
+
+        matches = memory.query_semantic_memory("apple").matches
+        positions = [match.observation_event.pose.position.x for match in matches if match.observation_event]
+        assert sorted(positions) == [-7.7, -4.4]
+
+
 def project(robot, *, tree=None, frame='map'):
     box = integration.detection3d('cup', x=3, y=2, z=1.5, size=(.08,.08,.12))
     support = integration.detection2d('cup', x=3, y=2, z=1.5, size=(.08,.08,.12))

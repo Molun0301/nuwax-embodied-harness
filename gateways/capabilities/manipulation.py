@@ -1,6 +1,5 @@
 """同一任务中前往操作站位、执行设备操作并更新记忆。"""
-import json
-from math import atan2, cos, hypot, sin
+from math import atan2
 
 from contracts.base import utc_now
 from core.capability import Capability
@@ -61,21 +60,12 @@ def _approach(platform, ctx, args, mode):
         raise GatewayError("目标周围没有可达操作站位。", error_code="navigation_failed", http_status=409)
     q = pose.orientation
     yaw = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-    approach = _ApproachContext(ctx)
-    goal = {"x": pose.position.x, "y": pose.position.y,
+    navigate_to_pose(platform, _ApproachContext(ctx), {"x": pose.position.x, "y": pose.position.y,
         "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
         "tolerance_position_m": config.approach_position_tolerance_m,
         "tolerance_yaw_rad": config.approach_yaw_tolerance_rad,
         # 离开或贴近台沿需要先后退；速度仍受机型后退上限约束。
-        "allow_reverse": True, "motion_generation": args["motion_generation"]}
-    if place_distance != "":
-        # 有独立放置站位时，先留出机身转向空间，再面向台面进入站位。
-        footprint = json.loads(value("derived.robot_geometry_json"))["footprint_xy_m"]
-        turn_radius = max(hypot(x, y) for x, y in footprint)
-        navigate_to_pose(platform, approach, {**goal,
-            "x": pose.position.x - turn_radius * cos(yaw),
-            "y": pose.position.y - turn_radius * sin(yaw)})
-    navigate_to_pose(platform, approach, goal)
+        "allow_reverse": True, "motion_generation": args["motion_generation"]})
     return instance
 
 

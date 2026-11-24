@@ -303,8 +303,7 @@ def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch
 
     monkeypatch.setattr(runtime.memory, "plan_manipulation_pose", plan)
     monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: station)
-    values = {"manipulation.place_standoff_distance_m": .64,
-              "derived.robot_geometry_json": '{"footprint_xy_m":[[0.3,0.4]]}'}
+    values = {"manipulation.place_standoff_distance_m": .64}
     monkeypatch.setattr(manipulation, "value", values.__getitem__)
     visited = []
     monkeypatch.setattr(manipulation, "navigate_to_pose", lambda _, __, goal: visited.append(goal))
@@ -315,9 +314,9 @@ def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch
 
     assert instance is furniture
     assert planned == [(True, .64), (False, .54)]
-    assert [goal["x"] for goal in visited] == pytest.approx([2., 2., 2.])
-    assert [goal["y"] for goal in visited] == pytest.approx([2.5, 3., 3.])
-    assert [goal["yaw_rad"] for goal in visited] == pytest.approx([pi / 2] * 3)
+    assert [goal["x"] for goal in visited] == pytest.approx([2., 2.])
+    assert [goal["y"] for goal in visited] == pytest.approx([3., 3.])
+    assert [goal["yaw_rad"] for goal in visited] == pytest.approx([pi / 2] * 2)
     assert all(goal["allow_reverse"] for goal in visited)
 
 

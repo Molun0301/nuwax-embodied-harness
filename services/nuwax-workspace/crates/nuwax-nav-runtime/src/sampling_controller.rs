@@ -177,11 +177,8 @@ impl Sampler {
         let max_linear = max_linear.min(speed_cap.max(min_linear));
         let min_yaw = (previous.angular_z - angular_step).max(-config.max_yaw_rate);
         let max_yaw = (previous.angular_z + angular_step).min(config.max_yaw_rate);
-        let forward = if turn_to.is_some() {
-            vec![0.]
-        } else {
-            samples(min_linear, max_linear, previous.linear.x, LINEAR_INTERVALS)
-        };
+        // 朝向修正也保留可达的平移动作，碰撞扫掠决定是否能边退边转。
+        let forward = samples(min_linear, max_linear, previous.linear.x, LINEAR_INTERVALS);
         let angular = samples(min_yaw, max_yaw, previous.angular_z, ANGULAR_INTERVALS);
         self.poses.clear();
         for &v in &forward {
@@ -220,7 +217,7 @@ impl Sampler {
             let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
                 + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
                 + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
-                + UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction);
+                + if turn_to.is_none() { UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction) } else { 0. };
             ranked.push(Candidate {
                 score,
                 same_turn: w * previous.angular_z > 0.,
@@ -403,6 +400,17 @@ mod tests {
                 .occupied,
             0
         );
+    }
+
+    #[test]
+    fn terminal_turn_does_not_move_along_the_route_when_rotation_is_clear() {
+        let (config, map) = fixture(&[]);
+        let route = Route::new(vec![START]);
+        let oriented = Sampler::default()
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, Some(1.))
+            .unwrap();
+        assert_eq!(oriented.command.linear, Point2::new(0., 0.));
+        assert!(oriented.command.angular_z > 0.);
     }
 
     #[test]

@@ -44,7 +44,8 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import capture_geometry, contract_pose, _stamp
+from services.perception.observation_geometry import (
+    _POINT_CLOUD_MERGE_WINDOW_NS, capture_geometry, contract_pose, _stamp)
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -55,8 +56,8 @@ from services.perception.trackers import Basic2DTrackerBackend
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
 _INPUT_LOG_LIMITER = LogRateLimiter()
-# 15 帧/秒约保留 1.3 秒，覆盖合并窗口并为后台补几何预留时间。
-_POINT_CLOUD_CACHE_FRAMES = 20
+# 按 Go2 雷达 15.4 帧/秒约保留 3 秒，用于覆盖检测耗时，保证发布样本时拍照时刻的点云仍在缓存中。
+_POINT_CLOUD_CACHE_FRAMES = 45
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -800,20 +801,20 @@ class PerceptionService:
         return None
 
     def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
-                                      stop_event=None):
+                                      stop_event=None, point_cloud_frames=()):
         """完成同帧几何与关键帧抓图，返回结果后结束感知操作。"""
         with self._operation(), self.point_cloud_consumer():
             return self._complete_observation_geometry(
                 context, inputs, store_artifact=store_artifact,
-                stop_event=stop_event)
+                stop_event=stop_event, point_cloud_frames=point_cloud_frames)
 
     def _complete_observation_geometry(self, context, inputs, *, store_artifact=False,
-                                      stop_event=None):
+                                      stop_event=None, point_cloud_frames=()):
         """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
         if inputs is None:
             return context, None, None
         image_frame, camera_info = inputs
-        geometry = self._capture_geometry(image_frame)
+        geometry = self._capture_geometry(image_frame, point_cloud_frames)
         if stop_event is not None and stop_event.is_set():
             return context, None, None
         if camera_info is None:
@@ -1528,11 +1529,20 @@ class PerceptionService:
             frames = sorted((*self._point_cloud_frames, frame), key=lambda item: _stamp(item.payload, item.payload.metadata))
             self._point_cloud_frames = tuple(frames[-_POINT_CLOUD_CACHE_FRAMES:])
 
-    def _capture_geometry(self, image_frame):
+    def point_cloud_frames_at(self, image_frame):
+        """取出图像来源时刻合并窗口内的缓存点云，随样本保存供后台补几何。"""
+        stamp = _stamp(image_frame, image_frame.metadata)
+        with self._point_cloud_lock:
+            return tuple(frame for frame in self._point_cloud_frames
+                if abs(_stamp(frame.payload, frame.payload.metadata) - stamp) <= _POINT_CLOUD_MERGE_WINDOW_NS)
+
+    def _capture_geometry(self, image_frame, saved_point_cloud_frames=()):
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
         transforms = () if snapshot is None else self._geometry_transforms()
         with self._point_cloud_lock:
             cloud_frames = self._point_cloud_frames
+        # 样本保存的拍照时刻点云与当前缓存合并，同一帧对象只保留一次。
+        cloud_frames = tuple({id(frame): frame for frame in (*saved_point_cloud_frames, *cloud_frames)}.values())
         geometry = capture_geometry(self._stream_bus, image_frame, transforms=transforms,
             map_name=None if snapshot is None else snapshot.map_name, point_cloud_frames=cloud_frames)
         self._frame_tree = geometry.frame_tree

@@ -19,7 +19,7 @@ def geometry_value(space):
 
 
 def semantic_geometry_value(space):
-    """标签沿用遵循原轮廓、坐标系和洞的规则。"""
+    """比较轮廓、坐标系和洞；只决定重新分割后是否沿用决策输入与观察样本。"""
     boundary = space.boundary
     return (space.frame_id,
         tuple((point.x, point.y, point.z) for point in boundary.polygon_points) if boundary else (),

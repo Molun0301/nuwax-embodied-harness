@@ -6,6 +6,7 @@
    原图保留；改力度或换地图即作废旧预览。 */
 import { h, icon, toast, confirmDialog } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, GEOMETRY_PHASES } from '../status.js';
+import { poseAt, trackPoseDrag } from '../stage/posedrag.js';
 
 const BADGE = { off: '', busy: 'n-badge--accent', warn: 'n-badge--warn', ok: 'n-badge--ok', bad: 'n-badge--bad' };
 const CLEANUP_LAYERS = [{ kind: 'source', label: '原图', color: '#748997', size: 1, checked: true },
@@ -16,7 +17,7 @@ const formatTime = value => (value ? new Date(value).toLocaleString('zh-CN', { h
 const formatSize = bytes => (bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB');
 
 export function mountMap(root, ctx) {
-  const { api, stream, tasks } = ctx;
+  const { api, stream, tasks, stage } = ctx;
   const state = { maps: [], phase: null, current: '', busy: false, task: null, page: 'list', detail: null, query: '', shown: false };
   const status = h('p', { class: 'c-status-line', role: 'status' });
   const view = h('div');
@@ -32,24 +33,26 @@ export function mountMap(root, ctx) {
       render();
     } catch (error) { say('读取地图列表失败：' + error.message, 'error'); }
   }
-  // 动作类能力直接返回结果；任务类能力返回任务，进度随任务更新。
-  async function run(label, name, args, done) {
+  // 动作类能力直接返回结果；任务类能力返回任务，进度随任务更新。end() 在结束时调用（成功、失败或取消）。
+  async function run(label, name, args, done, end) {
     if (state.busy) return;
     state.busy = true; render();
     say(label + '：已提交，等待网关应答。');
     try {
       const reply = await api.invoke(name, args);
-      if (reply.task) { state.task = { id: reply.task.task_id, label, done }; say(label + '：' + reply.task.message); }
-      else { say(done(reply)); toast(done(reply)); await load(); }
+      if (reply.task) { state.task = { id: reply.task.task_id, label, done, end }; say(label + '：' + reply.task.message); }
+      else { say(done(reply)); toast(done(reply)); end?.(); await load(); }
     } catch (error) {
       say(label + '失败：' + error.message, 'error');
+      end?.();
     } finally { state.busy = false; render(); }
   }
   tasks.onUpdate(task => {
     if (!state.task || task.task_id !== state.task.id) return;
-    const { label, done } = state.task;
+    const { label, done, end } = state.task;
     if (!isTerminalTaskState(task.state)) { say(label + '：' + task.message); return; }
     state.task = null;
+    end?.();
     if (task.state === 'succeeded') { const text = done(task.result || {}); say(text); toast(text); }
     else say(label + (task.state === 'cancelled' ? '已取消：' : '失败：') + task.message, 'error');
     void load();
@@ -64,6 +67,53 @@ export function mountMap(root, ctx) {
     render();
     if (snapshot.map_name && !listed) void load();
   });
+
+  const relocalized = result => '重定位成功' + (Number.isFinite(result.fitness) ? '，匹配度 ' + result.fitness.toFixed(3) : '');
+
+  /* ---------- 指定位置后重定位 ----------
+     舞台进入指定模式：按下处是机器狗位置，拖动方向是它面向的方向（stage/posedrag.js，与导航选点同一套），
+     松手后画出位置与朝向标记，调用 relocalize_active_map({planar_seed: [x, y, yaw]})；重定位结束后标记消失。 */
+  const seed = { picking: false };
+  function showSeed(pose) { stage.map.setSeedPose(pose); window.pointcloud3d?.previewNavigationPoint(pose); }
+  function startSeed() {
+    if (stage.map.viewMode === 'graph') stage.setView('2d');
+    seed.picking = true;
+    stage.setPicking(true);
+    window.__nuwaxResetMapInteraction?.();
+    stage.hint(h('div', { class: 'n-float c-hint', html: icon('locate-fixed', 'n-icon--sm') }, '在地图上按下机器狗所在位置，拖动指出它面向的方向；Esc 取消',
+      h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => cancelSeed() }, '取消')));
+    say('指定位置：在地图上按下机器狗所在位置，按住拖出它面向的方向。');
+  }
+  function endSeed() { seed.picking = false; stage.setPicking(false); stage.hint(null); }
+  function cancelSeed() { endSeed(); showSeed(null); say('已取消指定位置。'); }
+  stage.mapLayer.addEventListener('pointerdown', event => {
+    if (!seed.picking || event.button !== 0 || event.isPrimary === false) return;
+    // 捕获阶段拦下这次按下，地图不旋转平移，也不点选物品或区域。
+    event.stopPropagation();
+    event.preventDefault();
+    const view = stage.map.viewMode === '3d' ? '3d' : '2d';
+    const point = poseAt(view, event);
+    if (!point) { say('按下处没有地图，请在地图上按下机器狗所在位置。', 'warn'); return; }
+    showSeed(point);
+    if (view === '3d') window.pointcloud3d?.setBoundaryEditing(true);
+    trackPoseDrag(stage.mapLayer, event, point, view, {
+      onYaw: yaw => showSeed({ ...point, yaw }),
+      onEnd: yaw => {
+        if (view === '3d') window.pointcloud3d?.setBoundaryEditing(false);
+        if (!seed.picking) return;
+        if (yaw === undefined) {
+          showSeed(null);
+          say('需要按住拖出机器狗面向的方向，这次没有发送重定位。', 'warn');
+          toast('按住后拖动，指出机器狗面向的方向', { tone: 'warn' });
+          return;
+        }
+        endSeed();
+        showSeed({ ...point, yaw });
+        run('按指定位置重定位', 'relocalize_active_map', { planar_seed: [point.x, point.y, yaw] }, relocalized, () => showSeed(null));
+      },
+    });
+  }, true);
+  document.addEventListener('keydown', event => { if (seed.picking && event.key === 'Escape') { event.preventDefault(); cancelSeed(); } });
 
   /* ---------- 确认后执行 ---------- */
   async function activate(name) {
@@ -131,7 +181,8 @@ export function mountMap(root, ctx) {
         h('span', {}, '大小 ', h('b', { class: 'n-num' }, formatSize(currentEntry.size_bytes)))) : null,
       nameRow,
       session ? h('div', { class: 'c-card-actions' },
-        btn('重定位', () => run('重定位', 'relocalize_active_map', {}, result => '重定位成功' + (Number.isFinite(result.fitness) ? '，匹配度 ' + result.fitness.toFixed(3) : '')), { title: '在当前地图上重新估计机器人位置' }),
+        btn('重定位', () => run('重定位', 'relocalize_active_map', {}, relocalized), { title: '在当前地图上重新估计机器人位置' }),
+        btn('指定位置后重定位', startSeed, { title: '机器狗离建图起点较远、直接重定位失败时，在地图上指出它的位置和朝向作为初值再重定位' }),
         btn('保存', () => run('保存「' + state.current + '」', 'save_map', {}, result => '已保存地图「' + result.map_name + '」')),
         btn('另存为…', () => saveAs(nameRow)),
         btn('清除残影…', () => openCleanup(state.current), { disabled: state.busy || !currentEntry?.saved, title: currentEntry?.saved ? '去掉行人等移动物体留下的点，另存为新地图' : '先保存地图才能清除残影' }),
@@ -349,6 +400,6 @@ export function mountMap(root, ctx) {
 
   return {
     show() { state.shown = true; render(); void load(); },
-    hide() { state.shown = false; },
+    hide() { state.shown = false; if (seed.picking) cancelSeed(); },
   };
 }

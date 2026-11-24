@@ -6,9 +6,10 @@
    exploration-mission.js 迁出；跨楼层从 building-navigation.js 迁出。 */
 import { icon, h, toast } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, normalizeTaskState } from '../status.js';
+import { CLICK_PIXELS, poseAt, trackPoseDrag } from '../stage/posedrag.js';
 
 const TABS = [['pick', '选点'], ['named', '去某处'], ['explore', '自动探索'], ['floor', '跨楼层']];
-const DOUBLE_CLICK_MS = 500, CLICK_PIXELS = 6;
+const DOUBLE_CLICK_MS = 500;
 const EXPLORE_CAPS = ['explore_area_v2', 'resume_exploration', 'explore_building'];
 const FLOOR_CAPS = new Set(['navigate_to_floor', 'explore_building']);
 const FLOOR_STATES = { running: '任务运行中', cancelling: '正在取消任务', succeeded: '任务已完成', failed: '任务失败', cancelled: '任务已取消', timed_out: '任务已超时' };
@@ -122,36 +123,27 @@ export function mountNav(root, ctx) {
     if (!point) { setPickStatus('双击处没有地图点，未选点；请放大后双击可见地面', 'warn'); return; }
     selectMapPoint(point.x, point.y, point.frame_id, point);
   });
-  // 二维：捕获阶段先于地图画布自身的拖动处理。
+  // 二维：捕获阶段先于地图画布自身的拖动处理；双击的第二下按住拖动定朝向（stage/posedrag.js）。
   (function capture2d() {
     const mapEl = stage.canvas;
-    let drag = null, press = null, lastClick = null;
-    const unproject = ev => window.__nuwaxMapUnproject?.(ev.clientX, ev.clientY) || null;
+    let press = null, lastClick = null;
     mapEl.addEventListener('pointerdown', ev => {
       if (!window.__nuwaxNavigationActive || ev.button !== 0 || ev.isPrimary === false) return;
       const second = lastClick && ev.timeStamp - lastClick.time <= DOUBLE_CLICK_MS && Math.hypot(ev.clientX - lastClick.x, ev.clientY - lastClick.y) <= CLICK_PIXELS;
       lastClick = null;
       press = second ? null : { id: ev.pointerId, x: ev.clientX, y: ev.clientY, time: ev.timeStamp };
       if (!second) return;
-      const point = unproject(ev);
+      const point = poseAt('2d', ev);
       if (!point) { setPickStatus('等待可用的二维地图后选点', 'warn'); return; }
       ev.stopImmediatePropagation();
       ev.preventDefault();
-      drag = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, point, dragged: false };
-      mapEl.setPointerCapture(ev.pointerId);
       selectMapPoint(point.x, point.y, point.frame_id);
+      trackPoseDrag(mapEl, ev, point, '2d', {
+        onYaw: yaw => { pick.pendingPose = { ...pick.pendingPose, yaw }; showPick(pick.pendingPose); },
+        onEnd: () => renderPick(),
+      });
     }, true);
-    mapEl.addEventListener('pointermove', ev => {
-      if (!drag || drag.id !== ev.pointerId) return;
-      if (!drag.dragged && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) <= CLICK_PIXELS) return;
-      const point = unproject(ev);
-      if (!point) return;
-      drag.dragged = true;
-      pick.pendingPose = { ...pick.pendingPose, yaw: Math.atan2(point.y - drag.point.y, point.x - drag.point.x) };
-      showPick(pick.pendingPose);
-    });
-    function finishDrag(ev) {
-      if (drag && drag.id === ev.pointerId) { drag = null; renderPick(); return; }
+    function finishPress(ev) {
       const start = press;
       press = null;
       // 按下后几乎没动的单击留作双击的第一下。
@@ -159,8 +151,8 @@ export function mountNav(root, ctx) {
         lastClick = { time: start.time, x: start.x, y: start.y };
       }
     }
-    mapEl.addEventListener('pointerup', finishDrag);
-    mapEl.addEventListener('pointercancel', finishDrag);
+    mapEl.addEventListener('pointerup', finishPress);
+    mapEl.addEventListener('pointercancel', finishPress);
   })();
   function syncPicking() {
     const active = shown && tab === 'pick';

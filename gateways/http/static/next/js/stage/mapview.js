@@ -923,6 +923,8 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
     // 导航面板正在选的点：有朝向画箭头，没有朝向画圆点。
     const pick = window.__nuwaxNavigationModule?.getState().pendingPose;
     if (pick) drawGoalMarker(context, anchor, scale, pick, pick.yaw);
+    // 地图卡“指定位置后重定位”指出的位置与朝向，画法同导航目标。
+    if (state.seedPose) drawGoalMarker(context, anchor, scale, state.seedPose, state.seedPose.yaw);
     drawFrontiers(context, anchor, scale);
     items?.draw(context, project, canvas.width, canvas.height);
     drawRobot(context, anchor);
@@ -1246,6 +1248,8 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
       emit();
     },
     setHighlight(value) { state.highlightTarget = value; requestMapDraw(false); },
+    /* 重定位初值标记 {x, y, yaw}，null 清除。 */
+    setSeedPose(pose) { state.seedPose = pose; requestMapDraw(false); },
     setPointStyle(style) { state.pointStyle = style; window.pointcloud3d?.setPointStyle(style); emit(); },
     /* 舞台重新可见或尺寸变化时调用。 */
     refresh() {

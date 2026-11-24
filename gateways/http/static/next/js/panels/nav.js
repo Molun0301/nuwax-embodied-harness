@@ -7,6 +7,7 @@
 import { icon, h, toast } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, normalizeTaskState } from '../status.js';
 import { CLICK_PIXELS, poseAt, trackPoseDrag } from '../stage/posedrag.js';
+import { slideIn } from '../motion.js';
 
 const TABS = [['pick', '选点'], ['named', '去某处'], ['explore', '自动探索'], ['floor', '跨楼层']];
 const DOUBLE_CLICK_MS = 500;
@@ -25,6 +26,9 @@ export function mountNav(root, ctx) {
     seg.replaceChildren(...TABS.map(([id, label]) => h('button', { type: 'button', role: 'tab', 'aria-pressed': String(tab === id), onclick: () => setTab(id) }, label)));
   }
   function setTab(id) {
+    const index = id => TABS.findIndex(([key]) => key === id);
+    // 换页签：往右的从右侧进，往左的从左侧进。
+    if (id !== tab) slideIn(pages[id], Math.sign(index(id) - index(tab)));
     tab = id;
     renderSeg();
     for (const [key, page] of Object.entries(pages)) page.hidden = key !== id;

@@ -10,6 +10,7 @@ import { REGION_STATUS } from '../stage/regions.js';
 import { NODE_KINDS } from '../stage/graph.js';
 import { instanceName, observationOnly, instanceQuality, instanceExtent } from '../stage/items.js';
 import { planarYawFromPose } from '../stage/mapview.js';
+import { slideIn } from '../motion.js';
 
 const TASK_TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'timeout']);
 const FILTERS = [['all', '全部'], ['located', '有位置'], ['observation', '仅观察'], ['uncertain', '待确认']];
@@ -70,8 +71,11 @@ export function mountSemantic(root, ctx) {
       if (target && target.record_id === state.itemId && !target.target_pose) map.setHighlight(null);
     }
   }
+  // 页面深度：列表 0，详情 1，从“此处的物品”进的物品详情 2。进更深的页从右侧进，返回从左侧进；区域、物品两页签按左右。
+  const depth = () => (state.page === 'list' ? 0 : state.page === 'item' && state.cluster ? 2 : 1);
   function open(page, fields = {}) {
     clearSelection();
+    const from = { page: state.page, tab: state.tab, depth: depth() };
     Object.assign(state, { page, ...fields });
     state.pageKey = '';
     if (!state.task) say('');
@@ -83,6 +87,9 @@ export function mountSemantic(root, ctx) {
     }
     if (page === 'node') loadNode(state.nodeId);
     render();
+    if (!state.shown || (from.page === page && from.tab === state.tab && page === 'list')) return;
+    const dir = from.page === 'list' && page === 'list' ? (state.tab === 'items' ? 1 : -1) : Math.sign(depth() - from.depth);
+    slideIn(view, dir);
   }
   const toList = tab => open('list', { tab: tab || state.tab, regionId: null, itemId: null, cluster: null, nodeId: null, nodeDetail: null });
 

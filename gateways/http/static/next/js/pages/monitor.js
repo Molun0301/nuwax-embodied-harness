@@ -11,6 +11,7 @@ import { mountSemantic } from '../panels/semantic.js';
 import { mountNav } from '../panels/nav.js';
 import { mountMotion } from '../panels/motion.js';
 import { mountZones } from '../panels/zones.js';
+import { play, slideIn } from '../motion.js';
 
 export const PANELS = [['activity', '活动', 'activity'], ['map', '地图', 'map'], ['semantic', '语义', 'tag'],
   ['nav', '导航', 'navigation'], ['motion', '运动', 'move'], ['zones', '禁行区', 'ban']];
@@ -56,7 +57,7 @@ export function mount(root, ctx) {
   }
   function renderTabs() {
     if (narrow() && collapsed) {
-      tabs.replaceChildren(h('button', { class: 'c-peek', type: 'button', onclick: () => setCollapsed(false) },
+      tabs.replaceChildren(h('button', { class: 'c-peek', type: 'button', onclick: () => setCollapsed(false, true) },
         h('i', { class: 'c-peek-handle' }), h('span', { class: 'c-peek-text' }, peekText()),
         h('span', { class: 'c-peek-more', html: icon('chevron-up', 'n-icon--sm') }, '工具')));
       return;
@@ -68,28 +69,37 @@ export function mount(root, ctx) {
         : id === 'activity' && s.tasks.active.length && side !== 'activity' ? h('span', { class: 'c-tab-dot' }) : null;
       return h('button', { class: 'c-side-tab', type: 'button', role: 'tab', 'aria-selected': String(side === id), html: icon(ic),
         onclick: () => {
-          if (narrow() && id === side && !collapsed) { setCollapsed(true); return; }
+          if (narrow() && id === side && !collapsed) { setCollapsed(true, true); return; }
           go('monitor', id, { open: true });
         } }, label, dot);
     }));
   }
-  function setCollapsed(value) {
+  // animate：窄屏底部抽屉由用户拉起或收起时，从原来的高度滑到新的位置（首次进入不动）。
+  function setCollapsed(value, animate = false) {
+    const before = animate && narrow() ? aside.getBoundingClientRect().top : null;
     collapsed = value;
     monitor.classList.toggle('is-collapsed', collapsed);
+    if (before !== null) {
+      const dy = before - aside.getBoundingClientRect().top;
+      if (dy) play(aside, [{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { speed: 'slow', ease: collapsed ? 'in' : 'out' });
+    }
     collapseBtn.innerHTML = icon(collapsed ? 'chevron-left' : 'chevron-right');
     collapseBtn.title = collapsed ? '展开侧栏' : '收起侧栏';
     renderTabs();
   }
-  collapseBtn.addEventListener('click', () => setCollapsed(!collapsed));
+  collapseBtn.addEventListener('click', () => setCollapsed(!collapsed, true));
   stageEl.append(collapseBtn);
   /* opts.open：从页签、铃铛等明确要看面板的入口进来时展开收起的面板；opts.focus：滚动到面板内该编号的区块。 */
   function openSide(id, opts = {}) {
     if (shownModule && shownModule !== id) modules[shownModule].hide?.();
+    const previous = side;
     side = id;
     shownModule = id;
     for (const [key, pane] of Object.entries(panes)) pane.hidden = key !== id;
-    if (collapsed && opts.open) setCollapsed(false); else renderTabs();
+    if (collapsed && opts.open) setCollapsed(false, true); else renderTabs();
     modules[id].show(opts);
+    // 换页签：往右边的页签从右侧进，往左边的从左侧进。
+    if (previous !== id) slideIn(panes[id], Math.sign(PANEL_IDS.indexOf(id) - PANEL_IDS.indexOf(previous)));
   }
   store.subscribe(['business', 'tasks', 'unread', 'conn'], renderTabs);
 

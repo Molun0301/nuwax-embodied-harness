@@ -2,7 +2,7 @@
    数据沿用原日志页（console-logs.js，06 第 6 节）：首屏 /api/logs，before 游标翻页，实时 logs.entry 追加（独立连接，日志洪峰不挤主连接），
    离开本页时关闭实时连接、回来时先重读首屏再接上；缺口时重读最近一页；页面可见时每 3 秒补取独立组件写入文件的日志，不可见时停止、恢复可见立即取一次；导出 /api/logs/export。
    本地最多保留 5000 条，超出时优先保留符合当前筛选的记录。 */
-import { icon, h, toast, menu, copyText } from '/static/shared/neh-ui.js';
+import { icon, h, toast, menu, copyText, leave } from '/static/shared/neh-ui.js';
 import { createStream } from '../stream.js';
 
 const CACHE_LIMIT = 5000;
@@ -74,6 +74,8 @@ export function mount(root, ctx) {
   root.classList.add('n-page--full', 'c-logs');
   const records = new Map();
   const rowNodes = new Map();
+  // 首屏之后新到的记录（实时流、定时补取）：下一次渲染时整行轻微高亮后淡去。
+  const freshIds = new Set();
   const st = { levels: new Set(['error', 'warning', 'info']), component: '', query: '', task: '', request: '', hideWeb: true,
     paused: false, pending: 0, displayLimit: PAGE_SIZE, nextBefore: null, hasMore: false, loading: false, reading: null, polling: false, request_seq: 0,
     note: '', gapNote: '', selected: null, visible: false, renderTimer: null, filterTimer: null };
@@ -164,13 +166,14 @@ export function mount(root, ctx) {
   }
 
   /* ---------- 数据 ---------- */
-  function addEntries(entries, historical = false) {
+  function addEntries(entries, historical = false, live = !historical) {
     let count = 0;
     for (const raw of entries) {
       if (!raw) continue;
       const entry = normalize(raw, historical);
       if (records.has(entry.id)) continue;
       records.set(entry.id, entry);
+      if (live) freshIds.add(entry.id);
       count += 1;
     }
     if (records.size > CACHE_LIMIT) {
@@ -217,7 +220,7 @@ export function mount(root, ctx) {
     try {
       const result = await ctx.api.json('/api/logs?' + query);
       if (!st.nextBefore) { st.nextBefore = result.next_before; st.hasMore = Boolean(result.has_more); }
-      addEntries(result.entries || [], true);
+      addEntries(result.entries || [], true, true);
       st.note = '';
     } catch (error) {
       st.note = '日志暂时无法读取，将自动重试。原因：' + error.message;
@@ -277,7 +280,8 @@ export function mount(root, ctx) {
     const d = e.details;
     const context = e.event === 'http.request.completed' || e.event === 'http.request.failed'
       ? [[d.method, d.path].filter(Boolean).join(' '), d.status_code, Number.isFinite(Number(d.duration_ms)) ? Number(d.duration_ms).toFixed(1) + ' 毫秒' : ''].filter(v => v !== undefined && v !== '').join('  ') : '';
-    const tr = h('tr', { class: 'c-logrow', dataset: { level, id: e.id }, onclick: () => openDrawer(e) },
+    const tr = h('tr', { class: 'c-logrow', dataset: { level, id: e.id }, onclick: () => openDrawer(e),
+      onanimationend: ev => { if (ev.animationName === 'c-log-new') ev.currentTarget.classList.remove('c-log-new'); } },
       h('td', { class: 'n-num c-log-time', title: e.timestamp }, clock(e.timestamp)),
       h('td', {}, h('span', { class: 'c-loglevel', html: level === 'error' ? icon('circle-alert', 'n-icon--sm') : level === 'warning' ? icon('triangle-alert', 'n-icon--sm') : '' }, LEVEL_NAMES[e.level] || e.level)),
       h('td', { class: 'c-col-comp' }, h('div', { class: 'c-logcomp', title: e.component }, componentName(e))),
@@ -294,16 +298,21 @@ export function mount(root, ctx) {
     st.pending = 0;
     const filtered = ordered().filter(matches);
     const shown = filtered.slice(0, st.displayLimit);
+    // 表格里已有记录时才高亮新到的行；首屏和筛选后整表换新不高亮。
+    const hadRows = Boolean(tbody.querySelector('tr.c-logrow'));
     const wanted = shown.map(e => {
       if (!rowNodes.has(e.id)) rowNodes.set(e.id, row(e));
       const tr = rowNodes.get(e.id);
       tr.setAttribute('aria-selected', String(st.selected === e.id));
+      if (hadRows && freshIds.has(e.id)) tr.classList.add('c-log-new');
       return tr;
     });
+    freshIds.clear();
     if (!wanted.length) wanted.push(h('tr', {}, h('td', { colspan: 6 }, h('div', { class: 'n-empty', html: icon(st.loading ? 'scroll-text' : 'search') },
       h('div', { class: 'n-empty-title' }, st.loading ? '正在读取日志…' : '没有符合条件的记录'), st.loading ? null : h('div', {}, '放宽等级或组件筛选再看看。')))));
     const keep = new Set(wanted);
-    for (const node of [...tbody.children]) if (!keep.has(node)) node.remove();
+    // 移出表格的行去掉高亮，筛选放宽后再出现时不重放。
+    for (const node of [...tbody.children]) if (!keep.has(node)) { node.classList.remove('c-log-new'); node.remove(); }
     wanted.forEach((node, index) => { if (tbody.children[index] !== node) tbody.insertBefore(node, tbody.children[index] || null); });
     const notes = [st.note, st.gapNote].filter(Boolean);
     notice.hidden = !notes.length;
@@ -317,9 +326,9 @@ export function mount(root, ctx) {
 
   /* ---------- 详情抽屉 ---------- */
   let drawer = null;
-  function closeDrawer() { drawer?.remove(); drawer = null; st.selected = null; tbody.querySelectorAll('tr[aria-selected="true"]').forEach(tr => tr.setAttribute('aria-selected', 'false')); }
+  function closeDrawer() { leave(drawer, { to: 'translateX(100%)', speed: 'slow' }); drawer = null; st.selected = null; tbody.querySelectorAll('tr[aria-selected="true"]').forEach(tr => tr.setAttribute('aria-selected', 'false')); }
   function openDrawer(e) {
-    drawer?.remove();
+    const previous = drawer;
     st.selected = e.id;
     tbody.querySelectorAll('tr.c-logrow').forEach(tr => tr.setAttribute('aria-selected', String(tr.dataset.id === e.id)));
     const level = chipOf(e.level);
@@ -341,7 +350,9 @@ export function mount(root, ctx) {
         h('span', { class: 'n-toolbar-spacer' }),
         h('button', { class: 'n-btn n-btn--sm', type: 'button', html: icon('copy', 'n-icon--sm'), onclick: () => copy(asText(e), '这条记录') }, '复制文本'),
         h('button', { class: 'n-btn n-btn--sm', type: 'button', onclick: () => copy(JSON.stringify(publicEntry(e), null, 2), ' JSON') }, '复制 JSON')));
-    root.append(drawer);
+    // 已打开时换一条记录只换内容，不再从边缘滑入。
+    if (previous) { drawer.style.animation = 'none'; previous.replaceWith(drawer); }
+    else root.append(drawer);
   }
   document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && st.visible && drawer && !document.querySelector('dialog[open], .n-popover')) closeDrawer(); });
 

@@ -53,7 +53,7 @@ export function leave(el, { to = 'translateY(4px)', speed = 'base', hide = false
   }).catch(() => {});
 }
 /* 高度展开收起：body 收起时由样式隐藏（display: none），动画期间加 n-collapsing 保持显示并裁剪。
-   在改变展开状态之前调用 measure 记下起始高度，改完后调用返回的函数开始动画。 */
+   在改变展开状态之前调用本函数记下起始高度，改完后调用返回的函数开始动画。 */
 export function collapse(body) {
   if (!body?.animate || !body.isConnected) return () => {};
   const from = body.getBoundingClientRect().height;
@@ -66,6 +66,27 @@ export function collapse(body) {
     anim.finished.then(() => { if (body._height === anim) { body._height = null; body.classList.remove('n-collapsing'); } }).catch(() => {});
   };
 }
+/* 整块新建或即将移除的区域按高度展开收起：open 为真时从 0 展开到现有高度，否则从现有高度收到 0（停在 0，由调用方随后移除）。
+   返回动画结束的 Promise。 */
+export function slideHeight(el, open) {
+  if (!el?.animate || !el.isConnected) return Promise.resolve();
+  const full = el.getBoundingClientRect().height + 'px';
+  el.style.overflow = 'hidden';
+  const anim = el.animate([{ height: open ? '0px' : full }, { height: open ? full : '0px' }],
+    { duration: motionMs('base'), easing: easing(open ? 'out' : 'in'), fill: open ? 'none' : 'forwards' });
+  return anim.finished.then(() => { if (open) el.style.overflow = ''; }, () => {});
+}
+/* 进度条：页面每次刷新都整块重建时，按 key 记住上次的进度，新建的条从上次宽度过渡到新宽度。percent 为 null 时是不确定进度。 */
+const progressWidths = new Map();
+export function progressBar(key, percent, cls = '') {
+  const fill = h('span', { style: percent == null ? null : 'width:' + percent + '%' });
+  const last = progressWidths.get(key);
+  if (percent != null && last != null && last !== percent && fill.animate) {
+    fill.animate([{ width: last + '%' }, { width: percent + '%' }], { duration: motionMs('slow'), easing: easing('out') });
+  }
+  progressWidths.set(key, percent);
+  return h('div', { class: 'n-progress' + (percent == null ? ' n-progress--indeterminate' : '') + (cls ? ' ' + cls : '') }, fill);
+}
 /* 文字切换淡入：内容变化时（只比较文字）新内容淡入，用于一句话状态这类会整体换掉的文字。 */
 export function fadeOnChange(el) {
   let last = el.textContent;
@@ -76,16 +97,18 @@ export function fadeOnChange(el) {
   }).observe(el, { childList: true, characterData: true, subtree: true });
 }
 
-/* details 展开收起：点摘要时按高度动画，收起动画结束后才去掉 open。 */
+/* details 展开收起：点摘要时按高度动画，收起动画结束后才去掉 open。
+   收起期间带 data-closing，箭头样式据此在开始收起时就转回；收起途中再点改为重新展开。 */
 document.addEventListener('click', e => {
   const summary = e.target.closest?.('summary');
   const details = summary?.parentElement;
   if (!details || details.tagName !== 'DETAILS' || details.firstElementChild !== summary || !details.animate) return;
   e.preventDefault();
-  details._height?.cancel();
   const from = details.getBoundingClientRect().height;
-  const closing = details.open;
-  if (!closing) details.open = true;
+  details._height?.cancel();
+  const closing = details.open && details.dataset.closing !== 'true';
+  details.open = true;
+  if (closing) details.dataset.closing = 'true'; else delete details.dataset.closing;
   const to = closing ? summary.getBoundingClientRect().height : details.getBoundingClientRect().height;
   details.style.overflow = 'hidden';
   const anim = details.animate([{ height: from + 'px' }, { height: to + 'px' }], { duration: motionMs('base'), easing: easing(closing ? 'in' : 'out') });
@@ -93,7 +116,7 @@ document.addEventListener('click', e => {
   anim.finished.then(() => {
     if (details._height !== anim) return;
     details._height = null; details.style.overflow = '';
-    if (closing) details.open = false;
+    if (closing) { details.open = false; delete details.dataset.closing; }
   }).catch(() => {});
 });
 

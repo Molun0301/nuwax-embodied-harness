@@ -1,6 +1,6 @@
 /* 设备管理恢复页：业务没运行时（控制台打不开）在这里启动业务、更新、回退、调整模块和修改配置；未安装时整页是首次安装向导。
    与控制台“系统”“设置”页挂载同一组共用模块（/manager-assets/shared/，管理包自带的副本）。地址 #/system、#/settings。 */
-import { icon, h, setTheme, currentTheme } from '/manager-assets/shared/neh-ui.js';
+import { icon, h, setTheme, currentTheme, enter, fadeOnChange } from '/manager-assets/shared/neh-ui.js';
 import { mountSystem, mountWizard, managerRequest } from '/manager-assets/shared/system-pages.js';
 import { mount as mountSettings } from '/manager-assets/shared/settings-editor.js';
 
@@ -21,7 +21,7 @@ const top = (...kids) => h('header', { class: 'r-top' }, h('span', { class: 'r-b
 /* ---------- 已安装：系统、设置两个页签 ---------- */
 function mountInstalled() {
   const status = h('div', { class: 'r-status', role: 'status' });
-  const tabs = h('nav', { class: 'r-tabs', role: 'tablist', 'aria-label': '页面' },
+  const tabs = h('nav', { class: 'r-tabs', role: 'tablist', 'aria-label': '页面', 'data-ind': 'underline' },
     [['system', '系统'], ['settings', '设置']].map(([id, label]) => h('button', { type: 'button', role: 'tab', dataset: { tab: id }, onclick: () => { location.hash = '#/' + id; } }, label)));
   const notice = h('div', { class: 'r-notice', hidden: true, html: icon('info', 'n-icon--sm') },
     h('span', {}, '业务正在运行，日常管理请到控制台的系统页。这里在业务没运行时用于启动、更新、回退和修改配置。'),
@@ -37,14 +37,18 @@ function mountInstalled() {
       notice.hidden = state.code !== 'running';
     },
   });
-  // 系统页一直读业务状态，顶栏的一句话状态在设置页签也保持最新。
+  // 系统页一直读业务状态，顶栏的一句话状态在设置页签也保持最新；文字变化时淡入。
   sys.show();
-  let settings = null;
+  fadeOnChange(status);
+  let settings = null, shown = '';
   function showTab() {
     const id = location.hash.replace(/^#\/?/, '') === 'settings' ? 'settings' : 'system';
     tabs.querySelectorAll('button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === id)));
     sysView.hidden = id !== 'system';
     setView.hidden = id !== 'settings';
+    // 切换页签时新视图淡入并上移几像素；首次打开不做。
+    if (shown && shown !== id) enter(id === 'system' ? sysView : setView, { from: 'translateY(6px)', speed: 'slow' });
+    shown = id;
     if (id === 'settings') {
       settings = settings || mountSettings(setView, { title: '设置', request: managerRequest, onRestart: () => { location.hash = '#/system'; void sys.refresh(); } });
       void settings.load();

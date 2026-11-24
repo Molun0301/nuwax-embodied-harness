@@ -9,10 +9,12 @@ html, body { height: 100%; margin: 0; }
 .r-brand path { fill: none; stroke: var(--mint); stroke-width: 6.5; stroke-linecap: round; stroke-linejoin: round; }
 .r-title { font-size: var(--fs-14); font-weight: 600; color: var(--ink); white-space: nowrap; }
 .r-tabs { display: flex; align-self: stretch; gap: 2px; margin-left: 6px; }
-.r-tabs > button { position: relative; padding: 0 12px; border: 0; background: none; color: var(--muted); font-size: var(--fs-13); font-weight: 500; }
+.r-tabs > button { position: relative; padding: 0 12px; border: 0; background: none; color: var(--muted); font-size: var(--fs-13); font-weight: 500; transition: color var(--motion-fast) var(--ease-out); }
 .r-tabs > button:hover { color: var(--ink); }
 .r-tabs > button[aria-selected="true"] { color: var(--ink); }
 .r-tabs > button[aria-selected="true"]::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--accent); }
+/* 选中指示块就位后由它滑动显示下划线 */
+.r-tabs.n-has-ind > button[aria-selected="true"]::after { display: none; }
 .r-spacer { flex: 1; }
 .r-status { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: var(--fs-13); color: var(--ink-2); }
 .r-status > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -20,6 +22,12 @@ html, body { height: 100%; margin: 0; }
 .r-notice { grid-row: 2; display: flex; align-items: center; gap: 10px; padding: 7px 12px 7px 18px; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: var(--fs-13); color: var(--ink-2); }
 .r-notice > .n-icon { color: var(--info); }
 .r-notice > span { flex: 1; min-width: 0; }
+/* 提示条出现和消失：高度与内边距一起展开收起 */
+.r-notice { interpolate-size: allow-keywords; overflow: hidden;
+  transition: opacity var(--motion-base) var(--ease-out), height var(--motion-base) var(--ease-out), padding var(--motion-base) var(--ease-out),
+    border-bottom-width var(--motion-base) var(--ease-out), display var(--motion-base) allow-discrete; }
+.r-notice[hidden] { opacity: 0; height: 0; padding-block: 0; border-bottom-width: 0; transition-timing-function: var(--ease-in); }
+@starting-style { .r-notice { opacity: 0; height: 0; padding-block: 0; border-bottom-width: 0; } }
 /* 提示条隐藏时不占格，主体固定放在最后一行 */
 .r-main { position: relative; min-height: 0; grid-row: -2 / -1; }
 .r-view { position: absolute; inset: 0; }

@@ -494,7 +494,7 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-set-adv > summary::-webkit-details-marker { display: none; }
 .n-set-adv > summary:hover { color: var(--ink); background: var(--surface-2); }
 .n-set-adv > summary .n-icon { width: 14px; height: 14px; transition: transform var(--motion-base) var(--ease-out); }
-.n-set-adv[open] > summary .n-icon { transform: rotate(90deg); }
+.n-set-adv[open]:not([data-closing]) > summary .n-icon { transform: rotate(90deg); }
 .n-set-adv > .n-prop:first-of-type { border-top: 1px solid var(--line); }
 .n-savebar {
   position: sticky; bottom: 16px; z-index: 6; margin: 0 auto; width: min(720px, calc(100% - 32px));

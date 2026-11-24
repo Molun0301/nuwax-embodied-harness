@@ -75,8 +75,8 @@ export function mount(root, ctx) {
   const records = new Map();
   const rowNodes = new Map();
   const st = { levels: new Set(['error', 'warning', 'info']), component: '', query: '', task: '', request: '', hideWeb: true,
-    paused: false, pending: 0, displayLimit: PAGE_SIZE, nextBefore: null, hasMore: false, loading: false, request_seq: 0,
-    note: '', gapNote: '', selected: null, visible: false, renderTimer: null, filterTimer: null, gapReload: null };
+    paused: false, pending: 0, displayLimit: PAGE_SIZE, nextBefore: null, hasMore: false, loading: false, reading: null, polling: false, request_seq: 0,
+    note: '', gapNote: '', selected: null, visible: false, renderTimer: null, filterTimer: null };
 
   const toolbar = h('div', { class: 'n-toolbar' });
   const notice = h('div', { class: 'c-log-notice', hidden: true });
@@ -106,7 +106,7 @@ export function mount(root, ctx) {
   }
   const matches = e => st.levels.has(chipOf(e.level)) && matchesExceptLevel(e);
   const ordered = () => [...records.values()].sort((a, b) => (Date.parse(b.timestamp) || 0) - (Date.parse(a.timestamp) || 0) || b._order - a._order);
-  // 改筛选：立即废弃旧查询，防抖后按新条件重读第一页。
+  // 改筛选：立即废弃旧查询，防抖后按新条件重读第一页。只有筛选变化会作废在途的读取。
   function changed(immediate) {
     st.displayLimit = PAGE_SIZE;
     st.gapNote = '';
@@ -114,7 +114,7 @@ export function mount(root, ctx) {
     st.request_seq += 1;
     syncToolbar();
     scheduleRender();
-    st.filterTimer = setTimeout(reload, immediate ? 0 : 250);
+    st.filterTimer = setTimeout(() => reload(true), immediate ? 0 : 250);
   }
 
   /* ---------- 工具栏：控件只建一次，实时记录到达时只更新数量与按钮文字 ---------- */
@@ -180,7 +180,8 @@ export function mount(root, ctx) {
     }
     if (count) { st.pending += count; scheduleRender(); }
   }
-  async function load(append = false, quiet = false) {
+  /* 首屏、筛选与翻页读取：表格空着时显示“正在读取日志…”；按序号丢弃被筛选变化作废的结果。 */
+  async function load(append = false) {
     if (append && st.loading) return;
     const seq = ++st.request_seq;
     st.loading = true;
@@ -190,8 +191,7 @@ export function mount(root, ctx) {
     try {
       const result = await ctx.api.json('/api/logs?' + query);
       if (seq !== st.request_seq) return;
-      // 定时补取只追加新记录，不改翻页游标。
-      if (!quiet || !st.nextBefore) { st.nextBefore = result.next_before; st.hasMore = Boolean(result.has_more); }
+      st.nextBefore = result.next_before; st.hasMore = Boolean(result.has_more);
       addEntries(result.entries || [], true);
       st.note = result.cursor_expired ? '所选历史已超出文件保留范围，请改筛选条件重新查询。' : '';
     } catch (error) {
@@ -200,10 +200,37 @@ export function mount(root, ctx) {
       if (seq === st.request_seq) { st.loading = false; scheduleRender(); }
     }
   }
-  function reload() { st.nextBefore = null; st.hasMore = false; return load(false); }
+  /* 重读首屏。进入本页、实时流缺口只需要最新一页：已有首屏读取在途时沿用它，不再作废它另发一次；
+     设备上一次读取要几秒，若每次都重发，在途的读取会被不断作废，表格就一直停在“正在读取日志…”。筛选变化（force）才重发。 */
+  function reload(force = false) {
+    if (st.loading && st.reading && !force) return st.reading;
+    st.nextBefore = null; st.hasMore = false;
+    return (st.reading = load(false));
+  }
+  /* 定时补取：只追加独立组件新写入的记录，不占用“正在读取”、不改序号，不作废也不等待首屏读取；
+     翻页游标只在首屏读取失败、还没有游标时补上。 */
+  async function poll() {
+    if (st.loading || st.polling) return;
+    st.polling = true;
+    const query = params();
+    query.set('limit', String(PAGE_SIZE));
+    try {
+      const result = await ctx.api.json('/api/logs?' + query);
+      if (!st.nextBefore) { st.nextBefore = result.next_before; st.hasMore = Boolean(result.has_more); }
+      addEntries(result.entries || [], true);
+      st.note = '';
+    } catch (error) {
+      st.note = '日志暂时无法读取，将自动重试。原因：' + error.message;
+    } finally {
+      st.polling = false;
+      scheduleRender();
+    }
+  }
   async function more() {
     if (st.displayLimit >= CACHE_LIMIT) { st.note = '最多显示 5000 条，请缩小筛选范围或导出历史。'; scheduleRender(); return; }
     st.displayLimit = Math.min(CACHE_LIMIT, st.displayLimit + PAGE_SIZE);
+    // 首屏读取（进入本页、缺口重读）在途时等它读完，再从它给出的游标往前翻。
+    if (st.loading && st.reading) await st.reading;
     if (st.hasMore) await load(true);
     scheduleRender();
   }
@@ -234,7 +261,7 @@ export function mount(root, ctx) {
       // 连接刚打开时的回放缺口由刚重读的首屏覆盖，不另行提示。
       if (kind === 'replay' && initialReplay) return;
       st.gapNote = '实时日志有缺口，已重读最近 ' + PAGE_SIZE + ' 条匹配的记录；更早的记录请加载或导出。';
-      if (!st.gapReload) st.gapReload = reload().finally(() => { st.gapReload = null; });
+      void reload();
     });
     stream.connect();
   }
@@ -319,8 +346,8 @@ export function mount(root, ctx) {
   document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && st.visible && drawer && !document.querySelector('dialog[open], .n-popover')) closeDrawer(); });
 
   /* ---------- 可见性：可见时每 3 秒补取，不可见时停止 ---------- */
-  setInterval(() => { if (st.visible && !document.hidden && !st.loading) void load(false, true); }, POLL_MS);
-  document.addEventListener('visibilitychange', () => { if (st.visible && !document.hidden && !st.loading) void load(false, true); });
+  setInterval(() => { if (st.visible && !document.hidden) void poll(); }, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (st.visible && !document.hidden) void poll(); });
 
   syncToolbar();
   return {

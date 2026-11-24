@@ -5,6 +5,7 @@
    语义面板打开期间始终显示，便于点选与核对。 */
 
 const PALETTE = ['#4b9c86', '#648fb6', '#a18aba', '#b79461', '#719783', '#828eb4'];
+const INACTIVE_COLOR = '#9aa4ab';
 const CATEGORY_COLORS = { office: '#4b9c86', meeting_room: '#9580b0', corridor: '#648fb6', kitchen: '#b79461', storage: '#89916b' };
 export const REGION_STATUS = { candidate: '候选', auto_labeled: '自动标签', reviewed: '已审核', corrected: '已修正', rejected: '已否定', stale: '已过期' };
 
@@ -17,6 +18,15 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
   const bindingKey = b => JSON.stringify([b?.map_name, b?.frame_id, b?.map_revision]);
   const scopeKey = b => JSON.stringify([b?.map_name, b?.frame_id]);
   const regions = () => Array.isArray(state.data?.regions) ? state.data.regions : [];
+  // 有效区域：不是已过期、也不是已否定（只画这些）。编号与默认配色按有效区域从 1 起，舞台、列表、三维标签共用。
+  const isActive = r => r.review_status !== 'stale' && r.review_status !== 'rejected';
+  let activeCache = { data: null, list: [] };
+  function active() {
+    if (activeCache.data !== state.data) activeCache = { data: state.data, list: regions().filter(isActive) };
+    return activeCache.list;
+  }
+  // 有效区域的编号（从 1 起）；过期与已否定的区域没有编号，返回 null。
+  function number(region) { const index = active().indexOf(region); return index < 0 ? null : index + 1; }
   const visible = () => mode() === 'semantic' || (mode() !== 'graph' && state.layer) || state.panelOpen;
   const interested = () => visible();
 
@@ -28,13 +38,16 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     return ['map_name', 'frame_id', 'map_revision'].every(k => current[k] != null && current[k] === bound[k]);
   }
   function drawable() {
-    return matchesCurrent() ? regions().filter(r => r.review_status !== 'stale' && r.review_status !== 'rejected'
-      && r.frame_id === state.data.map_binding.frame_id && r.boundary?.frame_id === r.frame_id) : [];
+    return matchesCurrent() ? active().filter(r => r.frame_id === state.data.map_binding.frame_id && r.boundary?.frame_id === r.frame_id) : [];
   }
-  function color(region) { return CATEGORY_COLORS[region.metadata?.category] || PALETTE[Math.max(0, regions().indexOf(region)) % PALETTE.length]; }
+  // 过期与已否定的区域不上地图，列表里用灰色。
+  function color(region) {
+    if (!isActive(region)) return INACTIVE_COLOR;
+    return CATEGORY_COLORS[region.metadata?.category] || PALETTE[(number(region) - 1) % PALETTE.length];
+  }
   function emitLayer() {
     state.paths = [];
-    const list = visible() ? drawable().map(region => ({ ...region, display_color: color(region), display_index: regions().indexOf(region) + 1 })) : [];
+    const list = visible() ? drawable().map(region => ({ ...region, display_color: color(region), display_index: number(region) })) : [];
     const style = getComputedStyle(document.documentElement);
     window.dispatchEvent(new CustomEvent('pointcloud3d:semantic-regions', { detail: {
       regions: list, binding: state.data?.map_binding || null, visible: mode() === '3d' && visible(), selectedId: state.selected,
@@ -128,7 +141,7 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     labelItems.sort((a, b) => Number(b.selected) - Number(a.selected));
     ctx.font = `600 ${11.5 * ratio}px ${style.getPropertyValue('--font')}`;
     for (const item of labelItems) {
-      const index = regions().indexOf(item.r) + 1;
+      const index = number(item.r);
       let text = item.r.primary_label || String(index);
       if (!item.selected && !semantic && !item.r.primary_label) text = String(index);
       if (text.length > 14) text = text.slice(0, 13) + '…';
@@ -172,9 +185,11 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     /* 启停持续识别后写入后台返回的状态（与原控制台相同，不再另读一次）。 */
     setService(value) { state.service = value; scheduleStatus(); changed(); },
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-    color,
+    color, number,
     get layer() { return state.layer; },
     get regions() { return regions(); },
+    /* 有效区域（不含已过期、已否定），顺序即编号顺序。 */
+    get active() { return active(); },
     get selected() { return state.selected; },
     get service() { return state.service; },
     get error() { return state.error; },

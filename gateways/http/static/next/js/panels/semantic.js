@@ -44,7 +44,7 @@ export function mountSemantic(root, ctx) {
   const { api, stage, go } = ctx;
   const { regions, items, graph, map } = stage;
   const state = { shown: false, tab: 'regions', page: 'list', regionId: null, itemId: null, cluster: null, nodeId: null, nodeDetail: null, nodeToken: 0,
-    from: null, busy: false, task: null, taskTimer: null, filter: 'all', pageKey: '', listKey: '', detailKey: '', summary: { meta: null, error: '', loading: false, instances: null, fetchedAt: 0 } };
+    from: null, inactiveOpen: false, busy: false, task: null, taskTimer: null, filter: 'all', pageKey: '', listKey: '', detailKey: '', summary: { meta: null, error: '', loading: false, instances: null, fetchedAt: 0 } };
   const view = h('div');
   root.append(view);
   const status = h('p', { class: 'c-status-line', role: 'status' });
@@ -52,13 +52,14 @@ export function mountSemantic(root, ctx) {
   let derived = false;
   function say(text, level = '') { derived = false; status.textContent = text; status.dataset.level = level; }
   const regionList = () => regions.regions;
-  const regionName = (r, index = regionList().indexOf(r)) => r.primary_label || '区域 ' + (index + 1);
+  // 编号按有效区域（与舞台标签一致）；过期与已否定的区域没有编号。
+  const regionName = r => r.primary_label || (regions.number(r) ? '区域 ' + regions.number(r) : '未命名区域');
   const regionStatus = r => r.metadata?.label_locked ? '已命名' : REGION_STATUS[r.review_status] || '未知';
   const regionBadge = r => (r.metadata?.label_locked || ['reviewed', 'corrected'].includes(r.review_status) ? 'n-badge--ok'
-    : r.review_status === 'auto_labeled' ? 'n-badge--accent' : r.review_status === 'stale' ? 'n-badge--warn' : '');
+    : r.review_status === 'auto_labeled' ? 'n-badge--accent' : r.review_status === 'stale' || r.review_status === 'rejected' ? 'n-badge--warn' : '');
   const scopeMatches = inst => { const current = map.activeMapName(); return Boolean(current && inst.map_name && current === inst.map_name); };
   const back = (label, onclick) => h('button', { class: 'c-back', type: 'button', html: icon('chevron-left', 'n-icon--sm'), onclick }, label);
-  const chip = r => h('span', { class: 'c-regnum', style: 'background:' + regions.color(r) }, regionList().indexOf(r) + 1);
+  const chip = r => h('span', { class: 'c-regnum', style: 'background:' + regions.color(r) }, regions.number(r) ?? '');
 
   /* ---------- 页面切换 ---------- */
   function clearSelection() {
@@ -158,7 +159,7 @@ export function mountSemantic(root, ctx) {
     return service.busy ? '正在识别' : '持续识别已停止';
   }
   function renderRecog() {
-    const list = regionList(), named = list.filter(r => r.primary_label).length;
+    const list = regions.active, named = list.filter(r => r.primary_label).length;
     recogSub.textContent = `已命名 ${named} 个，未命名 ${list.length - named} 个` + (regionServiceText() ? '；' + regionServiceText() : '');
     const service = regions.service;
     runningBox.checked = Boolean(service?.running || service?.busy);
@@ -222,7 +223,7 @@ export function mountSemantic(root, ctx) {
     if (state.page !== 'list' && state.page !== 'cluster') return;
     regionsTab.setAttribute('aria-pressed', String(state.tab === 'regions'));
     itemsTab.setAttribute('aria-pressed', String(state.tab === 'items'));
-    regionsTab.replaceChildren('区域', h('span', { class: 'n-count' }, regionList().length));
+    regionsTab.replaceChildren('区域', h('span', { class: 'n-count' }, regions.active.length));
     itemsTab.replaceChildren('物品', h('span', { class: 'n-count' }, items.instances.length));
     if (state.page === 'cluster') {
       listBox.replaceChildren(...state.cluster.members.map(itemRow));
@@ -231,10 +232,20 @@ export function mountSemantic(root, ctx) {
     if (state.tab === 'regions') {
       renderRecog();
       const query = regionSearch.value.trim().toLowerCase();
-      const key = JSON.stringify([regionList().map(r => [r.scene_space_id, r.primary_label, r.review_status, r.metadata?.label_locked, regions.color(r)]), query, regions.matches]);
+      const key = JSON.stringify([regionList().map(r => [r.scene_space_id, r.primary_label, r.review_status, r.metadata?.label_locked, regions.color(r)]), query, regions.matches, state.inactiveOpen]);
       if (key === state.listKey) return;
       state.listKey = key;
-      const rows = regionList().filter((r, index) => !query || regionName(r, index).toLowerCase().includes(query)).map(regionRow);
+      const matches = r => !query || regionName(r).toLowerCase().includes(query);
+      // 有效区域在前；已过期与已否定的收在末尾，点开才列出（照旧可进详情）。
+      const rows = regions.active.filter(matches).map(regionRow);
+      const inactive = regionList().filter(r => regions.number(r) === null && matches(r));
+      if (inactive.length) {
+        const kinds = [...new Set(inactive.map(r => r.review_status))];
+        const label = (kinds.includes('stale') && kinds.includes('rejected') ? '已过期与已否定' : kinds.includes('stale') ? '已过期' : '已否定') + ' ' + inactive.length + ' 个';
+        rows.push(h('button', { class: 'n-btn n-btn--quiet n-btn--block c-fold', type: 'button', 'aria-expanded': String(state.inactiveOpen),
+          html: icon(state.inactiveOpen ? 'chevron-down' : 'chevron-right', 'n-icon--sm'), onclick: () => { state.inactiveOpen = !state.inactiveOpen; renderList(); } }, label));
+        if (state.inactiveOpen) rows.push(...inactive.map(regionRow));
+      }
       listBox.replaceChildren(...(rows.length ? rows : [h('p', { class: 'n-meta' }, query ? '没有匹配的区域。' : '当前地图还没有语义区域。打开持续识别，或点“重新划分区域”。')]));
       return;
     }
@@ -264,7 +275,6 @@ export function mountSemantic(root, ctx) {
     state.detailKey = key;
     view.dataset.regionId = r.scene_space_id;
     view.dataset.revision = String(r.metadata?.scene_revision);
-    const index = regionList().indexOf(r);
     const input = h('input', { class: 'n-input', type: 'text', maxlength: 120, required: true, placeholder: '为区域命名', 'aria-label': '区域名称', value: draft ?? r.primary_label ?? '' });
     const save = h('button', { class: 'n-btn', type: 'submit', disabled: state.busy || !regions.matches || ['stale', 'rejected'].includes(r.review_status) }, '保存名称');
     const form = h('form', { class: 'c-inline-form' }, input, save);
@@ -305,7 +315,7 @@ export function mountSemantic(root, ctx) {
     const samples = r.observation_samples || [];
     const center = r.boundary?.centroid?.position;
     fill(view, back('全部区域', () => toList('regions')),
-      h('div', { class: 'c-pane-head' }, chip(r), h('h2', {}, regionName(r, index)), h('span', { class: 'n-badge ' + regionBadge(r) }, regionStatus(r))),
+      h('div', { class: 'c-pane-head' }, chip(r), h('h2', {}, regionName(r)), h('span', { class: 'n-badge ' + regionBadge(r) }, regionStatus(r))),
       h('div', { class: 'c-card-actions c-gap-b' }, goBtn, focusBtn, relBtn),
       status,
       h('dl', { class: 'n-kv c-gap-b' }, h('dt', {}, '面积'), h('dd', { class: 'n-num' }, r.boundary?.area_m2 == null ? '未知' : r.boundary.area_m2.toFixed(2) + ' 平方米'),
@@ -331,7 +341,7 @@ export function mountSemantic(root, ctx) {
   /* ---------- 物品详情 ---------- */
   function regionOf(inst) {
     if (!finite(inst.pose) || !regions.matches) return null;
-    return regionList().find(r => r.boundary?.polygon_points?.length && inside(inst.pose, r.boundary.polygon_points)) || null;
+    return regions.active.find(r => r.boundary?.polygon_points?.length && inside(inst.pose, r.boundary.polygon_points)) || null;
   }
   function renderItem() {
     const inst = items.instances.find(item => item.instance_id === state.itemId);

@@ -49,8 +49,8 @@ export function mountNav(root, ctx) {
   function setPickStatus(text, level = '') { pickStatus.textContent = text; pickStatus.dataset.level = level; }
   function regionLabelAt(x, y) {
     const inside = (poly) => { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
-    const region = stage.regions.regions.find(r => r.boundary?.polygon_points?.length && inside(r.boundary.polygon_points.map(p => ({ x: p.x ?? p[0], y: p.y ?? p[1] }))));
-    return region ? region.primary_label || '未命名区域 ' + (stage.regions.regions.indexOf(region) + 1) : '';
+    const region = stage.regions.active.find(r => r.boundary?.polygon_points?.length && inside(r.boundary.polygon_points.map(p => ({ x: p.x ?? p[0], y: p.y ?? p[1] }))));
+    return region ? region.primary_label || '未命名区域 ' + stage.regions.number(region) : '';
   }
   function renderPick() {
     const pose = pick.pendingPose;

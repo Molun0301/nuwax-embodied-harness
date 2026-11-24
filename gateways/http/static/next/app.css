@@ -499,3 +499,5 @@ button.c-chipid:hover { background: var(--accent-soft); color: var(--accent-ink)
 .c-card-title--sm { font-size: var(--fs-14); }
 .c-gnode[data-dimmed="true"] { opacity: .22; }
 .c-graph-search { width: 132px; height: 28px; margin-left: 8px; font-size: var(--fs-12); }
+.c-fold { justify-content: flex-start; gap: 6px; margin-top: 6px; background: var(--surface-2); color: var(--ink-2); }
+.c-fold:hover { color: var(--ink); }

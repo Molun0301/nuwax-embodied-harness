@@ -7,7 +7,7 @@ import { createMapView, PLANAR_PIPELINE, MAP_TOPICS } from './mapview.js';
 import { createItems } from './items.js';
 import { createRegions } from './regions.js';
 import { createGraph } from './graph.js';
-import { businessView } from '../status.js';
+import { businessView, GEOMETRY_PHASES } from '../status.js';
 
 const VIEWS = [['2d', '2D', 'grid-2x2', '二维栅格地图'], ['3d', '3D', 'box', '三维点云地图'], ['semantic', '语义地图', 'tag', '区域整块着色并编号'], ['graph', '关系图', 'network', '区域、连接口与物品的关系']]
   .filter(([id]) => !PLANAR_PIPELINE || id !== '3d');
@@ -194,13 +194,13 @@ export function createStage(root, ctx, { onPick }) {
   }
 
   /* ---------- 状态条 ---------- */
-  function statusState(info) {
+  function statusState() {
     const s = store.get();
     if (s.business !== 'running') return ['n-dot--bad', '业务未运行'];
     if (s.conn.status === 'lost') return ['n-dot--warn', '画面已暂停'];
-    if (info.phase === 'mapping' || info.phase === 'exploring') return ['n-dot--busy', '建图中'];
-    if (!info.mapName || info.phase === 'idle' && !info.hasMap) return ['n-dot--off', '没有地图'];
-    return { ok: ['n-dot--ok', '已定位'], stale: ['n-dot--warn', '定位过期'], unavailable: ['n-dot--bad', '定位不可用'], none: ['n-dot--off', '未定位'] }[info.poseState];
+    // 定位文字与圆点按地图会话阶段，与顶栏、地图卡同一判断（已加载但重定位未成功时位姿在 odom 系，不能算已定位）。
+    const [label, tone] = GEOMETRY_PHASES[s.geometry.phase];
+    return ['n-dot--' + tone, label];
   }
   const statusDot = h('span', { class: 'n-dot' }), statusName = h('b', {}), statusText = h('span', { class: 'n-muted' });
   const poseX = h('span', { class: 'n-num' }), poseY = h('span', { class: 'n-num' }), poseYaw = h('span', { class: 'n-num' });
@@ -228,7 +228,7 @@ export function createStage(root, ctx, { onPick }) {
       statusDetail.hidden = true;
       return;
     }
-    const [dot, text] = statusState(info);
+    const [dot, text] = statusState();
     statusDot.className = 'n-dot ' + dot;
     statusName.textContent = info.mapName || text;
     statusText.textContent = info.mapName ? text : '';

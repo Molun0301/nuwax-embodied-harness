@@ -1258,14 +1258,12 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
     /* 状态条读取的摘要。 */
     info() {
       const point = pointFromPose(state.latestPose);
-      const envelope = state.lastLocalizationEnvelope;
       const grid = state.mapGrid;
       const kind = state.viewMode === '3d' ? 'map3d' : 'map2d';
       return {
         mapName: activeMapName(), hasMap: Boolean(grid) || (state.viewMode === '3d' && state.pc3dPointCountKnown && state.pc3dSourcePoints > 0),
-        phase: state.latestGeometryState?.phase || 'idle', emptyMessage: state.emptyMessage,
+        emptyMessage: state.emptyMessage,
         pose: point ? { ...point, yaw: planarYawFromPose(state.latestPose) } : null,
-        poseState: !point ? 'none' : envelope && (envelope.stale === true || statusOf(envelope) === 'stale') ? 'stale' : envelope && statusOf(envelope) !== 'available' ? 'unavailable' : 'ok',
         frameId: navigationFrameId(), rate: metrics.rate(kind), poseLatency: poseLatency(kind),
         grid: grid ? { width: Number(grid.width), height: Number(grid.height), resolution: gridResolution(grid) } : null,
         points: state.pc3dPointCountKnown ? { source: state.pc3dSourcePoints, displayed: state.pc3dDisplayedPoints } : null,

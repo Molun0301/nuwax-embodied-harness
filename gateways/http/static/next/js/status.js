@@ -129,6 +129,9 @@ export function deriveActivity(s, now, extra) {
   return { tone: 'idle', icon: 'circle-check', text: '空闲', meta: [idleDetail(s.geometry)] };
 }
 function byCreated(a, b) { return Number(b.created_at || 0) - Number(a.created_at || 0); }
+/* 地图会话阶段（geometry.state.phase）的短说法与色调：地图卡徽标、舞台状态条共用；顶栏一句话的整句说法见 idleDetail。 */
+export const GEOMETRY_PHASES = { idle: ['没有地图会话', 'off'], mapping: ['建图中', 'busy'], exploring: ['探索中', 'busy'],
+  loaded: ['已加载，未定位', 'warn'], localized: ['已定位', 'ok'], fault: ['故障', 'bad'] };
 export function idleDetail(geometry) {
   const name = geometry.mapName;
   if (!name || geometry.phase === 'idle') return '未加载地图';

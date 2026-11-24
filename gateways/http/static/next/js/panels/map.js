@@ -5,10 +5,9 @@
    清除残影从 map-cleanup.js 迁出：对已保存地图离线预览删除候选（原图、删除候选、清除后三层点云），确认后另存为新地图，
    原图保留；改力度或换地图即作废旧预览。 */
 import { h, icon, toast, confirmDialog } from '/static/shared/neh-ui.js';
-import { isTerminalTaskState } from '../status.js';
+import { isTerminalTaskState, GEOMETRY_PHASES } from '../status.js';
 
-const PHASES = { mapping: ['建图中', 'n-badge--accent'], exploring: ['探索中', 'n-badge--accent'], loaded: ['已加载，未定位', 'n-badge--warn'],
-  localized: ['已定位', 'n-badge--ok'], fault: ['故障', 'n-badge--bad'] };
+const BADGE = { off: '', busy: 'n-badge--accent', warn: 'n-badge--warn', ok: 'n-badge--ok', bad: 'n-badge--bad' };
 const CLEANUP_LAYERS = [{ kind: 'source', label: '原图', color: '#748997', size: 1, checked: true },
   { kind: 'candidates', label: '删除候选', color: '#ff615c', size: 2, checked: true }, { kind: 'result', label: '清除后', color: '#66d6a5', size: 1, checked: false }];
 // 换内容时略过条件为假的子元素（replaceChildren 会把 null 写成文字）。
@@ -120,7 +119,8 @@ export function mountMap(root, ctx) {
     if (state.page === 'cleanup') return;   // 清除残影子页自己管理内容
     if (state.page === 'detail') { renderDetail(); return; }
     const session = hasSession();
-    const [phaseLabel, phaseClass] = PHASES[state.phase] || ['没有地图会话', ''];
+    const [phaseLabel, phaseTone] = GEOMETRY_PHASES[state.phase] || GEOMETRY_PHASES.idle;
+    const phaseClass = BADGE[phaseTone];
     const currentEntry = state.maps.find(map => map.name === state.current);
     const nameRow = h('div');
     const btn = (label, onclick, extra = {}) => h('button', { class: 'n-btn n-btn--sm', type: 'button', disabled: state.busy || !session, onclick, ...extra }, label);

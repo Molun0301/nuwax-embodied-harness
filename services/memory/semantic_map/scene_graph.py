@@ -73,7 +73,6 @@ class SceneGraphService:
                 return capture, self._index
             spaces = sorted((space for space in capture["spaces"]
                 if same_scope(space.metadata.get("map_binding", {}), binding)
-                and space.metadata["map_binding"].get("map_revision") == binding["map_revision"]
                 and str(space.review_status.value) not in ("stale", "rejected")), key=lambda value: value.scene_space_id)
             from services.memory.semantic_map.scene_revisions import graph_geometry_value
             geometry_key = (binding_value(binding), tuple(graph_geometry_value(space) for space in spaces))

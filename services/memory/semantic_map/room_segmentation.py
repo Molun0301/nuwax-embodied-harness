@@ -301,11 +301,17 @@ class RoomSegmentationService:
         return spaces
 
     def _match_existing(self, spaces, labels, label_to_space, resolution, origin, scope, existing_spaces):
-        """在当前自由单元中心计算轮廓重叠，拆分合并只记录来源，不沿用标签。"""
+        """在当前自由单元中心计算轮廓重叠，已作废区域不参与。
+
+        交集占较小一方面积不少于 0.2 的旧区域记为来源。新区域与某个旧区域互为交集最大的一对，
+        且交集占较小一方面积不少于 0.6 时，继承该旧区域编号；其余新区域使用新编号。
+        """
         matches = defaultdict(list)
         old_links = defaultdict(list)
         work_cells = 0
         for old in existing_spaces:
+            if old.review_status == SceneSpaceReviewStatus.STALE:
+                continue
             if old.map_name != scope["map_name"] or old.frame_id != scope["frame_id"] or old.boundary is None:
                 continue
             geometry = old.boundary.metadata.get(_GEOMETRY_KEY)
@@ -345,17 +351,20 @@ class RoomSegmentationService:
                 index = label_to_space[int(label)]
                 area = spaces[index].boundary.area_m2
                 intersection = min(float(count) * resolution ** 2, old_area, area)
-                if intersection / min(old_area, area) < 0.2:
+                contained = intersection / min(old_area, area)
+                if contained < 0.2:
                     continue
                 iou = intersection / (old_area + area - intersection)
-                matches[index].append((old, iou))
-                old_links[old.scene_space_id].append(index)
+                matches[index].append((old, intersection, contained, iou))
+                old_links[old.scene_space_id].append((index, intersection))
         for index, related in matches.items():
             space = spaces[index]
-            space.metadata["predecessor_scene_space_ids"] = sorted({old.scene_space_id for old, _ in related})
-            if len(related) == 1 and len(old_links[related[0][0].scene_space_id]) == 1 and related[0][1] >= 0.6:
-                space.scene_space_id = related[0][0].scene_space_id
+            space.metadata["predecessor_scene_space_ids"] = sorted({old.scene_space_id for old, *_ in related})
+            old, _, contained, iou = max(related, key=lambda item: item[1])
+            best_new = max(old_links[old.scene_space_id], key=lambda item: item[1])[0]
+            if best_new == index and contained >= 0.6:
+                space.scene_space_id = old.scene_space_id
                 space.metadata["identity_match"] = "contour_overlap"
-                space.metadata["identity_overlap_iou"] = related[0][1]
+                space.metadata["identity_overlap_iou"] = iou
             else:
                 space.metadata["identity_match"] = "split_merge_or_changed_geometry"

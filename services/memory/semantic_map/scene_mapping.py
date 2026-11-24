@@ -167,9 +167,9 @@ class SceneMappingService:
         previous = {space.scene_space_id: space for space in capture["spaces"]}
         bound = []
         for region in regions:
+            # 继承了编号即沿用名字；轮廓变化只清除决策输入与观察样本，等新照片到来时让模型复核。
             old = previous.get(region.scene_space_id)
             unchanged = old is not None and getattr(region, "_geometry_unchanged", False)
-            keep_label = old is not None and (unchanged or old.metadata.get("label_locked") or old.review_status in LOCKED_STATUSES)
             metadata = {**(old.metadata if old else {}), **region.metadata,
                         MANAGED_KEY: True, "map_binding": capture["binding"],
                         "scene_revision": int(old.metadata.get("scene_revision", 0)) if old else 0,
@@ -179,15 +179,14 @@ class SceneMappingService:
             if not unchanged:
                 metadata.pop("decision_inputs", None)
                 metadata.pop("last_decision", None)
-                metadata.pop("adopted_label_evidence", None)
             updates = {"metadata": metadata}
             if old is not None:
                 updates.update({"human_aliases": old.human_aliases,
                                 "observation_samples": old.observation_samples if unchanged else [],
                                 "observation_sample_ids": old.observation_sample_ids if unchanged else [],
-                                "primary_label": old.primary_label if keep_label else None,
+                                "primary_label": old.primary_label,
                                 "candidate_labels": old.candidate_labels if unchanged else [],
-                                "review_status": old.review_status if keep_label and old.review_status != SceneSpaceReviewStatus.STALE else SceneSpaceReviewStatus.CANDIDATE})
+                                "review_status": old.review_status if old.review_status != SceneSpaceReviewStatus.STALE else SceneSpaceReviewStatus.CANDIDATE})
             prepared = region.model_copy(update=updates, deep=False)
             bound.append(prepared)
         return bound
@@ -420,7 +419,7 @@ class SceneMappingService:
                     request = self._request(space, capture, entries)
                     result = self._get_backend().decide(request)
                     ensure()
-                    # 内容变化时重新提取当前候选；不使用旧轮廓给新地图贴标签。
+                    # 地图内容变化时重新分割；区域编号还在就提交本次判断。
                     try:
                         current_capture = self.memory.capture_scene_mapping_state()
                     except GatewayError as error:
@@ -433,8 +432,8 @@ class SceneMappingService:
                         candidates = self._segmenter.segment(current_capture["grid"], map_name=current_capture["library_name"],
                             map_revision=current_capture["binding"]["map_revision"], existing_spaces=current_capture["spaces"])
                         matching = next((candidate for candidate in candidates if candidate.scene_space_id == space.scene_space_id), None)
-                        if matching is None or not getattr(matching, "_geometry_unchanged", False):
-                            raise GatewayError("模型返回时区域边界已变化。", error_code="scene_geometry_changed", http_status=409)
+                        if matching is None:
+                            raise GatewayError("模型返回时区域已被替换。", error_code="scene_geometry_changed", http_status=409)
                     updated = self._decision_space(space, result, entries, request, apply_labels=adopting)
                     updated.metadata["map_binding"] = current_capture["binding"]
                     updated.metadata["decision_policy_inputs"] = policy_inputs
@@ -463,7 +462,7 @@ class SceneMappingService:
                 "label_margin_below_threshold": "候选分差不足", "independent_views_insufficient": "独立视角不足",
                 "explicit_label_protected": "已有名称受保护", "no_valid_observation_evidence": "缺少有效观察证据",
                 "evidence_unchanged": "观察证据未变化", "cycle_budget": "达到本批区域上限",
-                "scene_geometry_changed": "建图进行中区域边界变化，未采用",
+                "scene_geometry_changed": "区域已被替换，未采用",
             }
             counts = {"named": len(applied), "candidate": len(label_candidates), "skipped": len(skipped), "failed": len(failures)}
             summary_parts = ["命名%d" % counts["named"]]

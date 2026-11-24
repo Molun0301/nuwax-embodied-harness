@@ -228,6 +228,36 @@ def test_adopted_label_is_not_revoked_by_nonadopting_decision(setup, weak_reason
     assert row['metadata']['last_decision']['adoption_blockers']
     assert row['metadata']['adopted_label_evidence']['decision']['category_scores']['office'] == .95
 
+def test_regions_stay_readable_when_live_grid_revision_changes(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    assert setup.service.run_once(apply_labels=True)['applied_ids']
+    region = setup.memory.records('scene_space')[0]
+    # 定位状态下实时栅格时间戳持续变化，轮廓不变时区域仍然有效。
+    setup.view.advance()
+    assert [space.scene_space_id for space in setup.service.current_spaces()] == [region.scene_space_id]
+    row = setup.service.get_map()['regions'][0]
+    assert row['review_status'] == 'auto_labeled' and row['primary_label'] == '办公室'
+    context = setup.memory.get_navigation_semantic_context()
+    assert region.scene_space_id in {space.scene_space_id for space in context.scene_spaces}
+    assert [node['name'] for node in setup.service.graph.query()['nodes'] if node['kind'] == 'region'] == ['办公室']
+
+def test_changed_contour_with_inherited_id_keeps_name(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    assert setup.service.run_once(apply_labels=True)['applied_ids']
+    before = setup.memory.records('scene_space')[0]
+    setup.view.cells[5:15, 5:15] = 100
+    setup.view.advance()
+    _, spaces = setup.service._refresh_regions(lambda: None)
+    after = spaces[0]
+    assert after.scene_space_id == before.scene_space_id
+    assert after.primary_label == '办公室' and after.review_status == before.review_status
+    assert after.metadata['adopted_label_evidence'] == before.metadata['adopted_label_evidence']
+    # 轮廓变化只清除决策输入和观察样本，等新照片到来时复核。
+    assert 'decision_inputs' not in after.metadata and 'last_decision' not in after.metadata
+    assert not after.observation_samples and not after.candidate_labels
+
 def test_no_evidence_does_not_adopt_and_category_catalog_refreshes_decision(setup,monkeypatch):
     result=setup.service.run_once(apply_labels=True)
     assert not result['applied_ids'] and result['skipped'][0]['reason']=='no_valid_observation_evidence'

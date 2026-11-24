@@ -33,6 +33,14 @@ class VideoSource:
         info = self.get_camera_info(camera_id)
         with Image.open(BytesIO(data)) as image:
             width, height = image.size
+        if info is not None and (width, height) != (info.width_px, info.height_px):
+            # 帧元数据的内参以实际解码画面的像素尺寸为准。
+            scale_x, scale_y = width / info.width_px, height / info.height_px
+            info = info.model_copy(update={
+                "width_px": width, "height_px": height,
+                "fx": info.fx * scale_x, "fy": info.fy * scale_y,
+                "cx": info.cx * scale_x, "cy": info.cy * scale_y,
+            })
         return ImageFrame(camera_id=info.camera_id if info is not None else "front_camera",
             frame_id=info.frame_id if info is not None else self.frame_id,
             timestamp=datetime.fromtimestamp(seconds, timezone.utc) + timedelta(microseconds=nanoseconds // 1000),

@@ -85,10 +85,10 @@ def _create_webrtc_connection(
     return connection, fatal_auth_errors
 
 
-def _encode_jpeg_frame(frame: Any) -> Tuple[bytes, int, int]:
+def _encode_jpeg_frame(frame: Any, reformatter: Any) -> Tuple[bytes, int, int]:
     try:
         cv2 = importlib.import_module("cv2")
-        image = frame.to_ndarray(format="bgr24")
+        image = reformatter.reformat(frame, format="bgr24").to_ndarray()
         if getattr(image, "ndim", 0) < 2:
             raise ValueError("视频帧没有有效的二维尺寸")
 
@@ -150,6 +150,7 @@ async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs:
 
 def _encode_and_write_frame(
     frame: Any,
+    reformatter: Any,
     shm_writer: VideoShmWriter,
     cancel_requested: threading.Event,
     demand: VideoDemandMonitor,
@@ -160,7 +161,7 @@ def _encode_and_write_frame(
         return None
     if not demand.has_consumers():
         return False
-    payload, width, height = _encode_jpeg_frame(frame)
+    payload, width, height = _encode_jpeg_frame(frame, reformatter)
     if cancel_requested.is_set():
         return None
     if not demand.has_consumers():
@@ -178,6 +179,8 @@ async def _consume_video_track(
     cancel_requested: threading.Event,
     demand: VideoDemandMonitor,
 ) -> None:
+    # 消费协程逐帧等待编码写入完成，同一轨道可复用一个转换器。
+    reformatter = importlib.import_module("av.video.reformatter").VideoReformatter()
     frames = asyncio.Queue(maxsize=1)
 
     async def receive_latest() -> None:
@@ -203,6 +206,7 @@ async def _consume_video_track(
             sent = await _run_blocking(
                 _encode_and_write_frame,
                 frame,
+                reformatter,
                 shm_writer,
                 cancel_requested,
                 demand,

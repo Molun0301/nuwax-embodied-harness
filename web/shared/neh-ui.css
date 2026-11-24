@@ -40,6 +40,12 @@
 
   --glass: rgba(255,255,255,.88); --glass-line: rgba(19,26,30,.08); --glass-ink: var(--ink); --glass-muted: var(--muted);
   --ease: cubic-bezier(.2,.7,.2,1);
+  /* 动效：时长三档；进入用减速曲线，退出用加速曲线。控制台与恢复页、各车道统一引用这些名字。 */
+  --motion-fast: 120ms;   /* 悬停、按下、开关 */
+  --motion-base: 190ms;   /* 下拉、弹层、页签指示、折叠展开 */
+  --motion-slow: 260ms;   /* 抽屉、对话框、页面切换 */
+  --ease-out: cubic-bezier(.2, .7, .2, 1);   /* 进入 */
+  --ease-in: cubic-bezier(.4, 0, 1, 1);      /* 退出 */
   color-scheme: light;
 }
 
@@ -91,7 +97,10 @@ p { margin: 0; }
 * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 6px; border: 3px solid transparent; background-clip: padding-box; }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+@media (prefers-reduced-motion: reduce) {
+  :root { --motion-fast: 1ms; --motion-base: 1ms; --motion-slow: 1ms; }
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
 
 /* ---------- 图标 ---------- */
 .n-icon { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }

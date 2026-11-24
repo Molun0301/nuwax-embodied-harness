@@ -1,6 +1,6 @@
 //! 采样执行器消费与样条执行器相同的地图工作线程和快照。
 use crate::local_workers::{MapInitializer, MapInput, MapWorker, PreparedMap};
-use crate::sampling_controller::{Route, Sampler};
+use crate::sampling_controller::{PoseGoal, Route, Sampler};
 use crate::surface_follower::{
     orientation_within_tolerance, position_within_tolerance, SurfaceFollower, SurfaceFollowerConfig,
 };
@@ -405,7 +405,8 @@ impl NavPlanner for SamplingFollower {
     fn step(&mut self) -> PlannerStep {
         self.prediction = None;
         self.sampler.yaw_error = None;
-        if self.reached() {
+        let position_reached = self.position_reached();
+        if position_reached && self.orientation_reached() {
             return PlannerStep::Succeeded;
         }
         if std::mem::take(&mut self.correction_replan_pending) {
@@ -422,8 +423,14 @@ impl NavPlanner for SamplingFollower {
             pose.pose.orientation.yaw(),
             pose.stamp.nanos,
         );
-        let turn_to = self.position_reached().then(|| goal.pose.orientation.yaw());
-        if self.route.is_empty() && turn_to.is_none() {
+        let goal_position = Self::position(goal);
+        let pose_goal = self.options.requires_orientation().then(|| PoseGoal {
+            position: goal_position,
+            yaw: goal.pose.orientation.yaw(),
+            position_tolerance_m: self.options.position_tolerance_m,
+            position_reached,
+        });
+        if self.route.is_empty() && !position_reached {
             return PlannerStep::Pending(Vec::new());
         }
         if let Some(result) = self.map_worker.take() {
@@ -465,7 +472,7 @@ impl NavPlanner for SamplingFollower {
         };
         let near_goal;
         let reference = if self.route.is_empty() {
-            near_goal = Route::new(vec![position]);
+            near_goal = Route::new(vec![goal_position]);
             &near_goal
         } else {
             &self.route
@@ -478,7 +485,7 @@ impl NavPlanner for SamplingFollower {
             position,
             yaw,
             self.applied,
-            turn_to,
+            pose_goal,
         ) {
             self.wait_reason = None;
             self.prediction = Some(Path3D {

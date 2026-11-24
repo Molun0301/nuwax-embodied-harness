@@ -115,6 +115,13 @@ pub(crate) struct Selection {
     pub(crate) poses: Vec<[f64; 3]>,
 }
 
+pub(crate) struct PoseGoal {
+    pub(crate) position: [f64; 3],
+    pub(crate) yaw: f64,
+    pub(crate) position_tolerance_m: f64,
+    pub(crate) position_reached: bool,
+}
+
 fn blocked(sample: &BodySample, here: BodySample) -> bool {
     sample.occupied < 0
         || (sample.occupied != 0 && (here.occupied != 1 || sample.depth > here.depth))
@@ -134,6 +141,7 @@ pub(crate) struct Sampler {
     samples: Vec<BodySample>,
     refined_poses: Vec<[f64; 4]>,
     refined_samples: Vec<BodySample>,
+    terminal: bool,
     pub(crate) yaw_error: Option<f64>,
 }
 
@@ -146,15 +154,23 @@ impl Sampler {
         position: [f64; 3],
         yaw: f64,
         previous: Twist2,
-        turn_to: Option<f64>,
+        pose_goal: Option<PoseGoal>,
     ) -> Option<Selection> {
         let (arc, nearest) = reference.nearest(position);
         let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * config.max_velocity);
-        let target = if turn_to.is_some() {
-            position
+        self.terminal = pose_goal.as_ref().is_some_and(|goal| {
+            // 先沿路线实际到位，再用较宽的退出范围容纳调整朝向时的小幅位移。
+            let exit = goal.position_tolerance_m + config.body_length / 2.;
+            goal.position_reached
+                || self.terminal && squared_distance(position, goal.position) <= exit * exit
+        });
+        let turn_to = pose_goal.filter(|_| self.terminal).map(|goal| goal.yaw);
+        let target_arc = if self.terminal {
+            reference.length()
         } else {
-            reference.point_at(arc + lookahead)
+            arc + lookahead
         };
+        let target = reference.point_at(target_arc);
         let delta = [target[0] - position[0], target[1] - position[1]];
         let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
         self.yaw_error = Some(angle_delta(heading, yaw));
@@ -217,7 +233,11 @@ impl Sampler {
             let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
                 + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
                 + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
-                + if turn_to.is_none() { UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction) } else { 0. };
+                + if self.terminal {
+                    0.
+                } else {
+                    UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction)
+                };
             ranked.push(Candidate {
                 score,
                 same_turn: w * previous.angular_z > 0.,
@@ -407,10 +427,51 @@ mod tests {
         let (config, map) = fixture(&[]);
         let route = Route::new(vec![START]);
         let oriented = Sampler::default()
-            .select(&map, &config, &route, START, 0., Twist2::ZERO, Some(1.))
+            .select(
+                &map, &config, &route, START, 0., Twist2::ZERO,
+                Some(PoseGoal {
+                    position: START, yaw: 1., position_tolerance_m: 0.06, position_reached: true,
+                }),
+            )
             .unwrap();
         assert_eq!(oriented.command.linear, Point2::new(0., 0.));
         assert!(oriented.command.angular_z > 0.);
+    }
+
+    #[test]
+    fn terminal_heading_and_translation_survive_drift_past_arrival_tolerance() {
+        let (mut config, map) = fixture(&[]);
+        config.body_length = 0.30;
+        config.max_reverse_velocity = 0.20;
+        let route = Route::new(vec![[2., 0., START[2]], START]);
+        let mut sampler = Sampler::default();
+        let goal = |position_reached| Some(PoseGoal {
+            position: START, yaw: 0., position_tolerance_m: 0.06, position_reached,
+        });
+        let approach = sampler
+            .select(
+                &map, &config, &route, [0.18, 0., START[2]], 0.55, Twist2::ZERO, goal(false),
+            )
+            .unwrap();
+        assert!(approach.command.angular_z > 0., "{:?}", approach.command);
+        for (x, position_reached) in [(0.04, true), (0.07, false), (0.18, false)] {
+            let position = [x, 0., START[2]];
+            let chosen = sampler
+                .select(
+                    &map, &config, &route, position, 0.55, Twist2::ZERO,
+                    goal(position_reached),
+                )
+                .unwrap();
+            assert!(chosen.command.angular_z < 0., "{:?}", chosen.command);
+            assert!(chosen.poses.last().unwrap()[0].abs() < x);
+        }
+        let rejoin = sampler
+            .select(
+                &map, &config, &route, [0.34, 0., START[2]], 0.55, Twist2::ZERO,
+                goal(false),
+            )
+            .unwrap();
+        assert!(rejoin.command.angular_z > 0., "{:?}", rejoin.command);
     }
 
     #[test]

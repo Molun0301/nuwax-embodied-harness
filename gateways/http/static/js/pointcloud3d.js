@@ -9,6 +9,7 @@ import { IncrementalPointCloudLayer } from './pointcloud-pages.js';
 import { DensePointCloudLayer } from './dense-pointcloud.js';
 
 const COLORS = {
+  background: 0x0c1a20,
   robot: 0xfbbf24,
   frontier: 0xf472b6,
   trajectory: 0xb2a0f8,
@@ -18,10 +19,41 @@ const COLORS = {
   navGoal: 0xa78bfa,
   semantic: 0x8aa7b8,
   semanticFallback: 0x94a3b8,
+  semanticSelected: 0xbdd7e5,
   forbiddenInside: 0xef4444,
   forbiddenOutside: 0xa855f7,
   forbiddenDisabled: 0x94a3b8,
 };
+
+// 舞台配色跟随主题：新控制台在 web/shared/neh-ui.css 定义舞台变量（背景与 2D 相同，亮暗两套）；
+// 旧控制台没有这些变量，保持深色背景与上面的原叠加色。
+const STAGE_COLOR_VARS = [['background', '--stage-bg'], ['robot', '--stage-robot'], ['frontier', '--stage-frontier'],
+  ['trajectory', '--stage-trajectory'], ['navPath', '--stage-path'], ['localPath', '--stage-local-path'], ['retainedPath', '--stage-retained-path'],
+  ['navGoal', '--stage-goal'], ['semantic', '--stage-item'], ['semanticFallback', '--stage-item'], ['semanticSelected', '--stage-item-selected']];
+function stageCss() {
+  if (typeof document === 'undefined') return null;
+  const css = getComputedStyle(document.documentElement);
+  return css.getPropertyValue('--stage-bg').trim() ? css : null;
+}
+function readStageColors() {
+  const css = stageCss();
+  if (!css) return;
+  for (const [key, name] of STAGE_COLOR_VARS) COLORS[key] = Number.parseInt(css.getPropertyValue(name).trim().slice(1), 16);
+}
+readStageColors();
+// 浅色舞台上，点云的基础、地面、结构、物体色（配置值按深色背景取的浅色）向深色混合 55%；高度色在两种背景上都清楚，不调整。
+function stagePointColor(rgb) {
+  if (!stageCss() || document.documentElement.dataset.theme === 'dark') return rgb;
+  return rgb.map((value, index) => Math.round(value * 0.45 + [27, 38, 44][index] * 0.55));
+}
+// 点的顶点颜色按线性值参与显示，配置里的颜色是网页常用的 sRGB 写法：原样交给顶点会显示得比写的浅一截
+// （深色背景上不明显，浅色背景上整片发白）。换成线性值后，显示出来就是配置的颜色。
+function linearByte(value) {
+  const c = value / 255;
+  return Math.round(255 * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+}
+const heightStop = color => pointCloudHexToRgb(color).map(linearByte);
+const floorColor = color => stagePointColor(pointCloudHexToRgb(color)).map(linearByte);
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
 const DEFAULT_POINT_STYLE = 'height';
@@ -32,7 +64,7 @@ const DEFAULT_POINTCLOUD3D_CONFIG = Object.freeze({
   spacingM: 0.1,
   size: 1.35,
   color: '#cbd5e1',
-  heightColors: Object.freeze(['#38bdf8', '#22d3ee', '#4ade80', '#facc15', '#fb7185']),
+  heightColors: Object.freeze(['#2f6690', '#1f7f95', '#1e8c7e', '#5e8f35', '#9c7420']),
   groundColor: '#38bdf8',
   structureColor: '#f8fafc',
   objectColor: '#fbbf24',
@@ -152,13 +184,13 @@ function buildPointStylePresets() { return Object.freeze({
 }); }
 let POINT_STYLE_PRESETS = buildPointStylePresets();
 let HEIGHT_COLOR_STOPS = Object.freeze(
-  POINTCLOUD3D_CONFIG.heightColors.map((color) => Object.freeze(pointCloudHexToRgb(color))),
+  POINTCLOUD3D_CONFIG.heightColors.map((color) => Object.freeze(heightStop(color))),
 );
 let FLOOR_COLORS = Object.freeze({
-  ground: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.groundColor)),
-  context: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.color)),
-  structure: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor)),
-  object: Object.freeze(pointCloudHexToRgb(POINTCLOUD3D_CONFIG.objectColor)),
+  ground: Object.freeze(floorColor(POINTCLOUD3D_CONFIG.groundColor)),
+  context: Object.freeze(floorColor(POINTCLOUD3D_CONFIG.color)),
+  structure: Object.freeze(floorColor(POINTCLOUD3D_CONFIG.structureColor)),
+  object: Object.freeze(floorColor(POINTCLOUD3D_CONFIG.objectColor)),
 });
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const MAX_POINTS = Math.floor(MAX_BUFFER_BYTES / (3 * 4));
@@ -616,7 +648,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._container.appendChild(this._renderer.domElement);
 
     this._scene = new THREE.Scene();
-    this._scene.background = new THREE.Color(0x0c1a20);
+    this._scene.background = new THREE.Color(COLORS.background);
 
     this._camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 500);
     this._camera.position.set(0, -10, 8);
@@ -645,10 +677,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
       depthWrite: false,
     });
     this._semanticSelectedMaterial = this._semanticPreciseMaterial.clone();
-    this._semanticSelectedMaterial.color.set(0xbdd7e5);
+    this._semanticSelectedMaterial.color.set(COLORS.semanticSelected);
     this._semanticSelectedMaterial.opacity = 0.26;
     this._semanticSelectedFallbackMaterial = this._semanticFallbackMaterial.clone();
-    this._semanticSelectedFallbackMaterial.color.set(0xbdd7e5);
+    this._semanticSelectedFallbackMaterial.color.set(COLORS.semanticSelected);
     this._semanticSelectedFallbackMaterial.opacity = 0.72;
     this._semanticRegionLayer = new SemanticRegionLayer(this._scene);
     this._sceneGraphLayer = new SceneGraphLayer(this._scene);
@@ -2633,15 +2665,38 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._rebuildPointCloud();
   }
 
+  /* 切换主题：重读舞台变量，背景与已有叠加对象立即换色；点云的非高度配色按新背景重新计算。 */
+  applyStageTheme() {
+    if (!stageCss()) return;
+    readStageColors();
+    if (this._scene) {
+      this._scene.background = new THREE.Color(COLORS.background);
+      const set = (material, key) => material?.color.setHex(COLORS[key]);
+      set(this._trajectoryLine?.material, 'trajectory');
+      set(this._navPathLine?.material, this._navigationPathMode === 'retained' ? 'retainedPath' : 'navPath');
+      set(this._navLocalPathLine?.material, 'localPath');
+      set(this._navGoalMesh?.material, 'navGoal');
+      set(this._navigationPickMarker?.material, 'navGoal');
+      this._frontierGroup?.traverse(object => set(object.material, 'frontier'));
+      this._robotEnvelope?.traverse(object => set(object.material, 'robot'));
+      set(this._semanticPreciseMaterial, 'semantic');
+      set(this._semanticFallbackMaterial, 'semanticFallback');
+      set(this._semanticSelectedMaterial, 'semanticSelected');
+      set(this._semanticSelectedFallbackMaterial, 'semanticSelected');
+    }
+    this.applyDisplayConfig(this._displayConfig);
+    this._requestRender();
+  }
+
   applyDisplayConfig(value) {
     POINTCLOUD3D_CONFIG = normalizePointCloud3DConfig(value);
     POINT_STYLE_PRESETS = buildPointStylePresets();
-    HEIGHT_COLOR_STOPS = POINTCLOUD3D_CONFIG.heightColors.map(pointCloudHexToRgb);
+    HEIGHT_COLOR_STOPS = POINTCLOUD3D_CONFIG.heightColors.map(heightStop);
     FLOOR_COLORS = {
-      ground: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.groundColor),
-      context: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.color),
-      structure: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.structureColor),
-      object: pointCloudHexToRgb(POINTCLOUD3D_CONFIG.objectColor),
+      ground: floorColor(POINTCLOUD3D_CONFIG.groundColor),
+      context: floorColor(POINTCLOUD3D_CONFIG.color),
+      structure: floorColor(POINTCLOUD3D_CONFIG.structureColor),
+      object: floorColor(POINTCLOUD3D_CONFIG.objectColor),
     };
     this._displayConfig = POINTCLOUD3D_CONFIG;
     this._processingConfig = { stylePresets: POINT_STYLE_PRESETS, heightColorStops: HEIGHT_COLOR_STOPS, floorColors: FLOOR_COLORS };
@@ -3022,6 +3077,8 @@ window.addEventListener('pointcloud3d:semantic-instances', (e) => {
   if (detail && Object.hasOwn(detail, 'selectedId')) window.pointcloud3d.setSemanticSelectedId(detail.selectedId);
   window.pointcloud3d.updateSemanticInstances(instances || []);
 });
+
+document.addEventListener('neh:theme', () => window.pointcloud3d?.applyStageTheme());
 
 window.addEventListener('pointcloud3d:semantic-regions', (event) => {
   window.pointcloud3d.updateSemanticRegions(event.detail || {});

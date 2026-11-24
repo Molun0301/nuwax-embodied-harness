@@ -13,8 +13,9 @@ const VIEWS = [['2d', '2D', 'grid-2x2', '二维栅格地图'], ['3d', '3D', 'box
   .filter(([id]) => !PLANAR_PIPELINE || id !== '3d');
 const POINT_STYLES = [['height', '按高度着色'], ['full', '完整点云（加载全部原始扫描点）'], ['singleFloor', '单层（去掉天花板）'], ['ground', '只看地面'], ['structure', '只看结构'], ['mono', '单色']];
 // 图例颜色与绘制一致（二维与三维共用叠加色）。
-const LEGEND = [['轨迹', 'line', '#b2a0f8'], ['全局路线', 'line', '#a5e27e'], ['局部路线', 'line', '#69dedc'], ['保留的全局路线（等待执行更新）', 'line', '#ffba78', 'retained'],
-  ['探索前沿', 'dot', '#f472b6'], ['导航目标', 'dot', '#a78bfa'], ['物品', 'tag', '#f59e0b']];
+const LEGEND = [['轨迹', 'line', 'var(--stage-trajectory)'], ['全局路线', 'line', 'var(--stage-path)'], ['局部路线', 'line', 'var(--stage-local-path)'],
+  ['保留的全局路线（等待执行更新）', 'line', 'var(--stage-retained-path)', 'retained'],
+  ['探索前沿', 'dot', 'var(--stage-frontier)'], ['导航目标', 'dot', 'var(--stage-goal)'], ['物品', 'tag', '#f59e0b']];
 
 /* root：舞台元素；onPick(hit)：点选物品、聚合、区域或关系图节点（P3 语义面板接上详情）。 */
 export function createStage(root, ctx, { onPick }) {
@@ -326,7 +327,8 @@ export function createStage(root, ctx, { onPick }) {
   function render() {
     const info = map.info();
     const m = mode();
-    const dark = m === '3d' || ui.swapped;
+    // 地图（2D、3D、语义地图、关系图）用舞台底色，随主题；视频在主画面时用深色。
+    const dark = ui.swapped;
     root.dataset.tone = dark ? 'dark' : 'light';
     root.classList.toggle('n-tone-dark', dark);
     root.dataset.view = m;

@@ -11,11 +11,17 @@ import { videoSourceTime } from './video.js';
 
 export const PLANAR_PIPELINE = window.__NUWAX_GEOMETRY_PIPELINE__ === 'slam_2d';
 // 叠加色沿用原值；底色与栅格按舞台配色（浅色舞台 / 暗色主题）取。
-const COLORS = {
-  trajectory: '#b2a0f8', frontier: '#f472b6', frontierStroke: '#fbcfe8', robot: '#fbbf24', robotStroke: '#fef3c7',
-  goal: '#a78bfa', goalStroke: '#ddd6fe', navPath: '#a5e27e', localPath: '#69dedc', retainedPath: '#ffba78',
-};
-const GRID_COLORS = { light: { free: [234, 236, 239], occupied: [34, 38, 43] }, dark: { free: [35, 39, 44], occupied: [141, 153, 163] } };
+// 栅格与叠加色取舞台主题变量（web/shared/neh-ui.css），切换主题时重读；描边色两种主题相同。
+const COLORS = { frontierStroke: '#fbcfe8', robotStroke: '#fef3c7', goalStroke: '#ddd6fe' };
+const STAGE_COLOR_VARS = { trajectory: '--stage-trajectory', frontier: '--stage-frontier', robot: '--stage-robot', goal: '--stage-goal',
+  navPath: '--stage-path', localPath: '--stage-local-path', retainedPath: '--stage-retained-path',
+  free: '--stage-free', occupied: '--stage-occupied', unknown: '--stage-unknown' };
+function readStageColors() {
+  const css = getComputedStyle(document.documentElement);
+  for (const [key, name] of Object.entries(STAGE_COLOR_VARS)) COLORS[key] = css.getPropertyValue(name).trim();
+}
+readStageColors();
+const hexRgb = hex => [1, 3, 5].map(index => parseInt(hex.slice(index, index + 2), 16));
 const TERMINAL_NAV = ['succeeded', 'failed', 'cancelled', 'replaced', 'stopped'];
 const ACTIVE_SPATIAL_STATUSES = new Set(['accepted', 'planning', 'running']);
 const ACTIVE_SPATIAL_CAPABILITIES = new Set(['explore_area_v2', 'explore_and_find_target', 'navigate_to_pose', 'navigate_to_named_location',
@@ -874,13 +880,12 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
     const theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
     const cache = state.mapBaseCache;
     if (cache && cache.key === state.mapGridContentKey && cache.width === width && cache.height === height && cache.theme === theme) return cache.canvas;
-    const colors = GRID_COLORS[theme];
+    const colors = { free: hexRgb(COLORS.free), occupied: hexRgb(COLORS.occupied), unknown: hexRgb(COLORS.unknown) };
     const image = context.createImageData(width, height);
     for (let row = 0; row < height; row += 1) {
       for (let col = 0; col < width; col += 1) {
         const value = Number(grid.data[row * width + col]);
-        if (value < 0) continue;   // 未知栅格透明，露出舞台底色
-        const color = value >= 65 ? colors.occupied : colors.free;
+        const color = value < 0 ? colors.unknown : value >= 65 ? colors.occupied : colors.free;
         const target = ((height - 1 - row) * width + col) * 4;
         image.data[target] = color[0]; image.data[target + 1] = color[1]; image.data[target + 2] = color[2]; image.data[target + 3] = 255;
       }
@@ -1029,7 +1034,7 @@ export function createMapView({ ctx, canvas, container3d, metrics, visible, onCh
     context.restore();
     recordDisplayedMapPose('map2d', state.pose);
   }
-  document.addEventListener('neh:theme', () => requestMapDraw(true));
+  document.addEventListener('neh:theme', () => { readStageColors(); requestMapDraw(true); });
   // 三维只在监控页、3D 视图且标签页可见时运行；机器人模型与完整点云的轮询随之启停。
   document.addEventListener('visibilitychange', () => window.pointcloud3d?.setVisible(state.viewMode === '3d' && visible()));
   new ResizeObserver(() => requestMapDraw(false)).observe(canvas);

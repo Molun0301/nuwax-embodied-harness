@@ -23,7 +23,12 @@
   --bad: #CC3A29; --bad-soft: rgba(204,58,41,.10);
   --info: #3563B5; --info-soft: rgba(53,99,181,.10);
 
-  --stage-light: #F6F7F8; --stage-dark: #0C1A20; --robot: #E8833A;
+  /* 舞台（地图）配色：2D、语义地图、关系图、3D 共用同一个底色；可通行与底色一眼分得开，障碍醒目。
+     未知与底色相同。叠加色（轨迹、路线、前沿、目标、机器人、物品）在可通行与底色上都清楚。视频主画面另用深色。 */
+  --stage-bg: #CBD3D8; --stage-unknown: #CBD3D8; --stage-free: #FBFCFC; --stage-occupied: #22313A; --stage-video: #0C1A20;
+  --stage-trajectory: #7A5AD8; --stage-path: #3B8F2A; --stage-local-path: #0C8A94; --stage-retained-path: #C76A14;
+  --stage-frontier: #D02E7A; --stage-goal: #6440D0; --stage-robot: #E07020; --stage-item: #4F6E80; --stage-item-selected: #1F6FAE;
+  --robot: #E8833A;
 
   --font: "Barlow", "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", system-ui, sans-serif;
   --mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, "Noto Sans Mono CJK SC", "DejaVu Sans Mono", Menlo, Consolas, monospace;
@@ -53,7 +58,9 @@
   --warn: #E3A73F; --warn-soft: rgba(227,167,63,.14);
   --bad: #EE6A57; --bad-soft: rgba(238,106,87,.14);
   --info: #79A2EA; --info-soft: rgba(121,162,234,.14);
-  --stage-light: #10171B;
+  --stage-bg: #0D1418; --stage-unknown: #0D1418; --stage-free: #33434C; --stage-occupied: #D5DEE2;
+  --stage-trajectory: #B2A0F8; --stage-path: #A5E27E; --stage-local-path: #69DEDC; --stage-retained-path: #FFBA78;
+  --stage-frontier: #F472B6; --stage-goal: #A78BFA; --stage-robot: #FBBF24; --stage-item: #8AA7B8; --stage-item-selected: #BDD7E5;
   --shadow-1: 0 1px 2px rgba(0,0,0,.4);
   --shadow-2: 0 1px 2px rgba(0,0,0,.4), 0 8px 22px -8px rgba(0,0,0,.7);
   --shadow-3: 0 2px 6px rgba(0,0,0,.45), 0 20px 44px -14px rgba(0,0,0,.8);

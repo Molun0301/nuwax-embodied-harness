@@ -60,8 +60,8 @@
 /* 监控：舞台 + 侧栏 */
 .c-monitor { display: grid; grid-template-columns: minmax(0, 1fr) var(--side-w, 388px); height: 100%; }
 .c-monitor.is-collapsed { grid-template-columns: minmax(0, 1fr) 0px; }
-.c-stage { position: relative; overflow: hidden; background: var(--stage-dark); min-width: 0; }
-.c-stage[data-tone="light"] { background: var(--stage-light); }
+.c-stage { position: relative; overflow: hidden; background: var(--stage-bg); min-width: 0; }
+.c-stage[data-tone="dark"] { background: var(--stage-video); }
 .c-maplayer { position: absolute; inset: 0; }
 .c-map2d, .c-map3d, .c-graph { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .c-map2d { cursor: grab; touch-action: none; }
@@ -94,7 +94,7 @@
 .c-video-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 8px 12px; color: var(--glass-muted); font-size: var(--fs-12); text-align: center; }
 .c-video[data-mode="stale"] .c-video-empty { place-items: end start; padding: 8px; color: #F2C066; }
 .c-pip.is-empty .c-video { background: transparent; }
-.c-pip-media .c-maplayer { background: var(--stage-dark); }
+.c-pip-media .c-maplayer { background: var(--stage-bg); }
 .c-stage-video { position: absolute; inset: 0; z-index: 1; }
 .c-pip-media svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .c-pip-foot { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 6px; }
@@ -405,7 +405,7 @@ button.c-chipid:hover { background: var(--accent-soft); color: var(--accent-ink)
 .c-camera .n-float-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* 关系图视图 */
-.c-graph { background: var(--stage-light); cursor: grab; touch-action: none; }
+.c-graph { background: var(--stage-bg); cursor: grab; touch-action: none; }
 .c-gedge { stroke: var(--line-strong); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
 .c-gedge[data-route="true"] { stroke: #4f8ccc; stroke-width: 3; }
 .c-gnode { cursor: pointer; }
@@ -414,7 +414,7 @@ button.c-chipid:hover { background: var(--accent-soft); color: var(--accent-ink)
 .c-gnode[data-kind="passage"] .c-gnode-shape { fill: #c68a3b; stroke: #c68a3b; }
 .c-gnode[data-kind="object"] .c-gnode-shape { fill: color-mix(in srgb, #f59e0b 22%, var(--surface)); stroke: #d08a10; }
 .c-gnode[aria-pressed="true"] .c-gnode-shape { stroke: var(--ink); stroke-width: 3; }
-.c-gnode text { fill: var(--ink); paint-order: stroke; stroke: var(--stage-light); stroke-linejoin: round; font-family: var(--font); font-weight: 500; }
+.c-gnode text { fill: var(--ink); paint-order: stroke; stroke: var(--stage-bg); stroke-linejoin: round; font-family: var(--font); font-weight: 500; }
 .c-gnode:focus-visible { outline: none; }
 .c-gnode:focus-visible .c-gnode-shape { stroke: var(--accent); stroke-width: 3; }
 

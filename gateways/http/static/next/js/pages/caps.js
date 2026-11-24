@@ -2,7 +2,7 @@
    行为沿用原能力页（capability-panel.js，06 第 8 节）：经 list_capabilities 取全部能力，按 input_schema 生成表单，
    留空的字段不发送；motion 为真或名称以 delete_ 开头的能力先确认；任务类按任务流显示状态与进度、可取消，结束后显示结果；
    失败显示后端原因与错误码。新增能力不改网页即出现。地址 #/caps/<能力名> 打开该能力。 */
-import { icon, h, toast, confirmDialog, sub as subBlock, copyText } from '/static/shared/neh-ui.js';
+import { icon, h, toast, confirmDialog, sub as subBlock, copyText, collapse, enter, progressBar } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, normalizeTaskState, taskKind } from '../status.js';
 
 // 类型用含义贴切的图标：查询看一眼（眼睛），动作立即生效（闪电），任务要花时间（沙漏）。
@@ -67,6 +67,12 @@ export function mount(root, ctx) {
     h('div', { class: 'c-caps-list' }, h('div', { class: 'c-split-list-head' }, h('div', { class: 'n-search', html: icon('search', 'n-icon--sm') }, search), kindSeg), list),
     main, result);
   root.append(split);
+  // 窄屏列表与详情互换时，新内容从前进方向淡入。
+  const narrow = matchMedia('(max-width: 760px)');
+  function showDetail(on) {
+    split.classList.toggle('is-detail', on);
+    if (narrow.matches) enter(split, { from: on ? 'translateX(12px)' : 'translateX(-12px)' });
+  }
   search.addEventListener('input', () => { st.query = search.value.trim().toLowerCase(); renderList(); });
 
   /* ---------- 左侧：类型筛选与分组列表 ---------- */
@@ -86,12 +92,17 @@ export function mount(root, ctx) {
       const items = caps.filter(c => (c.group || '其它') === g);
       const open = Boolean(q) || st.openGroups.has(g);
       return h('div', { class: 'c-capgroup', dataset: { open: String(open) } },
-        h('button', { class: 'c-capgroup-head', type: 'button', 'aria-expanded': String(open), onclick: () => {
-          if (st.openGroups.has(g)) st.openGroups.delete(g); else st.openGroups.add(g);
-          renderList();
+        // 就地展开收起（高度过渡），不重建整个列表。
+        h('button', { class: 'c-capgroup-head', type: 'button', 'aria-expanded': String(open), onclick: ev => {
+          const head = ev.currentTarget, group = head.parentElement;
+          const next = group.dataset.open !== 'true';
+          if (next) st.openGroups.add(g); else st.openGroups.delete(g);
+          const animate = collapse(group.lastElementChild);
+          group.dataset.open = String(next); head.setAttribute('aria-expanded', String(next));
+          animate(next);
         } }, h('span', { class: 'c-gicon', html: icon(items[0].group_icon || 'puzzle') }), h('b', {}, g), h('span', { class: 'n-meta' }, items.length), h('span', { html: icon('chevron-right', 'c-chev') })),
         h('div', { class: 'c-capgroup-body' }, items.map(c => h('button', { class: 'n-row c-cap-row', type: 'button', 'aria-selected': String(st.selected === c), title: c.description,
-          onclick: () => { select(c); split.classList.add('is-detail'); ctx.go('caps', c.name); } },
+          onclick: () => { select(c); showDetail(true); ctx.go('caps', c.name); } },
           h('span', { class: 'n-tip n-tip--right', 'data-tip': KIND[c.kind]?.[0] || c.kind, style: 'display:flex;align-self:flex-start;margin-top:2px' }, kindIcon(c.kind)),
           h('div', { class: 'n-row-main' }, h('div', { class: 'n-row-title' }, titleOf(c)), h('div', { class: 'n-row-sub' }, c.name)),
           c.motion ? h('span', { class: 'n-tip n-tip--left c-motion', 'data-tip': '会让机器人移动', html: icon('footprints', 'n-icon--sm') }) : null))));
@@ -160,7 +171,7 @@ export function mount(root, ctx) {
       optSec,
       !props.length ? h('p', { class: 'n-meta', style: 'margin:4px 0' }, '这个能力没有参数，直接执行即可。') : null);
     const hero = h('form', { class: 'c-caphero' },
-      h('button', { class: 'c-back', type: 'button', html: icon('chevron-left', 'n-icon--sm'), onclick: () => split.classList.remove('is-detail') }, '全部能力'),
+      h('button', { class: 'c-back', type: 'button', html: icon('chevron-left', 'n-icon--sm'), onclick: () => showDetail(false) }, '全部能力'),
       h('span', { class: 'n-hero-icon', html: icon(cap.group_icon || 'puzzle') }),
       h('div', { style: 'flex:1;min-width:0' },
         h('div', { class: 'n-meta c-capkind' }, kindIcon(cap.kind), KIND[cap.kind]?.[0] || cap.kind, h('span', { class: 'n-faint' }, cap.group || '其它'),
@@ -265,7 +276,7 @@ export function mount(root, ctx) {
             task.error_code ? h('div', { class: 'n-meta' }, '错误码 ', h('span', { class: 'n-code' }, task.error_code)) : null) : null)
             : h('div', { class: 'n-hl', style: 'display:grid;gap:8px;font-size:13px' },
               h('div', {}, task.message || task.stage || '已受理，后台执行中'),
-              h('div', { class: 'n-progress' + (percent == null ? ' n-progress--indeterminate' : '') }, h('span', { style: percent == null ? null : 'width:' + percent + '%' })),
+              progressBar('cap-task:' + task.task_id, percent),
               h('div', { class: 'n-meta' }, '进度也显示在顶栏与监控页“活动”。任务 ', h('span', { class: 'n-code' }, task.task_id)),
               cancelError ? h('div', { style: 'color:var(--bad)' }, '取消失败：' + cancelError) : null),
           consoleBlock(value)));

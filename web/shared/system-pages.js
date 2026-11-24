@@ -6,7 +6,7 @@
    - mountSystem(root, opts) → {show(), hide(), refresh()}；mountWizard(root, opts) → {destroy()}。
    业务启停、回退、模块调整都走“生成计划 → 提交任务 → 读任务进度”（plan / jobs），版本更新走一步更新接口 update；
    页面可见时每 10 秒读业务状态，有进行中的任务时每 2 秒读任务进度，不可见时都停止。 */
-import { icon, h, toast, confirmDialog, block as uiBlock, sub as uiSub, copyText } from './neh-ui.js';
+import { icon, h, toast, confirmDialog, block as uiBlock, sub as uiSub, copyText, enter, leave, slideHeight, progressBar } from './neh-ui.js';
 
 /* ================= 管理服务请求 ================= */
 let csrf = '';
@@ -516,9 +516,9 @@ export function mountSystem(root, opts = {}) {
       h('div', { class: 'n-hero-actions' }, h('span', { class: 'n-t1 n-num' }, percent),
         h('button', { class: 'n-btn', type: 'button', onclick: () => cancelJob(job) }, '取消'),
         h('button', { class: 'n-btn n-btn--quiet', type: 'button', 'aria-expanded': String(S.jobOpen), html: icon(S.jobOpen ? 'chevron-up' : 'chevron-down', 'n-icon--sm'),
-          onclick: () => { S.jobOpen = !S.jobOpen; renderJobParts(); } }, S.jobOpen ? '收起步骤' : '展开步骤')),
+          onclick: toggleJobSteps }, S.jobOpen ? '收起步骤' : '展开步骤')),
       h('div', { class: 's-hero-more' },
-        h('div', { class: 'n-progress s-hero-bar' }, h('span', { style: 'width:' + percent })),
+        progressBar('hero:' + job.id, job.progress || 0, 's-hero-bar'),
         h('p', { class: 'n-meta' }, jobBizLine(job) + '开始于 ' + fmtWhen(job.created_at) + '，已用时 ' + fmtDur(jobSeconds(job)) + '。'),
         S.jobOpen ? h('div', { class: 's-job-more' }, stepList(job, true),
           h('div', { class: 'n-pre n-terminal s-tail', 'aria-label': '最新步骤' }, log.slice(-8).map(l => h('div', { class: 's-tail-line' },
@@ -576,11 +576,19 @@ export function mountSystem(root, opts = {}) {
     return h('li', { class: 'n-tl-item' }, h('span', { class: 'n-tl-dot' + (dot ? ' n-tl-dot--' + dot : ''), html: dotHtml || '' }),
       h('div', { class: 's-tl-main' }, h('div', { class: 's-tl-head' }, head), meta), h('div', { class: 's-tl-action' }, action));
   }
+  // 展开或收起任务步骤：展开时新步骤区从 0 高度展开，收起时先收到 0 再重建。
+  function toggleJobSteps() {
+    const more = parts.hero?.querySelector('.s-job-more');
+    if (more) { void slideHeight(more, false).then(() => { S.jobOpen = false; renderJobParts(); }); return; }
+    S.jobOpen = true;
+    renderJobParts();
+    void slideHeight(parts.hero?.querySelector('.s-job-more'), true);
+  }
   function versionAction(kind) {
     const job = S.job && jobRunning(S.job) ? S.job : null;
     if (job && job.action === kind) {
       const p = (job.progress || 0) + '%';
-      return h('div', { class: 's-progress-mini' }, h('span', { class: 's-progress-text' }, (kind === 'update' ? '正在更新 ' : '正在回退 ') + p), h('div', { class: 'n-progress' }, h('span', { style: 'width:' + p })));
+      return h('div', { class: 's-progress-mini' }, h('span', { class: 's-progress-text' }, (kind === 'update' ? '正在更新 ' : '正在回退 ') + p), progressBar('mini:' + job.id, job.progress || 0));
     }
     const label = kind === 'update' ? '更新到此版本' : '回退到此版本';
     const ico = kind === 'update' ? 'download' : 'history';
@@ -856,7 +864,7 @@ export function mountSystem(root, opts = {}) {
   }
   function renderDrawer() {
     const d = S.drawer;
-    if (!d) { drawerEl?.remove(); scrimEl?.remove(); drawerEl = scrimEl = null; return; }
+    if (!d) { leave(drawerEl, { to: 'translateX(100%)', speed: 'slow' }); leave(scrimEl, { to: 'none', speed: 'slow' }); drawerEl = scrimEl = null; return; }
     const kind = d.type + ':' + (d.id || '');
     const keep = drawerEl && drawerEl.dataset.kind === kind ? drawerEl.querySelector('.n-drawer-body')?.scrollTop || 0 : 0;
     const logBox = drawerEl?.querySelector('.s-log');
@@ -1059,7 +1067,8 @@ export function mountWizard(root, opts = {}) {
     W.checking = false;
     render();
   }
-  function go(step) { W.step = step; body.scrollTop = 0; render(); }
+  // 换步骤时新内容淡入并上移几像素。
+  function go(step) { W.step = step; body.scrollTop = 0; render(); enter(body, { from: 'translateY(6px)', speed: 'slow' }); }
   const primary = (label, run, ico, disabled) => h('button', { class: 'n-btn n-btn--primary', type: 'button', disabled: Boolean(disabled), html: ico ? icon(ico, 'n-icon--sm') : '', onclick: run }, label);
   const back = step => h('button', { class: 'n-btn', type: 'button', onclick: () => go(step) }, '上一步');
   function render() {
@@ -1344,7 +1353,7 @@ export function mountWizard(root, opts = {}) {
       content: [h('section', { class: 'n-hl', 'aria-label': '安装进度' },
         h('div', { class: 's-inst-head' }, h('div', {}, h('div', { class: 'n-t3' }, (STAGE_TITLE[job.stage] || job.stage) + '：' + (job.message || '')),
           h('span', { class: 'n-meta' }, '已用时 ' + fmtDur(jobSeconds(job)) + '，安装到 ' + inst().install_dir + '。关闭这个页面不会中断安装。')), h('span', { class: 'n-t1 n-num' }, percent)),
-        h('div', { class: 'n-progress s-inst-bar' }, h('span', { style: 'width:' + percent }))), detail],
+        progressBar('install:' + job.id, job.progress || 0, 's-inst-bar')), detail],
     };
   }
 

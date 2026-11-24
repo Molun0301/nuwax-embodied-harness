@@ -55,13 +55,23 @@ export function createShell({ store, stream, api, tasks, feeds }) {
     const previous = current?.view;
     current = { view, sub };
     store.set({ route: { view, sub } });
+    let entering = null;
     if (previous !== view) {
       document.querySelectorAll('.n-rail-item[data-view]').forEach(b => b.setAttribute('aria-current', b.dataset.view === view ? 'page' : 'false'));
       for (const name of VIEWS) $('view-' + name).hidden = name !== view;
       if (previous && pages[previous]) pages[previous].hide();
+      // 从页面栏换到另一个视图时，主内容区整体淡入并上移几像素（首次打开不做）。
+      if (previous) entering = ui.enter($('view-' + view), { from: 'translateY(6px)', speed: 'slow' });
     }
     const target = await page(view);
-    if (current.view === view) target.show(sub, opts);
+    if (current.view !== view) return;
+    target.show(sub, opts);
+    // 页面在显示时自己开始的进入动画（如监控页右侧面板换页签的滑入）直接放到结束，免得和整体淡入叠成两次。
+    if (entering) {
+      for (const a of $('view-' + view).getAnimations({ subtree: true })) {
+        if (a !== entering && !(a instanceof CSSAnimation) && !(a instanceof CSSTransition) && a.effect?.getTiming().iterations !== Infinity) a.finish();
+      }
+    }
   }
   window.addEventListener('popstate', () => { const r = parseHash(); if (!current || r.view !== current.view || r.sub !== current.sub) void show(r.view, r.sub); });
   window.addEventListener('hashchange', () => { const r = parseHash(); if (!current || r.view !== current.view || r.sub !== current.sub) void show(r.view, r.sub); });
@@ -138,6 +148,7 @@ export function createShell({ store, stream, api, tasks, feeds }) {
     $('topProgress').style.width = (a.tone === 'busy' && a.progress != null ? Math.round(a.progress * 100) : 0) + '%';
   }
   store.subscribe(['business', 'manager', 'conn', 'services', 'tasks', 'estop', 'geometry', 'clockOffsetMs'], renderActivity);
+  ui.fadeOnChange($('activityText'));
   // 用时与急停提示按秒刷新；没有任务、急停提示也已过期时不重绘。
   setInterval(() => {
     const s = store.get();

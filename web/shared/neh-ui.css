@@ -119,10 +119,10 @@ p { margin: 0; }
   display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: var(--h-control); padding: 0 12px;
   border: 1px solid var(--line-strong); border-radius: var(--r-control); background: var(--surface); color: var(--ink-2);
   font-size: var(--fs-13); font-weight: 500; white-space: nowrap; text-decoration: none;
-  transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
+  transition: background var(--motion-fast), border-color var(--motion-fast), color var(--motion-fast), box-shadow var(--motion-fast), transform var(--motion-fast) var(--ease-out);
 }
 .n-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); text-decoration: none; }
-.n-btn:active:not(:disabled) { background: var(--surface-3); }
+.n-btn:active:not(:disabled) { background: var(--surface-3); transform: scale(.97); }
 .n-btn:disabled { cursor: not-allowed; color: var(--faint); background: var(--surface-2); border-color: var(--line); }
 .n-btn--primary { background: var(--primary); border-color: transparent; color: var(--on-primary); font-weight: 600; }
 .n-btn--primary:hover:not(:disabled) { background: var(--primary-hover); color: var(--on-primary); }
@@ -144,7 +144,7 @@ p { margin: 0; }
 .n-input, .n-select, .n-textarea {
   width: 100%; height: var(--h-control); padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r-control);
   background: var(--surface); color: var(--ink); font-size: var(--fs-13); outline: none;
-  transition: border-color .15s, box-shadow .15s;
+  transition: border-color var(--motion-fast), box-shadow var(--motion-fast);
 }
 .n-textarea { height: auto; min-height: 72px; padding: 8px 10px; resize: vertical; line-height: 1.5; }
 .n-input::placeholder, .n-textarea::placeholder { color: var(--faint); }
@@ -175,11 +175,11 @@ p { margin: 0; }
 .n-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 .n-switch .n-switch-track {
   width: 34px; height: 20px; border-radius: 10px; background: var(--line-strong); position: relative; flex: none;
-  transition: background .18s var(--ease);
+  transition: background var(--motion-fast) var(--ease-out);
 }
 .n-switch .n-switch-track::after {
   content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
-  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform .18s var(--ease);
+  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform var(--motion-fast) var(--ease-out);
 }
 .n-switch input:checked + .n-switch-track { background: var(--accent); }
 [data-theme="dark"] .n-switch input:checked + .n-switch-track::after { background: #0A2A2C; }
@@ -193,7 +193,7 @@ p { margin: 0; }
 .n-seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: 9px; background: var(--surface-3); }
 .n-seg > button {
   height: 26px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: var(--muted);
-  font-size: var(--fs-13); font-weight: 500; white-space: nowrap; transition: background .15s, color .15s, box-shadow .15s;
+  font-size: var(--fs-13); font-weight: 500; white-space: nowrap; transition: background var(--motion-fast), color var(--motion-fast), box-shadow var(--motion-fast);
 }
 .n-seg > button:hover { color: var(--ink); }
 .n-seg > button[aria-pressed="true"], .n-seg > button[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-1); }
@@ -201,12 +201,23 @@ p { margin: 0; }
 .n-seg--block { display: flex; }
 .n-seg--block > button { flex: 1; }
 .n-seg .n-count { margin-left: 4px; color: var(--faint); font-weight: 500; }
+/* 选中指示（neh-ui.js 放进容器的 .n-ind）：一块单独的底，换选中项时滑过去；按钮自身不再画选中底 */
+.n-seg, .n-tabs, [data-ind] { position: relative; }
+.n-ind { position: absolute; z-index: 0; pointer-events: none; transform-origin: left center; }
+.n-seg > .n-ind { border-radius: 6px; background: var(--surface); box-shadow: var(--shadow-1); }
+[data-theme="dark"] .n-seg > .n-ind { background: var(--surface-3); }
+.n-float .n-seg > .n-ind { background: var(--surface); }
+.n-tone-dark .n-float .n-seg > .n-ind, .n-tone-dark.n-float .n-seg > .n-ind { background: rgba(255,255,255,.14); box-shadow: none; }
+.n-seg.n-has-ind > button { position: relative; z-index: 1; }
+.n-seg.n-has-ind > button[aria-pressed="true"], .n-seg.n-has-ind > button[aria-selected="true"] { background: transparent !important; box-shadow: none !important; }
+.n-tabs > .n-ind, [data-ind="underline"] > .n-ind { bottom: -1px; height: 2px; border-radius: 2px; background: var(--accent); }
+.n-tabs.n-has-ind > button[aria-selected="true"]::after { display: none; }
 
 /* ---------- 下划线页签（面板顶部、页面分区） ---------- */
 .n-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
 .n-tabs > button {
   position: relative; height: 40px; padding: 0 10px; border: 0; background: none; color: var(--muted);
-  font-size: var(--fs-13); font-weight: 500;
+  font-size: var(--fs-13); font-weight: 500; transition: color var(--motion-fast);
 }
 .n-tabs > button:hover { color: var(--ink); }
 .n-tabs > button[aria-selected="true"] { color: var(--ink); }
@@ -243,7 +254,7 @@ p { margin: 0; }
 
 /* ---------- 进度 ---------- */
 .n-progress { height: 4px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
-.n-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .4s var(--ease); }
+.n-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width var(--motion-slow) var(--ease-out); }
 .n-progress--indeterminate > span { width: 36% !important; animation: n-slide 1.3s var(--ease) infinite; }
 @keyframes n-slide { from { transform: translateX(-100%); } to { transform: translateX(280%); } }
 .n-spin { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--accent-line); border-top-color: var(--accent); animation: n-rot .8s linear infinite; flex: none; }
@@ -262,7 +273,9 @@ p { margin: 0; }
 .n-rail-item {
   position: relative; width: 60px; min-height: 54px; padding: 7px 0 6px; display: grid; justify-items: center; align-content: center; gap: 4px;
   border: 0; border-radius: 10px; background: transparent; color: var(--muted); font-size: var(--fs-11); font-weight: 500; text-decoration: none;
+  transition: background var(--motion-fast), color var(--motion-fast), transform var(--motion-fast) var(--ease-out);
 }
+.n-rail-item:active { transform: scale(.96); }
 .n-rail-item:hover { background: var(--surface-2); color: var(--ink); text-decoration: none; }
 .n-rail-item[aria-current="page"] { background: var(--accent-soft); color: var(--accent-ink); }
 .n-rail-item[aria-current="page"]::before { content: ""; position: absolute; left: -6px; top: 14px; bottom: 14px; width: 3px; border-radius: 0 3px 3px 0; background: var(--accent); }
@@ -276,7 +289,7 @@ p { margin: 0; }
 }
 .n-topbar-sep { width: 1px; height: 28px; background: var(--line); flex: none; }
 .n-topbar-progress { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: transparent; overflow: hidden; }
-.n-topbar-progress > span { display: block; height: 100%; background: var(--accent); transition: width .5s var(--ease); }
+.n-topbar-progress > span { display: block; height: 100%; background: var(--accent); transition: width var(--motion-slow) var(--ease-out); }
 
 /* ---------- 页面（能力、日志、设置、设备管理各页） ---------- */
 .n-page { min-height: 0; overflow: auto; }
@@ -307,7 +320,7 @@ p { margin: 0; }
 .n-list { display: grid; }
 .n-row {
   display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 10px; border-radius: var(--r-control);
-  color: var(--ink); text-align: left; background: transparent; border: 0; width: 100%;
+  color: var(--ink); text-align: left; background: transparent; border: 0; width: 100%; transition: background var(--motion-fast);
 }
 button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surface-2); text-decoration: none; }
 .n-row[aria-selected="true"], .n-row[aria-current="true"] { background: var(--accent-soft); }
@@ -341,27 +354,42 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-popover {
   position: absolute; z-index: 40; min-width: 220px; padding: 6px; background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--r-float); box-shadow: var(--shadow-3);
+  transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-base) var(--ease-out);
 }
+@starting-style { .n-popover { opacity: 0; transform: translateY(4px); } .n-popover[data-side="top"] { transform: translateY(-4px); } }
 .n-menu-item {
   display: flex; align-items: center; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; border-radius: 6px;
-  background: transparent; color: var(--ink-2); font-size: var(--fs-13); text-align: left;
+  background: transparent; color: var(--ink-2); font-size: var(--fs-13); text-align: left; transition: background var(--motion-fast), color var(--motion-fast);
 }
 .n-menu-item:hover { background: var(--surface-2); color: var(--ink); }
 .n-menu-item--danger { color: var(--bad); }
 .n-menu-item--danger:hover { background: var(--bad-soft); color: var(--bad); }
 .n-menu-sep { height: 1px; margin: 5px 4px; background: var(--line); }
 .n-tip { position: relative; }
-.n-tip[data-tip]:hover::after {
-  content: attr(data-tip); position: absolute; z-index: 60; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%);
+.n-tip[data-tip]::after {
+  content: attr(data-tip); position: absolute; z-index: 60; left: 50%; bottom: calc(100% + 8px); transform: translate(-50%, 4px);
   width: max-content; max-width: 260px; padding: 6px 9px; border-radius: 6px; background: #11191D; color: #E9EFF1;
   font-size: var(--fs-12); font-weight: 400; line-height: 1.45; white-space: normal; text-align: left; pointer-events: none; box-shadow: var(--shadow-2);
+  opacity: 0; visibility: hidden;
+  transition: opacity var(--motion-fast) var(--ease-in), transform var(--motion-fast) var(--ease-in), visibility 0s var(--motion-fast);
 }
-.n-tip--below[data-tip]:hover::after { bottom: auto; top: calc(100% + 8px); }
-.n-tip--left[data-tip]:hover::after { left: auto; right: calc(100% + 8px); top: 50%; bottom: auto; transform: translateY(-50%); }
+.n-tip[data-tip]:hover::after { opacity: 1; visibility: visible; transform: translate(-50%, 0);
+  transition: opacity var(--motion-base) var(--ease-out) 150ms, transform var(--motion-base) var(--ease-out) 150ms, visibility 0s 150ms; }
+.n-tip--below[data-tip]::after { bottom: auto; top: calc(100% + 8px); transform: translate(-50%, -4px); }
+.n-tip--below[data-tip]:hover::after { transform: translate(-50%, 0); }
+.n-tip--left[data-tip]::after { left: auto; right: calc(100% + 8px); top: 50%; bottom: auto; transform: translate(4px, -50%); }
+.n-tip--left[data-tip]:hover::after { transform: translate(0, -50%); }
 
 /* ---------- 对话框 ---------- */
-.n-dialog { border: 0; padding: 0; border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-4); width: min(480px, calc(100vw - 32px)); }
-.n-dialog::backdrop { background: rgba(9,16,20,.42); backdrop-filter: blur(2px); }
+.n-dialog { border: 0; padding: 0; border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-4); width: min(480px, calc(100vw - 32px));
+  transition: opacity var(--motion-slow) var(--ease-out), transform var(--motion-slow) var(--ease-out),
+    overlay var(--motion-slow) allow-discrete, display var(--motion-slow) allow-discrete; }
+.n-dialog:not([open]) { opacity: 0; transform: scale(.96); transition-timing-function: var(--ease-in); }
+@starting-style { .n-dialog[open] { opacity: 0; transform: scale(.96); } }
+.n-dialog::backdrop { background: rgba(9,16,20,.42); backdrop-filter: blur(2px);
+  transition: background var(--motion-slow), backdrop-filter var(--motion-slow), overlay var(--motion-slow) allow-discrete, display var(--motion-slow) allow-discrete; }
+.n-dialog:not([open])::backdrop { background: rgba(9,16,20,0); backdrop-filter: blur(0); }
+@starting-style { .n-dialog[open]::backdrop { background: rgba(9,16,20,0); backdrop-filter: blur(0); } }
 .n-dialog-body { padding: 22px 24px 8px; display: grid; gap: 10px; }
 .n-dialog-title { font-size: var(--fs-16); font-weight: 600; display: flex; align-items: center; gap: 10px; }
 .n-dialog-title .n-icon { color: var(--warn); }
@@ -373,12 +401,12 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-toasts { position: fixed; z-index: 80; left: 50%; bottom: 24px; transform: translateX(-50%); display: grid; gap: 8px; justify-items: center; pointer-events: none; }
 .n-toast {
   pointer-events: auto; display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 8px 10px 8px 14px; border-radius: 10px;
-  background: #11191D; color: #E9EFF1; box-shadow: var(--shadow-3); font-size: var(--fs-13); animation: n-toast-in .22s var(--ease);
+  background: #11191D; color: #E9EFF1; box-shadow: var(--shadow-3); font-size: var(--fs-13); animation: n-toast-in var(--motion-base) var(--ease-out);
 }
 .n-toast .n-icon { color: var(--mint); }
 .n-toast--bad .n-icon { color: #FF8D7C; }
 .n-toast--warn .n-icon { color: #F2C066; }
-.n-toast .n-toast-action { border: 0; background: rgba(255,255,255,.1); color: #fff; height: 26px; padding: 0 10px; border-radius: 6px; font-size: var(--fs-12); font-weight: 600; }
+.n-toast .n-toast-action { border: 0; background: rgba(255,255,255,.1); color: #fff; height: 26px; padding: 0 10px; border-radius: 6px; font-size: var(--fs-12); font-weight: 600; transition: background var(--motion-fast); }
 .n-toast .n-toast-action:hover { background: rgba(255,255,255,.18); }
 @keyframes n-toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
@@ -424,7 +452,9 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-float-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; min-width: 32px; padding: 0 9px;
   border: 0; border-radius: 7px; background: transparent; color: var(--glass-ink); font-size: var(--fs-12); font-weight: 500; white-space: nowrap;
+  transition: background var(--motion-fast), color var(--motion-fast), transform var(--motion-fast) var(--ease-out);
 }
+.n-float-btn:active { transform: scale(.95); }
 .n-float-btn:hover { background: color-mix(in srgb, var(--glass-ink) 10%, transparent); }
 .n-float-btn[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--glass-ink); }
 .n-tone-dark .n-float-btn[aria-pressed="true"] { background: rgba(112,227,196,.18); color: var(--mint); }
@@ -459,7 +489,7 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-set-cat-head .n-set-cat-switch { margin-left: auto; }
 .n-set-cat[data-disabled="true"] .n-prop { opacity: .55; }
 .n-set-cat .n-prop:first-of-type { border-top: 0; }
-.n-set-key { font: 11px/1.4 var(--mono); color: var(--faint); border: 0; background: none; padding: 0; cursor: copy; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.n-set-key { font: 11px/1.4 var(--mono); color: var(--faint); border: 0; background: none; padding: 0; cursor: copy; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color var(--motion-fast); }
 .n-set-key:hover { color: var(--accent); }
 .n-set-control { display: grid; gap: 4px; justify-items: stretch; min-width: 0; }
 .n-set-control .n-switch { justify-self: start; }
@@ -467,17 +497,20 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-set-default-val { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .n-set-reset { border: 0; background: none; padding: 0; color: var(--accent); font-size: var(--fs-11); white-space: nowrap; flex: none; }
 .n-set-adv { border-top: 1px solid var(--line); }
-.n-set-adv > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 16px; color: var(--muted); font-size: var(--fs-12); font-weight: 500; }
+.n-set-adv > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 16px; color: var(--muted); font-size: var(--fs-12); font-weight: 500; transition: background var(--motion-fast), color var(--motion-fast); }
 .n-set-adv > summary::-webkit-details-marker { display: none; }
 .n-set-adv > summary:hover { color: var(--ink); background: var(--surface-2); }
-.n-set-adv > summary .n-icon { width: 14px; height: 14px; transition: transform .15s; }
-.n-set-adv[open] > summary .n-icon { transform: rotate(90deg); }
+.n-set-adv > summary .n-icon { width: 14px; height: 14px; transition: transform var(--motion-base) var(--ease-out); }
+.n-set-adv[open]:not([data-closing]) > summary .n-icon { transform: rotate(90deg); }
 .n-set-adv > .n-prop:first-of-type { border-top: 1px solid var(--line); }
 .n-savebar {
   position: sticky; bottom: 16px; z-index: 6; margin: 0 auto; width: min(720px, calc(100% - 32px));
   display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 16px; border-radius: 12px;
-  background: #11191D; color: #E9EFF1; box-shadow: var(--shadow-4); animation: n-toast-in .22s var(--ease);
+  background: #11191D; color: #E9EFF1; box-shadow: var(--shadow-4);
+  transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-base) var(--ease-out), display var(--motion-base) allow-discrete;
 }
+@starting-style { .n-savebar { opacity: 0; transform: translateY(8px); } }
+.n-savebar[hidden] { opacity: 0; transform: translateY(8px); transition-timing-function: var(--ease-in); }
 .n-savebar .n-savebar-text { flex: 1; min-width: 0; font-size: var(--fs-13); }
 .n-savebar .n-savebar-text small { display: block; color: #9DB0B8; font-size: var(--fs-12); }
 .n-savebar .n-btn { border-color: rgba(255,255,255,.16); background: transparent; color: #E9EFF1; }
@@ -546,19 +579,19 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 
 /* 右侧抽屉（日志详情、记录详情、调整模块） */
 .n-drawer { position: absolute; top: 0; right: 0; bottom: 0; width: min(420px, 100%); z-index: 20; display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
-  background: var(--surface); border-left: 1px solid var(--line); box-shadow: var(--shadow-3); animation: n-drawer-in .2s var(--ease); }
+  background: var(--surface); border-left: 1px solid var(--line); box-shadow: var(--shadow-3); animation: n-drawer-in var(--motion-slow) var(--ease-out); }
 .n-drawer-head { display: flex; align-items: center; gap: 8px; min-height: 52px; padding: 8px 10px 8px 18px; border-bottom: 1px solid var(--line); }
 .n-drawer-head h2 { font-size: var(--fs-16); font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .n-drawer-body { overflow: auto; padding: 16px 18px 24px; }
 .n-drawer-foot { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 18px; border-top: 1px solid var(--line); }
-@keyframes n-drawer-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes n-drawer-in { from { transform: translateX(100%); } to { transform: none; } }
 
 /* ---------- 第三版：让页面在模糊后仍能认出结构 ----------
    可折叠板块 .n-block（图标块 + 标题 + 摘要 + 侧边状态 + 折叠箭头）；子分组 .n-sub；
    磁贴 .n-tiles/.n-tile；时间线 .n-tl；状态大区 .n-hero。 */
 .n-block { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-panel); scroll-margin-top: 72px; }
 .n-block + .n-block { margin-top: 10px; }
-.n-block-head { display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 12px 12px 12px 16px; border-radius: inherit; cursor: pointer; user-select: none; }
+.n-block-head { display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 12px 12px 12px 16px; border-radius: inherit; cursor: pointer; user-select: none; transition: background var(--motion-fast); }
 .n-block-head:hover { background: color-mix(in srgb, var(--surface-2) 75%, transparent); }
 .n-block[data-open="true"] > .n-block-head { border-radius: var(--r-panel) var(--r-panel) 0 0; }
 .n-block-icon { flex: none; display: flex; color: var(--ink-2); }
@@ -571,7 +604,8 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-block-aside { display: flex; align-items: center; gap: 10px; flex: none; cursor: default; }
 .n-block-chev { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border: 0; border-radius: 8px; background: none; color: var(--faint); }
 .n-block-chev:hover { background: var(--surface-3); color: var(--ink); }
-.n-block-chev .n-icon { width: 16px; height: 16px; transition: transform .2s var(--ease); }
+.n-block-chev { transition: background var(--motion-fast), color var(--motion-fast); }
+.n-block-chev .n-icon { width: 16px; height: 16px; transition: transform var(--motion-base) var(--ease-out); }
 .n-block[data-open="true"] > .n-block-head .n-block-chev .n-icon { transform: rotate(90deg); }
 .n-block-body { border-top: 1px solid var(--line); }
 .n-block[data-open="false"] > .n-block-body { display: none; }
@@ -583,11 +617,14 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-sub-head h3 { font-size: var(--fs-13); font-weight: 600; color: var(--ink-2); }
 .n-sub-head .n-sub-count { font-size: var(--fs-12); color: var(--faint); }
 .n-sub-head .n-sub-aside { margin-left: auto; display: flex; align-items: center; gap: 10px; cursor: default; }
-.n-sub-head .n-sub-chev { width: 16px; height: 16px; color: var(--faint); transition: transform .2s var(--ease); }
+.n-sub-head .n-sub-chev { width: 16px; height: 16px; color: var(--faint); transition: transform var(--motion-base) var(--ease-out); }
 .n-sub[data-open="true"] > .n-sub-head .n-sub-chev { transform: rotate(90deg); }
 .n-sub[data-open="false"] > .n-sub-body { display: none; }
 .n-block-body > .n-sub:last-child[data-open="false"] > .n-sub-head { border-radius: 0 0 11px 11px; }
 .n-sub[data-disabled="true"] > .n-sub-body { opacity: .55; }
+.n-sub-body { transition: opacity var(--motion-base); }
+/* 展开收起动画期间（neh-ui.js collapse）保持显示并裁剪 */
+.n-collapsing { display: block !important; overflow: hidden !important; }
 
 .n-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--tile-min, 200px), 1fr)); gap: 10px; }
 .n-tile { position: relative; display: grid; gap: 8px; align-content: start; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); min-width: 0; }

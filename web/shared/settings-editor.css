@@ -9,8 +9,8 @@
 .n-set-options { grid-column: 1 / -1; margin: 2px 0 6px; }
 .n-set-options > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; height: 28px; color: var(--accent-ink); font-size: var(--fs-12); font-weight: 500; }
 .n-set-options > summary::-webkit-details-marker { display: none; }
-.n-set-options > summary .n-icon { width: 14px; height: 14px; transition: transform .15s; }
-.n-set-options[open] > summary .n-icon { transform: rotate(90deg); }
+.n-set-options > summary .n-icon { width: 14px; height: 14px; transition: transform var(--motion-base) var(--ease-out); }
+.n-set-options[open]:not([data-closing]) > summary .n-icon { transform: rotate(90deg); }
 .n-set-options-group { display: grid; gap: 8px; padding: 10px 0 4px; }
 .n-set-options-group + .n-set-options-group { border-top: 1px dashed var(--line); }
 .n-set-options-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px 20px; }

@@ -25,6 +25,142 @@ export function h(tag, attrs, ...kids) {
   return el;
 }
 
+/* ---------- 动效 ----------
+   时长与曲线取 neh-ui.css 的 --motion-fast/base/slow 与 --ease-out/--ease-in（系统设置减少动效时时长为 1ms）。
+   能用 CSS 过渡的都在样式表里；下面是需要脚本的几类：元素离开后再移除或隐藏、高度展开收起、分段与页签的选中指示滑动。 */
+const rootStyle = () => getComputedStyle(document.documentElement);
+export function motionMs(speed = 'base') { return parseFloat(rootStyle().getPropertyValue('--motion-' + speed)) || 0; }
+const easing = kind => rootStyle().getPropertyValue(kind === 'in' ? '--ease-in' : '--ease-out').trim() || 'ease';
+
+/* 进入：从 from（默认下移 4px、透明）回到原位；正在离开的元素会先停止离开。 */
+export function enter(el, { from = 'translateY(4px)', speed = 'base' } = {}) {
+  if (!el?.animate) return null;
+  if (el._leave) { el._leave.cancel(); el._leave = null; el.style.pointerEvents = ''; }
+  return el.animate([{ opacity: 0, transform: from }, { opacity: 1, transform: 'none' }], { duration: motionMs(speed), easing: easing('out') });
+}
+/* 离开：淡出并移向 to，结束后移除（hide 为真时改为设 hidden）；离开期间不接收点击。 */
+export function leave(el, { to = 'translateY(4px)', speed = 'base', hide = false } = {}) {
+  if (!el || el._leave) return;
+  if (!el.animate || !el.isConnected) { if (hide) el.hidden = true; else el.remove(); return; }
+  el.style.pointerEvents = 'none';
+  const anim = el.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: to }], { duration: motionMs(speed), easing: easing('in'), fill: 'forwards' });
+  el._leave = anim;
+  anim.finished.then(() => {
+    if (el._leave !== anim) return;
+    el._leave = null;
+    if (!hide) { el.remove(); return; }
+    el.hidden = true; el.style.pointerEvents = ''; anim.cancel();
+  }).catch(() => {});
+}
+/* 高度展开收起：body 收起时由样式隐藏（display: none），动画期间加 n-collapsing 保持显示并裁剪。
+   在改变展开状态之前调用本函数记下起始高度，改完后调用返回的函数开始动画。 */
+export function collapse(body) {
+  if (!body?.animate || !body.isConnected) return () => {};
+  const from = body.getBoundingClientRect().height;
+  body._height?.cancel();
+  return open => {
+    body.classList.add('n-collapsing');
+    const to = open ? body.scrollHeight : 0;
+    const anim = body.animate([{ height: from + 'px' }, { height: to + 'px' }], { duration: motionMs('base'), easing: easing(open ? 'out' : 'in') });
+    body._height = anim;
+    anim.finished.then(() => { if (body._height === anim) { body._height = null; body.classList.remove('n-collapsing'); } }).catch(() => {});
+  };
+}
+/* 整块新建或即将移除的区域按高度展开收起：open 为真时从 0 展开到现有高度，否则从现有高度收到 0（停在 0，由调用方随后移除）。
+   返回动画结束的 Promise。 */
+export function slideHeight(el, open) {
+  if (!el?.animate || !el.isConnected) return Promise.resolve();
+  const full = el.getBoundingClientRect().height + 'px';
+  el.style.overflow = 'hidden';
+  const anim = el.animate([{ height: open ? '0px' : full }, { height: open ? full : '0px' }],
+    { duration: motionMs('base'), easing: easing(open ? 'out' : 'in'), fill: open ? 'none' : 'forwards' });
+  return anim.finished.then(() => { if (open) el.style.overflow = ''; }, () => {});
+}
+/* 进度条：页面每次刷新都整块重建时，按 key 记住上次的进度，新建的条从上次宽度过渡到新宽度。percent 为 null 时是不确定进度。 */
+const progressWidths = new Map();
+export function progressBar(key, percent, cls = '') {
+  const fill = h('span', { style: percent == null ? null : 'width:' + percent + '%' });
+  const last = progressWidths.get(key);
+  if (percent != null && last != null && last !== percent && fill.animate) {
+    fill.animate([{ width: last + '%' }, { width: percent + '%' }], { duration: motionMs('slow'), easing: easing('out') });
+  }
+  progressWidths.set(key, percent);
+  return h('div', { class: 'n-progress' + (percent == null ? ' n-progress--indeterminate' : '') + (cls ? ' ' + cls : '') }, fill);
+}
+/* 文字切换淡入：内容变化时（只比较文字）新内容淡入，用于一句话状态这类会整体换掉的文字。 */
+export function fadeOnChange(el) {
+  let last = el.textContent;
+  new MutationObserver(() => {
+    if (el.textContent === last) return;
+    last = el.textContent;
+    el.animate?.([{ opacity: 0 }, { opacity: 1 }], { duration: motionMs('base'), easing: easing('out') });
+  }).observe(el, { childList: true, characterData: true, subtree: true });
+}
+
+/* details 展开收起：点摘要时按高度动画，收起动画结束后才去掉 open。
+   收起期间带 data-closing，箭头样式据此在开始收起时就转回；收起途中再点改为重新展开。 */
+document.addEventListener('click', e => {
+  const summary = e.target.closest?.('summary');
+  const details = summary?.parentElement;
+  if (!details || details.tagName !== 'DETAILS' || details.firstElementChild !== summary || !details.animate) return;
+  e.preventDefault();
+  const from = details.getBoundingClientRect().height;
+  details._height?.cancel();
+  const closing = details.open && details.dataset.closing !== 'true';
+  details.open = true;
+  if (closing) details.dataset.closing = 'true'; else delete details.dataset.closing;
+  const to = closing ? summary.getBoundingClientRect().height : details.getBoundingClientRect().height;
+  details.style.overflow = 'hidden';
+  const anim = details.animate([{ height: from + 'px' }, { height: to + 'px' }], { duration: motionMs('base'), easing: easing(closing ? 'in' : 'out') });
+  details._height = anim;
+  anim.finished.then(() => {
+    if (details._height !== anim) return;
+    details._height = null; details.style.overflow = '';
+    if (closing) { details.open = false; delete details.dataset.closing; }
+  }).catch(() => {});
+});
+
+/* 分段控件与下划线页签：选中指示是一块单独的底，换选中项时从原位置滑过去（只动 transform）。
+   自动作用于 .n-seg、.n-tabs 与带 data-ind 的容器（data-ind="underline" 为下划线）；容器里的按钮整体重建时也接着滑。 */
+const IND_BOX = '.n-seg, .n-tabs, [data-ind]';
+const pendingInd = new Set();
+let indFrame = 0;
+function placeIndicator(box) {
+  const selected = box.querySelector(':scope > [aria-pressed="true"], :scope > [aria-selected="true"]');
+  let ind = box.querySelector(':scope > .n-ind');
+  if (!box.isConnected) { indResize.unobserve(box); box._indWatched = false; return; }
+  if (!selected) { ind?.remove(); box.classList.remove('n-has-ind'); box._ind = null; return; }
+  const underline = box.matches('.n-tabs, [data-ind="underline"]');
+  const x = selected.offsetLeft + (underline ? 8 : 0), w = Math.max(0, selected.offsetWidth - (underline ? 16 : 0));
+  if (!w) return;   // 容器还没显示：等显示后尺寸变化再放
+  if (!ind) { ind = h('span', { class: 'n-ind', 'aria-hidden': 'true' }); box.prepend(ind); }
+  box.classList.add('n-has-ind');
+  ind.style.left = x + 'px'; ind.style.width = w + 'px';
+  if (!underline) { ind.style.top = selected.offsetTop + 'px'; ind.style.height = selected.offsetHeight + 'px'; }
+  const prev = box._ind;
+  box._ind = { x, w };
+  if (prev && prev.w && (prev.x !== x || prev.w !== w))
+    ind.animate([{ transform: 'translateX(' + (prev.x - x) + 'px) scaleX(' + prev.w / w + ')' }, { transform: 'none' }], { duration: motionMs('base'), easing: easing('out') });
+}
+function queueIndicator(box) {
+  pendingInd.add(box);
+  if (!indFrame) indFrame = requestAnimationFrame(() => { indFrame = 0; const boxes = [...pendingInd]; pendingInd.clear(); boxes.forEach(placeIndicator); });
+}
+const indResize = new ResizeObserver(entries => entries.forEach(entry => queueIndicator(entry.target)));
+function watchBoxes(node) {
+  if (node.nodeType !== 1) return;
+  const boxes = node.matches(IND_BOX) ? [node, ...node.querySelectorAll(IND_BOX)] : node.querySelectorAll(IND_BOX);
+  for (const box of boxes) { if (!box._indWatched) { box._indWatched = true; indResize.observe(box); } queueIndicator(box); }
+}
+new MutationObserver(records => {
+  for (const r of records) {
+    if (r.type === 'attributes') { if (r.target.parentElement?.matches(IND_BOX)) queueIndicator(r.target.parentElement); continue; }
+    if (r.target.matches?.(IND_BOX) && [...r.addedNodes].some(n => !n.classList?.contains('n-ind'))) queueIndicator(r.target);
+    r.addedNodes.forEach(watchBoxes);
+  }
+}).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-pressed', 'aria-selected'] });
+if (document.body) watchBoxes(document.body); else document.addEventListener('DOMContentLoaded', () => watchBoxes(document.body));
+
 function toasts() {
   let el = document.querySelector('.n-toasts');
   if (!el) { el = h('div', { class: 'n-toasts', role: 'status', 'aria-live': 'polite' }); document.body.append(el); }
@@ -36,9 +172,9 @@ export function toast(message, opts = {}) {
   const tone = opts.tone || 'ok';
   const el = h('div', { class: 'n-toast n-toast--' + tone, html: icon(tone === 'bad' ? 'circle-alert' : tone === 'warn' ? 'triangle-alert' : tone === 'info' ? 'info' : 'check') });
   el.append(h('span', {}, message));
-  if (opts.action) el.append(h('button', { class: 'n-toast-action', type: 'button', onclick: () => { el.remove(); opts.action.run(); } }, opts.action.label));
+  if (opts.action) el.append(h('button', { class: 'n-toast-action', type: 'button', onclick: () => { leave(el, { to: 'translateY(8px)' }); opts.action.run(); } }, opts.action.label));
   toasts().append(el);
-  setTimeout(() => el.remove(), opts.duration || 4200);
+  setTimeout(() => leave(el, { to: 'translateY(8px)' }), opts.duration || 4200);
 }
 
 /* 复制文字：优先剪贴板接口；不可用或被拒时用隐藏文本框加原生复制（设备常经 http 地址打开，非安全来源没有剪贴板接口）。
@@ -68,7 +204,8 @@ export function confirmDialog({ title, text, items, confirmText = '确认', dang
       items && items.length ? h('ul', { class: 'n-dialog-list' }, items.map(t => h('li', {}, t))) : null,
       extra || null);
     if (danger) body.querySelector('.n-dialog-title .n-icon')?.style.setProperty('color', 'var(--bad)');
-    const done = v => { dlg.close(); dlg.remove(); resolve(v); };
+    // 关闭时先播放退出过渡（样式表里的对话框与背景淡出），结束后再移除。
+    const done = v => { dlg.close(); setTimeout(() => dlg.remove(), motionMs('slow') + 20); resolve(v); };
     const actions = h('div', { class: 'n-dialog-actions' },
       h('button', { class: 'n-btn', type: 'button', onclick: () => done(false) }, '取消'),
       h('button', { class: 'n-btn ' + (danger ? 'n-btn--danger-fill' : 'n-btn--primary'), type: 'button', onclick: () => done(true) }, confirmText));
@@ -90,7 +227,7 @@ export function currentTheme() { return document.documentElement.dataset.theme =
 /* 弹出层：贴着 anchor 打开，点外部或 Esc 关闭；同一时间只有一个。 */
 export function popover(anchor, content, { align = 'start', side = 'bottom' } = {}) {
   closePopovers();
-  const pop = h('div', { class: 'n-popover', role: 'menu' }); pop.append(content);
+  const pop = h('div', { class: 'n-popover', role: 'menu', dataset: { side } }); pop.append(content);
   document.body.append(pop);
   const r = anchor.getBoundingClientRect(); const pw = pop.offsetWidth; const ph = pop.offsetHeight;
   let x = align === 'end' ? r.right - pw : r.left; let y = side === 'top' ? r.top - ph - 6 : r.bottom + 6;
@@ -101,7 +238,9 @@ export function popover(anchor, content, { align = 'start', side = 'bottom' } = 
   pop._cleanup = () => document.removeEventListener('pointerdown', onOutside, true);
   return pop;
 }
-export function closePopovers() { document.querySelectorAll('.n-popover').forEach(p => { p._cleanup?.(); p.remove(); }); }
+export function closePopovers() {
+  document.querySelectorAll('.n-popover').forEach(p => { p._cleanup?.(); leave(p, { to: p.dataset.side === 'top' ? 'translateY(-4px)' : 'translateY(4px)' }); });
+}
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopovers(); });
 
 /* 菜单：items 为 {label, icon, danger, run} 或分隔线 '-'。 */
@@ -125,7 +264,11 @@ export function block({ icon: ic, title, summary, aside, open = true, state = 'o
     h('div', { class: 'n-block-title' }, h('h2', {}, title), summary ? h('p', {}, summary) : null),
     aside ? h('div', { class: 'n-block-aside', onclick: e => e.stopPropagation() }, aside) : null, chev);
   el.body = h('div', { class: 'n-block-body' });
-  el.setOpen = v => { el.dataset.open = String(v); chev.setAttribute('aria-expanded', String(v)); chev.setAttribute('aria-label', v ? '收起' : '展开'); };
+  el.setOpen = v => {
+    const animate = collapse(el.body);
+    el.dataset.open = String(v); chev.setAttribute('aria-expanded', String(v)); chev.setAttribute('aria-label', v ? '收起' : '展开');
+    animate(v);
+  };
   head.addEventListener('click', () => { const v = el.dataset.open !== 'true'; el.setOpen(v); onToggle?.(v); });
   el.append(head, el.body);
   return el;
@@ -138,7 +281,11 @@ export function sub({ title, count, aside, open = true, disabled = false, onTogg
     h('h3', {}, title), count != null ? h('span', { class: 'n-sub-count' }, count) : null,
     aside ? h('div', { class: 'n-sub-aside', onclick: e => e.stopPropagation() }, aside) : null);
   el.body = h('div', { class: 'n-sub-body' });
-  el.setOpen = v => { el.dataset.open = String(v); head.setAttribute('aria-expanded', String(v)); };
+  el.setOpen = v => {
+    const animate = collapse(el.body);
+    el.dataset.open = String(v); head.setAttribute('aria-expanded', String(v));
+    animate(v);
+  };
   const toggle = () => { const v = el.dataset.open !== 'true'; el.setOpen(v); onToggle?.(v); };
   head.addEventListener('click', toggle);
   head.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });

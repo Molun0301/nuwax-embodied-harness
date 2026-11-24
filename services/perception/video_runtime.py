@@ -143,8 +143,9 @@ class PerceptionVideoRuntime:
                 and (detector_backend_name is None or backend == detector_backend_name)]
             return max(candidates, key=lambda value: value.context.timestamp, default=None)
 
-    def publish_sample(self, context, *, map_name, pose=None, frame_tree=None, image_bytes=None, inputs=None, complete=False):
-        sample = PerceptionSample(context, map_name, pose, frame_tree, image_bytes, inputs, complete)
+    def publish_sample(self, context, *, map_name, pose=None, frame_tree=None, image_bytes=None, inputs=None, complete=False,
+                       point_cloud_frames=()):
+        sample = PerceptionSample(context, map_name, pose, frame_tree, image_bytes, inputs, complete, point_cloud_frames)
         with self._condition:
             key = (context.camera_id, context.detector_backend)
             previous = self._samples.get(key)
@@ -163,7 +164,8 @@ class PerceptionVideoRuntime:
             return sample
         inputs = sample.inputs
         context, pose, tree = self._perception_service.complete_observation_geometry(
-            sample.context, inputs, store_artifact=True, stop_event=self._stop)
+            sample.context, inputs, store_artifact=True, stop_event=self._stop,
+            point_cloud_frames=sample.point_cloud_frames)
         return self.publish_sample(context, map_name=sample.map_name,
             pose=pose if inputs is not None else sample.pose,
             frame_tree=tree if inputs is not None else sample.frame_tree, image_bytes=sample.image_bytes,
@@ -259,7 +261,9 @@ class PerceptionVideoRuntime:
         self._seen_frames[key] = frame
         decision = self._selector.decide(now=image.timestamp, current_pose=pose)
         image_bytes, _ = encode_image_frame_bytes(image)
-        sample = self.publish_sample(context, map_name=map_name, image_bytes=image_bytes, inputs=inputs)
+        # 记忆写线程可能数秒后才补几何，发布时先取出拍照时刻的点云随样本保存。
+        sample = self.publish_sample(context, map_name=map_name, image_bytes=image_bytes, inputs=inputs,
+            point_cloud_frames=self._perception_service.point_cloud_frames_at(image))
         if self._event_bus is not None:
             self._event_bus.publish(self._event_bus.build_event("perception.scene_ready",
                 category=RuntimeEventCategory.PERCEPTION, source="perception_video_runtime",

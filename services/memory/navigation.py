@@ -1025,9 +1025,9 @@ class NavigationMixin:
         original = candidate.inspection_pose
         if candidate.source_collection != OBJECT_INSTANCES_COLLECTION or camera_info is None or frame_tree is None:
             return original
-        camera = next((edge for edge in frame_tree.transforms if edge.child_frame_id == camera_info.frame_id), None)
+        camera = next(edge for edge in frame_tree.transforms if edge.child_frame_id == camera_info.frame_id)
         instance = self.get_semantic_instance(candidate.record_id)
-        if camera is None or instance is None:
+        if instance is None:
             return original
         clearance = self._planner.object_clearance(instance)
         poses = [original, *(pose for pose in instance.inspection_poses if self._planner.outside_target(pose, clearance))]

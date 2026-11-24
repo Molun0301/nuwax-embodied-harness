@@ -60,7 +60,8 @@ def _approach(platform, ctx, args, mode):
         "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
         "tolerance_position_m": config.approach_position_tolerance_m,
         "tolerance_yaw_rad": config.approach_yaw_tolerance_rad,
-        "motion_generation": args["motion_generation"]})
+        # 离开或贴近台沿需要先后退；速度仍受机型后退上限约束。
+        "allow_reverse": True, "motion_generation": args["motion_generation"]})
     return instance
 
 

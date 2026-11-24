@@ -247,7 +247,7 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     picked = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=target.instance_id))
     assert picked.state is TaskState.SUCCEEDED and picked.motion
     assert visits == [(picked.task_id, {"x": .54, "y": 0, "z": .9, "frame_id": "map",
-                                        "yaw_rad": pi, "motion_generation": 7,
+                                        "yaw_rad": pi, "motion_generation": 7, "allow_reverse": True,
                                         "tolerance_position_m": .06, "tolerance_yaw_rad": .15})]
     assert read_offsets == [("", 0), ("table", 80)]
     assert device.requests[0]["params"]["goal_mode"] == "pick"

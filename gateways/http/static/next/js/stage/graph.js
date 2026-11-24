@@ -16,9 +16,12 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
   const el = (tag, attrs = {}) => { const n = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v)); return n; };
   const interested = () => mode() === 'graph' || state.layer;
   const bindingKey = b => JSON.stringify([b?.map_name, b?.frame_id, b?.map_revision]);
+  const scopeKey = b => JSON.stringify([b?.map_name, b?.frame_id]);
+  /* 同一张地图、同一坐标系即可显示。地图内容更新时修订号随每个地图帧变化，这期间保留已读的关系图，
+     重新读取到后一次替换（与语义区域相同，避免每次地图更新先清空再出现）。 */
   function current() {
     const b = binding(), g = state.graph?.map_binding;
-    return Boolean(b?.available && g && ['map_name', 'frame_id', 'map_revision'].every(key => b[key] != null && b[key] === g[key]));
+    return Boolean(b?.available && g && scopeKey(b) === scopeKey(g));
   }
   function notifyLayer() {
     const visible = Boolean(current() && state.layer);
@@ -28,13 +31,14 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
   async function load() {
     if (!interested() || !binding()?.available) return;
     if (state.request) return state.request;
-    const generation = state.generation;
+    const generation = state.generation, scope = scopeKey(binding());
     state.request = (async () => {
       try {
         const graph = await api.invoke('get_scene_graph', { limit: 500, kinds: ['region', 'passage', 'object'] });
-        if (generation !== state.generation) return;
+        // 只在换了地图时作废；同一地图内容更新期间读到的结果照常采用。
+        if (scopeKey(binding()) !== scope) return;
         const b = binding();
-        if (!b?.available || bindingKey(b) !== bindingKey(graph.map_binding)) throw new Error('地图已更新，等待对应关系图。');
+        if (!b?.available || scopeKey(b) !== scopeKey(graph.map_binding)) throw new Error('地图已更新，等待对应关系图。');
         if (state.graph?.graph_revision !== graph.graph_revision) state.route = null;
         state.graph = graph;
         state.error = '';
@@ -42,7 +46,7 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
         render();
         notifyLayer();
       } catch (error) {
-        if (generation !== state.generation) return;
+        if (scopeKey(binding()) !== scope) return;
         state.error = error.message;
         notifyLayer();
       }
@@ -212,10 +216,13 @@ export function createGraph({ api, stream, svg, binding, mode, requestDraw, onSe
   function contextChanged() {
     const b = binding(), key = bindingKey(b) + ':' + Boolean(b?.available);
     if (key === state.contextKey) return;
+    const sameMap = state.contextKey && state.contextScope === scopeKey(b) + ':' + Boolean(b?.available);
     state.contextKey = key;
+    state.contextScope = scopeKey(b) + ':' + Boolean(b?.available);
     state.generation += 1;
-    state.graph = null; state.route = null; state.selected = null; state.layoutKey = ''; state.error = '';
-    render(); notifyLayer(); schedule(); changed();
+    // 只是地图内容更新：保留关系图、选择与路径，重新读取；换了地图才清空。
+    if (!sameMap) { state.graph = null; state.route = null; state.selected = null; state.layoutKey = ''; state.error = ''; render(); notifyLayer(); changed(); }
+    schedule();
   }
 
   svg.addEventListener('wheel', event => {

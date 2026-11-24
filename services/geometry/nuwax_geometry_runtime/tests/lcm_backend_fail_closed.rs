@@ -90,6 +90,7 @@ impl Fixture {
         config.set("derived", "min_executable_linear_mps", 0.0);
         config.set("derived", "min_executable_angular_rps", 0.0);
         config.set("derived", "actuator_max_linear_mps", 0.0);
+        config.set("derived", "actuator_max_reverse_mps", 0.0);
         config.set("derived", "actuator_max_yaw_rps", 0.0);
         config.set("derived", "actuator_motion_model", "");
         let mut command = Command::new(executable);

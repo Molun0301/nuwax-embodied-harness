@@ -10,7 +10,7 @@ import numpy as np
 from contracts.base import utc_now
 from contracts.geometry import Pose
 from contracts.memory import MemoryPayloadFilter, MemoryQueryMatch, MemoryQueryResult, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
-from contracts.spatial_memory import NavigationCandidate, ObservationEvent, SceneSpace, SemanticInstance, SceneSpaceReviewStatus
+from contracts.spatial_memory import InstanceLifecycleState, NavigationCandidate, ObservationEvent, SceneSpace, SemanticInstance, SceneSpaceReviewStatus
 from core.errors import GatewayError
 from services.memory.semantic_map.scene_mapping_state import MANAGED_KEY
 from services.memory.store import EmbeddingVector
@@ -475,7 +475,7 @@ class QueryMixin:
             return (MemoryRecordKind.SCENE_SPACE.value, candidate.scene_space.scene_space_id)
         return (candidate.record_kind.value, candidate.point.point_id)
 
-    def _query_records(self, query, *, allowed_record_kinds, similarity_threshold, limit, payload_filter=None, query_scope='mixed', grounding_plan=None, include_non_direct_navigation_candidates=False):
+    def _query_records(self, query, *, allowed_record_kinds, similarity_threshold, limit, payload_filter=None, query_scope='mixed', grounding_plan=None, include_non_direct_navigation_candidates=False, include_removed_instances=True):
         from types import SimpleNamespace
         from services.memory.store import MODELS
         normalized = self._normalize_text(query)
@@ -538,6 +538,8 @@ class QueryMixin:
                     point = SimpleNamespace(point_id=identity,record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,payload=payload,vectors={})
                     if not self._filter_record(record,point,payload_filter):
                         continue
+                    if not include_removed_instances and record.lifecycle_state == InstanceLifecycleState.REMOVED:
+                        continue
                     candidate = self._score_candidate(query=query,normalized_query=normalized,point=point,
                         allowed_record_kinds=allowed_record_kinds,current_pose=current_pose,text_recall_score=0.,
                         query_image_vector=None,query_scope=query_scope,source_snapshot=('instance',record),semantic_available=False)
@@ -588,6 +590,8 @@ class QueryMixin:
                     payload['query_vector_contributions'] = {name:round(value,6) for name,value in contributions.items()}
                     point = SimpleNamespace(point_id=identity,record_kind=record_kind.value,payload=payload,vectors=stored_vectors)
                     if not self._filter_record(record,point,payload_filter):
+                        continue
+                    if kind == 'instance' and not include_removed_instances and record.lifecycle_state == InstanceLifecycleState.REMOVED:
                         continue
                     candidate = self._score_candidate(query=query,normalized_query=normalized,point=point,
                         allowed_record_kinds=(record_kind,),current_pose=current_pose,
@@ -749,9 +753,10 @@ class QueryMixin:
         value = (payload_filter or MemoryPayloadFilter()).model_copy(update={**({'max_age_sec': max_age_sec} if max_age_sec is not None else {}), **({'near_pose': near_pose} if near_pose is not None else {}), **({'max_distance_m': max_distance_m} if max_distance_m is not None else {})})
         return self._query_records(query, allowed_record_kinds=(MemoryRecordKind.TAGGED_LOCATION,), similarity_threshold=similarity_threshold, limit=limit, payload_filter=value, query_scope=str((grounding_plan.metadata if grounding_plan is not None else {}).get('query_scope') or 'mixed'), grounding_plan=grounding_plan, include_non_direct_navigation_candidates=include_non_direct_navigation_candidates)
 
-    def query_semantic_memory(self, query, *, similarity_threshold=0.25, limit=5, payload_filter=None, max_age_sec=None, near_pose=None, max_distance_m=None):
+    def query_semantic_memory(self, query, *, similarity_threshold=0.25, limit=5, payload_filter=None, max_age_sec=None, near_pose=None, max_distance_m=None, include_removed=False):
+        """物品位置查询默认不返回已被搬走（removed）的实例；include_removed 为真时一并返回。"""
         value = (payload_filter or MemoryPayloadFilter()).model_copy(update={**({'max_age_sec': max_age_sec} if max_age_sec is not None else {}), **({'near_pose': near_pose} if near_pose is not None else {}), **({'max_distance_m': max_distance_m} if max_distance_m is not None else {})})
-        return self._query_records(query, allowed_record_kinds=(MemoryRecordKind.SCENE, MemoryRecordKind.NOTE, MemoryRecordKind.OBJECT_INSTANCE, MemoryRecordKind.OBSERVATION_EVENT), similarity_threshold=similarity_threshold, limit=limit, payload_filter=value)
+        return self._query_records(query, allowed_record_kinds=(MemoryRecordKind.SCENE, MemoryRecordKind.NOTE, MemoryRecordKind.OBJECT_INSTANCE, MemoryRecordKind.OBSERVATION_EVENT), similarity_threshold=similarity_threshold, limit=limit, payload_filter=value, include_removed_instances=include_removed)
 
     def query_scene_spaces(self, query='', *, similarity_threshold=0.25, limit=5, payload_filter=None,
                            max_age_sec=None, near_pose=None, max_distance_m=None, grounding_plan=None,

@@ -246,9 +246,9 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     monkeypatch.setattr(manipulation, "navigate_to_pose", navigate)
     picked = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=target.instance_id))
     assert picked.state is TaskState.SUCCEEDED and picked.motion
-    assert visits == [(picked.task_id, {"x": .58, "y": 0, "z": .9, "frame_id": "map",
+    assert visits == [(picked.task_id, {"x": .54, "y": 0, "z": .9, "frame_id": "map",
                                         "yaw_rad": pi, "motion_generation": 7,
-                                        "tolerance_position_m": .08, "tolerance_yaw_rad": .15})]
+                                        "tolerance_position_m": .06, "tolerance_yaw_rad": .15})]
     assert read_offsets == [("", 0), ("table", 80)]
     assert device.requests[0]["params"]["goal_mode"] == "pick"
     held = picked.result["held_object"]
@@ -259,6 +259,12 @@ def test_pick_moves_to_nearest_station_and_persists_removal_then_place_writes_ob
     assert moved.metadata["moved_by_robot"] is True
     assert moved.metadata["moved_by_robot_task_id"] == picked.task_id
     assert moved.metadata["moved_by_robot_at"] == held["started_at"]
+    # 新调用者问物品位置时默认不再得到已搬走的原实例，显式要求时仍可查到。
+    def queried(arguments):
+        return {match.record_id for match in invoke(runtime, "query_semantic_memory",
+            {"query": "apple", "similarity_threshold": 0, **arguments}, "test")["query_result"].matches}
+    assert target.instance_id not in queried({})
+    assert target.instance_id in queried({"include_removed": True})
 
     video = runtime.perception.video_runtime
     calls = []

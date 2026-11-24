@@ -11,6 +11,7 @@ fn make_explorer(
     let d = nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,
         nav_profile: "pct-scan-3d".into(),
         actuator_max_linear_mps: 0.0,
+        actuator_max_reverse_mps: 0.0,
         actuator_max_yaw_rps: 0.0,
         actuator_motion_model: String::new(),
         robot_geometry_json: TEST_GEOMETRY.into(),

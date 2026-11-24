@@ -30,6 +30,7 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
   const visible = () => mode() === 'semantic' || (mode() !== 'graph' && state.layer) || state.panelOpen;
   const interested = () => visible();
 
+  // 修订号也一致：命名等编辑要求区域与当前地图内容同一修订。
   function matchesCurrent() {
     const current = binding();
     // 请求暂时失败时保留同一地图的已读标注。
@@ -37,8 +38,14 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     const bound = state.data.map_binding;
     return ['map_name', 'frame_id', 'map_revision'].every(k => current[k] != null && current[k] === bound[k]);
   }
+  /* 绘制只要求同一张地图、同一坐标系。地图内容更新时修订号随每个地图帧变化，新修订的区域要等重新读取才到；
+     这期间照旧画已读的区域，新数据到达后一次替换（原来按修订号判断，每次地图更新都会先清空再出现，三维、二维一起闪）。 */
+  function sameMap() {
+    const current = binding();
+    return Boolean(current?.available && state.data?.map_binding && scopeKey(current) === scopeKey(state.data.map_binding));
+  }
   function drawable() {
-    return matchesCurrent() ? active().filter(r => r.frame_id === state.data.map_binding.frame_id && r.boundary?.frame_id === r.frame_id) : [];
+    return sameMap() ? active().filter(r => r.frame_id === state.data.map_binding.frame_id && r.boundary?.frame_id === r.frame_id) : [];
   }
   // 过期与已否定的区域不上地图，列表里用灰色。
   function color(region) {
@@ -70,10 +77,11 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
   async function load() {
     // 没有地图时没有区域可显示，不读取。
     if (state.request || !binding()?.available) return state.request;
-    const generation = state.generation, version = state.streamVersion;
+    const generation = state.generation, version = state.streamVersion, scope = scopeKey(binding());
     state.request = (async () => {
       const results = await Promise.allSettled([api.invoke('get_scene_mapping_status'), api.invoke('get_semantic_map')]);
-      if (generation !== state.generation) return;
+      // 只在换了地图时作废；同一地图内容更新期间读到的结果照常采用（设备忙、地图更新快时不会一直读不到）。
+      if (scopeKey(binding()) !== scope) return;
       if (results[0].status === 'fulfilled') state.service = results[0].value;
       if (results[1].status === 'fulfilled' && version === state.streamVersion) {
         if (!accept(results[1].value)) { state.error = '地图已切换，等待对应语义记录。'; emitLayer(); }
@@ -109,7 +117,7 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
   /* 二维绘制：语义地图视图整块着色（0.34），其它视图淡填充（0.14）加虚线轮廓；名称避让重叠，选中的优先。 */
   function draw2d(ctx, project) {
     state.paths = [];
-    if (!visible() || !matchesCurrent()) return;
+    if (!visible() || !sameMap()) return;
     const semantic = mode() === 'semantic';
     const ratio = ctx.canvas.width / Math.max(ctx.canvas.getBoundingClientRect().width, 1);
     const style = getComputedStyle(document.documentElement);
@@ -162,7 +170,7 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
   }
   /* 点选：返回命中的区域（在 draw2d 记下的路径里找）。 */
   function hitAt(ctx, x, y) {
-    if (!visible() || !matchesCurrent()) return null;
+    if (!visible() || !sameMap()) return null;
     return state.paths.find(p => ctx.isPointInPath(p.path, x, y, 'evenodd'))?.region || null;
   }
   function select(id) {
@@ -172,7 +180,9 @@ export function createRegions({ api, stream, binding, mode, requestDraw }) {
     changed();
   }
 
-  stream.on('memory.scene_spaces', frame => { state.streamVersion += 1; accept(frame.payload); });
+  // 同一主题有两种载荷：语义建图的地图快照（带 map_binding 与 regions）被采用；记忆服务的记录快照不含绑定，不采用，
+  // 也不让正在进行的读取作废。
+  stream.on('memory.scene_spaces', frame => { if (accept(frame.payload)) state.streamVersion += 1; });
   window.addEventListener('pointcloud3d:ready', emitLayer);
   new MutationObserver(emitLayer).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 

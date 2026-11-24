@@ -125,7 +125,10 @@ impl SamplingFollower {
         self.position_reached() && self.orientation_reached()
     }
     fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
-        let mut config = self.config.native_config(map, self.options, false);
+        let lateral = self.config.kinematics().is_some_and(|motion| {
+            motion.model == nuwax_nav_types_messages::MotionModel::Omnidirectional
+        });
+        let mut config = self.config.native_config(map, self.options, lateral);
         config.planning_horizon = config
             .planning_horizon
             .max(config.max_velocity * crate::sampling_controller::PREDICTION_SECONDS);
@@ -428,6 +431,7 @@ impl NavPlanner for SamplingFollower {
             position: goal_position,
             yaw: goal.pose.orientation.yaw(),
             position_tolerance_m: self.options.position_tolerance_m,
+            yaw_tolerance_rad: self.options.yaw_tolerance_rad,
             position_reached,
         });
         if self.route.is_empty() && !position_reached {

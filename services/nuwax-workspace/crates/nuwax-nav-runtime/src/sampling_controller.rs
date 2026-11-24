@@ -99,12 +99,15 @@ fn samples(min: f64, max: f64, previous: f64, intervals: usize) -> Vec<f64> {
     out
 }
 
-fn arc_pose(position: [f64; 3], yaw: f64, v: f64, w: f64, time: f64) -> [f64; 4] {
+fn arc_pose(position: [f64; 3], yaw: f64, linear: Point2, w: f64, time: f64) -> [f64; 4] {
     let half = w * time / 2.;
-    let travel = v * time * if half == 0. { 1. } else { half.sin() / half };
+    let scale = if half == 0. { 1. } else { half.sin() / half };
+    let forward = linear.x * time * scale;
+    let lateral = linear.y * time * scale;
+    let (s, c) = (yaw + half).sin_cos();
     [
-        position[0] + travel * (yaw + half).cos(),
-        position[1] + travel * (yaw + half).sin(),
+        position[0] + forward * c - lateral * s,
+        position[1] + forward * s + lateral * c,
         position[2],
         yaw + 2. * half,
     ]
@@ -119,6 +122,7 @@ pub(crate) struct PoseGoal {
     pub(crate) position: [f64; 3],
     pub(crate) yaw: f64,
     pub(crate) position_tolerance_m: f64,
+    pub(crate) yaw_tolerance_rad: f64,
     pub(crate) position_reached: bool,
 }
 
@@ -131,7 +135,7 @@ struct Candidate {
     score: f64,
     same_turn: bool,
     index: usize,
-    v: f64,
+    linear: Point2,
     w: f64,
 }
 
@@ -159,10 +163,14 @@ impl Sampler {
         let (arc, nearest) = reference.nearest(position);
         let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * config.max_velocity);
         self.terminal = pose_goal.as_ref().is_some_and(|goal| {
-            // 先沿路线实际到位，再用较宽的退出范围容纳调整朝向时的小幅位移。
             let exit = goal.position_tolerance_m + config.body_length / 2.;
+            let near = squared_distance(position, goal.position) <= exit * exit;
+            // 朝向已经合适时，全向机体可以在末段横移，不必朝侧向位置误差转身。
+            let aligned_approach = config.max_lateral_velocity > 0.
+                && reference.length() - arc <= exit
+                && angle_delta(goal.yaw, yaw).abs() <= goal.yaw_tolerance_rad;
             goal.position_reached
-                || self.terminal && squared_distance(position, goal.position) <= exit * exit
+                || near && (self.terminal || aligned_approach)
         });
         let turn_to = pose_goal.filter(|_| self.terminal).map(|goal| goal.yaw);
         let target_arc = if self.terminal {
@@ -195,13 +203,35 @@ impl Sampler {
         let max_yaw = (previous.angular_z + angular_step).min(config.max_yaw_rate);
         // 朝向修正也保留可达的平移动作，碰撞扫掠决定是否能边退边转。
         let forward = samples(min_linear, max_linear, previous.linear.x, LINEAR_INTERVALS);
+        let (sin, cos) = yaw.sin_cos();
+        let desired_lateral = (-delta[0] * sin + delta[1] * cos) / PREDICTION_SECONDS;
+        let mut translations = Vec::with_capacity(forward.len() * 2);
+        for vx in forward {
+            let x_acceleration = vx - previous.linear.x;
+            let y_step = (linear_step.powi(2) - x_acceleration.powi(2)).max(0.).sqrt();
+            let lateral_cap = if self.terminal {
+                config.max_lateral_velocity.min((speed_cap.powi(2) - vx.powi(2)).max(0.).sqrt())
+            } else {
+                0.
+            };
+            let reachable_min = previous.linear.y - y_step;
+            let reachable_max = previous.linear.y + y_step;
+            let minimum = reachable_min.max(-lateral_cap).min(reachable_max);
+            let maximum = reachable_max.min(lateral_cap).max(minimum);
+            let zero = 0_f64.clamp(minimum, maximum);
+            translations.push(Point2::new(vx, zero));
+            let toward_goal = desired_lateral.clamp(minimum, maximum);
+            if toward_goal != zero {
+                translations.push(Point2::new(vx, toward_goal));
+            }
+        }
         let angular = samples(min_yaw, max_yaw, previous.angular_z, ANGULAR_INTERVALS);
         self.poses.clear();
-        for &v in &forward {
+        for &linear in &translations {
             for &w in &angular {
                 for step in 1..=PREDICTION_STEPS {
-                    let mut pose = arc_pose(position, yaw, v, w, step as f64 * SAMPLE_SECONDS);
-                    if v != 0. {
+                    let mut pose = arc_pose(position, yaw, linear, w, step as f64 * SAMPLE_SECONDS);
+                    if linear.x != 0. || linear.y != 0. {
                         // 三维机体高度随同一条参考路线，保留当拍实测的高度偏移。
                         let (_, projected) = reference.nearest([pose[0], pose[1], pose[2]]);
                         pose[2] += projected[2] - nearest[2];
@@ -214,11 +244,11 @@ impl Sampler {
         snapshot.sample_poses(config, &self.poses, &mut self.samples, None);
 
         let mut ranked = Vec::new();
-        for ((index, samples), (v, w)) in
+        for ((index, samples), (linear, w)) in
             self.samples.chunks_exact(PREDICTION_STEPS).enumerate().zip(
-                forward
+                translations
                     .iter()
-                    .flat_map(|&v| angular.iter().map(move |&w| (v, w))),
+                    .flat_map(|&linear| angular.iter().map(move |&w| (linear, w))),
             )
         {
             if samples.iter().any(|sample| blocked(sample, here)) {
@@ -229,7 +259,8 @@ impl Sampler {
                 .iter()
                 .map(|sample| sample.clearance)
                 .fold(f64::INFINITY, f64::min);
-            let speed_fraction = v.abs() / config.max_velocity.max(config.max_reverse_velocity);
+            let speed_fraction =
+                linear.x.hypot(linear.y) / config.max_velocity.max(config.max_reverse_velocity);
             let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
                 + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
                 + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
@@ -242,7 +273,7 @@ impl Sampler {
                 score,
                 same_turn: w * previous.angular_z > 0.,
                 index,
-                v,
+                linear,
                 w,
             });
         }
@@ -255,21 +286,21 @@ impl Sampler {
         self.refined_samples.clear();
         let radius = (config.body_length / 2. + config.body_center_x.abs())
             .hypot(config.body_width / 2. + config.body_center_y.abs());
-        for Candidate { index, v, w, .. } in ranked {
+        for Candidate { index, linear, w, .. } in ranked {
             let coarse = &self.poses[index * PREDICTION_STEPS..(index + 1) * PREDICTION_STEPS];
             self.refined_poses.clear();
             let mut start_z = position[2];
             for (step, point) in coarse.iter().enumerate() {
                 let dz = point[2] - start_z;
                 // 平移、转角扫过的最远机身点及沿路线的高度变化共同限定步距。
-                let travel = SAMPLE_SECONDS * (v.abs() + radius * w.abs()) + dz.abs();
+                let travel = SAMPLE_SECONDS * (linear.x.hypot(linear.y) + radius * w.abs()) + dz.abs();
                 let subdivisions = (2. * travel / config.resolution).ceil().max(1.) as usize;
                 for part in 1..=subdivisions {
                     let fraction = part as f64 / subdivisions as f64;
                     let mut sample = arc_pose(
                         position,
                         yaw,
-                        v,
+                        linear,
                         w,
                         (step as f64 + fraction) * SAMPLE_SECONDS,
                     );
@@ -290,7 +321,7 @@ impl Sampler {
             }
             return Some(Selection {
                 command: Twist2 {
-                    linear: Point2::new(v, 0.),
+                    linear,
                     angular_z: w,
                 },
                 poses: coarse.iter().map(|p| [p[0], p[1], p[2]]).collect(),
@@ -430,7 +461,8 @@ mod tests {
             .select(
                 &map, &config, &route, START, 0., Twist2::ZERO,
                 Some(PoseGoal {
-                    position: START, yaw: 1., position_tolerance_m: 0.06, position_reached: true,
+                    position: START, yaw: 1., position_tolerance_m: 0.06,
+                    yaw_tolerance_rad: 0.15, position_reached: true,
                 }),
             )
             .unwrap();
@@ -446,7 +478,8 @@ mod tests {
         let route = Route::new(vec![[2., 0., START[2]], START]);
         let mut sampler = Sampler::default();
         let goal = |position_reached| Some(PoseGoal {
-            position: START, yaw: 0., position_tolerance_m: 0.06, position_reached,
+            position: START, yaw: 0., position_tolerance_m: 0.06,
+            yaw_tolerance_rad: 0.15, position_reached,
         });
         let approach = sampler
             .select(
@@ -472,6 +505,30 @@ mod tests {
             )
             .unwrap();
         assert!(rejoin.command.angular_z > 0., "{:?}", rejoin.command);
+    }
+
+    #[test]
+    fn sideward_pose_error_uses_lateral_motion_when_the_device_can_strafe() {
+        let (mut config, map) = fixture(&[]);
+        let target = [0., 0.09, START[2]];
+        let route = Route::new(vec![START, target]);
+        let goal = || Some(PoseGoal {
+            position: target, yaw: 0., position_tolerance_m: 0.06,
+            yaw_tolerance_rad: 0.15, position_reached: false,
+        });
+        let without_lateral = Sampler::default()
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, goal())
+            .unwrap();
+        assert_eq!(without_lateral.command.linear.y, 0.);
+        assert!(without_lateral.command.angular_z > 0.);
+        config.max_lateral_velocity = 0.2;
+        let lateral = Sampler::default()
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, goal())
+            .unwrap();
+        assert_eq!(lateral.command.angular_z, 0.);
+        assert!(lateral.command.linear.y > 0.);
+        assert!(lateral.command.linear.x.hypot(lateral.command.linear.y)
+            <= config.max_acceleration * config.sample_dt);
     }
 
     #[test]

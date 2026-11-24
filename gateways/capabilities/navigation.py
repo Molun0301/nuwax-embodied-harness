@@ -166,9 +166,9 @@ class _TargetSearch:
             lambda state: state.map_name == self.map_name and state.can_navigate, self.ctx)
         self.platform.memory.wait_for_library(self.map_name, self.ctx)
 
-    def refresh(self, *, frame_count=1, interval_sec=.05, remember=True, source="target_search"):
+    def refresh(self, *, frame_count=1, interval_sec=.05, remember=True, source="target_search", source_after_ns=None):
         samples = self.runtime.run_burst(self.ctx, reason=self.reason, frame_count=frame_count,
-                                         interval_sec=interval_sec)
+                                         interval_sec=interval_sec, source_after_ns=source_after_ns)
         sample = samples[-1]
         return sample, self.observe_sample(sample, frame_count=len(samples), remember=remember, source=source)
 
@@ -215,7 +215,7 @@ class _TargetSearch:
         allowed = [candidate for candidate, diagnostic in zip(candidates, diagnostics) if diagnostic["allowed_for_navigation"]]
         selected, clarification = self._select_low_ambiguity_target_candidates(
             query=self.query, candidates=allowed, candidate_diagnostics=diagnostics)
-        return {"verification": verification, "candidates": selected, "candidate_diagnostics": diagnostics,
+        return {"verification": verification, "candidates": selected, "candidate_diagnostics": diagnostics, "sample": sample,
                 "clarification": clarification}
 
     def writeback(self, sample, verification, candidate, goal_id):
@@ -274,7 +274,9 @@ class _TargetSearch:
             self.attempted.append(candidate.record_id)
             diagnostic = next(item for item in diagnostics if item["record_id"] == candidate.record_id)
             diagnostic["navigation_attempted"] = True
-            pose = candidate.inspection_pose
+            sample = state["sample"]
+            pose = self.platform.memory.select_target_verification_pose(candidate, sample.context.camera_info, sample.frame_tree)
+            candidate = candidate.model_copy(update={"inspection_pose": pose})
             orientation = pose.orientation
             yaw = math.atan2(2 * (orientation.w * orientation.z + orientation.x * orientation.y),
                              1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z))
@@ -282,7 +284,7 @@ class _TargetSearch:
             try:
                 navigation = navigate_to_pose(self.platform, self.ctx, {"x": pose.position.x, "y": pose.position.y,
                     "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
-                    "tolerance_position_m": 0.35,
+                    "tolerance_position_m": 0.10,
                     "motion_generation": self.args["motion_generation"]})
             except GatewayError as error:
                 self.ctx.check()
@@ -290,7 +292,9 @@ class _TargetSearch:
                 diagnostic.update(allowed_for_navigation=False, rejection_reason=error.error_code)
                 last_error = error
                 continue
-            sample, refresh = self.refresh(frame_count=3, remember=False, source="target_arrival_verify")
+            stopped_at = _wait_for_stationary_observation(self.platform, self.ctx)
+            sample, refresh = self.refresh(frame_count=3, remember=False, source="target_arrival_verify",
+                                           source_after_ns=stopped_at)
             verification = self.verify(sample, candidate=candidate, goal_id=navigation["goal_id"])
             writeback = self.writeback(sample, verification, candidate, navigation["goal_id"])
             if verification.verified:
@@ -529,20 +533,23 @@ def find_target(platform, ctx, args):
         return result
 
 
-def _inspection_samples(search):
+def _wait_for_stationary_observation(platform, ctx):
     # 导航到达和归零回执不等于实测停稳。只接收停稳确认后的原始图像。
-    ctx = search.ctx
     started = clock.source_now_ns()
     while True:
         ctx.check()
-        motion = search.platform.motion.measured_motion()
+        motion = platform.motion.measured_motion()
         if (motion is not None and motion.source_timestamp_ns >= started
                 and math.hypot(*motion.linear_xyz[:2]) < .02 and abs(motion.angular_xyz[2]) < .02):
-            break
+            return motion.source_timestamp_ns
         ctx.wait(.05)
+
+
+def _inspection_samples(search):
+    stopped_at = _wait_for_stationary_observation(search.platform, search.ctx)
     count = search.platform.config.perception.instance_association.confirmation_min_observations
-    samples = search.runtime.run_burst(ctx, reason=search.reason, frame_count=count, interval_sec=.12,
-                                       source_after_ns=motion.source_timestamp_ns)
+    samples = search.runtime.run_burst(search.ctx, reason=search.reason, frame_count=count, interval_sec=.12,
+                                       source_after_ns=stopped_at)
     return [(sample, search._find_scene_object(search.query, sample.context)) for sample in samples]
 
 

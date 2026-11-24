@@ -423,6 +423,7 @@ def test_find_target_region_excludes_outside_memory_and_live_detections(tmp_path
     from contracts.runtime_views import SceneObjectSummary
     from contracts.spatial_memory import SceneSpace, SceneSpaceBoundary
     from gateways.capabilities import navigation
+    from services.navigation.motion_client import MeasuredMotion
     from services.perception.runtime_sample import PerceptionSample
 
     robot = integration.position(0, 0, 0)
@@ -445,13 +446,21 @@ def test_find_target_region_excludes_outside_memory_and_live_detections(tmp_path
         return {"goal_id": "goal", "arrival": "target"}
 
     monkeypatch.setattr(navigation, "navigate_to_pose", arrive)
+    monkeypatch.setattr(navigation.clock, "source_now_ns", lambda: 100)
+    stopped = MeasuredMotion("robot", 101, 0, 0, "base_link", (0., 0., 0.), (0., 0., 0.), None)
     with integration.memory_at(tmp_path, pose=robot) as (memory, geometry):
         for sample in samples:
             memory.remember_current_scene(map_name="house", perception_context=sample.context,
                                           observation_pose=robot)
         captured = iter(samples)
+        burst_sources = []
+
+        def burst(ctx, *, reason, frame_count, interval_sec, source_after_ns):
+            burst_sources.append(source_after_ns)
+            return (next(captured),)
+
         video = SimpleNamespace(acquire=lambda *a, **kw: None, release=lambda reason: None,
-            run_burst=lambda *a, **kw: (next(captured),), complete_sample=lambda sample: sample)
+            run_burst=burst, complete_sample=lambda sample: sample)
         region_lookups = []
 
         def resolve(name):
@@ -459,10 +468,13 @@ def test_find_target_region_excludes_outside_memory_and_live_detections(tmp_path
             return (kitchen,)
 
         platform = SimpleNamespace(memory=memory, geometry_state=geometry,
+            motion=SimpleNamespace(measured_motion=lambda: stopped),
             perception=SimpleNamespace(video_runtime=video),
             scene_mapping=SimpleNamespace(graph=SimpleNamespace(resolve_regions=resolve)))
         result = navigation.find_target(platform, ctx, {"query":"apple", "region":"厨房", "motion_generation":1})
         assert region_lookups == ["厨房"] and len(visits) == 1
+        assert visits[0]["tolerance_position_m"] == .10
+        assert burst_sources == [None, stopped.source_timestamp_ns]
         assert result["found_mode"] == "memory_candidate_navigation"
         assert result["navigation_candidate"].anchor_pose.position.x == pytest.approx(2)
         assert result["arrival_verification"].verified

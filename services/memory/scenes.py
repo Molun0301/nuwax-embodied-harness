@@ -23,6 +23,10 @@ _AUTOMATIC_OBSERVATION_SOURCES = {"perception_video_runtime", "inspect_target"}
 
 class ScenesMixin:
 
+    def index_scene_embedding(self, entry):
+        """让放置任务的结果在返回前可参与向量检索。"""
+        self._embeddings._process((entry.map_name, "memory", entry.memory_id))
+
     def observation_event_ids_for_memory(self, memory_id):
         return tuple(event.event_id for event in self.reader().read("observation",
             where="json_extract(filter_json,'$.source_memory_id')=?", params=(memory_id,)))

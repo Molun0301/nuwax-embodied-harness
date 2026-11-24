@@ -1,13 +1,16 @@
 """同一任务中前往操作站位、执行设备操作并更新记忆。"""
-from math import atan2
+import json
+from math import atan2, cos, hypot, sin
 
 from contracts.base import utc_now
 from core.capability import Capability
+from core.config import value
 from core.errors import GatewayError
 from gateways.capabilities.common import rpc_errors
 from gateways.capabilities.memory import remember_sample
 from gateways.capabilities.navigation import navigate_to_pose
 from services.manipulation.http_backend import DeviceError
+from services.memory.semantic_map.room_segmentation import pose_in_scene_space
 
 
 def _motion_options(_platform, args):
@@ -50,29 +53,52 @@ def _approach(platform, ctx, args, mode):
         raise GatewayError("当前记忆库中没有目标实例。", http_status=404)
     current = platform.geometry_state.wait_for_pose(ctx)
     config = platform.config.manipulation
+    place_distance = value("manipulation.place_standoff_distance_m") if mode == "place" else ""
+    distance = config.standoff_distance_m if place_distance == "" else place_distance
     pose = platform.memory.plan_manipulation_pose(instance, current, place=mode == "place",
-        distance_m=config.standoff_distance_m, cloud_chunks=_map_cloud_chunks(platform, ctx))
+        distance_m=distance, cloud_chunks=_map_cloud_chunks(platform, ctx))
     if pose is None:
         raise GatewayError("目标周围没有可达操作站位。", error_code="navigation_failed", http_status=409)
     q = pose.orientation
     yaw = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-    navigate_to_pose(platform, _ApproachContext(ctx), {"x": pose.position.x, "y": pose.position.y,
+    approach = _ApproachContext(ctx)
+    goal = {"x": pose.position.x, "y": pose.position.y,
         "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
         "tolerance_position_m": config.approach_position_tolerance_m,
         "tolerance_yaw_rad": config.approach_yaw_tolerance_rad,
         # 离开或贴近台沿需要先后退；速度仍受机型后退上限约束。
-        "allow_reverse": True, "motion_generation": args["motion_generation"]})
+        "allow_reverse": True, "motion_generation": args["motion_generation"]}
+    if place_distance != "":
+        # 有独立放置站位时，先留出机身转向空间，再面向台面进入站位。
+        footprint = json.loads(value("derived.robot_geometry_json"))["footprint_xy_m"]
+        turn_radius = max(hypot(x, y) for x, y in footprint)
+        navigate_to_pose(platform, approach, {**goal,
+            "x": pose.position.x - turn_radius * cos(yaw),
+            "y": pose.position.y - turn_radius * sin(yaw)})
+    navigate_to_pose(platform, approach, goal)
     return instance
 
 
-def _remember_placement(platform, ctx, held):
+def _remember_placement(platform, ctx, held, target):
     runtime = platform.perception.video_runtime
     reason = f"manipulation_place:{ctx.task_id}"
     labels = (held["label"],) if held and held["label"] else ()
     runtime.acquire(reason, open_vocabulary_classes=labels)
     try:
         sample, = runtime.run_burst(ctx, reason=reason, frame_count=1)
-        remember_sample(platform, sample, metadata={"source": "manipulation_place", "task_id": ctx.task_id})
+        metadata = {"source": "manipulation_place", "task_id": ctx.task_id}
+        if target is not None and labels:
+            spaces = platform.scene_mapping.memory.capture_scene_partition()["spaces"]
+            room = next((space for space in spaces if space.primary_label and sample.pose is not None
+                         and pose_in_scene_space(sample.pose, space)), None)
+            surface = target.display_name or target.label
+            location = f"{room.primary_label}的{surface}" if room is not None else surface
+            entry = remember_sample(platform, sample, title=f"物品位置：{labels[0]}",
+                summary=f"{labels[0]} 已放在{location}上。", tags=[*labels, location],
+                metadata={**metadata, "placement_target_instance_id": target.instance_id})
+            platform.memory.index_scene_embedding(entry)
+        else:
+            remember_sample(platform, sample, metadata=metadata)
     finally:
         runtime.release(reason)
 
@@ -98,7 +124,7 @@ def execute_manipulation_task(platform, ctx, args):
         elif mode == "place":
             held = service.held_object
             service.held_object = None
-            _remember_placement(platform, ctx, held)
+            _remember_placement(platform, ctx, held, instance)
         return {**result, "held_object": service.held_object}
     except DeviceError as error:
         raise GatewayError(str(error), error_code=error.code,

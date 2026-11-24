@@ -3472,6 +3472,16 @@ apply = "restart"
 panel = "操作设备"
 category = "外部设备"
 
+[manipulation.place_standoff_distance_m]
+type = "float"
+special_values = [""]
+default = ""
+description = "放置任务从台面中心到操作站位的平面距离，单位为米。配置后先在站位外完成朝向对齐。留空时沿用操作站位距离。"
+consumers = ["gateways/capabilities/manipulation.py:_approach"]
+apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+
 [manipulation.approach_position_tolerance_m]
 type = "float"
 default = 0.06

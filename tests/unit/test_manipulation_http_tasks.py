@@ -288,6 +288,39 @@ def test_missing_target_does_not_submit_device_operation(runtime, device, monkey
     assert not device.requests
 
 
+def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch):
+    from gateways.capabilities import manipulation
+
+    station = Pose(frame_id="map", position=Vector3(x=2, y=3, z=.9),
+                   orientation=Quaternion(z=2 ** -.5, w=2 ** -.5))
+    furniture = object()
+    monkeypatch.setattr(runtime.memory, "get_semantic_instance", lambda _: furniture)
+    planned = []
+
+    def plan(_instance, _current, *, place, distance_m, cloud_chunks):
+        planned.append((place, distance_m))
+        return station
+
+    monkeypatch.setattr(runtime.memory, "plan_manipulation_pose", plan)
+    monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: station)
+    values = {"manipulation.place_standoff_distance_m": .64,
+              "derived.robot_geometry_json": '{"footprint_xy_m":[[0.3,0.4]]}'}
+    monkeypatch.setattr(manipulation, "value", values.__getitem__)
+    visited = []
+    monkeypatch.setattr(manipulation, "navigate_to_pose", lambda _, __, goal: visited.append(goal))
+
+    args = {"target_instance_id": "nightstand", "motion_generation": 7}
+    instance = manipulation._approach(runtime, object(), args, "place")
+    manipulation._approach(runtime, object(), args, "pick")
+
+    assert instance is furniture
+    assert planned == [(True, .64), (False, .54)]
+    assert [goal["x"] for goal in visited] == pytest.approx([2., 2., 2.])
+    assert [goal["y"] for goal in visited] == pytest.approx([2.5, 3., 3.])
+    assert [goal["yaw_rad"] for goal in visited] == pytest.approx([pi / 2] * 3)
+    assert all(goal["allow_reverse"] for goal in visited)
+
+
 def _client(runtime):
     app = FastAPI()
     app.include_router(build_mcp_router(runtime))

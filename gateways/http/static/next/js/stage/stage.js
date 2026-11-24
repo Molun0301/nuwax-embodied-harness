@@ -8,6 +8,7 @@ import { createItems } from './items.js';
 import { createRegions } from './regions.js';
 import { createGraph } from './graph.js';
 import { businessView, GEOMETRY_PHASES } from '../status.js';
+import { fadeIn, rise, sink, flip } from '../motion.js';
 
 const VIEWS = [['2d', '2D', 'grid-2x2', '二维栅格地图'], ['3d', '3D', 'box', '三维点云地图'], ['semantic', '语义地图', 'tag', '区域整块着色并编号'], ['graph', '关系图', 'network', '区域、连接口与物品的关系']]
   .filter(([id]) => !PLANAR_PIPELINE || id !== '3d');
@@ -78,6 +79,8 @@ export function createStage(root, ctx, { onPick }) {
 
   /* ---------- 视图切换 ---------- */
   function setView(next) {
+    // 换视图时新画面淡入（同一视图重复点不动）。
+    if (next !== mode()) fadeIn(mapLayer);
     map.setViewMode(next);
     graphSvg.toggleAttribute('hidden', next !== 'graph');
     if (next === 'graph') graph.render();
@@ -118,10 +121,14 @@ export function createStage(root, ctx, { onPick }) {
     }),
     h('div', { class: 'c-legend-row c-legend-static' }, swatch('dot', '#fbbf24'), h('span', { id: 'robotGeometryLegend' }, '机器人')),
     styleSection);
+  // 图层与图例面板：打开时从按钮下方落下，关闭时淡出后隐藏。
   function setLayersOpen(open) {
+    if (open === ui.layersOpen) return;
     ui.layersOpen = open;
-    layersPanel.hidden = !open;
     layersBtn.setAttribute('aria-expanded', String(open));
+    layersPanel._leaving?.cancel();
+    if (open) { layersPanel.hidden = false; rise(layersPanel, -1); return; }
+    layersPanel._leaving = sink(layersPanel, () => { layersPanel.hidden = true; }, -1);
   }
   layersBtn.addEventListener('click', () => setLayersOpen(!ui.layersOpen));
   document.addEventListener('pointerdown', event => { if (ui.layersOpen && !layersPanel.contains(event.target) && !layersBtn.contains(event.target)) setLayersOpen(false); }, true);
@@ -136,6 +143,9 @@ export function createStage(root, ctx, { onPick }) {
     map.refresh();
     video.refresh();
     render();
+    // 互换后主画面与画中画里的内容各自淡入。
+    fadeIn(ui.swapped ? stageVideo : mapLayer);
+    fadeIn(pipMedia);
   }
   // 画中画的按钮与标签常驻，视频状态每半秒刷新时只改文字与状态。
   const pipBtn = (onclick) => h('button', { class: 'n-float-btn n-tip n-tip--below', type: 'button', onclick });
@@ -147,8 +157,12 @@ export function createStage(root, ctx, { onPick }) {
   };
   const pipDot = h('span', { class: 'n-dot' }), pipTitle = h('span', {});
   const swapBtn = pipBtn(swap);
-  const sizeBtn = pipBtn(() => { ui.pipLarge = !ui.pipLarge; renderPip(); video.refresh(); map.refresh(); });
-  const hideBtn = pipBtn(() => { if (ui.swapped) swap(); ui.pipHidden = true; renderPip(); });
+  // 放大缩小：从原来的位置与大小过渡到新的；收起：画中画淡出后换成“摄像头”按钮，按钮淡入。
+  const sizeBtn = pipBtn(() => { const before = pip.getBoundingClientRect(); ui.pipLarge = !ui.pipLarge; renderPip(); flip(pip, before); video.refresh(); map.refresh(); });
+  const hideBtn = pipBtn(() => {
+    if (ui.swapped) swap();
+    sink(pip, () => { ui.pipHidden = true; renderPip(); rise(pip, -1, 'fast'); }, -1);
+  });
   setTip(hideBtn, 'minus', '收起');
   const pipHead = h('div', { class: 'c-pip-head' }, h('div', { class: 'c-pip-title' }, pipDot, pipTitle), swapBtn, sizeBtn, hideBtn);
   const rateChip = h('span', { class: 'c-chip n-num', title: '实际显示帧率' });
@@ -156,7 +170,7 @@ export function createStage(root, ctx, { onPick }) {
   const recognize = h('button', { class: 'c-chip c-chip-toggle', type: 'button', onclick: () => video.togglePerception() }, h('i', { class: 'c-mini-switch' }), '识别');
   const pipFoot = h('div', { class: 'c-pip-foot' }, rateChip, delayChip, recognize);
   const pipMedia = h('div', { class: 'c-pip-media' }, videoMedia, pipFoot);
-  const pipOpen = h('button', { class: 'n-float-btn', type: 'button', title: '展开摄像头画面', onclick: () => { ui.pipHidden = false; renderPip(); video.refresh(); } });
+  const pipOpen = h('button', { class: 'n-float-btn', type: 'button', title: '展开摄像头画面', onclick: () => { ui.pipHidden = false; renderPip(); rise(pip, -1); video.refresh(); } });
   function renderPip() {
     const v = video.summary();
     if (ui.pipHidden && !ui.swapped) {
@@ -323,6 +337,24 @@ export function createStage(root, ctx, { onPick }) {
       h('button', { class: 'n-btn n-btn--primary', type: 'button', onclick: () => go('system') }, view.actionLabel)));
   }
 
+  /* 舞台提示（上方，落下）与遥控浮层（下方，升起）的出现与消失；动的是浮层本身，外框负责定位。
+     消失途中又要显示时取消消失。 */
+  function present(box, content, from) {
+    box._leaving?.cancel();
+    box._leaving = null;
+    if (content) {
+      const appearing = box.hidden;
+      box.hidden = false;
+      box.replaceChildren(content);
+      if (appearing) rise(content, from);
+      return;
+    }
+    if (box.hidden) return;
+    const current = box.firstElementChild;
+    const finish = () => { box.hidden = true; box.replaceChildren(); box._leaving = null; };
+    if (current) box._leaving = sink(current, finish, from); else finish();
+  }
+
   /* ---------- 整体刷新 ---------- */
   function render() {
     const info = map.info();
@@ -352,9 +384,9 @@ export function createStage(root, ctx, { onPick }) {
   return {
     map, items, regions, graph, video,
     /* 舞台正上方的操作提示：content 为元素，null 清除。 */
-    hint(content) { hintBox.hidden = !content; hintBox.replaceChildren(...(content ? [content] : [])); },
+    hint(content) { present(hintBox, content, -1); },
     /* 舞台正下方的浮层（运动页的遥控面板）：content 为元素，null 清除。 */
-    hud(content) { hudBox.hidden = !content; hudBox.replaceChildren(...(content ? [content] : [])); },
+    hud(content) { present(hudBox, content, 1); },
     /* 导航选点时舞台显示十字光标。 */
     setPicking(value) { root.dataset.picking = String(Boolean(value)); },
     /* 画面与地图互换（运动页“视频放到主画面”）。 */

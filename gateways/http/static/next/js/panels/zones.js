@@ -5,6 +5,7 @@
    - 三维草稿依附点云来源，点云来源变化时作废。
    新页面另加：每个禁行区有启用开关；删除不确认，轻提示里可撤销；清空全部先确认。 */
 import { h, icon, toast, confirmDialog } from '/static/shared/neh-ui.js';
+import { rise } from '../motion.js';
 
 const API_URL = '/api/navigation/forbidden-zones';
 const FRAME_ID = 'map';
@@ -506,6 +507,7 @@ export function mountZones(root, ctx) {
   function startCreate() {
     state.creating = true;
     draftBox.hidden = false;
+    rise(draftBox, -1);
     newBtn.hidden = true;
     nameInput.value = '禁行区 ' + (state.zones.length + 1);
     renderSegs();

@@ -7,6 +7,7 @@
 import { h, icon, toast, confirmDialog } from '/static/shared/neh-ui.js';
 import { isTerminalTaskState, GEOMETRY_PHASES } from '../status.js';
 import { poseAt, trackPoseDrag } from '../stage/posedrag.js';
+import { slideIn } from '../motion.js';
 
 const BADGE = { off: '', busy: 'n-badge--accent', warn: 'n-badge--warn', ok: 'n-badge--ok', bad: 'n-badge--bad' };
 const CLEANUP_LAYERS = [{ kind: 'source', label: '原图', color: '#748997', size: 1, checked: true },
@@ -165,6 +166,13 @@ export function mountMap(root, ctx) {
   }
 
   /* ---------- 页面 ---------- */
+  // 换页时带方向：进入详情、清除残影从右侧进，返回从左侧进；同一页刷新数据不动。
+  const PAGE_DEPTH = { list: 0, detail: 1, cleanup: 2 };
+  let shownPage = null;
+  function pageMoved() {
+    if (shownPage !== null && shownPage !== state.page) slideIn(view, Math.sign(PAGE_DEPTH[state.page] - PAGE_DEPTH[shownPage]));
+    shownPage = state.page;
+  }
   function render() {
     if (state.page === 'cleanup') return;   // 清除残影子页自己管理内容
     if (state.page === 'detail') { renderDetail(); return; }
@@ -212,6 +220,7 @@ export function mountMap(root, ctx) {
       card, status,
       h('div', { class: 'n-group-title' }, '已保存的地图（' + state.maps.length + '）', h('span', { class: 'n-group-actions' }, h('button', { class: 'n-btn n-btn--quiet n-btn--sm', type: 'button', onclick: () => load().then(() => say('地图列表已刷新。')) }, '刷新'))),
       h('div', { class: 'c-gap-b' }, search), list);
+    pageMoved();
   }
   function renderDetail() {
     const map = state.maps.find(item => item.name === state.detail);
@@ -231,6 +240,7 @@ export function mountMap(root, ctx) {
         act('eraser', '清除残影', map.saved ? '去掉行人等移动物体留下的点，另存为新地图，原图保留。' : '这张地图还没保存，保存后才能清除残影。', () => openCleanup(map.name), false, !map.saved),
         act('trash-2', '删除地图', '同时删除这张地图的语义区域与空间记忆，无法恢复。', () => remove(map.name), true)),
       status);
+    pageMoved();
   }
 
   /* ---------- 清除残影 ---------- */
@@ -396,6 +406,7 @@ export function mountMap(root, ctx) {
       h('label', { class: 'n-field c-gap-t' }, h('span', { class: 'n-label' }, '新地图名称'), clName), h('div', { class: 'c-gap-t' }, clApply));
     clButtons();
     drawCleanup();
+    pageMoved();
   }
 
   return {

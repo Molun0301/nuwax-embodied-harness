@@ -106,7 +106,7 @@
 .c-chip-toggle:disabled { opacity: .55; cursor: not-allowed; }
 .c-chip-toggle[data-tone="bad"] { color: #FF8D7C; }
 .c-mini-switch { position: relative; width: 20px; height: 12px; border-radius: 6px; background: rgba(255,255,255,.28); flex: none; transition: background .15s; }
-.c-mini-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.c-mini-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: #fff; transition: transform var(--motion-fast) var(--ease-out); }
 .c-chip-toggle[aria-pressed="true"] .c-mini-switch { background: var(--mint); }
 .c-chip-toggle[aria-pressed="true"] .c-mini-switch::after { transform: translateX(8px); background: #0A2A2C; }
 

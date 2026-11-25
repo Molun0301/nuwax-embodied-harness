@@ -72,7 +72,7 @@ class PerceptionVideoRuntime:
         self._write_status()
 
     def acquire(self, reason, *, interval_sec=None, camera_id=None,
-                detector_backend_name=None, open_vocabulary_classes=()):
+                detector_backend_name=None, open_vocabulary_classes=(), prompt_categories=None):
         with self._condition:
             self._condition.wait_for(lambda: not self._releasing or self._closed)
             if self._closed:
@@ -96,7 +96,7 @@ class PerceptionVideoRuntime:
                 self._reasons[reason] = (self._interval_sec if interval_sec is None else interval_sec,
                     camera_id or self._camera_id,
                     detector_backend_name or self._detector_backend_name or None,
-                    tuple(open_vocabulary_classes))
+                    tuple(open_vocabulary_classes), dict(prompt_categories or {}))
                 if new_reason:
                     self._video_consumers[reason] = consumer
                     consumer = None
@@ -182,7 +182,8 @@ class PerceptionVideoRuntime:
             settings = self._reasons[reason]
             self._bursts.append(burst)
         self.acquire(reason, interval_sec=self._burst_interval_sec if interval_sec is None else interval_sec,
-            camera_id=settings[1], detector_backend_name=settings[2], open_vocabulary_classes=settings[3])
+            camera_id=settings[1], detector_backend_name=settings[2],
+            open_vocabulary_classes=settings[3], prompt_categories=settings[4])
         try:
             while True:
                 ctx.check()
@@ -211,10 +212,12 @@ class PerceptionVideoRuntime:
                 self._processing = True
             groups = {}
             interval = min(value[0] for value in settings.values())
-            for reason, (_, camera, backend, classes) in settings.items():
-                group = groups.setdefault((camera, backend), {"reasons": set(), "classes": set()})
+            for reason, (_, camera, backend, classes, prompt_categories) in settings.items():
+                group = groups.setdefault((camera, backend),
+                    {"reasons": set(), "classes": set(), "prompt_categories": {}})
                 group["reasons"].add(reason)
                 group["classes"].update(classes)
+                group["prompt_categories"].update(prompt_categories)
             started = clock.monotonic()
             real_started = time.monotonic()
             failed = False
@@ -246,9 +249,11 @@ class PerceptionVideoRuntime:
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
         map_name = "default" if self._geometry_state is None else snapshot.map_name if snapshot is not None else ""
         pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
+        prompt_categories = group["prompt_categories"]
         context = self._perception_service.detect_current_frame_fast(camera_id=camera,
             requested_by="perception_video_runtime", detector_backend_name=backend,
-            open_vocabulary_classes=tuple(sorted(group["classes"])) or None)
+            open_vocabulary_classes=tuple(sorted(group["classes"])) or None,
+            detection_metadata={"prompt_categories": prompt_categories} if prompt_categories else None)
         inputs = self._perception_service.get_fast_observation_input(context)
         if inputs is None:
             return

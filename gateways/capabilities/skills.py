@@ -7,7 +7,8 @@ from gateways.capabilities.navigation import explore_and_find_target, find_targe
 TEXT = {"type": "string"}
 TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
 THRESHOLD = {"type": "number", "minimum": 0, "maximum": 1}
-QUERY = {"query": {**TEXT, "description": "目标物体的英文名词，检测器只认英文，如 apple、red cup。"},
+QUERY = {"query": {**TEXT, "description": "目标物品类别，用英文名词（如 apple、nightstand）。用作记忆标签，未给外观描述时也用作检测词。"},
+         "appearance_description": {**TEXT, "description": "可选的英文外观描述（如 white two drawer cabinet）。用作检测词，并作为可查询的实例属性保存。"},
          "camera_id": TEXT, "timeout_sec": TIMEOUT}
 
 CAPABILITIES = [

@@ -54,7 +54,7 @@ class InstanceAssociationService:
     _TRACK_CONTINUITY_SEC = 30.0
     _SIMILARITY_CACHE_LIMIT = 512
     _EMBEDDER_CACHE_IDENTITY_FIELDS = ('model_name', 'dimension', 'model_revision', 'revision', 'version', 'cache_revision')
-    _SEMANTIC_ATTRIBUTE_KEYS = ('color', 'colour', 'material', 'shape', 'category', 'object_type', 'brand', 'model', 'pattern', 'text', 'ocr_text', 'description', 'display_name_zh')
+    _SEMANTIC_ATTRIBUTE_KEYS = ('color', 'colour', 'material', 'shape', 'category', 'object_type', 'brand', 'model', 'pattern', 'text', 'ocr_text', 'description', 'appearance_description', 'display_name_zh')
     _POSE_EVIDENCE_KEYS = ('projection_method', 'projection_confidence', 'support_point_count', 'projection_degradation_reason', 'pose_quality_level', 'observation_only', 'coverage', 'depth_coverage', 'map_projection_coverage', 'reprojection_error', 'geometry_projection_method', 'geometry_projection_status', 'segmentation_projection_status', 'support_points_2d', 'support_points_3d', 'support_points_map', 'centroid_map', 'bbox_3d_map', 'object_3d_bbox', 'object_extent', 'position_support_radius_m', 'navigable', 'non_navigable_reason', 'has_structured_segmentation', 'segmentation_score', 'predicted_iou', 'stability_score', 'segmentation_quality_score', 'segmentation_support_point_count', 'segmentation_bbox_xyxy', 'centroid_uv', 'mask_center_px', 'segmentation_area_ratio', 'segmentation_occlusion_flags', 'segmentation_truncation_flags')
 
     def __init__(self, *, text_embedder: Optional[TextEmbedder], inspection_pose_planner: Optional[InspectionPosePlanner]=None, association_config=None,

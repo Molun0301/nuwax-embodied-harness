@@ -325,9 +325,8 @@ class DeferredProjectionConfig:
 class PerceptionPostProcessConfig:
     """检测后处理配置：类无关 NMS（杠杆二，见方案文档第 6.2 节）。
 
-    在 detector 之后、tracker 之前，对单帧检测做类无关 NMS：忽略标签，凡 bbox IoU
-    高于阈值的重叠框只保留置信度最高的一个，解决「同一物体被同时框成多个重叠标签」
-    导致的重复识别。纯单帧无状态，下游 tracker / 关联 / 记忆无需改动。
+    在 detector 之后、tracker 之前按交并比筛除重叠的低分框。
+    同标签框的交并比未达阈值时，还筛除至少 95% 面积被较大框覆盖的小框。
     """
 
     enabled: bool = schema_default('perception.postprocess_nms_enabled')

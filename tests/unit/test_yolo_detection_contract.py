@@ -268,6 +268,48 @@ def test_fixed_engine_subset_and_duplicate_door_window_follow_production_pipelin
     assert bundle.metadata['postprocess']['suppressed_count'] == 1
 
 
+@pytest.mark.parametrize("background_count", [0, 32])
+def test_visual_prompt_labels_use_category_and_discard_nested_same_prompt_boxes(background_count):
+    from services.perception.detectors import DetectorPipeline
+    from services.perception.postprocess import ClassAgnosticNmsPostProcessor
+
+    prompt = "white two drawer cabinet"
+    boxes = [
+        [0, 0, 596.55, 477.19], [0, 1.41, 184.78, 478.34],
+        [603, 180, 636, 370], [530, 40, 620, 100], [200, 200, 230, 245],
+    ]
+    scores = [.8355, .91, .79, .72, .69]
+    classes = [0, 0, 0, 0, 1]
+    for i in range(background_count):
+        boxes.append([10 + i * 10, 100, 15 + i * 10, 110])
+        scores.append(.60)
+        classes.append(2)
+
+    class Model:
+        def set_classes(self, names):
+            assert names[0] == prompt and "nightstand" not in names
+            self.names = names
+
+        def predict(self, image, **kwargs):
+            return [_result(names=self.names, boxes=boxes, scores=scores, classes=classes)]
+
+    backend = YoloWorldDetectorBackend(use_worker_process=False)
+    backend._model = Model()
+    pipeline = DetectorPipeline((backend,), post_processor=ClassAgnosticNmsPostProcessor())
+    frame = _frame(width=640, height=480, metadata={
+        "open_vocabulary_classes": [prompt, "remote", "knob"],
+        "prompt_categories": {prompt: "nightstand"},
+    })
+    bundle, _ = pipeline.detect(frame)
+    nightstands = [item for item in bundle.detections_2d if item.label == "nightstand"]
+    assert [item.score for item in nightstands] == [.8355, .79, .72]
+    assert all(item.attributes["appearance_description"] == prompt for item in nightstands)
+    assert all(item.attributes["aliases"] == ["nightstand"] for item in nightstands)
+    assert bundle.detections_2d[3].label == "remote"
+    assert len(bundle.detections_2d) == 4 + background_count
+    assert bundle.metadata["postprocess"]["suppressed_count"] == 1
+
+
 def test_dynamic_vocabulary_stays_on_inference_device_after_first_prediction(monkeypatch):
     """复现CPU词元缓存随首次预测迁移参数后，第二次换词设备不一致。"""
     import sys

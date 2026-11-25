@@ -24,7 +24,7 @@ from contracts.base import utc_now
 from contracts.image import ImageEncoding, ImageFrame
 from contracts.maps import OccupancyGrid
 from contracts.naming import build_anchor_id, build_artifact_id, build_instance_id, build_memory_id
-from contracts.spatial_memory import InstanceLifecycleState, SemanticInstance
+from contracts.spatial_memory import InstanceConfirmationState, InstanceLifecycleState, SemanticInstance
 from gateways.agent.router import build_agent_router
 from gateways.invoke import invoke
 from gateways.mcp.protocol import build_mcp_router
@@ -192,13 +192,44 @@ def test_real_mcp_catalog_and_execution_use_new_capability(device, runtime):
         assert tool["inputSchema"]["properties"]["goal_mode"]["enum"] == ["pick", "place", "transfer"]
         for name in ("find_target", "explore_and_find_target", "inspect_target"):
             tool = next(item for item in catalog["result"]["tools"] if item["name"] == name)
-            assert "apple、red cup" in tool["inputSchema"]["properties"]["query"]["description"]
+            schema = tool["inputSchema"]
+            assert "apple、nightstand" in schema["properties"]["query"]["description"]
+            assert "可查询" in schema["properties"]["appearance_description"]["description"]
+            assert "appearance_description" not in schema["required"]
         response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": NAME, "arguments": {"instruction": "苹果入盘"}}}).json()
         status = terminal(runtime, response["result"]["structuredContent"]["task"])
         assert status.state is TaskState.SUCCEEDED and status.motion is False
         operation, = [r["params"] for r in device.requests if r["op"] == "manipulate"]
         assert operation["goal_mode"] == "transfer" and operation["timeout_sec"] == 120
+
+
+def test_instance_description_is_searchable_without_changing_its_memory_label(runtime):
+    label = "nightstand"
+    description = "white two drawer cabinet"
+    memory = runtime.memory
+    library = memory.current_library
+    now = utc_now()
+    instances = [
+        SemanticInstance(instance_id=build_instance_id(label), label=label, map_name=library,
+            pose=Pose(frame_id="map", position=Vector3(x=x)), confidence=.95,
+            anchor_id=build_anchor_id(label), first_seen_ts=now, last_seen_ts=now,
+            confirmation_state=InstanceConfirmationState.CONFIRMED, lifecycle_state=InstanceLifecycleState.ACTIVE,
+            attributes={"appearance_description": description} if x > 0 else {})
+        for x in (-2, 2)
+    ]
+    for instance in instances:
+        memory.write(lambda store: store.put("instance", instance))
+
+    def found(query):
+        result = memory.query_semantic_memory(query)
+        return {match.semantic_instance.instance_id: match.semantic_instance
+                for match in result.matches if match.semantic_instance is not None}
+
+    assert set(found(label)) == {instance.instance_id for instance in instances}
+    restored, = found(description).values()
+    assert restored.instance_id == instances[1].instance_id
+    assert restored.label == label and restored.attributes["appearance_description"] == description
 
 
 @pytest.mark.parametrize("args", [{"instruction": " "}, {"instruction": "x", "timeout_sec": 0},

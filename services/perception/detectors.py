@@ -1343,4 +1343,26 @@ class DetectorPipeline:
                 detections_3d=bundle.detections_3d,
                 metadata={**dict(bundle.metadata or {}), "postprocess": nms_stats},
             )
+        prompt_categories = {
+            _normalize_label(prompt): (prompt, _normalize_label(category))
+            for prompt, category in (image_frame.metadata.get("prompt_categories") or {}).items()
+        }
+        if prompt_categories:
+            def categorize(detection):
+                prompt_category = prompt_categories.get(detection.label)
+                if prompt_category is None:
+                    return detection
+                description, label = prompt_category
+                attributes = dict(detection.attributes)
+                if "aliases" in attributes:
+                    attributes["aliases"] = [label, *(
+                        alias for alias in attributes["aliases"] if alias not in {detection.label, label})]
+                attributes["appearance_description"] = description
+                return detection.model_copy(update={"label": label, "attributes": attributes})
+
+            bundle = DetectionBundle(
+                detections_2d=tuple(categorize(item) for item in bundle.detections_2d),
+                detections_3d=tuple(categorize(item) for item in bundle.detections_3d),
+                metadata=bundle.metadata,
+            )
         return bundle, backend.spec

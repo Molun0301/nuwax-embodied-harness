@@ -876,7 +876,7 @@ advanced = true
 [perception.postprocess_nms_enabled]
 type = "boolean"
 default = true
-description = "是否对目标检测结果执行跨类别非极大值抑制。"
+description = "是否执行检测框交并比抑制与同标签包含去重。"
 consumers = [
     "core/settings.py:load_config",
 ]

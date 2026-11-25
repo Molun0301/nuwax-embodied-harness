@@ -124,6 +124,7 @@ class _TargetSearch:
         self.platform, self.ctx, self.args = platform, ctx, args
         self.runtime = platform.perception.video_runtime
         self.query = args["query"]
+        self.appearance_description = args.get("appearance_description")
         self.camera_id = args.get("camera_id")
         self.backend = args.get("detector_backend")
         self.reason = f"{capability}:{ctx.task_id}"
@@ -137,8 +138,10 @@ class _TargetSearch:
 
     @contextmanager
     def acquired(self):
+        prompt = self.appearance_description or self.query
         self.runtime.acquire(self.reason, interval_sec=self.args.get("search_refresh_interval_sec", .8),
-            camera_id=self.camera_id, detector_backend_name=self.backend, open_vocabulary_classes=(self.query,))
+            camera_id=self.camera_id, detector_backend_name=self.backend, open_vocabulary_classes=(prompt,),
+            prompt_categories={prompt: self.query} if self.appearance_description else None)
         try:
             yield
         except GatewayError as error:

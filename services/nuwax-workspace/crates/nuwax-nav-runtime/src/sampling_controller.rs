@@ -1,5 +1,6 @@
 //! 在一拍可达窗口中比较恒速圆弧，同一快照完成整批机身查询。
 use nuwax_core::logging::CollisionEvidence;
+use nuwax_nav_mls_planner::{surface::GroundQueryState, SurfaceSnapshot};
 use nuwax_nav_scan_native::{clearance_speed_cap, BodySample, CollisionSnapshot, Config};
 use nuwax_nav_types_messages::{Point2, Twist2};
 
@@ -118,11 +119,12 @@ pub(crate) struct Selection {
     pub(crate) poses: Vec<[f64; 3]>,
 }
 
-pub(crate) struct PoseGoal {
+pub(crate) struct PoseGoal<'a> {
     pub(crate) position: [f64; 3],
     pub(crate) yaw: f64,
     pub(crate) position_tolerance_m: f64,
     pub(crate) position_reached: bool,
+    pub(crate) approach_surface: Option<&'a SurfaceSnapshot>,
 }
 
 fn blocked(sample: &BodySample, here: BodySample) -> bool {
@@ -131,6 +133,7 @@ fn blocked(sample: &BodySample, here: BodySample) -> bool {
 }
 
 struct Candidate {
+    remaining_overlap: f64,
     score: f64,
     same_turn: bool,
     index: usize,
@@ -145,6 +148,7 @@ pub(crate) struct Sampler {
     refined_poses: Vec<[f64; 4]>,
     refined_samples: Vec<BodySample>,
     terminal: bool,
+    pub(crate) supported_terminal: bool,
     pub(crate) yaw_error: Option<f64>,
 }
 
@@ -157,12 +161,22 @@ impl Sampler {
         position: [f64; 3],
         yaw: f64,
         previous: Twist2,
-        pose_goal: Option<PoseGoal>,
+        pose_goal: Option<PoseGoal<'_>>,
     ) -> Option<Selection> {
         let (arc, nearest) = reference.nearest(position);
         let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * config.max_velocity);
+        self.supported_terminal = false;
+        let terminal_surface = pose_goal
+            .as_ref()
+            .filter(|_| config.max_lateral_velocity > 0.)
+            .and_then(|goal| goal.approach_surface);
         self.terminal = pose_goal.as_ref().is_some_and(|goal| {
             let exit = goal.position_tolerance_m + config.body_length / 2.;
+            let exit = if terminal_surface.is_some() {
+                exit.max(lookahead)
+            } else {
+                exit
+            };
             let near = squared_distance(position, goal.position) <= exit * exit;
             // 全向机体接近停点时可以并行修正位置和朝向。
             let omnidirectional_approach = config.max_lateral_velocity > 0.
@@ -171,16 +185,6 @@ impl Sampler {
                 || near && (self.terminal || omnidirectional_approach)
         });
         let turn_to = pose_goal.filter(|_| self.terminal).map(|goal| goal.yaw);
-        let target_arc = if self.terminal {
-            reference.length()
-        } else {
-            arc + lookahead
-        };
-        let target = reference.point_at(target_arc);
-        let delta = [target[0] - position[0], target[1] - position[1]];
-        let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
-        self.yaw_error = Some(angle_delta(heading, yaw));
-
         let mut here = [BodySample::default()];
         snapshot.sample_poses(
             config,
@@ -190,6 +194,16 @@ impl Sampler {
         );
         let here = here[0];
         let speed_cap = clearance_speed_cap(config, here.clearance);
+        // 净空限速缩小当拍可及范围，沿参考线先追踪弯角前的近点。
+        let target_arc = if self.terminal {
+            reference.length()
+        } else {
+            arc + lookahead * speed_cap / config.max_velocity
+        };
+        let target = reference.point_at(target_arc);
+        let delta = [target[0] - position[0], target[1] - position[1]];
+        let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
+        self.yaw_error = Some(angle_delta(heading, yaw));
         let linear_step = config.max_acceleration * config.sample_dt;
         let angular_step = config.max_yaw_acceleration * config.sample_dt;
         let min_linear = (previous.linear.x - linear_step).max(-config.max_reverse_velocity);
@@ -203,15 +217,17 @@ impl Sampler {
         let forward = samples(min_linear, max_linear, previous.linear.x, LINEAR_INTERVALS);
         let (sin, cos) = yaw.sin_cos();
         let desired_lateral = (-delta[0] * sin + delta[1] * cos) / PREDICTION_SECONDS;
+        let lateral_velocity = if self.terminal || here.clearance < config.obstacle_clearance_m {
+            config.max_lateral_velocity
+        } else {
+            0.
+        };
         let mut translations = Vec::with_capacity(forward.len() * 2);
         for vx in forward {
             let x_acceleration = vx - previous.linear.x;
             let y_step = (linear_step.powi(2) - x_acceleration.powi(2)).max(0.).sqrt();
-            let lateral_cap = if self.terminal {
-                config.max_lateral_velocity.min((speed_cap.powi(2) - vx.powi(2)).max(0.).sqrt())
-            } else {
-                0.
-            };
+            let lateral_cap =
+                lateral_velocity.min((speed_cap.powi(2) - vx.powi(2)).max(0.).sqrt());
             let reachable_min = previous.linear.y - y_step;
             let reachable_max = previous.linear.y + y_step;
             let minimum = reachable_min.max(-lateral_cap).min(reachable_max);
@@ -221,6 +237,13 @@ impl Sampler {
             let toward_goal = desired_lateral.clamp(minimum, maximum);
             if toward_goal != zero {
                 translations.push(Point2::new(vx, toward_goal));
+            }
+            if here.occupied == 1 {
+                for vy in [minimum, maximum] {
+                    if vy != zero && vy != toward_goal {
+                        translations.push(Point2::new(vx, vy));
+                    }
+                }
             }
         }
         let angular = samples(min_yaw, max_yaw, previous.angular_z, ANGULAR_INTERVALS);
@@ -268,6 +291,7 @@ impl Sampler {
                     UNUSED_SPEED_WEIGHT_M * (1. - speed_fraction)
                 };
             ranked.push(Candidate {
+                remaining_overlap: samples.last().unwrap().depth,
                 score,
                 same_turn: w * previous.angular_z > 0.,
                 index,
@@ -276,8 +300,9 @@ impl Sampler {
             });
         }
         ranked.sort_by(|a, b| {
-            a.score
-                .total_cmp(&b.score)
+            a.remaining_overlap
+                .total_cmp(&b.remaining_overlap)
+                .then_with(|| a.score.total_cmp(&b.score))
                 .then_with(|| b.same_turn.cmp(&a.same_turn))
         });
         self.refined_poses.clear();
@@ -317,6 +342,12 @@ impl Sampler {
             {
                 continue;
             }
+            if let Some(surface) = terminal_surface.filter(|_| self.terminal) {
+                if !has_observed_support(surface, config, &self.refined_poses) {
+                    continue;
+                }
+                self.supported_terminal = true;
+            }
             return Some(Selection {
                 command: Twist2 {
                     linear,
@@ -324,6 +355,14 @@ impl Sampler {
                 },
                 poses: coarse.iter().map(|p| [p[0], p[1], p[2]]).collect(),
             });
+        }
+        // 缺少安全圆弧时仍发原零速。已观测末段在停车后用新的速度窗继续采样。
+        if let Some(surface) = terminal_surface.filter(|_| self.terminal && previous != Twist2::ZERO) {
+            let [x, y, z] = position;
+            if has_observed_support(surface, config, &[[x, y, z, yaw]]) {
+                self.supported_terminal = true;
+                return Some(Selection { command: Twist2::ZERO, poses: vec![position] });
+            }
         }
         None
     }
@@ -353,10 +392,22 @@ impl Sampler {
     }
 }
 
+fn has_observed_support(surface: &SurfaceSnapshot, config: &Config, poses: &[[f64; 4]]) -> bool {
+    poses.iter().all(|&[x, y, body_z, _]| {
+        let support_z = body_z - config.body_to_ground;
+        let ground = surface.query_ground([x, y], support_z);
+        ground.state == GroundQueryState::Observed
+            && ground.height.is_some_and(|height| {
+                (-config.max_step_down..=config.max_step_up).contains(&(height - support_z))
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nuwax_nav_scan_native::MapOwner;
+    use std::sync::Arc;
 
     const START: [f64; 3] = [0., 0., 0.4];
 
@@ -373,6 +424,12 @@ mod tests {
         (config, map.snapshot())
     }
 
+    fn observed_floor() -> Arc<SurfaceSnapshot> {
+        let ground = (-20..20).flat_map(|x| (-20..20).map(move |y|
+            [(f64::from(x) + 0.5) * 0.05, (f64::from(y) + 0.5) * 0.05, 0.])).collect::<Vec<_>>();
+        crate::local_workers::observed_ground_test_source(&ground, &[])
+    }
+
     #[test]
     fn straight_route_uses_reachable_forward_command_only() {
         let (config, map) = fixture(&[]);
@@ -386,6 +443,42 @@ mod tests {
         );
         assert_eq!(chosen.command.linear.y, 0.);
         assert_eq!(chosen.command.angular_z, 0.);
+    }
+
+    #[test]
+    fn omnidirectional_travel_can_move_sideways_beside_an_obstacle() {
+        let (mut config, _) = fixture(&[]);
+        config.body_length = 0.2945;
+        config.body_width = 0.5567;
+        config.body_center_x = 0.1182;
+        config.max_velocity = 0.30;
+        config.max_lateral_velocity = 0.20;
+        config.max_yaw_rate = 0.30;
+        config.max_yaw_acceleration = 2.0;
+        config.max_acceleration = 0.5;
+        let mut map = MapOwner::new(&config).unwrap();
+        map.seed_occupied(&[
+            [0.344, -0.224, 0.425], [0.369, -0.181, 0.425],
+            [0.394, -0.138, 0.425], [0.419, -0.095, 0.425],
+        ], START);
+        map.update_surface(&[], &[], &[], &[]).unwrap();
+        let route = Route::new(vec![START, [-0.09, 0.02, START[2]], [0.1, 0.5, START[2]]]);
+        let chosen = Sampler::default()
+            .select(&map.snapshot(), &config, &route, START, 0., Twist2::ZERO, None)
+            .unwrap();
+        assert!(chosen.command.linear.y > 0., "{:?}", chosen.command);
+    }
+
+    #[test]
+    fn omnidirectional_travel_turns_to_the_route_in_open_space() {
+        let (mut config, map) = fixture(&[]);
+        config.max_lateral_velocity = 0.20;
+        let route = Route::new(vec![START, [0., 2., START[2]]]);
+        let chosen = Sampler::default()
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, None)
+            .unwrap();
+        assert_eq!(chosen.command.linear.y, 0.);
+        assert!(chosen.command.angular_z > 0.);
     }
 
     #[test]
@@ -461,6 +554,7 @@ mod tests {
                 Some(PoseGoal {
                     position: START, yaw: 1., position_tolerance_m: 0.06,
                     position_reached: true,
+                    approach_surface: None,
                 }),
             )
             .unwrap();
@@ -478,6 +572,7 @@ mod tests {
         let goal = |position_reached| Some(PoseGoal {
             position: START, yaw: 0., position_tolerance_m: 0.06,
             position_reached,
+            approach_surface: None,
         });
         let approach = sampler
             .select(
@@ -513,6 +608,7 @@ mod tests {
         let goal = || Some(PoseGoal {
             position: target, yaw: 0., position_tolerance_m: 0.06,
             position_reached: false,
+            approach_surface: None,
         });
         let without_lateral = Sampler::default()
             .select(&map, &config, &route, START, 0., Twist2::ZERO, goal())
@@ -547,11 +643,82 @@ mod tests {
                 Some(PoseGoal {
                     position: goal, yaw: 0., position_tolerance_m: 0.06,
                     position_reached: false,
+                    approach_surface: None,
                 }),
             )
             .unwrap();
         assert!(chosen.command.linear.y > 0., "{:?}", chosen.command);
         assert!(chosen.command.angular_z < 0., "{:?}", chosen.command);
+    }
+
+    #[test]
+    fn early_terminal_uses_observed_ground_before_taking_over_an_approach() {
+        let surface = observed_floor();
+        let missing = crate::local_workers::observed_ground_test_source(&[[2., 2., 0.]], &[]);
+        let (mut config, map) = fixture(&[]);
+        config.body_length = 0.30;
+        config.max_velocity = 0.30;
+        config.max_lateral_velocity = 0.20;
+        let target = [0.06, 0.45, START[2]];
+        let route = Route::new(vec![START, target]);
+        let goal = |surface| Some(PoseGoal {
+            position: target,
+            yaw: 0.,
+            position_tolerance_m: 0.06,
+            position_reached: false,
+            approach_surface: Some(surface),
+        });
+        let mut sampler = Sampler::default();
+        let selected = sampler
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, goal(&surface))
+            .unwrap();
+        assert!(selected.command.linear.y > 0.);
+        assert_eq!(selected.command.angular_z, 0.);
+        assert!(sampler.supported_terminal);
+        assert!(sampler
+            .select(&map, &config, &route, START, 0., Twist2::ZERO, goal(&missing))
+            .is_none());
+        assert!(!sampler.supported_terminal);
+    }
+
+    #[test]
+    fn braking_keeps_an_observed_terminal_route_for_sideways_escape() {
+        let surface = observed_floor();
+        let (mut config, _) = fixture(&[]);
+        config.body_length = 0.2945;
+        config.body_width = 0.5567;
+        config.max_velocity = 0.30;
+        config.max_lateral_velocity = 0.20;
+        config.max_yaw_rate = 0.;
+        config.max_yaw_acceleration = 0.;
+        config.max_acceleration = 0.5;
+        let wall = (-12..12).map(|x| [(f64::from(x) + 0.5) * 0.05, -0.275, 0.425])
+            .collect::<Vec<_>>();
+        let mut owner = MapOwner::new(&config).unwrap();
+        owner.seed_occupied(&wall, START);
+        owner.update_surface(&[], &[], &[], &[]).unwrap();
+        let map = owner.snapshot();
+        assert_eq!(map.pose_clearance(START, 0.).occupied, 1);
+        let target = [0.1, -0.30, START[2]];
+        let route = Route::new(vec![START, target]);
+        let goal = || Some(PoseGoal {
+            position: target,
+            yaw: 0.,
+            position_tolerance_m: 0.06,
+            position_reached: false,
+            approach_surface: Some(&surface),
+        });
+        let inward = Twist2 { linear: Point2::new(0., -0.09), ..Twist2::ZERO };
+        let mut sampler = Sampler::default();
+        let braking = sampler
+            .select(&map, &config, &route, START, 0., inward, goal())
+            .expect("停车时保留具备实测支撑的末段");
+        assert_eq!(braking.command, Twist2::ZERO);
+        assert!(sampler.supported_terminal);
+        let departing = sampler
+            .select(&map, &config, &route, START, 0., braking.command, goal())
+            .unwrap();
+        assert!(departing.command.linear.y > 0.);
     }
 
     #[test]

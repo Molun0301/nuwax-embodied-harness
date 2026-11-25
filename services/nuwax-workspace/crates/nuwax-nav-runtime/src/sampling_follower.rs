@@ -4,7 +4,9 @@ use crate::sampling_controller::{PoseGoal, Route, Sampler};
 use crate::surface_follower::{
     orientation_within_tolerance, position_within_tolerance, SurfaceFollower, SurfaceFollowerConfig,
 };
-use crate::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RuntimeError, SurfaceSnapshot};
+use crate::{
+    ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RuntimeError, SurfaceSnapshot, TerminalPhase,
+};
 use nuwax_core::logging::{CollisionLogPose, DiagnosticLimiter};
 use nuwax_nav_astar::navigation_map::CostMap2D;
 use nuwax_nav_types_messages::{
@@ -367,6 +369,14 @@ impl NavPlanner for SamplingFollower {
         self.wait_reason.clone()
     }
 
+    fn terminal_phase(&self) -> TerminalPhase {
+        if self.sampler.supported_terminal {
+            TerminalPhase::Translating
+        } else {
+            TerminalPhase::Travel
+        }
+    }
+
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
         self.prediction.as_ref().map_or_else(Vec::new, |path| {
             path.poses.iter().map(Self::position).collect()
@@ -407,6 +417,7 @@ impl NavPlanner for SamplingFollower {
 
     fn step(&mut self) -> PlannerStep {
         self.prediction = None;
+        self.sampler.supported_terminal = false;
         self.sampler.yaw_error = None;
         let position_reached = self.position_reached();
         if position_reached && self.orientation_reached() {
@@ -427,12 +438,7 @@ impl NavPlanner for SamplingFollower {
             pose.stamp.nanos,
         );
         let goal_position = Self::position(goal);
-        let pose_goal = self.options.requires_orientation().then(|| PoseGoal {
-            position: goal_position,
-            yaw: goal.pose.orientation.yaw(),
-            position_tolerance_m: self.options.position_tolerance_m,
-            position_reached,
-        });
+        let goal_yaw = goal.pose.orientation.yaw();
         if self.route.is_empty() && !position_reached {
             return PlannerStep::Pending(Vec::new());
         }
@@ -481,6 +487,17 @@ impl NavPlanner for SamplingFollower {
             &self.route
         };
         let config = self.native_config(&map.source);
+        let pose_goal = self.options.requires_orientation().then(|| PoseGoal {
+            position: goal_position,
+            yaw: goal_yaw,
+            position_tolerance_m: self.options.position_tolerance_m,
+            position_reached,
+            approach_surface: self.reference.last()
+                .filter(|&&end| !position_within_tolerance(
+                    end, goal_position, self.options.position_tolerance_m, &map.source,
+                ))
+                .map(|_| map.source.as_ref()),
+        });
         if let Some(selection) = self.sampler.select(
             &map.snapshot,
             &config,

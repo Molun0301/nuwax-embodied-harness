@@ -11,6 +11,7 @@ from typing import List, Optional
 import httpx
 import numpy as np
 
+from services.model_imports import LOCAL_MODEL_IMPORT_LOCK
 from services.model_providers import resolve_text_embedding_provider_spec, resolve_vision_language_provider_spec
 
 
@@ -375,7 +376,8 @@ class SentenceTransformerTextEmbedder(TextEmbedder):
         device: Optional[str] = None,
     ) -> None:
         try:
-            from sentence_transformers import SentenceTransformer
+            with LOCAL_MODEL_IMPORT_LOCK:
+                from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise RuntimeError(
                 "当前环境未安装 sentence-transformers，无法启用 BGE 文本向量化。"
@@ -431,16 +433,17 @@ class CLIPVisionLanguageEmbedder(VisionLanguageEmbedder):
         dimension: Optional[int] = None,
         device: Optional[str] = None,
     ) -> None:
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-        except ImportError as exc:
-            raise RuntimeError(
-                "当前环境未安装 transformers，无法启用 CLIP 多模态向量化。"
-            ) from exc
-        try:
-            import torch
-        except ImportError as exc:
-            raise RuntimeError("当前环境未安装 torch，无法启用 CLIP 多模态向量化。") from exc
+        with LOCAL_MODEL_IMPORT_LOCK:
+            try:
+                from transformers import CLIPModel, CLIPProcessor
+            except ImportError as exc:
+                raise RuntimeError(
+                    "当前环境未安装 transformers，无法启用 CLIP 多模态向量化。"
+                ) from exc
+            try:
+                import torch
+            except ImportError as exc:
+                raise RuntimeError("当前环境未安装 torch，无法启用 CLIP 多模态向量化。") from exc
 
         self._torch = torch
         resolved_model_name = self._resolve_model_name(model_name)

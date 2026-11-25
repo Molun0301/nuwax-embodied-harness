@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
 from core.errors import GatewayError
+from services.model_imports import LOCAL_MODEL_IMPORT_LOCK
 from services.model_providers import resolve_detection_provider_spec
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr
@@ -121,10 +122,11 @@ def _ensure_torchvision_nms_fallback() -> None:
         return
 
     try:
-        import torch
-        import torchvision
-        import torchvision.ops as torchvision_ops
-        import torchvision.ops.boxes as torchvision_boxes
+        with LOCAL_MODEL_IMPORT_LOCK:
+            import torch
+            import torchvision
+            import torchvision.ops as torchvision_ops
+            import torchvision.ops.boxes as torchvision_boxes
     except ImportError:
         return
 

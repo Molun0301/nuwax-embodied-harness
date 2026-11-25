@@ -21,6 +21,8 @@ class Capability:
     before_submit: Optional[Callable] = None
     # 能力所属功能分组的中文名，由登记处按定义模块填写，网页能力面板据此分组。
     group: str = ""
+    # 调用参数 timeout_sec 是否覆盖任务期限。
+    timeout_from_args: bool = True
 
 
 class CapabilityTable:

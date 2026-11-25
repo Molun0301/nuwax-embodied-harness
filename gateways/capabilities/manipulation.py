@@ -11,6 +11,8 @@ from gateways.capabilities.navigation import navigate_to_pose
 from services.manipulation.http_backend import DeviceError
 from services.memory.semantic_map.room_segmentation import pose_in_scene_space
 
+OPERATION_TIMEOUT_SEC = 120
+
 
 def _motion_options(_platform, args):
     if "target_instance_id" in args:
@@ -105,8 +107,10 @@ def execute_manipulation_task(platform, ctx, args):
             instance = _approach(platform, ctx, args, mode)
         ctx.progress(0.5, "manipulating", "正在向设备提交操作指令。")
         binding = service.bind()
-        result = service.run(ctx, binding, {"instruction": args["instruction"].strip(), "goal_mode": mode,
-            "timeout_sec": args.get("timeout_sec", 120), "max_steps": args.get("max_steps", 1440)})
+        operation_timeout = args.get("timeout_sec", OPERATION_TIMEOUT_SEC)
+        with ctx.time_limit(operation_timeout):
+            result = service.run(ctx, binding, {"instruction": args["instruction"].strip(), "goal_mode": mode,
+                "timeout_sec": operation_timeout, "max_steps": args.get("max_steps", 1440)})
         if mode == "pick":
             picked_at = utc_now()
             service.held_object = {"instance_id": instance.instance_id if instance else None,
@@ -123,12 +127,14 @@ def execute_manipulation_task(platform, ctx, args):
             http_status=503 if error.code == "manipulation_unavailable" else 409) from error
 
 
-CAPABILITIES = [Capability("execute_manipulation_task", "执行抓取、放置或完整搬运。给定目标实例时，先前往面向目标的操作站位。",
+CAPABILITIES = [Capability("execute_manipulation_task",
+    "执行抓取、放置或完整搬运。给定目标实例时，先按位姿导航规则前往操作站位。timeout_sec 仅用于设备操作。",
     {"type": "object", "properties": {
         "instruction": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": r"\S"},
-        "timeout_sec": {"type": "number", "minimum": 1, "maximum": 1800, "default": 120},
+        "timeout_sec": {"type": "number", "minimum": 1, "maximum": 1800, "default": OPERATION_TIMEOUT_SEC,
+                        "description": "仅设备操作的期限（秒），从提交抓取、放下或搬运指令开始计时。"},
         "max_steps": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1440},
         "goal_mode": {"type": "string", "enum": ["pick", "place", "transfer"], "default": "transfer"},
         "target_instance_id": {"type": "string", "description": "抓取目标实例或放置台面实例。省略时原地操作。"}},
      "required": ["instruction"], "additionalProperties": False}, "task", execute_manipulation_task,
-     timeout_sec=120, before_submit=_motion_options)]
+     before_submit=_motion_options, timeout_from_args=False)]

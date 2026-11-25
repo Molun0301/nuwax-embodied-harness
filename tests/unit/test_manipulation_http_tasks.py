@@ -185,7 +185,10 @@ def test_real_mcp_catalog_and_execution_use_new_capability(device, runtime):
     with TestClient(app) as client:
         catalog = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
         tool = next(item for item in catalog["result"]["tools"] if item["name"] == NAME)
-        assert tool["inputSchema"]["properties"]["timeout_sec"]["maximum"] == 1800
+        timeout = tool["inputSchema"]["properties"]["timeout_sec"]
+        assert timeout["maximum"] == 1800 and timeout["default"] == 120
+        assert "仅用于设备操作" in tool["description"]
+        assert "仅设备操作" in timeout["description"]
         assert tool["inputSchema"]["properties"]["goal_mode"]["enum"] == ["pick", "place", "transfer"]
         for name in ("find_target", "explore_and_find_target", "inspect_target"):
             tool = next(item for item in catalog["result"]["tools"] if item["name"] == name)
@@ -194,7 +197,8 @@ def test_real_mcp_catalog_and_execution_use_new_capability(device, runtime):
             "params": {"name": NAME, "arguments": {"instruction": "苹果入盘"}}}).json()
         status = terminal(runtime, response["result"]["structuredContent"]["task"])
         assert status.state is TaskState.SUCCEEDED and status.motion is False
-        assert next(r for r in device.requests if r["op"] == "manipulate")["params"]["goal_mode"] == "transfer"
+        operation, = [r["params"] for r in device.requests if r["op"] == "manipulate"]
+        assert operation["goal_mode"] == "transfer" and operation["timeout_sec"] == 120
 
 
 @pytest.mark.parametrize("args", [{"instruction": " "}, {"instruction": "x", "timeout_sec": 0},
@@ -286,6 +290,69 @@ def test_missing_target_does_not_submit_device_operation(runtime, device, monkey
     result = terminal(runtime, submit(runtime, goal_mode="pick", target_instance_id=build_instance_id("missing")))
     assert result.state is TaskState.FAILED and result.result == {"stage": "approaching"}
     assert not device.requests
+
+
+def test_instance_place_completes_after_navigation_outlasts_device_timeout(runtime, device, monkeypatch):
+    from core import clock
+    from gateways.capabilities import manipulation
+    from services.geometry.state import GoalStatus
+
+    station = Pose(frame_id="map", position=Vector3(x=2, y=3, z=.9), orientation=Quaternion(w=1))
+    now = utc_now()
+    surface = SemanticInstance(instance_id=build_instance_id("nightstand"),
+        anchor_id=build_anchor_id("nightstand"), label="nightstand",
+        map_name=runtime.memory.current_library, pose=station, confidence=.9,
+        first_seen_ts=now, last_seen_ts=now)
+    runtime.memory.write(lambda store: store.put_live_instance(surface, persist=True))
+    monkeypatch.setattr(runtime, "ensure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime.motion, "begin", lambda: 7)
+    monkeypatch.setattr(runtime.memory, "plan_manipulation_pose", lambda *args, **kwargs: station)
+    monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: station)
+    navigation = SimpleNamespace(goal_id="goal", status=GoalStatus.SUCCEEDED,
+                                 message="已到达", remaining_distance_m=0)
+    snapshot = SimpleNamespace(info=SimpleNamespace(map_frame_id="map"),
+                               navigation=navigation, previous_navigation=None)
+    monkeypatch.setattr(runtime.geometry_state, "snapshot", lambda: snapshot)
+    navigation_timeouts = []
+
+    def set_goal(_goal, *, timeout_sec):
+        navigation_timeouts.append(timeout_sec)
+        return "goal"
+
+    monkeypatch.setattr(runtime.geometry, "set_goal", set_goal)
+    cancelled_goals = []
+    monkeypatch.setattr(runtime.geometry, "cancel_goal", cancelled_goals.append)
+
+    time_ns = 20_000_000_000
+    monkeypatch.setattr(clock, "uses_device_clock", lambda: True)
+    monkeypatch.setattr(clock, "_device_sample", lambda: (time_ns, 1.0, False))
+
+    def arrive(predicate, ctx):
+        nonlocal time_ns
+        assert not device.started.is_set()
+        time_ns += 2_000_000_000
+        ctx.check()
+        assert predicate(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(runtime.geometry_state, "wait_for", arrive)
+    written = []
+
+    def writeback(_platform, ctx, _held, target):
+        nonlocal time_ns
+        time_ns += 2_000_000_000
+        ctx.check()
+        written.append(target.instance_id)
+
+    monkeypatch.setattr(manipulation, "_remember_placement", writeback)
+    status = terminal(runtime, submit(runtime, goal_mode="place",
+                                     target_instance_id=surface.instance_id, timeout_sec=1))
+    assert status.state is TaskState.SUCCEEDED
+    assert navigation_timeouts == [None] and not cancelled_goals
+    operation, = [item["params"] for item in device.requests if item["op"] == "manipulate"]
+    assert operation["goal_mode"] == "place" and operation["timeout_sec"] == 1
+    assert status.result["device_status"]["result"]["physics_success"] is True
+    assert written == [surface.instance_id]
 
 
 def test_operation_station_uses_place_distance_and_pick_yaw_offset(runtime, monkeypatch):

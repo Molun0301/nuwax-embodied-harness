@@ -171,7 +171,10 @@ class SceneMappingService:
         for region in regions:
             old = previous.get(region.scene_space_id)
             unchanged = old is not None and getattr(region, "_geometry_unchanged", False)
-            keep_label = old is not None and (unchanged or old.metadata.get("label_locked") or old.review_status in LOCKED_STATUSES)
+            # 一对一继承区域编号时保留已采纳的名称；轮廓变化仍重新收集决策输入。
+            adopted = old is not None and old.review_status is SceneSpaceReviewStatus.AUTO_LABELED
+            keep_label = old is not None and (
+                unchanged or adopted or old.metadata.get("label_locked") or old.review_status in LOCKED_STATUSES)
             metadata = {**(old.metadata if old else {}), **region.metadata,
                         MANAGED_KEY: True, "map_binding": capture["binding"],
                         "scene_revision": int(old.metadata.get("scene_revision", 0)) if old else 0,
@@ -181,7 +184,8 @@ class SceneMappingService:
             if not unchanged:
                 metadata.pop("decision_inputs", None)
                 metadata.pop("last_decision", None)
-                metadata.pop("adopted_label_evidence", None)
+                if not adopted:
+                    metadata.pop("adopted_label_evidence", None)
             updates = {"metadata": metadata}
             if old is not None:
                 updates.update({"human_aliases": old.human_aliases,

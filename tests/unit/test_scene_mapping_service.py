@@ -261,6 +261,39 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
     assert new['metadata']['adopted_label_evidence']['category'] == 'bedroom'
     assert len(new['metadata']['adopted_label_evidence']['observation_samples']) == 2
 
+
+def test_adopted_room_keeps_name_on_cold_resegmentation(setup, monkeypatch):
+    import services.memory.semantic_map.scene_mapping as mapping_module
+
+    start = utc_now()
+    monkeypatch.setattr(mapping_module.clock, "source_now_ns", lambda: round(start.timestamp() * 1e9))
+    setup.backend.winner = "bedroom"
+    for x in (2, 3):
+        remember(setup, x, timestamp=start)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    before, = setup.service.get_map()["regions"]
+
+    # 冷加载后自由格边沿略有差别，房间仍继承同一编号，旧照片已超过决策时效。
+    setup.view.cells[5:8, 5:13] = 100
+    setup.view.advance()
+    now = start + timedelta(seconds=setup.service.config.max_evidence_age_sec + 1)
+    monkeypatch.setattr(mapping_module.clock, "source_now_ns", lambda: round(now.timestamp() * 1e9))
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        result = service.run_once(apply_labels=False)
+        assert result["skipped"][0]["reason"] == "no_valid_observation_evidence"
+        row, = service.get_map()["regions"]
+        assert row["scene_space_id"] == accepted
+        assert row["primary_label"] == "卧室" and row["review_status"] == "auto_labeled"
+        assert row["metadata"]["adopted_label_evidence"] == before["metadata"]["adopted_label_evidence"]
+        assert [node["name"] for node in service.graph.query(kinds=["region"])["nodes"]] == ["卧室"]
+    finally:
+        service.close()
+        memory.close()
+
+
 @pytest.mark.parametrize('weak_reason', ['low_score', 'adoption_disabled', 'unknown'])
 def test_adopted_label_is_not_revoked_by_nonadopting_decision(setup, weak_reason):
     memory, backend, service = setup.memory, setup.backend, setup.service

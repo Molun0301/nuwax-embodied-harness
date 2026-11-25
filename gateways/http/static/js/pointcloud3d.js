@@ -41,11 +41,37 @@ function readStageColors() {
   for (const [key, name] of STAGE_COLOR_VARS) COLORS[key] = Number.parseInt(css.getPropertyValue(name).trim().slice(1), 16);
 }
 readStageColors();
-// 浅色舞台上，点云的基础、地面、结构、物体色（配置值按深色背景取的浅色）向深色混合 65%，四种默认色对亮色舞台底色的对比度都在 3:1 以上；
-// 高度色只有一套，默认值取明度相同、只换色相的五种颜色，对亮暗两种舞台底色的对比度都在 3:1 以上，不随主题调整。
+// 浅色舞台上，点云的基础、地面、结构、物体色（配置值按深色背景取的浅色）向深色混合 65%，四种默认色对亮色舞台底色的对比度都在 3:1 以上。
 function stagePointColor(rgb) {
   if (!stageCss() || document.documentElement.dataset.theme === 'dark') return rgb;
   return rgb.map((value, index) => Math.round(value * 0.35 + [27, 38, 44][index] * 0.65));
+}
+// sRGB 字节与 OKLab 互换，供亮色舞台换算高度色。
+const srgbToLinear = value => { const c = value / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+const linearToSrgb = c => Math.round(255 * Math.min(1, Math.max(0, c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055)));
+function rgbToOklab(rgb) {
+  const [r, g, b] = rgb.map(srgbToLinear);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s];
+}
+function oklabToRgb([L, a, b]) {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s].map(linearToSrgb);
+}
+// 高度色配置按暗色舞台取：地面暗、墙和家具亮，结构最醒目（默认是舒缓版青灰色系）。
+// 浅色舞台上保持色相与彩度，把明度翻到深色一侧（OKLab 明度 L' = 0.83 − 0.6 × L）：地面变浅、墙和家具变深，仍是结构最醒目。
+function stageHeightColor(rgb) {
+  if (!stageCss() || document.documentElement.dataset.theme === 'dark') return rgb;
+  const [L, a, b] = rgbToOklab(rgb);
+  return oklabToRgb([0.83 - 0.6 * L, a, b]);
 }
 // 点的顶点颜色按线性值参与显示，配置里的颜色是网页常用的 sRGB 写法：原样交给顶点会显示得比写的浅一截
 // （深色背景上不明显，浅色背景上整片发白）。换成线性值后，显示出来就是配置的颜色。
@@ -53,7 +79,7 @@ function linearByte(value) {
   const c = value / 255;
   return Math.round(255 * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
 }
-const heightStop = color => pointCloudHexToRgb(color).map(linearByte);
+const heightStop = color => stageHeightColor(pointCloudHexToRgb(color)).map(linearByte);
 const floorColor = color => stagePointColor(pointCloudHexToRgb(color)).map(linearByte);
 
 const LOD_STRIDE = { preview: 8, medium: 4, full: 1 };
@@ -61,12 +87,11 @@ const DEFAULT_POINT_STYLE = 'height';
 // 导航双击选点：两次按下间隔与位移上限，与常见系统双击判定相当。
 const NAVIGATION_DOUBLE_CLICK_MS = 500;
 const NAVIGATION_CLICK_PIXELS = 6;
-// 点不透明、无雾化，显示色与配置一致；1.35 像素的点在 0.1 米采样下只盖住约三成画面，其余露出舞台底色，看上去整片发浅，默认改为 2 像素。
 const DEFAULT_POINTCLOUD3D_CONFIG = Object.freeze({
   spacingM: 0.1,
-  size: 2,
+  size: 1.35,
   color: '#cbd5e1',
-  heightColors: Object.freeze(['#1a6cc6', '#027786', '#017d38', '#896604', '#c04020']),
+  heightColors: Object.freeze(['#60838d', '#77a0a7', '#97bdc1', '#c0dad8', '#e9f4f1']),
   groundColor: '#38bdf8',
   structureColor: '#f8fafc',
   objectColor: '#fbbf24',

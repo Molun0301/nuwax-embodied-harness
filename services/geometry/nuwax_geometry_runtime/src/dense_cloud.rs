@@ -721,10 +721,10 @@ impl DenseSnapshot {
     }
 
     pub fn read(&self, offset: u64, count: u32) -> Result<Vec<u8>, String> {
-        if count == 0 || count > CHUNK_POINTS || offset > self.point_count {
+        if count == 0 || offset > self.point_count {
             return Err("完整点云分块位置或大小非法".into());
         }
-        let count = (self.point_count - offset).min(count as u64) as usize;
+        let count = (self.point_count - offset).min(u64::from(count.min(CHUNK_POINTS))) as usize;
         let mut output = Vec::with_capacity(count * 12);
         if count == 0 {
             return Ok(output);

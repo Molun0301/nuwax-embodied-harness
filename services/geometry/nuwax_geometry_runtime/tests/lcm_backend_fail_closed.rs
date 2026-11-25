@@ -319,6 +319,53 @@ impl Drop for Fixture {
         let _ = self.child.wait();
     }
 }
+#[tokio::test]
+async fn gateway_default_request_reads_dense_cloud_and_reports_source_change() {
+    let mut fixture = Fixture::start(false, false).await;
+    fixture.mapping("完整点云").await;
+    fixture.mapping_frames().await;
+    fixture.map_ready().await;
+
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap();
+    let output = Command::new("python3")
+        .current_dir(repo)
+        .env("NUWAX_INSTALL_HOME", &fixture.root)
+        .args(["-c", r#"
+import json
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
+
+from core.config import value
+from core.settings import load_config
+from gateways.app import create_gateway_app
+from services.geometry.client import GeometryClient
+
+config = load_config()
+geometry = GeometryClient(f"127.0.0.1:{value('geometry.runtime_port')}")
+try:
+    runtime = SimpleNamespace(config=config, geometry=geometry)
+    app = create_gateway_app(runtime, config, start_runtime_on_lifespan=False)
+    with TestClient(app) as client:
+        response = client.get('/api/pointcloud/dense')
+        assert response.status_code == 200, response.text
+        meta = json.loads(response.headers['X-Nuwax-Pointcloud'])
+        assert meta['offset_points'] == 0
+        assert 0 < len(response.content) == 12 * meta['total_points'] <= 12 * 65_536
+        response = client.get('/api/pointcloud/dense', params={'epoch': 'expired', 'offset': 1})
+        assert response.status_code == 409, response.text
+        assert response.json()['error']['code'] == 'dense_cloud_source_changed', response.text
+finally:
+    geometry.close()
+"#])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

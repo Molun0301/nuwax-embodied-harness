@@ -122,7 +122,6 @@ pub(crate) struct PoseGoal {
     pub(crate) position: [f64; 3],
     pub(crate) yaw: f64,
     pub(crate) position_tolerance_m: f64,
-    pub(crate) yaw_tolerance_rad: f64,
     pub(crate) position_reached: bool,
 }
 
@@ -165,12 +164,11 @@ impl Sampler {
         self.terminal = pose_goal.as_ref().is_some_and(|goal| {
             let exit = goal.position_tolerance_m + config.body_length / 2.;
             let near = squared_distance(position, goal.position) <= exit * exit;
-            // 朝向已经合适时，全向机体可以在末段横移，不必朝侧向位置误差转身。
-            let aligned_approach = config.max_lateral_velocity > 0.
-                && reference.length() - arc <= exit
-                && angle_delta(goal.yaw, yaw).abs() <= goal.yaw_tolerance_rad;
+            // 全向机体接近停点时可以并行修正位置和朝向。
+            let omnidirectional_approach = config.max_lateral_velocity > 0.
+                && reference.length() - arc <= exit;
             goal.position_reached
-                || near && (self.terminal || aligned_approach)
+                || near && (self.terminal || omnidirectional_approach)
         });
         let turn_to = pose_goal.filter(|_| self.terminal).map(|goal| goal.yaw);
         let target_arc = if self.terminal {
@@ -462,7 +460,7 @@ mod tests {
                 &map, &config, &route, START, 0., Twist2::ZERO,
                 Some(PoseGoal {
                     position: START, yaw: 1., position_tolerance_m: 0.06,
-                    yaw_tolerance_rad: 0.15, position_reached: true,
+                    position_reached: true,
                 }),
             )
             .unwrap();
@@ -479,7 +477,7 @@ mod tests {
         let mut sampler = Sampler::default();
         let goal = |position_reached| Some(PoseGoal {
             position: START, yaw: 0., position_tolerance_m: 0.06,
-            yaw_tolerance_rad: 0.15, position_reached,
+            position_reached,
         });
         let approach = sampler
             .select(
@@ -514,7 +512,7 @@ mod tests {
         let route = Route::new(vec![START, target]);
         let goal = || Some(PoseGoal {
             position: target, yaw: 0., position_tolerance_m: 0.06,
-            yaw_tolerance_rad: 0.15, position_reached: false,
+            position_reached: false,
         });
         let without_lateral = Sampler::default()
             .select(&map, &config, &route, START, 0., Twist2::ZERO, goal())
@@ -529,6 +527,31 @@ mod tests {
         assert!(lateral.command.linear.y > 0.);
         assert!(lateral.command.linear.x.hypot(lateral.command.linear.y)
             <= config.max_acceleration * config.sample_dt);
+    }
+
+    #[test]
+    fn near_omnidirectional_goal_corrects_position_and_heading_together() {
+        let (mut config, map) = fixture(&[]);
+        config.body_length = 0.30;
+        config.max_velocity = 0.30;
+        config.max_lateral_velocity = 0.20;
+        config.max_reverse_velocity = 0.20;
+        config.max_yaw_acceleration = 2.0;
+        config.sample_dt = 0.15;
+        // 将现场的位移和偏航误差旋转到目标朝向为零，保留安全停点的偏移。
+        let goal = [0.075, 0.054, START[2]];
+        let route = Route::new(vec![START, [0.045, 0.054, START[2]]]);
+        let chosen = Sampler::default()
+            .select(
+                &map, &config, &route, START, 0.077, Twist2::ZERO,
+                Some(PoseGoal {
+                    position: goal, yaw: 0., position_tolerance_m: 0.06,
+                    position_reached: false,
+                }),
+            )
+            .unwrap();
+        assert!(chosen.command.linear.y > 0., "{:?}", chosen.command);
+        assert!(chosen.command.angular_z < 0., "{:?}", chosen.command);
     }
 
     #[test]

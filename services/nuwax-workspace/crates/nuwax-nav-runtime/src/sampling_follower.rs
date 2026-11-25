@@ -431,7 +431,6 @@ impl NavPlanner for SamplingFollower {
             position: goal_position,
             yaw: goal.pose.orientation.yaw(),
             position_tolerance_m: self.options.position_tolerance_m,
-            yaw_tolerance_rad: self.options.yaw_tolerance_rad,
             position_reached,
         });
         if self.route.is_empty() && !position_reached {

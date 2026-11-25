@@ -472,6 +472,7 @@ class DetectionGeometryAugmentor:
             bbox_xyxy=(x_min, y_min, x_max, y_max),
             from_mask=projection_status == "mask_depth_support",
             max_points=self._max_points_per_detection,
+            min_support_points=self._min_support_points,
             focal_lengths_px=(camera_info.fx,camera_info.fy),
         )
         selected_indices = selection.indices

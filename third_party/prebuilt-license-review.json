@@ -262,7 +262,7 @@
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "7fd0456cccc82c99e652c78297ac0ce2512a04e0a6e7c8ee9f57484fffca43e9",
+          "review_key": "5f24cb99de3632d59cf1b8579ecc4b84b110c3a48a1a30da92e4882dc0b62ff4",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -281,11 +281,11 @@
             "系统包补丁升级：libc6:amd64、libc6-dev:amd64 由2.39-0ubuntu8.9变为2.39-0ubuntu8.12（Ubuntu安全更新，同一软件包、许可不变）"
           ],
           "evidence": {
-            "run_id": 44393919541,
-            "source_revision": "d5fb8f6cf4483abfa03c0c7efa3aa146e2be3f4e",
+            "run_id": 45614835098,
+            "source_revision": "6fecd43fda2ea5a27a3c168e94dd174e3c55f95f",
             "audit": "neh-prebuilt-noble-x86_64/audit-nuwax-mapping-cli.json",
-            "reviewed_at": "2026-11-19T02:36:46.007961+00:00",
-            "说明": "对比运行43361156973的审计（review_key与原批准值e284033d75ef7e04eef3130750a021d433b559aab50b8f8722baa088ad4af060一致）与运行44393919541的审计，逐项比较仓库内crate名称与许可、Cargo包名称版本与许可、内嵌与系统组件身份、原生库清单及许可正文。核查输入的全部变化：新增Cargo依赖memmap2 0.9.12；系统包libc6、libc6-dev补丁版本变化；仓库内crate 12个不变、Cargo包238→239。没有新增许可种类、许可不明或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。包内审计为share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json。"
+            "reviewed_at": "2026-11-25T14:29:14.732498+00:00",
+            "说明": "对比运行45614834792（复用源码b0de2f6d的程序附件，review_key与原批准值7fd0456cccc82c99e652c78297ac0ce2512a04e0a6e7c8ee9f57484fffca43e9一致）与运行45614835098（源码6fecd43f，配置模式默认值变化使本程序在当前构建镜像重新编译）的审计，逐项比较仓库内crate名称与许可、Cargo包与内嵌组件身份、原生库清单、许可正文及实际使用的系统包。唯一变化：noble-x86_64构建镜像的Ubuntu安全更新使系统包libsqlite3-0由3.45.1-1ubuntu2.9变为3.45.1-1ubuntu2.11。没有新增组件、许可种类或著佐权强度变化；原生库清单不变；GPL-3.0-only组合、NOTICE、对应源码及替换重建条件保留。同一运行其余九项review_key与原批准值一致。"
           }
         }
       }

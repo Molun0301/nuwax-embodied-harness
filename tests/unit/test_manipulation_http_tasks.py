@@ -288,7 +288,7 @@ def test_missing_target_does_not_submit_device_operation(runtime, device, monkey
     assert not device.requests
 
 
-def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch):
+def test_operation_station_uses_place_distance_and_pick_yaw_offset(runtime, monkeypatch):
     from gateways.capabilities import manipulation
 
     station = Pose(frame_id="map", position=Vector3(x=2, y=3, z=.9),
@@ -303,7 +303,8 @@ def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch
 
     monkeypatch.setattr(runtime.memory, "plan_manipulation_pose", plan)
     monkeypatch.setattr(runtime.geometry_state, "wait_for_pose", lambda _: station)
-    values = {"manipulation.place_standoff_distance_m": .64}
+    offset = 7 * pi / 180
+    values = {"manipulation.place_standoff_distance_m": .64, "manipulation.pick_yaw_offset_rad": offset}
     monkeypatch.setattr(manipulation, "value", values.__getitem__)
     visited = []
     monkeypatch.setattr(manipulation, "navigate_to_pose", lambda _, __, goal: visited.append(goal))
@@ -316,7 +317,7 @@ def test_place_uses_its_configured_distance_for_the_station(runtime, monkeypatch
     assert planned == [(True, .64), (False, .54)]
     assert [goal["x"] for goal in visited] == pytest.approx([2., 2.])
     assert [goal["y"] for goal in visited] == pytest.approx([3., 3.])
-    assert [goal["yaw_rad"] for goal in visited] == pytest.approx([pi / 2] * 2)
+    assert [goal["yaw_rad"] for goal in visited] == pytest.approx([pi / 2, pi / 2 + offset])
     assert all(goal["allow_reverse"] for goal in visited)
 
 

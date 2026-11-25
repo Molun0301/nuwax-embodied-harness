@@ -60,6 +60,8 @@ def _approach(platform, ctx, args, mode):
         raise GatewayError("目标周围没有可达操作站位。", error_code="navigation_failed", http_status=409)
     q = pose.orientation
     yaw = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+    if mode == "pick":
+        yaw += value("manipulation.pick_yaw_offset_rad")
     navigate_to_pose(platform, _ApproachContext(ctx), {"x": pose.position.x, "y": pose.position.y,
         "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
         "tolerance_position_m": config.approach_position_tolerance_m,

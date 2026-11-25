@@ -3482,6 +3482,15 @@ apply = "restart"
 panel = "操作设备"
 category = "外部设备"
 
+[manipulation.pick_yaw_offset_rad]
+type = "float"
+default = 0.0
+description = "抓取站位相对正对目标的偏航偏置，单位为弧度，正值向左。站位位置不受影响。"
+consumers = ["gateways/capabilities/manipulation.py:_approach"]
+apply = "restart"
+panel = "操作设备"
+category = "外部设备"
+
 [manipulation.approach_position_tolerance_m]
 type = "float"
 default = 0.06

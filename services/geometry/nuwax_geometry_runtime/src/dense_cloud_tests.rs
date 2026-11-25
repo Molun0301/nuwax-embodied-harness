@@ -410,7 +410,8 @@ fn dense_cloud_preserves_over_a_million_distinct_subcells_and_frozen_prefixes() 
     assert!(frozen.read(frozen.point_count, 1).unwrap().is_empty());
     let latest = cloud.snapshot((2) * 100, 2, "密集验证").unwrap();
     assert_eq!(latest.point_count, frozen.point_count + 1);
-    let first = frozen.read(0, CHUNK_POINTS).unwrap();
+    let first = frozen.read(0, 200_000).unwrap();
+    assert_eq!(first.len(), CHUNK_POINTS as usize * 12);
     assert_eq!(
         f32::from_le_bytes(first[..4].try_into().unwrap()),
         0.011_f32
@@ -442,7 +443,7 @@ fn dense_cloud_rejects_wrong_identity_truncation_and_invalid_coordinates() {
     let snapshot = cloud.snapshot((1) * 100, 1, "源").unwrap();
     assert_eq!(snapshot.point_count, 1);
     assert!(snapshot.read(2, 1).is_err());
-    assert!(snapshot.read(0, CHUNK_POINTS + 1).is_err());
+    assert!(snapshot.read(0, 0).is_err());
     let (file, _) = snapshot.archive("map").unwrap();
     let mut wrong = snapshot.metadata("map");
     wrong.session_generation += 1;

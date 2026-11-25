@@ -33,6 +33,7 @@ def select_object_support(
     bbox_xyxy: Tuple[float, float, float, float],
     from_mask: bool,
     max_points: int,
+    min_support_points: int = 5,
     focal_lengths_px: Optional[Tuple[float,float]] = None,
 ) -> SupportSelection:
     """从候选点中选择物体主体支持点。
@@ -56,9 +57,11 @@ def select_object_support(
     # 深度噪声随距离平方增长；间隙至少为3厘米，避免把同一表面拆成小簇。
     gaps = np.diff(depths)
     cuts = np.flatnonzero(gaps > np.maximum(0.03, 0.01 + 0.01*depths[:-1]**2)) + 1
-    # 框内的后方背景可能比物体拥有更多雷达点；取最近表面，避免扫描密度变化使位置跳到背景。
-    # 主体点数不足仍交给原支持点门槛拒绝，不能转取更密的后方背景。
-    cluster = sorted_indices[:cuts[0] if cuts.size else count]
+    # 跳过近处的小簇；全都不足时保留最近簇的统计，由调用方判为稀疏。
+    boundaries = np.concatenate(([0], cuts, [count]))
+    eligible = np.flatnonzero(np.diff(boundaries) >= min_support_points)
+    cluster_index = eligible[0] if eligible.size else 0
+    cluster = sorted_indices[boundaries[cluster_index]:boundaries[cluster_index + 1]]
     points = camera_points[cluster]
     low,high = np.quantile(points,[0.05,0.95],axis=0)
     spread = float(high[2]-low[2])

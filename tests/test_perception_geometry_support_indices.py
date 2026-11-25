@@ -54,12 +54,13 @@ def test_selection_matches_full_mask_oracle(count, polygon):
                         &(pixels[indices,1]>=115)&(pixels[indices,1]<=185)]
         if bbox_count and not len(indices):
             status='support_cluster_empty'
-    # 四个相隔1米的独立平面；取有候选的最近平面，不能以背景点数替代主体。
+    # 四个相隔 1 米的独立平面；取拥有至少 5 点的最近平面。
     planes=[indices[depths[indices]==depth] for depth in (1.,2.,3.,4.)]
-    dominant=next((group for group in planes if len(group)),planes[0])
-    selected=dominant[np.linspace(0,len(dominant)-1,min(24,len(dominant)),dtype=np.int64)] if len(dominant) else dominant
-    if 0<len(dominant)<5:
-        selected=np.empty(0,dtype=np.int64)
+    nearest = next((group for group in planes if len(group) >= 5), None)
+    selected = np.empty(0, dtype=np.int64)
+    if nearest is not None:
+        selected = nearest[np.linspace(0, len(nearest)-1, min(24, len(nearest)), dtype=np.int64)]
+    elif indices.size:
         status="support_cluster_sparse"
     result, support_count = augmentor._augment_single_detection(
         detection=detection, camera_info=camera(), projected_pixels=pixels,
@@ -88,14 +89,16 @@ def test_selection_matches_full_mask_oracle(count, polygon):
     np.testing.assert_array_equal(pixels, before_pixels)
 
 
-def test_multiple_detections_share_one_calibrated_projection():
-    augmentor = DetectionGeometryAugmentor()
+@pytest.mark.parametrize('min_support_points, cluster_count, support_count', [(5, 6, 6), (10, 1, 0)])
+def test_multiple_detections_share_one_calibrated_projection(min_support_points, cluster_count, support_count):
+    augmentor = DetectionGeometryAugmentor(min_support_points=min_support_points)
     cam = camera()
     cam.distortion_model = 'plumb_bob'
     cam.distortion_coefficients = [.1, -.02, .001, .002, 0.]
     image = ImageFrame(camera_id='cam', frame_id='camera', width_px=640,
                        height_px=480, encoding='rgb8', data=b'x')
-    points = np.array([[(i-2)*.01,0.,2.] for i in range(6)]+[[.1,.2,1.],
+    points = np.array([[(i-2)*.01,0.,2.] for i in range(6)]
+        + [[i*.01, 0., 3.] for i in range(9)] + [[.1,.2,1.],
         [0.,0.,0.],[np.nan,0.,1.],[0.,0.,-.1]])
     cloud = PointCloudFrame(frame_id='camera', point_count=len(points), points_xyz_array=points)
     detection = Detection2D(label='item', score=.9, camera_id='cam',
@@ -105,12 +108,16 @@ def test_multiple_detections_share_one_calibrated_projection():
         result, metadata = augmentor.augment_detections((detection,) * 3,
             image_frame=image, camera_info=cam, point_cloud=cloud)
     assert project.call_count == 1
-    assert metadata['geometry_support_point_total'] == 0
+    assert metadata['geometry_support_point_total'] == 3 * support_count
     for item in result:
-        assert item.attributes['geometry_support_point_count'] == 0
-        assert item.attributes['support_cluster_point_count'] == 1
-        assert item.attributes['geometry_projection_status'] == 'support_cluster_sparse'
-        assert 'support_points_3d' not in item.attributes
+        assert item.attributes['geometry_support_point_count'] == support_count
+        assert item.attributes['support_cluster_point_count'] == cluster_count
+        if support_count:
+            assert item.attributes['geometry_projection_status'] == 'mask_depth_support'
+            assert [point['z'] for point in item.attributes['support_points_3d']['points']] == [2.] * support_count
+        else:
+            assert item.attributes['geometry_projection_status'] == 'support_cluster_sparse'
+            assert 'support_points_3d' not in item.attributes
     _, metadata = augmentor.augment_detections((detection,), image_frame=image,
                                                camera_info=cam, point_cloud=None)
     assert metadata['geometry_projection_degradation_reason'] == 'point_cloud_unavailable'

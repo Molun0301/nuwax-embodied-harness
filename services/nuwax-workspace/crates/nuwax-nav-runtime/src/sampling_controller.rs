@@ -115,9 +115,8 @@ pub(crate) struct Selection {
     pub(crate) poses: Vec<[f64; 3]>,
 }
 
-fn blocked(sample: &BodySample, here: BodySample) -> bool {
-    sample.occupied < 0
-        || (sample.occupied != 0 && (here.occupied != 1 || sample.depth > here.depth))
+fn blocked(sample: &BodySample) -> bool {
+    sample.occupied < 0 || sample.worsened != 0
 }
 
 struct Candidate {
@@ -159,14 +158,11 @@ impl Sampler {
         let heading = turn_to.unwrap_or_else(|| delta[1].atan2(delta[0]));
         self.yaw_error = Some(angle_delta(heading, yaw));
 
+        let start = [position[0], position[1], position[2], yaw];
         let mut here = [BodySample::default()];
-        snapshot.sample_poses(
-            config,
-            &[[position[0], position[1], position[2], yaw]],
-            &mut here,
-            None,
-        );
+        snapshot.sample_poses(config, &[start], &mut here, None, None);
         let here = here[0];
+        let overlap_start = (here.occupied == 1).then_some(&start);
         let speed_cap = clearance_speed_cap(config, here.clearance);
         let linear_step = config.max_acceleration * config.sample_dt;
         let angular_step = config.max_yaw_acceleration * config.sample_dt;
@@ -198,7 +194,7 @@ impl Sampler {
             }
         }
         self.samples.resize(self.poses.len(), BodySample::default());
-        snapshot.sample_poses(config, &self.poses, &mut self.samples, None);
+        snapshot.sample_poses(config, &self.poses, &mut self.samples, None, overlap_start);
 
         let mut ranked = Vec::new();
         for ((index, samples), (v, w)) in
@@ -208,7 +204,7 @@ impl Sampler {
                     .flat_map(|&v| angular.iter().map(move |&w| (v, w))),
             )
         {
-            if samples.iter().any(|sample| blocked(sample, here)) {
+            if samples.iter().any(blocked) {
                 continue;
             }
             let endpoint = self.poses[(index + 1) * PREDICTION_STEPS - 1];
@@ -263,12 +259,10 @@ impl Sampler {
             }
             self.refined_samples
                 .resize(self.refined_poses.len(), BodySample::default());
-            snapshot.check_poses(config, &self.refined_poses, &mut self.refined_samples, None);
-            if self
-                .refined_samples
-                .iter()
-                .any(|sample| blocked(sample, here))
-            {
+            snapshot.check_poses(
+                config, &self.refined_poses, &mut self.refined_samples, None, overlap_start,
+            );
+            if self.refined_samples.iter().any(blocked) {
                 continue;
             }
             return Some(Selection {
@@ -295,13 +289,15 @@ impl Sampler {
             &[[position[0], position[1], position[2], yaw]],
             &mut [BodySample::default()],
             Some(&mut evidence),
+            None,
         );
-        snapshot.sample_poses(config, &self.poses, &mut self.samples, Some(&mut evidence));
+        snapshot.sample_poses(config, &self.poses, &mut self.samples, Some(&mut evidence), None);
         snapshot.check_poses(
             config,
             &self.refined_poses,
             &mut self.refined_samples,
             Some(&mut evidence),
+            None,
         );
         evidence
     }
@@ -421,7 +417,7 @@ mod tests {
         let (config, map) = fixture(&[[-0.225, 0.025, 0.425]]);
         let route = Route::new(vec![START, [2., 0., START[2]]]);
         let mut here = [BodySample::default()];
-        map.sample_poses(&config, &[[0., 0., START[2], 0.]], &mut here, None);
+        map.sample_poses(&config, &[[0., 0., START[2], 0.]], &mut here, None, None);
         assert_eq!(here[0].occupied, 1);
         assert!(here[0].depth > 0.);
         let mut sampler = Sampler::default();
@@ -443,7 +439,73 @@ mod tests {
                 ]
             })
             .collect();
-        map.sample_poses(&config, &poses, &mut checked, None);
+        map.sample_poses(&config, &poses, &mut checked, None, None);
         assert!(checked.iter().all(|sample| sample.depth <= here[0].depth));
+    }
+
+    fn go2_surface(
+        start: [f64; 3],
+        obstacles: &[[f64; 3]],
+        ground: &[[f64; 3]],
+    ) -> (Config, CollisionSnapshot) {
+        let (mut config, _) = fixture(&[]);
+        // Go2 模型的碰撞外包与日志中的站立高度。
+        config.body_length = 0.6789949835601197;
+        config.body_width = 0.328;
+        config.body_center_x = 0.00050250821994;
+        config.body_to_ground = 0.3622421636189938;
+        config.body_z_max = 0.057;
+        config.max_step_up = 0.15;
+        config.max_reverse_velocity = 0.3;
+        let mut owner = MapOwner::new(&config).unwrap();
+        owner.seed_occupied(&[], start);
+        owner.update_surface(obstacles, ground, &[], &[]).unwrap();
+        (config, owner.snapshot())
+    }
+
+    #[test]
+    fn go2_nov25_underbody_contacts_allow_retreat_along_descending_reference() {
+        let start = [-0.21989090831894054, -0.47048306495654785, -0.031081356171455413];
+        let yaw = 2. * 0.2817029821463093_f64.atan2(0.9595016570334186);
+        // 03:02:21 的六个近地实体带。障碍点输入为日志高度带的中心。
+        let obstacles = [
+            [-0.225, -0.425, -0.225],
+            [-0.125, -0.375, -0.225],
+            [-0.075, -0.375, -0.225],
+            [-0.125, -0.325, -0.225],
+            [-0.075, -0.325, -0.225],
+            [-0.025, -0.375, -0.225],
+        ];
+        let (config, map) = go2_surface(start, &obstacles, &[]);
+        let current = arc_pose(start, yaw, 0., 0., 0.);
+        let into_contact = arc_pose(start, yaw, 0.10, 0., 0.4);
+        let mut retreat = arc_pose(start, yaw, -0.10, 0., 0.4);
+        retreat[2] -= 0.01;
+        let mut samples = [BodySample::default(); 3];
+        map.sample_poses(
+            &config, &[current, into_contact, retreat], &mut samples, None, Some(&current),
+        );
+        assert_eq!(samples[0].occupied, 1);
+        assert!(blocked(&samples[1]));
+        assert!(samples[2].depth > samples[0].depth);
+        assert!(!blocked(&samples[2]));
+    }
+
+    #[test]
+    fn go2_nov25_rear_surface_does_not_block_forward_departure() {
+        let start = [1.9394981856366669, 1.5415525622569988, 0.00010888801586371281];
+        let yaw = 2. * 0.18872139134758806_f64.atan2(0.9820306698101798);
+        let (config, map) = go2_surface(start, &[], &[[1.575, 1.625, -0.209375]]);
+        // 日志汇总预测扫掠上的接触。补测转入该后缘格时再离开的情形。
+        assert_eq!(map.pose_clearance(start, yaw).occupied, 0);
+        for yaw in [yaw, yaw - 0.10] {
+            let target = arc_pose(start, yaw, 1., 0., 1.);
+            let route = Route::new(vec![start, [target[0], target[1], start[2] - 0.05]]);
+            let selected = Sampler::default()
+                .select(&map, &config, &route, start, yaw, Twist2::ZERO, None)
+                .unwrap();
+            assert!(selected.command.linear.x > 0., "{:?}", selected.command);
+        }
+        assert_eq!(map.pose_clearance(start, yaw - 0.10).occupied, 1);
     }
 }

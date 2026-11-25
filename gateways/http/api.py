@@ -17,6 +17,7 @@ from gateways.auth import GatewayAccessManager
 from core.errors import GatewayError, as_gateway_error
 from gateways.invoke import invoke
 from gateways.health import summary as health_summary
+from services.geometry.client import GeometryError
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -283,8 +284,14 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
         offset: int = Query(default=0, ge=0, le=2 ** 53 - 1),
         delta: bool = False,
     ) -> Response:
-        chunk = await run_in_threadpool(runtime.geometry.get_dense_cloud_chunk,
-                                        expected_epoch=epoch, offset_points=offset, allow_delta=delta)
+        try:
+            chunk = await run_in_threadpool(runtime.geometry.get_dense_cloud_chunk,
+                                            expected_epoch=epoch, offset_points=offset, allow_delta=delta)
+        except GeometryError as error:
+            if error.message == "DENSE_CLOUD_SOURCE_CHANGED":
+                raise GatewayError("完整点云来源已变化", error_code="dense_cloud_source_changed",
+                                   http_status=409) from error
+            raise
         metadata = to_jsonable({name: getattr(chunk, name) for name in (
             "epoch", "source_timestamp_ns", "frame_id", "total_points", "offset_points",
             "bounds_min", "bounds_max", "base_epoch", "base_offset_points", "removed_ranges")})

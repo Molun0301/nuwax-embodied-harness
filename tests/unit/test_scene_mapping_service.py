@@ -262,6 +262,25 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
     assert len(new['metadata']['adopted_label_evidence']['observation_samples']) == 2
 
 
+
+def test_cold_restore_keeps_room_when_same_grid_is_republished(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    setup.view.advance()
+
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        row, = service.get_map()["regions"]
+        assert row["scene_space_id"] == accepted and row["review_status"] == "auto_labeled"
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert node["node_id"] == accepted and node["name"] == "办公室"
+    finally:
+        service.close()
+        memory.close()
+
 def test_adopted_room_keeps_name_on_cold_resegmentation(setup, monkeypatch):
     import services.memory.semantic_map.scene_mapping as mapping_module
 

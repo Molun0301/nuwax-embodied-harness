@@ -134,8 +134,8 @@ class SemanticMapState:
         for space in capture["spaces"]:
             if not space.metadata.get(MANAGED_KEY) or space.map_name != capture["library_name"]:
                 continue
-            binding = space.metadata.get("map_binding", {})
-            valid = same_scope(binding, capture["binding"]) and binding.get("map_revision") == capture["binding"]["map_revision"]
+            # 新分区提交前，同一地图和坐标系沿用尚未作废的区域。
+            valid = same_scope(space.metadata.get("map_binding", {}), capture["binding"])
             if not valid or space.review_status is SceneSpaceReviewStatus.STALE:
                 if include_stale:
                     result.append(space.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE}))

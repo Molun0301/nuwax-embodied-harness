@@ -369,6 +369,23 @@ impl NavPlanner for SamplingFollower {
         self.wait_reason.clone()
     }
 
+    fn recovery_surface(&mut self) -> Option<crate::RecoverySurface> {
+        if let Some(update) = self.map_worker.take() {
+            match update {
+                Ok(map) if map.epoch == self.epoch => self.prepared = Some(map),
+                Ok(_) => {}
+                Err(_) => self.prepared = None,
+            }
+        }
+        let map = self.prepared.as_ref().filter(|map| map.epoch == self.epoch)?;
+        let forward = self.native_config(&map.source);
+        let reverse = self.config.native_config(
+            &map.source, GoalOptions { allow_reverse: true, ..self.options },
+            forward.max_lateral_velocity > 0.,
+        );
+        Some(crate::RecoverySurface { snapshot: map.snapshot.clone(), forward, reverse })
+    }
+
     fn terminal_phase(&self) -> TerminalPhase {
         if self.sampler.supported_terminal {
             TerminalPhase::Translating
@@ -471,8 +488,13 @@ impl NavPlanner for SamplingFollower {
                 true,
             ));
         }
+        let can_retrace = !position_reached
+            && self.config.kinematics().is_some_and(|motion| motion.max_reverse_mps > 0.);
         if elapsed >= REPLAN_AFTER_NS && !self.progress.replanned {
             self.progress.replanned = true;
+            if can_retrace {
+                return PlannerStep::Blocked(NO_PROGRESS.into());
+            }
             return PlannerStep::ReplanRequired(NO_PROGRESS.into());
         }
         let Some(map) = map else {
@@ -498,15 +520,15 @@ impl NavPlanner for SamplingFollower {
                 ))
                 .map(|_| map.source.as_ref()),
         });
-        if let Some(selection) = self.sampler.select(
-            &map.snapshot,
-            &config,
-            reference,
-            position,
-            yaw,
-            self.applied,
-            pose_goal,
-        ) {
+        let planned = if can_retrace && self.progress.replanned {
+            self.sampler.select_departure(&map.snapshot, &config, reference, position, yaw, self.applied, pose_goal, true)
+        } else {
+            self.sampler.select(&map.snapshot, &config, reference, position, yaw, self.applied, pose_goal)
+        };
+        if let Some(selection) = planned {
+            if selection.only_stop && self.applied == Twist2::ZERO {
+                return PlannerStep::Blocked(self.blocked(Some(&map), BLOCKED, false));
+            }
             self.wait_reason = None;
             self.prediction = Some(Path3D {
                 poses: selection
@@ -525,7 +547,7 @@ impl NavPlanner for SamplingFollower {
             });
             return PlannerStep::Command(selection.command);
         }
-        PlannerStep::ReplanRequired(self.blocked(Some(&map), BLOCKED, false))
+        PlannerStep::Blocked(self.blocked(Some(&map), BLOCKED, false))
     }
 
     fn stop(&mut self) {
@@ -590,7 +612,7 @@ mod tests {
         let until = Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match follower.step() {
-                PlannerStep::ReplanRequired(reason) => {
+                PlannerStep::Blocked(reason) => {
                     assert_eq!(reason, BLOCKED);
                     break;
                 }

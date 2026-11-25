@@ -809,6 +809,11 @@ async fn run_surface_planner_with_computer(
                     continue;
                 }
                 if successful.should_reuse(surface_replan_rejection(execution_feedback.as_ref(), active_goal), &input) {
+                    if execution_feedback.as_ref().is_some_and(|feedback| feedback.locally_blocked) {
+                        hub.planning.send_replace(Some((active_goal.session_id.clone(), active_goal.goal_key(),
+                            surface_planning_diagnostic(execution_feedback.as_ref(), active_goal,
+                                "相同出发条件下，原全局路线已被局部执行拒绝"), false, true)));
+                    }
                     continue;
                 }
                 let surface = input.actual.as_ref().map_or_else(|| Arc::clone(surface), |actual|

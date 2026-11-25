@@ -117,6 +117,7 @@ fn arc_pose(position: [f64; 3], yaw: f64, linear: Point2, w: f64, time: f64) -> 
 pub(crate) struct Selection {
     pub(crate) command: Twist2,
     pub(crate) poses: Vec<[f64; 3]>,
+    pub(crate) only_stop: bool,
 }
 
 pub(crate) struct PoseGoal<'a> {
@@ -134,11 +135,20 @@ fn blocked(sample: &BodySample, here: BodySample) -> bool {
 
 struct Candidate {
     remaining_overlap: f64,
+    executable_progress: f64,
     score: f64,
     same_turn: bool,
     index: usize,
     linear: Point2,
     w: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    Follow,
+    Departure,
+    FreeDeparture,
+    Retreat,
 }
 
 #[derive(Default)]
@@ -153,6 +163,34 @@ pub(crate) struct Sampler {
 }
 
 impl Sampler {
+    pub(crate) fn select_retreat(
+        &mut self,
+        snapshot: &CollisionSnapshot,
+        config: &Config,
+        reference: &Route,
+        position: [f64; 3],
+        yaw: f64,
+        previous: Twist2,
+        goal: PoseGoal<'_>,
+    ) -> Option<Selection> {
+        self.select_mode(snapshot, config, reference, position, yaw, previous, Some(goal), SelectionMode::Retreat)
+    }
+
+    pub(crate) fn select_departure(
+        &mut self,
+        snapshot: &CollisionSnapshot,
+        config: &Config,
+        reference: &Route,
+        position: [f64; 3],
+        yaw: f64,
+        previous: Twist2,
+        pose_goal: Option<PoseGoal<'_>>,
+        along_route: bool,
+    ) -> Option<Selection> {
+        let mode = if along_route { SelectionMode::Departure } else { SelectionMode::FreeDeparture };
+        self.select_mode(snapshot, config, reference, position, yaw, previous, pose_goal, mode)
+    }
+
     pub(crate) fn select(
         &mut self,
         snapshot: &CollisionSnapshot,
@@ -162,6 +200,20 @@ impl Sampler {
         yaw: f64,
         previous: Twist2,
         pose_goal: Option<PoseGoal<'_>>,
+    ) -> Option<Selection> {
+        self.select_mode(snapshot, config, reference, position, yaw, previous, pose_goal, SelectionMode::Follow)
+    }
+
+    fn select_mode(
+        &mut self,
+        snapshot: &CollisionSnapshot,
+        config: &Config,
+        reference: &Route,
+        position: [f64; 3],
+        yaw: f64,
+        previous: Twist2,
+        pose_goal: Option<PoseGoal<'_>>,
+        mode: SelectionMode,
     ) -> Option<Selection> {
         let (arc, nearest) = reference.nearest(position);
         let lookahead = LOOKAHEAD_MIN_M.max(PREDICTION_SECONDS * config.max_velocity);
@@ -247,6 +299,23 @@ impl Sampler {
             }
         }
         let angular = samples(min_yaw, max_yaw, previous.angular_z, ANGULAR_INTERVALS);
+        // 重规划后的出发候选必须沿路线产生可分辨的平移。
+        let distance_to_route = |point: [f64; 3], projection: [f64; 3]| {
+            (point[0] - projection[0]).hypot(point[1] - projection[1])
+        };
+        let departure_progress = if matches!(mode, SelectionMode::Departure | SelectionMode::FreeDeparture) {
+            let to_route = distance_to_route(position, nearest);
+            let largest_step = translations.iter().map(|v| v.x.hypot(v.y)).fold(0., f64::max);
+            let measurable = (largest_step * PREDICTION_SECONDS).min(config.resolution);
+            let measurable = if mode == SelectionMode::Departure {
+                measurable.min(reference.length() - arc + to_route)
+            } else {
+                measurable
+            };
+            Some((to_route, measurable))
+        } else {
+            None
+        };
         self.poses.clear();
         for &linear in &translations {
             for &w in &angular {
@@ -276,14 +345,43 @@ impl Sampler {
                 continue;
             }
             let endpoint = self.poses[(index + 1) * PREDICTION_STEPS - 1];
+            if let Some((to_route, measurable)) = departure_progress {
+                let end = [endpoint[0], endpoint[1], endpoint[2]];
+                let advance = if mode == SelectionMode::Departure {
+                    let (end_arc, end_projection) = reference.nearest(end);
+                    end_arc - arc + to_route - distance_to_route(end, end_projection)
+                } else {
+                    // 退出只要求当前位置能安全移动，全局规划负责从这里另选路线。
+                    distance_to_route(end, position)
+                };
+                if advance <= 0. || advance < measurable {
+                    continue;
+                }
+            }
             let clearance = samples
                 .iter()
                 .map(|sample| sample.clearance)
                 .fold(f64::INFINITY, f64::min);
             let speed_fraction =
                 linear.x.hypot(linear.y) / config.max_velocity.max(config.max_reverse_velocity);
-            let score = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1])
-                + config.body_length / 2. * angle_delta(heading, endpoint[3]).abs()
+            let position_error = (endpoint[0] - target[0]).hypot(endpoint[1] - target[1]);
+            let yaw_error = angle_delta(heading, endpoint[3]).abs();
+            let executable_progress = if mode == SelectionMode::Retreat {
+                // 死区内的一拍仍可用于加速，优先选朝参考位姿接近可执行速度的候选。
+                let ratio = |gain: f64, minimum: f64| {
+                    if minimum > 0. {
+                        (gain / (PREDICTION_SECONDS * minimum)).clamp(0., 1.)
+                    } else {
+                        0.
+                    }
+                };
+                ratio(delta[0].hypot(delta[1]) - position_error, config.min_executable_linear_mps)
+                    .max(ratio(angle_delta(heading, yaw).abs() - yaw_error, config.min_executable_angular_rps))
+            } else {
+                0.
+            };
+            let score = position_error
+                + config.body_length / 2. * yaw_error
                 + CLEARANCE_WEIGHT * (config.obstacle_clearance_m - clearance).max(0.)
                 + if self.terminal {
                     0.
@@ -292,6 +390,7 @@ impl Sampler {
                 };
             ranked.push(Candidate {
                 remaining_overlap: samples.last().unwrap().depth,
+                executable_progress,
                 score,
                 same_turn: w * previous.angular_z > 0.,
                 index,
@@ -302,6 +401,7 @@ impl Sampler {
         ranked.sort_by(|a, b| {
             a.remaining_overlap
                 .total_cmp(&b.remaining_overlap)
+                .then_with(|| b.executable_progress.total_cmp(&a.executable_progress))
                 .then_with(|| a.score.total_cmp(&b.score))
                 .then_with(|| b.same_turn.cmp(&a.same_turn))
         });
@@ -309,6 +409,7 @@ impl Sampler {
         self.refined_samples.clear();
         let radius = (config.body_length / 2. + config.body_center_x.abs())
             .hypot(config.body_width / 2. + config.body_center_y.abs());
+        let mut stop = None;
         for Candidate { index, linear, w, .. } in ranked {
             let coarse = &self.poses[index * PREDICTION_STEPS..(index + 1) * PREDICTION_STEPS];
             self.refined_poses.clear();
@@ -342,26 +443,45 @@ impl Sampler {
             {
                 continue;
             }
+            if mode == SelectionMode::Retreat && self.refined_poses.iter().any(|&[x, y, z, _]| {
+                let position = [x, y, z];
+                squared_distance(reference.nearest(position).1, position) > config.resolution.powi(2)
+            }) {
+                continue;
+            }
             if let Some(surface) = terminal_surface.filter(|_| self.terminal) {
                 if !has_observed_support(surface, config, &self.refined_poses) {
                     continue;
                 }
                 self.supported_terminal = true;
             }
-            return Some(Selection {
+            let selection = Selection {
                 command: Twist2 {
                     linear,
                     angular_z: w,
                 },
                 poses: coarse.iter().map(|p| [p[0], p[1], p[2]]).collect(),
-            });
+                only_stop: false,
+            };
+            if selection.command == Twist2::ZERO {
+                if mode == SelectionMode::Follow {
+                    stop = Some(selection);
+                }
+                continue;
+            }
+            return Some(stop.unwrap_or(selection));
+        }
+        if let Some(mut selection) = stop {
+            // 零速可能只是最优分，也可能是唯一能通过扫掠的候选。
+            selection.only_stop = true;
+            return Some(selection);
         }
         // 缺少安全圆弧时仍发原零速。已观测末段在停车后用新的速度窗继续采样。
-        if let Some(surface) = terminal_surface.filter(|_| self.terminal && previous != Twist2::ZERO) {
+        if let Some(surface) = terminal_surface.filter(|_| mode == SelectionMode::Follow && self.terminal && previous != Twist2::ZERO) {
             let [x, y, z] = position;
             if has_observed_support(surface, config, &[[x, y, z, yaw]]) {
                 self.supported_terminal = true;
-                return Some(Selection { command: Twist2::ZERO, poses: vec![position] });
+                return Some(Selection { command: Twist2::ZERO, poses: vec![position], only_stop: false });
             }
         }
         None

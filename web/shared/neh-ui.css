@@ -458,6 +458,9 @@ button.n-row:hover, a.n-row:hover, .n-row--hover:hover { background: var(--surfa
 .n-float-btn:hover { background: color-mix(in srgb, var(--glass-ink) 10%, transparent); }
 .n-float-btn[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--glass-ink); }
 .n-tone-dark .n-float-btn[aria-pressed="true"] { background: rgba(112,227,196,.18); color: var(--mint); }
+/* 独立浮层按钮（自身带 n-float）：保留浮层的玻璃底与描边，悬停时在玻璃底上加深一点。 */
+.n-float.n-float-btn { background: var(--glass); border: 1px solid var(--glass-line); }
+.n-float.n-float-btn:hover { background: color-mix(in srgb, var(--glass-ink) 6%, var(--glass)); }
 .n-float-sep { width: 1px; align-self: stretch; margin: 6px 2px; background: var(--glass-line); }
 .n-float-stack { display: grid; padding: 3px; gap: 2px; }
 .n-float-row { display: flex; align-items: center; padding: 3px; gap: 2px; }

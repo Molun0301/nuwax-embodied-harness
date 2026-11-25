@@ -306,6 +306,8 @@ class RoomSegmentationService:
         old_links = defaultdict(list)
         work_cells = 0
         for old in existing_spaces:
+            if old.review_status is SceneSpaceReviewStatus.STALE:
+                continue
             if old.map_name != scope["map_name"] or old.frame_id != scope["frame_id"] or old.boundary is None:
                 continue
             geometry = old.boundary.metadata.get(_GEOMETRY_KEY)

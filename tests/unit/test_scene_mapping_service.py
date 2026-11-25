@@ -263,6 +263,34 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
 
 
 
+
+def test_cold_resegmentation_ignores_retired_matching_room(setup):
+    from contracts.naming import build_scene_space_id
+    from contracts.spatial_memory import SceneSpaceReviewStatus
+
+    setup.backend.winner = "kitchen"
+    for x in (2, 3):
+        remember(setup, x)
+    active_id, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    active, = setup.memory.records("scene_space")
+    retired = active.model_copy(update={
+        "scene_space_id": build_scene_space_id("geometry", timestamp=utc_now(), suffix="000000ab"),
+        "review_status": SceneSpaceReviewStatus.STALE,
+        "primary_label": None,
+    })
+    setup.memory.write(lambda store: store.put("scene_space", retired))
+    setup.view.advance()
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        service.run_once(apply_labels=False)
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert (node["node_id"], node["name"]) == (active_id, active.primary_label)
+    finally:
+        service.close()
+        memory.close()
+
 def test_cold_restore_keeps_room_when_same_grid_is_republished(setup):
     for x in (2, 3):
         remember(setup, x)

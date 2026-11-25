@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 using Eigen::Vector3d;
@@ -382,13 +383,33 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
 extern "C" void nuwax_scan_free(ScanOutput* out){std::free(out->samples);out->samples=nullptr;out->sample_count=0;}
 
 extern "C" void nuwax_scan_sample_poses(const void* snapshot,const ScanConfig* c,const double* poses,
-    size_t count, ScanBodySample* output, CollisionEvidence* evidence, uint32_t measure_clearance) {
+    size_t count, ScanBodySample* output, CollisionEvidence* evidence, uint32_t measure_clearance,
+    const double* overlap_start) {
   const CollisionEvidenceScope capture(evidence);
   GridMap map;
   map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
   std::vector<GridMap::BodyCell> contacts;
   const double r=c->resolution, hx=c->body_length/2., hy=c->body_width/2.;
   const double low_offset=std::max(c->max_step_up,r)-c->body_to_ground;
+  const auto horizontalDepth=[&](const double* pose) {
+    const double cs=std::cos(pose[3]), sn=std::sin(pose[3]), ac=std::abs(cs), as=std::abs(sn);
+    const double x=pose[0]+cs*c->body_center_x-sn*c->body_center_y;
+    const double y=pose[1]+sn*c->body_center_x+cs*c->body_center_y;
+    return [=](const GridMap::BodyCell& cell) {
+      const double dx=(cell.x+.5)*r-x, dy=(cell.y+.5)*r-y;
+      return std::min({
+        ac*hx+as*hy+r/2.-std::abs(dx), as*hx+ac*hy+r/2.-std::abs(dy),
+        hx+r/2.*(ac+as)-std::abs(cs*dx+sn*dy), hy+r/2.*(ac+as)-std::abs(-sn*dx+cs*dy),
+      });
+    };
+  };
+  std::map<GridMap::BodyCell,double> initial_depths;
+  if(overlap_start && map.bodyContacts(
+      Vector3d(overlap_start[0],overlap_start[1],overlap_start[2]),overlap_start[3],
+      0.,&contacts)==1) {
+    const auto depth=horizontalDepth(overlap_start);
+    for(const auto& cell:contacts) initial_depths.emplace(cell,depth(cell));
+  }
   for(size_t i=0;i<count;++i) {
     const auto* pose=poses+i*4;
     const Vector3d point(pose[0],pose[1],pose[2]);
@@ -400,24 +421,20 @@ extern "C" void nuwax_scan_sample_poses(const void* snapshot,const ScanConfig* c
       if(measure_clearance) sample.clearance=map.bodyFieldClearance(point,yaw,std::max(.20,c->obstacle_clearance_m));
       continue;
     }
-    // 最深的接触按矩形分离轴和竖向碰撞带的最小退出距离度量。
-    // 业务约束与图外由碰撞查询单独返回，始终不可穿过。
+    // 高度带决定格子是否接触，已有接触按各格的平面退出距离检查方向。
+    // 参考线高度起伏不能让向外走的动作被误判向内，也不能放过新接触。
     sample.occupied=map.bodyContacts(point,yaw,0.,&contacts,nullptr,false);
     if(sample.occupied!=1) continue;
-    const double cs=std::cos(yaw), sn=std::sin(yaw), ac=std::abs(cs), as=std::abs(sn);
-    const double x=point.x()+cs*c->body_center_x-sn*c->body_center_y;
-    const double y=point.y()+sn*c->body_center_x+cs*c->body_center_y;
+    const auto horizontal=horizontalDepth(pose);
     const double low=point.z()+low_offset, high=point.z()+c->body_z_max;
     for(const auto& cell:contacts) {
-      const double dx=(cell.x+.5)*r-x, dy=(cell.y+.5)*r-y;
       const double bottom=cell.surface?cell.low:cell.z*r;
       const double top=cell.surface?cell.high:(cell.z+1.)*r;
-      const double depth=std::min({
-        ac*hx+as*hy+r/2.-std::abs(dx), as*hx+ac*hy+r/2.-std::abs(dy),
-        hx+r/2.*(ac+as)-std::abs(cs*dx+sn*dy), hy+r/2.*(ac+as)-std::abs(-sn*dx+cs*dy),
-        high-bottom, top-low,
-      });
-      sample.depth=std::max(sample.depth,depth);
+      const double depth=horizontal(cell);
+      sample.depth=std::max(sample.depth,std::min({depth,high-bottom,top-low}));
+      const auto initial=initial_depths.find(cell);
+      constexpr double rounding=64.*std::numeric_limits<double>::epsilon();
+      if(initial==initial_depths.end() || depth>initial->second+rounding) sample.worsened=1;
     }
   }
 }

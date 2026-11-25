@@ -81,6 +81,60 @@ fn dense_raw_retraction_keeps_using_free_evidence_for_unconfirmed_points() {
     assert!(map.dense.snapshot(2, 2, "稠密撤销").is_none());
 }
 
+#[tokio::test]
+async fn loaded_map_retracts_observed_empty_voxel_after_localization_allows_writes() {
+    use crate::mapper::{Mapper, MapperConfig};
+    let mut original = immediate_map(977);
+    let original_stamp = 1_000_000_000;
+    let ghost = Point3::new(2.025, 0.025, 0.625);
+    let wall = Point3::new(7.975, 0.025, 0.625);
+    let origin = crate::dynamic_scene::tests::ORIGIN;
+    original.fine.accumulate(977, "雷达", 1, &[ghost, wall], origin, original_stamp,
+        Some(MappedFrame::unfiltered())).unwrap();
+    original.accumulate_display(&[ghost, wall], original_stamp).unwrap();
+    original.commit(original_stamp).unwrap();
+
+    let config = MapperConfig {
+        confirmation: MappingConfirmationConfig::go2_defaults_for_test(),
+        ..MapperConfig::default()
+    };
+    let source = Mapper::start(977, MapperConfig::default()).unwrap();
+    source.feed(crate::mapper::tests::room_frame(977, original_stamp));
+    let mut baseline = source.snapshot().await.unwrap();
+    source.shutdown().await.unwrap();
+    baseline.cloud = original.snapshot();
+    let loaded = Mapper::load(978, config, baseline, true).unwrap();
+    let mut map_updates = loaded.map_rx();
+    map_updates.borrow_and_update();
+
+    let (points, _) = crate::dynamic_scene::tests::corridor(None, 0.);
+    let mut frame = crate::mapper::tests::room_frame(978, 2_000_000_000);
+    frame.points_body = points.iter().map(|p| p.coords.into()).collect();
+    loaded.feed(frame.clone());
+    assert_eq!(loaded.snapshot().await.unwrap().cloud.display, original.snapshot().display);
+    assert!(!map_updates.has_changed().unwrap());
+
+    loaded.update_transform(Some(Isometry3::identity()), Some(true)).await.unwrap();
+    frame.odom_pose.timestamp_ns += 1_000_000_000;
+    let stamp = frame.odom_pose.timestamp_ns;
+    loaded.feed(frame);
+    let updated = loaded.snapshot().await.unwrap();
+
+    assert!(map_updates.has_changed().unwrap());
+    assert_eq!(map_updates.borrow().as_ref().unwrap().meta.as_ref().unwrap().timestamp_ns, original_stamp);
+    assert_eq!(updated.cloud.display.len(), 12);
+    let surface = updated.cloud.fine.unwrap();
+    assert_eq!(surface.manifest().source_timestamp_ns, stamp);
+    let mut reader = nuwax_map_chunks::RegionReader::new(surface.repository.clone(), 1024 * 1024);
+    for (point, present) in [(ghost, false), (wall, true)] {
+        let key = voxel_key(point.coords.into(), VOXEL_SIZE).unwrap();
+        let key3 = [key.0, key.1, key.2];
+        let occupied = reader.region(surface.manifest(), key3, key3, 1).unwrap();
+        assert_eq!(occupied.len(), usize::from(present));
+    }
+    loaded.shutdown().await.unwrap();
+}
+
 #[test]
 fn recording_budget_stops_open_scan_and_progress_writes_while_accumulation_continues() {
     for stage in ["open", "scan", "progress"] {

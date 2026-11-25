@@ -198,12 +198,14 @@ pub struct BodySample {
     pub clearance: f64,
     pub depth: f64,
     pub occupied: i32,
+    pub worsened: i32,
 }
 
 extern "C" {
     fn nuwax_scan_sample_poses(
         map: *const c_void, config: *const Config, poses: *const f64, count: usize,
         output: *mut BodySample, evidence: *mut CollisionEvidence, measure_clearance: u32,
+        overlap_start: *const f64,
     );
     fn nuwax_scan_clearance_speed_cap(config: *const Config, clearance: f64) -> f64;
     fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
@@ -425,27 +427,31 @@ impl CollisionSnapshot {
     pub fn sample_poses(
         &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
         evidence: Option<&mut CollisionEvidence>,
+        overlap_start: Option<&[f64; 4]>,
     ) {
-        self.query_bodies(config, poses, output, evidence, true);
+        self.query_bodies(config, poses, output, evidence, true, overlap_start);
     }
 
     /// 加密复核只读碰撞与穿透深度，排序所需的净空已在粗查计算。
     pub fn check_poses(
         &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
         evidence: Option<&mut CollisionEvidence>,
+        overlap_start: Option<&[f64; 4]>,
     ) {
-        self.query_bodies(config, poses, output, evidence, false);
+        self.query_bodies(config, poses, output, evidence, false, overlap_start);
     }
 
     fn query_bodies(
         &self, config: &Config, poses: &[[f64; 4]], output: &mut [BodySample],
         evidence: Option<&mut CollisionEvidence>, measure_clearance: bool,
+        overlap_start: Option<&[f64; 4]>,
     ) {
         let count = poses.len().min(output.len());
         unsafe {
             nuwax_scan_sample_poses(self.0.0.as_ptr(), config, poses.as_ptr().cast(), count,
                 output.as_mut_ptr(), evidence.map_or(std::ptr::null_mut(), |value| value),
-                u32::from(measure_clearance));
+                u32::from(measure_clearance),
+                overlap_start.map_or(std::ptr::null(), |pose| pose.as_ptr()));
         }
     }
     pub fn affects(&self, previous: &Self, trajectory: &Trajectory, from: f64) -> bool {

@@ -219,6 +219,7 @@ pub(crate) struct CloudMap {
     fine: FineCloud,
     dense: DenseCloud,
     dufo: OnlineDufo,
+    loaded_clear_dufo: OnlineDufo,
     voxels: VoxelIndex,
     pages: PagedVoxelSnapshot,
     voxel_size: f32,
@@ -320,6 +321,7 @@ impl CloudMap {
             fine,
             dense,
             dufo: Default::default(),
+            loaded_clear_dufo: Default::default(),
             voxels,
             pages,
             voxel_size: size,
@@ -374,14 +376,15 @@ impl CloudMap {
             updates.expire(stamp);
             return Ok(None);
         }
+        // 只有取得定位写入许可的扫描才累积旧图撤销证据。未获许可的近期分类
+        // 仍实时运行，其已见空域不能提前消耗一次性的撤销增量。
+        let (mut classified, _) = self.loaded_clear_dufo.observe(points, origin, stamp, Isometry3::identity())?;
         let confirmed: Vec<_> = updates.select(points, static_indices.iter().copied(), stamp)
             .into_iter().map(|index| points[index as usize]).collect();
-        if confirmed.is_empty() {
+        if confirmed.is_empty() && !classified.has_clears() {
             return Ok(None);
         }
-        // 这些点已做过完整帧的动静判定。零时间的空查询交付无撤销的分类结果，
-        // 让精细层和建图内核复用同一路径，加载图不接收空域撤销。
-        let (classified, _) = self.dufo.observe(&[], origin, 0, Isometry3::identity())?;
+        classified.bind_points(points, static_indices);
         self.fine.accumulate(
             self.session_id,
             &frame.sensor_id,
@@ -391,6 +394,13 @@ impl CloudMap {
             stamp,
             Some(classified.clone()),
         )?;
+        for key in self.fine.removed_keys() {
+            updates.base.remove(key);
+        }
+        if confirmed.is_empty() && self.fine.removed_keys().is_empty() {
+            return Ok(None);
+        }
+        self.remove_cleared_display(points, &classified)?;
         self.accumulate_display(&confirmed, stamp)?;
         Ok(Some((confirmed, classified)))
     }
@@ -447,6 +457,22 @@ impl CloudMap {
         self.dense.append(&retained)?;
         let admitted: Vec<_> = admitted_indices.into_iter()
             .map(|index| points[index as usize]).collect();
+        self.remove_cleared_display(points, &dynamic)?;
+        if !admitted.is_empty() || !self.fine.removed_keys().is_empty() {
+            self.accumulate_display(&admitted, stamp)?;
+        }
+        self.poses
+            .push((stamp, isometry_matrix(&(map_from_odom * odom))));
+        self.record(sequence, frame, map_from_odom)?;
+        Ok(BuildingObservation {
+            dynamic,
+            static_indices: indices,
+            ground_indices,
+            admitted,
+        })
+    }
+
+    fn remove_cleared_display(&mut self, points: &[Point3<f64>], dynamic: &MappedFrame) -> Result<(), String> {
         let hits: ahash::AHashSet<_> = points
             .iter()
             .filter_map(|p| voxel_key([p.x, p.y, p.z], self.voxel_size))
@@ -463,18 +489,7 @@ impl CloudMap {
             self.voxels.remove(&key);
             self.pages.removed(key, CM_MAX_POINTS);
         }
-        if !admitted.is_empty() || !self.fine.removed_keys().is_empty() {
-            self.accumulate_display(&admitted, stamp)?;
-        }
-        self.poses
-            .push((stamp, isometry_matrix(&(map_from_odom * odom))));
-        self.record(sequence, frame, map_from_odom)?;
-        Ok(BuildingObservation {
-            dynamic,
-            static_indices: indices,
-            ground_indices,
-            admitted,
-        })
+        Ok(())
     }
 
     pub(crate) fn has_retractions(&self) -> bool {

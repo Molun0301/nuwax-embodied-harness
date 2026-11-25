@@ -41,10 +41,11 @@ function readStageColors() {
   for (const [key, name] of STAGE_COLOR_VARS) COLORS[key] = Number.parseInt(css.getPropertyValue(name).trim().slice(1), 16);
 }
 readStageColors();
-// 浅色舞台上，点云的基础、地面、结构、物体色（配置值按深色背景取的浅色）向深色混合 55%；高度色在两种背景上都清楚，不调整。
+// 浅色舞台上，点云的基础、地面、结构、物体色（配置值按深色背景取的浅色）向深色混合 65%，四种默认色对亮色舞台底色的对比度都在 3:1 以上；
+// 高度色只有一套，默认值取明度相同、只换色相的五种颜色，对亮暗两种舞台底色的对比度都在 3:1 以上，不随主题调整。
 function stagePointColor(rgb) {
   if (!stageCss() || document.documentElement.dataset.theme === 'dark') return rgb;
-  return rgb.map((value, index) => Math.round(value * 0.45 + [27, 38, 44][index] * 0.55));
+  return rgb.map((value, index) => Math.round(value * 0.35 + [27, 38, 44][index] * 0.65));
 }
 // 点的顶点颜色按线性值参与显示，配置里的颜色是网页常用的 sRGB 写法：原样交给顶点会显示得比写的浅一截
 // （深色背景上不明显，浅色背景上整片发白）。换成线性值后，显示出来就是配置的颜色。
@@ -60,11 +61,12 @@ const DEFAULT_POINT_STYLE = 'height';
 // 导航双击选点：两次按下间隔与位移上限，与常见系统双击判定相当。
 const NAVIGATION_DOUBLE_CLICK_MS = 500;
 const NAVIGATION_CLICK_PIXELS = 6;
+// 点不透明、无雾化，显示色与配置一致；1.35 像素的点在 0.1 米采样下只盖住约三成画面，其余露出舞台底色，看上去整片发浅，默认改为 2 像素。
 const DEFAULT_POINTCLOUD3D_CONFIG = Object.freeze({
   spacingM: 0.1,
-  size: 1.35,
+  size: 2,
   color: '#cbd5e1',
-  heightColors: Object.freeze(['#2f6690', '#1f7f95', '#1e8c7e', '#5e8f35', '#9c7420']),
+  heightColors: Object.freeze(['#1a6cc6', '#027786', '#017d38', '#896604', '#c04020']),
   groundColor: '#38bdf8',
   structureColor: '#f8fafc',
   objectColor: '#fbbf24',
@@ -1399,6 +1401,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
           size: POINT_STYLE_PRESETS.full.size,
           onChange: state => this._applyDenseCloudState(state),
         });
+        this._denseCloud.setHeightStops(HEIGHT_COLOR_STOPS);
         this._scene.add(this._denseCloud.group);
       }
       this._denseCloud.setDisplaySource(this._denseSourceSuspended ? null : this._pointCloudMapWatermark?.header || null);
@@ -2704,7 +2707,10 @@ class PointCloud3DViewer extends PointCloudProcessor {
     // 旧工作线程结果不能覆盖新样式，保留点云和相机，只重新计算显示数据。
     this._invalidatePointCloudWork();
     this._cloudContextKey = null;
-    if (this._denseCloud) this._denseCloud.material.size = POINT_STYLE_PRESETS.full.size;
+    if (this._denseCloud) {
+      this._denseCloud.material.size = POINT_STYLE_PRESETS.full.size;
+      this._denseCloud.setHeightStops(HEIGHT_COLOR_STOPS);
+    }
     this._rebuildPointCloud();
     this._requestRender();
   }

@@ -42,7 +42,6 @@ export function mountNav(root, ctx) {
   /* ================= 选点 ================= */
   const pick = { active: false, taskId: null, pendingPose: null, submittedPose: null, submittedGoalId: null, submitting: false };
   const pickStatus = h('p', { class: 'c-status-line', role: 'status' });
-  const pickDetail = h('p', { class: 'n-meta' });
   const heightInput = h('input', { class: 'n-input n-num', type: 'number', step: 'any', inputmode: 'decimal', placeholder: '留空使用当前定位高度' });
   const pickCard = h('div');
   const submitLabel = h('span', {});
@@ -50,7 +49,7 @@ export function mountNav(root, ctx) {
   submitBtn.append(submitLabel);
   pages.pick.append(pickCard,
     h('label', { class: 'n-field c-field-gap', title: '目标在地图中的机体 Z 坐标，不是物品中心或脚下地面高度' }, h('span', { class: 'n-label' }, '目标机体高度（米）'), heightInput),
-    submitBtn, pickStatus, pickDetail);
+    submitBtn, pickStatus);
   function setPickStatus(text, level = '') { pickStatus.textContent = text; pickStatus.dataset.level = level; }
   function regionLabelAt(x, y) {
     const inside = (poly) => { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
@@ -113,12 +112,11 @@ export function mountNav(root, ctx) {
       pick.submittedGoalId = task.data.goal_id;
       window.dispatchEvent(new CustomEvent('navigation:submitted-goal', { detail: { goal_id: pick.submittedGoalId } }));
     }
-    pickDetail.textContent = task.message;
+    // 执行中的消息由下方“正在执行”任务块显示，状态行只写结束时的结果。
+    if (!isTerminalTaskState(task.state)) { setPickStatus(''); return; }
     setPickStatus(task.message, task.state === 'failed' || task.state === 'timed_out' ? 'error' : '');
-    if (isTerminalTaskState(task.state)) {
-      pick.taskId = null;
-      if (pick.pendingPose === pick.submittedPose) clearPick();
-    }
+    pick.taskId = null;
+    if (pick.pendingPose === pick.submittedPose) clearPick();
   }
   // 三维：pointcloud3d.js 自己处理双击与拖动，选中后发事件。
   window.addEventListener('pointcloud3d:navigation-pick', event => {
@@ -231,8 +229,8 @@ export function mountNav(root, ctx) {
     const state = normalizeTaskState(task.state);
     const runningNow = !isTerminalTaskState(state);
     namedCancel.disabled = !runningNow || state === 'cancelling';
-    const pct = Number.isFinite(Number(task.progress)) ? ' ' + Math.round(Number(task.progress) * 100) + '%' : '';
-    if (runningNow) namedSay('前往「' + named.target + '」：' + task.message + pct);
+    // 执行中的消息与进度由“正在执行”任务块显示，状态行只写结束时的结果。
+    if (runningNow) namedSay('');
     else if (state === 'succeeded') namedSay('已到达「' + named.target + '」' + (task.result?.verification ? '并完成核对' : '') + '。');
     else namedSay('前往「' + named.target + '」' + (state === 'cancelled' ? '已取消：' : '失败：') + task.message, 'error');
     if (!runningNow) named.taskId = null;
@@ -278,7 +276,7 @@ export function mountNav(root, ctx) {
       }
       const reply = await api.invoke('explore_area_v2', args);
       ex.taskId = reply.task.task_id; ex.loadedCheckpoint = null;
-      exSay(reply.task.message);
+      applyExploreTask(reply.task);
     } catch (error) { exSay(error.message, 'error'); }
     finally { ex.busy = false; exStart.disabled = false; }
   }
@@ -308,7 +306,9 @@ export function mountNav(root, ctx) {
     if (saved?.paused) {
       exSay('已停止探索并保存地图和进度。');
       if (ex.loadedCheckpoint !== saved.checkpoint_id) { ex.loadedCheckpoint = saved.checkpoint_id; loadCheckpoints(); }
-    } else exSay(task.message, ['failed', 'timed_out'].includes(task.state) ? 'error' : '');
+    } else if (isTerminalTaskState(task.state)) exSay(task.message, ['failed', 'timed_out'].includes(task.state) ? 'error' : '');
+    // 执行中的消息由上方任务块显示。
+    else exSay('');
   }
 
   /* ================= 跨楼层 ================= */
@@ -364,14 +364,16 @@ export function mountNav(root, ctx) {
   function renderFloorTask() {
     if (!fl.task) { flDetail.hidden = true; floorButtons(); return; }
     const t = fl.task, data = t.data || {};
-    const lines = ['任务：' + t.task_id, '功能：' + t.capability, '阶段：' + t.stage, '进度：' + Math.round(t.progress * 100) + '%', t.message];
+    const lines = ['任务：' + t.task_id, '功能：' + t.capability, '阶段：' + t.stage, '进度：' + Math.round(t.progress * 100) + '%'];
     if (data.floor_id) lines.push('楼层：' + data.floor_id);
     if (data.completed_floors) lines.push('已保存楼层：' + data.completed_floors.join('、'));
     if (t.error_code) lines.push('错误码：' + t.error_code);
     if (t.result) lines.push(JSON.stringify(t.result, null, 2));
     flDetail.textContent = lines.join('\n');
     flDetail.hidden = false;
-    flSay(FLOOR_STATES[normalizeTaskState(t.state)] || t.state, ['failed', 'timed_out'].includes(t.state) ? 'error' : '');
+    // 执行中的消息由“正在执行”任务块显示；结束后写在状态行，详情不再重复。
+    const label = FLOOR_STATES[normalizeTaskState(t.state)] || t.state;
+    flSay(isTerminalTaskState(t.state) && t.message ? label + '：' + t.message : label, ['failed', 'timed_out'].includes(t.state) ? 'error' : '');
     floorButtons();
   }
   async function submitFloor(explore) {

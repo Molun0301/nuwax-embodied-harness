@@ -53,22 +53,23 @@ function extendPointCloudBounds(bounds, positions) {
   }
 }
 
-function createMaterial(size) {
+function createMaterial(size, heightStops) {
   const material = new THREE.PointsMaterial({ size, sizeAttenuation: false });
-  // 与对照页相同的高度色相；直接在顶点着色器计算，避免每点再存一份颜色数组。
+  // 与其它点云样式共用配置的高度色（线性值）；直接在顶点着色器按高度插值，避免每点再存一份颜色数组。
   material.onBeforeCompile = shader => {
-    shader.vertexShader = `varying vec3 denseColor;\n${shader.vertexShader}`;
+    const count = heightStops.value.length;
+    shader.uniforms.denseStops = heightStops;
+    shader.vertexShader = `uniform vec3 denseStops[${count}];\nvarying vec3 denseColor;\n${shader.vertexShader}`;
     shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `
       #include <begin_vertex>
-      float denseHeight = clamp((position.z + 0.5) / 4.0, 0.0, 1.0);
-      float denseHue = 0.62 - denseHeight * 0.6;
-      vec3 denseRgb = clamp(abs(fract(vec3(denseHue) + vec3(0.0, 2.0/3.0, 1.0/3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
-      denseColor = vec3(0.62) + 0.68 * (denseRgb - 0.5) * 0.76;
+      float denseT = clamp((position.z + 0.5) / 4.0, 0.0, 1.0) * ${count - 1}.0;
+      denseColor = denseStops[${count - 1}];
+      ${Array.from({ length: count - 1 }, (_, i) => `if (denseT >= ${i}.0 && denseT <= ${i + 1}.0) denseColor = mix(denseStops[${i}], denseStops[${i + 1}], denseT - ${i}.0);`).join('\n')}
     `);
     shader.fragmentShader = `varying vec3 denseColor;\n${shader.fragmentShader}`;
     shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', 'diffuseColor.rgb *= denseColor;');
   };
-  material.customProgramCacheKey = () => 'dense-height-v1';
+  material.customProgramCacheKey = () => `dense-height-stops-${heightStops.value.length}`;
   return material;
 }
 
@@ -77,7 +78,8 @@ export class DensePointCloudLayer {
     this.group = new THREE.Group();
     this.group.name = 'complete-scan-pointcloud';
     this.group.visible = false;
-    this.material = createMaterial(size);
+    this.heightStops = { value: [] };
+    this.material = createMaterial(size, this.heightStops);
     this.onChange = onChange;
     this.fetchChunk = fetchChunk;
     this.count = 0;
@@ -90,6 +92,11 @@ export class DensePointCloudLayer {
     this._serial = 0;
     this._timer = null;
     this._abort = null;
+  }
+
+  /* 高度色为线性 0—255 值（与其它点云样式相同），只换数值不重编译。 */
+  setHeightStops(stops) {
+    this.heightStops.value = stops.map(color => new THREE.Vector3(...color.map(channel => channel / 255)));
   }
 
   append({ positions, total, metadata, ranges = [] }) {

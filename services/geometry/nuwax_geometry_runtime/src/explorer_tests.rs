@@ -245,6 +245,49 @@ fn feedback(explorer: &mut Explorer, id: String, status: proto::GoalStatus) {
         })
         .unwrap();
 }
+
+#[test]
+fn completion_return_dispatches_home_without_full_motion_calibration() {
+    for surface_mode in [false, true] {
+        let mut explorer = make_explorer("住宅".into(), "map".into(), surface_mode).unwrap();
+        let mut start = request();
+        start.stop_conditions = Some(proto::ExplorationStopConditions {
+            max_goals: Some(0),
+            ..Default::default()
+        });
+        start.return_policy = Some(proto::ExplorationReturnPolicy {
+            return_on_completion: true,
+            ..Default::default()
+        });
+        explorer.start("完成后返航".into(), start).unwrap();
+        let home = pose();
+        let returning = explorer
+            .tick(Some(home.clone()), Some(grid()), Ok(floor(|_, _| false)), Ok(()))
+            .unwrap();
+        let (id, target) = returning.goal.expect("应派发回到实测起点的导航");
+        assert!(returning.status.returning);
+        assert_eq!(target.pose.unwrap().position, home.position);
+        feedback(&mut explorer, id, proto::GoalStatus::Succeeded);
+        assert_eq!(explorer.status("").phase, proto::ExplorationPhase::Succeeded as i32);
+    }
+}
+
+#[test]
+fn only_planar_distance_budget_requires_full_motion_calibration() {
+    let mut start = request();
+    start.return_policy = Some(proto::ExplorationReturnPolicy {
+        maximum_distance_m: Some(20.),
+        ..Default::default()
+    });
+    let mut planar = make_explorer("住宅".into(), "map".into(), false).unwrap();
+    assert_eq!(
+        planar.start("二维预算".into(), start.clone()).unwrap_err().message(),
+        "返航需要导航运动标定"
+    );
+    let mut surface = make_explorer("住宅".into(), "map".into(), true).unwrap();
+    surface.start("三维预算".into(), start).unwrap();
+}
+
 #[test]
 fn max_goals_waits_for_active_child_terminal_before_stopping() {
     let mut explorer = started_with_max_goals(1);

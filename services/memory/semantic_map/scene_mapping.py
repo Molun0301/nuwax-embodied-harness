@@ -64,7 +64,8 @@ class SceneMappingService:
         self._segmenter = RoomSegmentationService(min_area_m2=config.min_area_m2,
                                                  doorway_width_m=config.doorway_width_m,
                                                  max_cells=config.max_cells)
-        self.graph = SceneGraphService(memory_service=self.memory, max_cells=config.max_cells)
+        self.graph = SceneGraphService(memory_service=self.memory, max_cells=config.max_cells,
+                                       segmenter=self._segmenter)
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._stop = threading.Event()
@@ -368,9 +369,12 @@ class SceneMappingService:
             self.stream_bus.publish("memory.scene_spaces", source="scene_mapping_service", payload=self.get_map(), status="available")
 
 
+    def capture_partition(self):
+        return self.memory.capture_scene_partition(segmenter=self._segmenter)
+
     def update_label(self, **arguments):
         """网页和智能体显式命名与模型提交共享通知出口。"""
-        result = self.memory.update_scene_mapping_label(**arguments)
+        result = self.memory.update_scene_mapping_label(segmenter=self._segmenter, **arguments)
         self._publish_map()
         return result
 

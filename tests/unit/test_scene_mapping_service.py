@@ -291,6 +291,26 @@ def test_cold_resegmentation_ignores_retired_matching_room(setup):
         service.close()
         memory.close()
 
+
+def test_cold_scene_graph_reads_saved_name_with_changed_free_cells(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    saved, = setup.memory.records("scene_space")
+    setup.view.cells[8, 8] = 100
+    setup.view.advance()
+
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert (node["node_id"], node["name"]) == (accepted, saved.primary_label)
+        assert list(memory.records("scene_space")) == [saved]
+    finally:
+        service.close()
+        memory.close()
+
 def test_cold_restore_keeps_room_when_same_grid_is_republished(setup):
     for x in (2, 3):
         remember(setup, x)

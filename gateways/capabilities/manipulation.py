@@ -80,7 +80,7 @@ def _remember_placement(platform, ctx, held, target):
         sample, = runtime.run_burst(ctx, reason=reason, frame_count=1)
         metadata = {"source": "manipulation_place", "task_id": ctx.task_id}
         if target is not None and labels:
-            spaces = platform.scene_mapping.memory.capture_scene_partition()["spaces"]
+            spaces = platform.scene_mapping.capture_partition()["spaces"]
             room = next((space for space in spaces if space.primary_label and sample.pose is not None
                          and pose_in_scene_space(sample.pose, space)), None)
             surface = target.display_name or target.label

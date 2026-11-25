@@ -34,8 +34,9 @@ class SceneGraphIndex:
 class SceneGraphService:
     """按需构建一个当前图；几何缓存与标签变化分离，不增加后台线程。"""
 
-    def __init__(self, *, memory_service, max_cells):
+    def __init__(self, *, memory_service, max_cells, segmenter):
         self.memory = memory_service
+        self._segmenter = segmenter
         self.max_cells = max_cells
         self._lock = threading.RLock()
         self._geometry_key = None
@@ -64,7 +65,7 @@ class SceneGraphService:
 
     def _capture(self):
         with self._lock:
-            capture = self.memory.capture_scene_graph_state()
+            capture = self.memory.capture_scene_graph_state(segmenter=self._segmenter)
             binding = capture["binding"]
             self._library_name = capture["library_name"]
             records = capture["memory_snapshot"].records

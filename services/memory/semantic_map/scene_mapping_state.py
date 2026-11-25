@@ -185,8 +185,8 @@ class SemanticMapState:
         with self._partition_lock:
             return self._writer(capture, write, require_content=False)
 
-    def update_scene_mapping_label(self, *, scene_space_id, map_name, expected_revision, label, requested_by=None):
-        capture = self.capture_scene_partition()
+    def update_scene_mapping_label(self, *, scene_space_id, map_name, expected_revision, label, segmenter, requested_by=None):
+        capture = self.capture_scene_partition(segmenter=segmenter)
         if map_name != capture["library_name"]:
             raise GatewayError("请求地图不是当前地图。", error_code="scene_scope_changed", http_status=409)
         current = next((space for space in capture["spaces"]
@@ -198,7 +198,7 @@ class SemanticMapState:
         return self.commit_scene_mapping_label(capture, current, label=label.strip(), source="explicit_tool_update",
                                               expected_revision=expected_revision, requested_by=requested_by)
 
-    def capture_scene_partition(self, *, include_decision_inputs=False):
+    def capture_scene_partition(self, *, segmenter, include_decision_inputs=False):
         with self._partition_lock:
             capture = self.capture_scene_mapping_state(include_decision_inputs=include_decision_inputs)
             if self._partition is not None and not same_scope(self._partition.binding, capture["binding"]):
@@ -206,7 +206,10 @@ class SemanticMapState:
             if self._partition is None:
                 persisted = self.current_managed_scene_spaces(capture)
                 if persisted:
-                    self._publish_partition(capture, persisted)
+                    # 保存图可能早于最后一次分区。用已载入的实际自由格恢复边界和区域编号。
+                    restored = segmenter.segment(capture["grid"], map_name=capture["library_name"],
+                        map_revision=capture["binding"]["map_revision"], existing_spaces=persisted)
+                    self._publish_partition(capture, restored)
             partition = self._partition
         capture["partition"] = partition
         all_spaces = capture["spaces"]
@@ -219,8 +222,8 @@ class SemanticMapState:
             capture.update(grid=partition.grid, binding=partition.binding, spaces=spaces)
         return capture
 
-    def capture_scene_graph_state(self):
-        capture = self.capture_scene_partition(include_decision_inputs=True)
+    def capture_scene_graph_state(self, *, segmenter):
+        capture = self.capture_scene_partition(segmenter=segmenter, include_decision_inputs=True)
         snapshot = capture["memory_snapshot"]
         instances = snapshot.model_map("instance")
         entries = capture["entries"]

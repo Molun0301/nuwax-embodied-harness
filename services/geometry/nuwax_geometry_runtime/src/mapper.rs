@@ -947,16 +947,14 @@ impl Worker {
         if let Some(candidate) = candidate {
             PersistentOccupancyGrid::merge_or_create(&mut self.grid, &candidate.latest_frame_occupancy)?;
             self.grid_stamp = stamp;
+        }
+        // 单独的空域撤销也要通知地图输出，使导航采用已更新的精细图。
+        if committed_this_frame || self.cloud.has_retractions() {
             self.cloud.commit(stamp)?;
             self.fine_root.send_replace(self.cloud.surface());
             if let Err(error) = self.publish_grid() {
                 tracing::warn!(%error,"禁行区尚未刷新，等待输入");
             }
-        }
-        // 无已确认回波时不构建二维栅格，仍发布已发生的精细图撤销。
-        if !committed_this_frame && !self.read_only && self.cloud.has_retractions() {
-            self.cloud.commit(stamp)?;
-            self.fine_root.send_replace(self.cloud.surface());
         }
         // 无已确认回波不能覆盖仍待封存的上一帧投影输入。
         if !input.registered_points_map.is_empty() {

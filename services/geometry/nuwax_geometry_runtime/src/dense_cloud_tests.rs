@@ -1,6 +1,63 @@
 use super::*;
 
 #[test]
+fn dense_region_includes_box_boundaries_and_omits_removed_points() {
+    let mut cloud = DenseCloud::new().unwrap();
+    cloud.append(&[
+        Point3::new(-1.0, 0.0, 0.0),
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(0.75, 0.0, 0.0),
+        Point3::new(1.0, 1.0, 1.0),
+        Point3::new(0.5, 0.5, 1.1),
+    ]).unwrap();
+    let voxel_size = crate::pointcloud::VOXEL_SIZE;
+    let removed = crate::pointcloud::voxel_key([0.75, 0.0, 0.0], voxel_size).unwrap();
+    assert_eq!(cloud.remove_voxels(&[removed], voxel_size).unwrap(), 1);
+    let snapshot = cloud.snapshot(10, 1, "3").unwrap();
+
+    let (total, data) = cloud.read_region(&snapshot, [[0.0; 3], [1.0; 3]], "", 0, 10).unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(
+        data.chunks_exact(12).map(decode_point).collect::<Vec<_>>(),
+        vec![[0.0; 3], [1.0; 3]],
+    );
+}
+
+#[test]
+fn dense_region_pages_preserve_archive_order_within_epoch() {
+    let mut cloud = DenseCloud::new().unwrap();
+    let points: Vec<_> = (0..(PAGE_POINTS * 2 + 13)).map(|index| {
+        Point3::new((index % 64) as f64 * 0.05, (index / 64) as f64 * 0.05, 0.1)
+    }).collect();
+    cloud.append(&points).unwrap();
+    let snapshot = cloud.snapshot(10, 1, "3").unwrap();
+    let bounds = [[0.0, 1.0, 0.0], [2.0, 6.0, 1.0]];
+    let (total, all) = cloud.read_region(&snapshot, bounds, "", 0, CHUNK_POINTS).unwrap();
+    assert!(total > 259);
+
+    let mut paged = Vec::new();
+    for offset in (0..total).step_by(259) {
+        let (count, page) = cloud.read_region(&snapshot, bounds, &snapshot.epoch, offset, 259).unwrap();
+        assert_eq!(count, total);
+        paged.extend(page);
+    }
+    assert_eq!(paged, all);
+}
+
+#[test]
+fn dense_region_rejects_previous_epoch_after_removal() {
+    let mut cloud = DenseCloud::new().unwrap();
+    cloud.append(&[Point3::origin(), Point3::new(1.0, 0.0, 0.0)]).unwrap();
+    let old = cloud.snapshot(10, 1, "3").unwrap();
+    assert_eq!(cloud.remove_voxels(&[(0, 0, 0)], crate::pointcloud::VOXEL_SIZE).unwrap(), 1);
+    let current = cloud.snapshot(11, 2, "3").unwrap();
+
+    let error = cloud.read_region(&current, [[-1.0; 3], [1.0; 3]], &old.epoch, 1, 1)
+        .unwrap_err();
+    assert_eq!(error, "DENSE_CLOUD_SOURCE_CHANGED");
+}
+
+#[test]
 fn dense_cloud_ten_minute_surface_jitter() {
     let voxel_size = f64::from(crate::pointcloud::VOXEL_SIZE);
     let center = |key: i32| (f64::from(key) + 0.5) * voxel_size;

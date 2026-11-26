@@ -163,6 +163,11 @@ class GeometryRuntimeStub(object):
                 request_serializer=geometry__runtime__pb2.DenseCloudChunkRequest.SerializeToString,
                 response_deserializer=geometry__runtime__pb2.DenseCloudChunk.FromString,
                 _registered_method=True)
+        self.GetDenseCloudRegion = channel.unary_unary(
+                '/nuwax.geometry.v3.GeometryRuntime/GetDenseCloudRegion',
+                request_serializer=geometry__runtime__pb2.DenseCloudRegionRequest.SerializeToString,
+                response_deserializer=geometry__runtime__pb2.DenseCloudChunk.FromString,
+                _registered_method=True)
         self.GetFrameTree = channel.unary_unary(
                 '/nuwax.geometry.v3.GeometryRuntime/GetFrameTree',
                 request_serializer=geometry__runtime__pb2.Empty.SerializeToString,
@@ -386,6 +391,12 @@ class GeometryRuntimeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetDenseCloudRegion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetFrameTree(self, request, context):
         """读取坐标树最新边（map→odom、odom→base、base→传感器）。任何状态都允许。
         """
@@ -507,6 +518,11 @@ def add_GeometryRuntimeServicer_to_server(servicer, server):
             'GetDenseCloudChunk': grpc.unary_unary_rpc_method_handler(
                     servicer.GetDenseCloudChunk,
                     request_deserializer=geometry__runtime__pb2.DenseCloudChunkRequest.FromString,
+                    response_serializer=geometry__runtime__pb2.DenseCloudChunk.SerializeToString,
+            ),
+            'GetDenseCloudRegion': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetDenseCloudRegion,
+                    request_deserializer=geometry__runtime__pb2.DenseCloudRegionRequest.FromString,
                     response_serializer=geometry__runtime__pb2.DenseCloudChunk.SerializeToString,
             ),
             'GetFrameTree': grpc.unary_unary_rpc_method_handler(
@@ -1033,6 +1049,33 @@ class GeometryRuntime(object):
             target,
             '/nuwax.geometry.v3.GeometryRuntime/GetDenseCloudChunk',
             geometry__runtime__pb2.DenseCloudChunkRequest.SerializeToString,
+            geometry__runtime__pb2.DenseCloudChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetDenseCloudRegion(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nuwax.geometry.v3.GeometryRuntime/GetDenseCloudRegion',
+            geometry__runtime__pb2.DenseCloudRegionRequest.SerializeToString,
             geometry__runtime__pb2.DenseCloudChunk.FromString,
             options,
             channel_credentials,

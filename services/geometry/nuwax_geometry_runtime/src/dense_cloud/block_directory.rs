@@ -60,6 +60,40 @@ impl BlockDirectory {
     pub(super) fn get(&self, key: [u32; 3]) -> Option<&AHashSet<usize>> {
         self.blocks.as_ref()?.get(&key)
     }
+
+    pub(super) fn pages_in_region(
+        &self,
+        min: super::Key,
+        max: super::Key,
+    ) -> Option<AHashSet<usize>> {
+        let blocks = self.blocks.as_ref()?;
+        let low = self.key(min);
+        let high = self.key(max);
+        let block_count = (0..3).fold(1_u64, |count, axis| {
+            count.saturating_mul(u64::from(high[axis] - low[axis]) + 1)
+        });
+        let mut candidates = AHashSet::new();
+        // 小区域直接查块；大区域只枚举已经登记的块，避免遍历空白空间。
+        if block_count <= blocks.len() as u64 {
+            for x in low[0]..=high[0] {
+                for y in low[1]..=high[1] {
+                    for z in low[2]..=high[2] {
+                        if let Some(pages) = blocks.get(&[x, y, z]) {
+                            candidates.extend(pages.iter().copied());
+                        }
+                    }
+                }
+            }
+        } else {
+            for (key, pages) in blocks {
+                if (0..3).all(|axis| low[axis] <= key[axis] && key[axis] <= high[axis]) {
+                    candidates.extend(pages.iter().copied());
+                }
+            }
+        }
+        Some(candidates)
+    }
+
     pub(super) fn missing(&self) -> bool {
         self.blocks.is_none()
     }

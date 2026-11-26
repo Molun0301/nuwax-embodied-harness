@@ -215,6 +215,10 @@ enum Command {
         proto::DenseCloudChunkRequest,
         oneshot::Sender<Result<proto::DenseCloudChunk, String>>,
     ),
+    DenseRegion(
+        proto::DenseCloudRegionRequest,
+        oneshot::Sender<Result<proto::DenseCloudChunk, String>>,
+    ),
     Transform {
         correction: Option<Isometry3<f64>>,
         loaded_writing: Option<bool>,
@@ -512,6 +516,16 @@ impl Mapper {
             .map_err(|_| "建图任务已结束")?;
         rx.await.map_err(|_| "建图任务已结束")?
     }
+    pub async fn dense_region(
+        &self,
+        request: proto::DenseCloudRegionRequest,
+    ) -> Result<proto::DenseCloudChunk, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::DenseRegion(request, tx))
+            .map_err(|_| "建图任务已结束")?;
+        rx.await.map_err(|_| "建图任务已结束")?
+    }
     /// 读取当前精细根，不排入建图命令队列。
     pub fn fine_root(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
         self.fine_root.borrow().clone()
@@ -733,6 +747,13 @@ impl Worker {
             }
             Command::Dense(request, reply) => {
                 let _ = reply.send(self.cloud.dense_chunk(request, &self.config.map_frame_id));
+                Ok(())
+            }
+            Command::DenseRegion(request, reply) => {
+                let correction_seq = self.transform.borrow().1;
+                let _ = reply.send(self.cloud.dense_region(
+                    request, &self.config.map_frame_id, correction_seq,
+                ));
                 Ok(())
             }
             Command::Transform {

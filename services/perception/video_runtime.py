@@ -84,8 +84,6 @@ class PerceptionVideoRuntime:
             if new_reason:
                 consumer = ExitStack()
                 consumer.enter_context(self._perception_service.video_consumer())
-                if self._remember_keyframes:
-                    consumer.enter_context(self._perception_service.point_cloud_consumer())
             with self._condition:
                 if self._closed:
                     raise GatewayError("感知运行时已关闭。", error_code="perception_runtime_closed", http_status=409)
@@ -172,11 +170,6 @@ class PerceptionVideoRuntime:
             inputs=inputs, complete=True)
 
     def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
-        with self._perception_service.point_cloud_consumer():
-            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec,
-                                   source_after_ns=source_after_ns)
-
-    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
         burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count, source_after_ns)
         with self._condition:
             settings = self._reasons[reason]

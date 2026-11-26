@@ -11,6 +11,7 @@ from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D
 from contracts.pointcloud import PointCloudFrame
 from services.localization.frame_tree_ops import resolve_frame_transform
+from services.perception.observation_geometry import ACCUMULATED_CLOUD_MAX_DEPTH_M
 from services.perception.self_body import SelfBodyRegion, is_self_body
 from services.perception.support_points import select_object_support
 
@@ -121,6 +122,14 @@ class DetectionGeometryAugmentor:
             ground_meta["ground_removed_point_count"]=int(keep.size-np.count_nonzero(keep))
             projected_pixels,camera_points,map_points=projected_pixels[keep],camera_points[keep],map_points[keep]
         metadata.update(ground_meta)
+        # 先按像素块、再按相机深度排序，每个 4×4 像素块只交付最近的点。
+        columns = (image_frame.width_px + 3) // 4
+        pixel_blocks = projected_pixels.astype(np.int64) // 4
+        block_ids = pixel_blocks[:, 1] * columns + pixel_blocks[:, 0]
+        by_depth = np.lexsort((camera_points[:, 2], block_ids))
+        nearest = np.sort(by_depth[np.diff(block_ids[by_depth], prepend=-1) != 0])
+        projected_pixels, camera_points = projected_pixels[nearest], camera_points[nearest]
+        map_points = map_points[nearest] if map_points is not None else None
         augmented = []
         augmented_count = 0
         support_point_total = 0
@@ -210,7 +219,11 @@ class DetectionGeometryAugmentor:
         )
         if camera_array is None or camera_array.size == 0:
             return None
-        valid_depth_mask = np.all(np.isfinite(camera_array), axis=1) & (camera_array[:, 2] > self._min_depth_m)
+        valid_depth_mask = (
+            np.all(np.isfinite(camera_array), axis=1)
+            & (camera_array[:, 2] > self._min_depth_m)
+            & (camera_array[:, 2] <= ACCUMULATED_CLOUD_MAX_DEPTH_M)
+        )
         if not np.any(valid_depth_mask):
             return None
         camera_array = camera_array[valid_depth_mask]

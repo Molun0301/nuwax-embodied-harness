@@ -4,7 +4,7 @@ from datetime import datetime
 
 from contracts.compat import StrEnum
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator
 
 from contracts.base import ContractModel, MetadataDict, TimestampedContract
 from contracts.geometry import Pose, Vector3
@@ -89,13 +89,6 @@ class InstanceObservationWindowSample(TimestampedContract):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="观察置信度。")
     track_id: Optional[str] = Field(default=None, description="观察关联的跟踪标识。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _ignore_removed_observer_pose(cls, value):
-        if isinstance(value, dict) and "observer_pose" in value:
-            return {key: item for key, item in value.items() if key != "observer_pose"}
-        return value
 
 
 class InstanceCorrectionBucket(ContractModel):
@@ -377,13 +370,6 @@ class SemanticInstance(TimestampedContract):
         default_factory=list,
         description="已合并进本实例的旧实例标识，查询与导航按别名解析到本实例。",
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _ignore_removed_projection_cache(cls, value):
-        if isinstance(value, dict) and "deferred_projection_cache" in value:
-            return {key: item for key, item in value.items() if key != "deferred_projection_cache"}
-        return value
 
     @field_validator("instance_id")
     @classmethod

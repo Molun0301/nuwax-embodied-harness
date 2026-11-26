@@ -15,7 +15,7 @@ from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import InstanceConfirmationState, InstanceSupportEvidence, InstanceDynamicState, InstanceLifecycleState, InstanceMovability, InstanceObservationWindowSample, SemanticInstance
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.instance_consolidation import InstanceConsolidator, InstanceMerge
-from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, insufficient_point_support, measurement_sigma_m, observation_support_points, accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label, cross_label_geometry_compatible, record_support_evidence, cooccurrence_evidence, cooccurrence_sources, observation_source_key, observation_window_sources, remember_coobserved_instances, instance_identity_ids, observation_source_index, historical_coobserved_ids, geometry_overlap_diagnostics, measurement_geometry_fit
+from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, measurement_sigma_m, observation_support_points, accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label, cross_label_geometry_compatible, record_support_evidence, cooccurrence_evidence, cooccurrence_sources, observation_source_key, observation_window_sources, remember_coobserved_instances, instance_identity_ids, observation_source_index, historical_coobserved_ids, geometry_overlap_diagnostics, measurement_geometry_fit
 from services.memory.object_extent import merge_object_extent, resolve_object_extent
 from services.memory.correction_buckets import add_observation
 from services.memory.map_correction import SAMPLE_SOURCE, SESSION_KEY
@@ -228,7 +228,6 @@ class InstanceAssociationService:
         groups = {}
         for index, item in enumerate(observations):
             if (self._is_fallback_observation(item)
-                    or insufficient_point_support(item.attributes, self._association_config.min_support_points)
                     or classify_instance_category(item.label, item.attributes.get('category')) == InstanceDynamicState.DYNAMIC):
                 continue
             groups.setdefault((item.source_observation_id, item.camera_id), []).append(index)

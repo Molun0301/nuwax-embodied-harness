@@ -618,13 +618,9 @@ impl DenseCloud {
         &self,
         snapshot: &DenseSnapshot,
         [min, max]: [[f64; 3]; 2],
-        expected_epoch: &str,
         offset: u64,
         count: u32,
     ) -> Result<(u64, Vec<u8>), String> {
-        if !expected_epoch.is_empty() && expected_epoch != snapshot.epoch {
-            return Err("DENSE_CLOUD_SOURCE_CHANGED".into());
-        }
         if count == 0 {
             return Err("完整点云分块位置或大小非法".into());
         }

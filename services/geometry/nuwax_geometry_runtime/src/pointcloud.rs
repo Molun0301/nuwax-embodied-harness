@@ -799,22 +799,23 @@ impl CloudMap {
     }
 
     pub fn dense_region(
-        &self,
+        &mut self,
         request: proto::DenseCloudRegionRequest,
         frame_id: &str,
         correction_seq: u64,
     ) -> Result<proto::DenseCloudChunk, String> {
-        let snapshot = self.dense_snapshot.as_ref().ok_or(if request.expected_epoch.is_empty() {
+        let latest = self.dense_snapshot.clone().ok_or(if request.expected_epoch.is_empty() {
             "当前地图没有点云"
         } else {
             "DENSE_CLOUD_SOURCE_CHANGED"
         })?;
+        let snapshot = self.dense.pin_read(latest, &request.expected_epoch, request.offset_points)?;
         let bounds = [request.bounds_min, request.bounds_max].map(|coord| {
             let coord = coord.unwrap_or_default();
             [coord.x, coord.y, coord.z]
         });
         let (total_points, xyz_f32_le) = self.dense.read_region(
-            snapshot, bounds, &request.expected_epoch, request.offset_points, request.max_points,
+            &snapshot, bounds, request.offset_points, request.max_points,
         )?;
         Ok(proto::DenseCloudChunk {
             epoch: snapshot.epoch.clone(),

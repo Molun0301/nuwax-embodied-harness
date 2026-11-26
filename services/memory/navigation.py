@@ -6,7 +6,7 @@ import re
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 from contracts.base import utc_now
-from contracts.geometry import Pose
+from contracts.geometry import FrameTree, Pose, Transform
 from contracts.memory import MemoryQueryMatch, MemoryPayloadFilter, MemoryArrivalVerification, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
 from contracts.spatial_memory import GroundingQueryPlan, NavigationCandidate, SceneSpace
 from contracts.runtime_views import PerceptionContext, NavigationSemanticContext
@@ -19,6 +19,8 @@ from contracts.memory import GoalSpec, GoalConstraint, GoalSpatialRelation, Goal
 from contracts.spatial_memory import SpatialAnchor, SpatialAnchorKind, NavigationTrajectoryEvent, NavigationTrajectoryEventKind, SemanticGraphRelation, SemanticGraphRelationKind
 from core.state_store import StateNamespace
 from core.target_query import target_label_matches_query
+from services.localization.frame_tree_ops import transform_points_to_frame
+from services.memory.semantic_map.scene_graph_geometry import target_in_scene_spaces
 from services.memory.store import MODELS
 import uuid
 import logging
@@ -722,7 +724,7 @@ class NavigationMixin:
     def resolve_navigation_candidates(
         self, query: str, *, camera_id: Optional[str] = None, similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None, map_name: Optional[str] = None, limit: int = 5,
-        goal_id: Optional[str] = None, object_target: bool = False,
+        goal_id: Optional[str] = None, object_target: bool = False, regions: Tuple[SceneSpace, ...] = (),
     ) -> Tuple[NavigationCandidate, ...]:
         """解析记忆导航候选。找物候选须有匹配的检测标签和同一地图坐标系。"""
         if not self.is_enabled():
@@ -762,6 +764,8 @@ class NavigationMixin:
                 candidate = match.navigation_candidate
                 if candidate.record_id in seen_record_ids:
                     continue
+                if regions and not target_in_scene_spaces(candidate.anchor_pose, regions):
+                    continue
                 seen_record_ids.add(candidate.record_id)
                 candidates.append(candidate)
                 if len(candidates) >= candidate_pool_limit:
@@ -793,6 +797,8 @@ class NavigationMixin:
                     continue
                 candidate = match.navigation_candidate
                 if candidate.record_id in seen_record_ids:
+                    continue
+                if regions and not target_in_scene_spaces(candidate.anchor_pose, regions):
                     continue
                 seen_record_ids.add(candidate.record_id)
                 candidates.append(candidate)
@@ -852,6 +858,13 @@ class NavigationMixin:
         self._state_store.write(StateNamespace.MEMORY, 'last_navigation_candidate_resolution', resolution, source='memory_service', metadata={'kind': 'navigation_candidate_resolution'})
         self._publish_memory_event('memory.navigation_candidates_resolved', '记忆导航候选已解析。', payload={**observability_metadata, 'top_decision': resolution.top_decision, 'direct_candidate_count': resolution.direct_candidate_count, 'resolution_confidence': resolution.confidence})
         return decorated_candidates
+
+    def detections_in_regions(self, detections, *, context, pose, frame_tree, regions):
+        if pose is None:
+            return ()
+        return tuple(detection for detection in detections if target_in_scene_spaces(
+            self._projector.detection_map_pose(detection, perception_context=context,
+                current_pose=pose, map_frame=regions[0].frame_id, frame_tree=frame_tree), regions))
 
     def get_navigation_semantic_context(self, *, map_name=None):
         state = self.geometry_state.snapshot() if self.geometry_state is not None else None
@@ -1006,6 +1019,36 @@ class NavigationMixin:
                 if self._planner.outside_target(pose, clearance):
                     return pose
         return None
+
+    def select_target_verification_pose(self, candidate, camera_info, frame_tree):
+        """按相机构图对已生成的物体巡检位姿排序。"""
+        original = candidate.inspection_pose
+        if candidate.source_collection != OBJECT_INSTANCES_COLLECTION or camera_info is None or frame_tree is None:
+            return original
+        camera = next(edge for edge in frame_tree.transforms if edge.child_frame_id == camera_info.frame_id)
+        instance = self.get_semantic_instance(candidate.record_id)
+        if instance is None:
+            return original
+        clearance = self._planner.object_clearance(instance)
+        poses = [original, *(pose for pose in instance.inspection_poses if self._planner.outside_target(pose, clearance))]
+        margin_x, margin_y = camera_info.width_px / 8, camera_info.height_px / 8
+
+        def framing(pose):
+            body = Transform(parent_frame_id=pose.frame_id, child_frame_id=camera.parent_frame_id,
+                             translation=pose.position, rotation=pose.orientation)
+            tree = FrameTree(root_frame_id=pose.frame_id, transforms=[body, camera])
+            (point,) = transform_points_to_frame(tree, (instance.pose.position,),
+                source_frame_id=instance.pose.frame_id, target_frame_id=camera_info.frame_id)
+            if point.z <= 0:
+                return math.inf, math.inf
+            u = camera_info.cx + camera_info.fx * point.x / point.z
+            v = camera_info.cy + camera_info.fy * point.y / point.z
+            clip = max(0., margin_x-u, u+margin_x-camera_info.width_px,
+                       margin_y-v, v+margin_y-camera_info.height_px)
+            distance = math.hypot(pose.position.x-original.position.x, pose.position.y-original.position.y)
+            return clip, distance
+
+        return min(poses, key=framing)
 
     def _record_arrival_trajectory_graph(self, result: MemoryArrivalVerification) -> None:
         metadata = dict(result.metadata or {})

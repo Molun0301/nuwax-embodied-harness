@@ -72,9 +72,9 @@ fn compare(cfg: Config,cells: &[Cell],bands: &[Band],queries: &[([f64;3],[f64;3]
     // 重复与改变来源交错，覆盖区域候选之间的查询，避免仅验证同一目标缓存。
     for &(start,goal) in queries.iter().chain(queries.iter().rev()) {
         let expected=independent.plan(start,goal);
-        let actual=search.cost(start,goal);
-        assert_eq!(actual.is_ok(),expected.is_ok(),"start={start:?} goal={goal:?}, actual={actual:?}, expected={expected:?}");
-        if let (Ok(actual),Ok(route))=(actual,expected) {
+        let actual=search.cost(start,goal).unwrap();
+        assert_eq!(actual.is_some(),expected.is_ok(),"start={start:?} goal={goal:?}, actual={actual:?}, expected={expected:?}");
+        if let (Some(actual),Ok(route))=(actual,expected) {
             let (cost,endpoint,yaw)=summarize(&route);
             assert!((actual.cost-cost).abs()<1e-10,"cost: {actual:?}, {cost}");
             assert_eq!(actual.endpoint,endpoint);
@@ -138,11 +138,11 @@ fn multi_goal_cancellation_reaches_cold_and_warm_search_then_recovers() {
         let mut search=planner.multi_goal_search().unwrap();
         assert!(search.cost_cancellable(start,goal,&flag).unwrap_err().contains("取消"));
         flag.store(false,Ordering::Release);
-        assert!(search.cost_cancellable(start,goal,&flag).is_ok());
+        assert!(search.cost_cancellable(start,goal,&flag).unwrap().is_some());
         flag.store(true,Ordering::Release);
         assert!(search.cost_cancellable(start,goal,&flag).unwrap_err().contains("取消"));
         flag.store(false,Ordering::Release);
-        assert!(search.cost_cancellable(start,goal,&flag).is_ok());
+        assert!(search.cost_cancellable(start,goal,&flag).unwrap().is_some());
         with_planning_cancellation(Arc::new(AtomicBool::new(true)),|| {
             assert!(search.cost(start,goal).unwrap_err().contains("取消"));
         });
@@ -262,7 +262,7 @@ fn source_search_settles_goals_in_path_cost_order_and_expands_only_as_far_as_nee
     // 完整查询不受单源搜索影响。
     let mut independent=Planner::from_cells(config(),&cells,&bands).unwrap();
     let expected=summarize(&independent.plan(start,goals[2]).unwrap());
-    let exact=search.cost(start,goals[2]).unwrap();
+    let exact=search.cost(start,goals[2]).unwrap().unwrap();
     assert!((exact.cost-expected.0).abs()<1e-10);
     assert_eq!((exact.endpoint,exact.yaw),(expected.1,expected.2));
 }

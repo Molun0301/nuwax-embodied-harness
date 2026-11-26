@@ -87,6 +87,7 @@ class Platform:
 
 def build_platform(config) -> Platform:
     from contracts.artifacts import ArtifactRetentionPolicy
+    from gateways.agent.service import AgentToolService
     from gateways.capabilities import building, cleanup, exploration, follow, maps, memory, manipulation, motion, navigation, perception as perception_caps, skills as skills_caps, system
     from gateways.capabilities.exploration import ExplorationControl
     from gateways.person_follow import GatewayPersonFollowBridge
@@ -130,6 +131,7 @@ def build_platform(config) -> Platform:
         for cap in module.CAPABILITIES:
             platform.capabilities.register(replace(cap, group=group, group_icon=group_icon))
     platform.tasks = TaskRunner(platform)
+    platform.agent_tools = AgentToolService(platform)
     home = os.environ.get("NUWAX_INSTALL_HOME", config.base_dir)
     platform.motion = MotionClient(motion_guard_socket(home))
     platform.geometry = GeometryClient(f"127.0.0.1:{config.geometry.external.port}")

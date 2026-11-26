@@ -715,6 +715,11 @@ impl SurfaceFollower {
             None
         };
         self.submit_map();
+        if checked.no_candidate()
+            && self.config.kinematics().is_some_and(|motion| motion.max_reverse_mps > 0.)
+        {
+            return Err(PlannerStep::Blocked(self.wait_reason.clone().unwrap()));
+        }
         Ok(Twist2 {
             linear: Point2::new(checked.command[0], checked.command[1]),
             angular_z: checked.command[2],
@@ -846,6 +851,22 @@ impl NavPlanner for SurfaceFollower {
                 Some(format!("{wait}；{failure}")),
             _ => self.wait_reason.clone(),
         }
+    }
+    fn recovery_surface(&mut self) -> Option<crate::RecoverySurface> {
+        if let Some(update) = self.map_worker.take() {
+            match update {
+                Ok(map) if map.epoch == self.epoch => self.prepared = Some(map),
+                Ok(_) => {}
+                Err(_) => self.prepared = None,
+            }
+        }
+        let map = self.prepared.as_ref().filter(|map| map.epoch == self.epoch)?;
+        let forward = self.native_config(&map.source);
+        let reverse = self.config.native_config(
+            &map.source, GoalOptions { allow_reverse: true, ..self.options },
+            forward.max_lateral_velocity > 0.,
+        );
+        Some(crate::RecoverySurface { snapshot: map.snapshot.clone(), forward, reverse })
     }
     fn terminal_phase(&self) -> TerminalPhase {
         self.terminal_phase

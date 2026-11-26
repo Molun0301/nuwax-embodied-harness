@@ -92,7 +92,8 @@ class Device:
             url = urlsplit(self.base_url)
             address = urlunsplit(('wss' if url.scheme == 'https' else 'ws', url.netloc,
                                   url.path.rstrip('/') + '/api/v1/stream', '', ''))
-            async with websockets.connect(address, max_size=64 * 1024 * 1024) as socket:
+            # 本机二进制帧直接传输，避免在平台事件环和设备线程上逐帧压缩图像与点云。
+            async with websockets.connect(address, max_size=64 * 1024 * 1024, compression=None) as socket:
                 async for raw in socket:
                     if not isinstance(raw, bytes):
                         continue

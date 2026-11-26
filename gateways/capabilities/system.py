@@ -1,5 +1,6 @@
 """系统与任务能力。"""
 from dataclasses import asdict
+import asyncio
 
 from core import components
 from core.capability import Capability
@@ -17,7 +18,8 @@ def robot_status(platform, args):
             "robot_model": platform.robot.manifest.robot_model,
             "assembly": asdict(platform.robot.get_status()),
             "robot_state": platform.robot_state.get_latest_snapshot(), "motion_guard": guard,
-            "perception_runtime": platform.perception.video_runtime.get_status()}
+            "perception_runtime": platform.perception.video_runtime.get_status(),
+            "held_object": platform.manipulation.held_object}
 
 
 def active_tasks(platform, args):
@@ -41,6 +43,10 @@ def task_status(platform, args):
     return asdict(status)
 
 
+def wait_task(platform, args):
+    return asyncio.run(platform.agent_tools.wait_task_async(args["task_id"], args.get("timeout_sec", 30)))
+
+
 def cancel_task(platform, args):
     cancelled = platform.tasks.cancel(args["task_id"], args.get("message", "用户取消"))
     status = platform.tasks.status(args["task_id"])
@@ -60,6 +66,9 @@ CAPABILITIES = [
                schema(), "query", list_capabilities),
     Capability("get_task_status", "读取任务快照。", schema({"task_id": {"type": "string"}}, ("task_id",)),
                "query", task_status),
+    Capability("wait_task", "等待任务终态，超时返回当前任务快照。",
+               schema({"task_id": {"type": "string"}, "timeout_sec": {"type": "number", "default": 30}}, ("task_id",)),
+               "query", wait_task, timeout_sec=30),
     Capability("cancel_task", "请求取消任务，处理器退出后结束。",
                schema({"task_id": {"type": "string"}, "message": {"type": "string"}}, ("task_id",)),
                "action", cancel_task),

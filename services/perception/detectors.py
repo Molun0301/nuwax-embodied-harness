@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, SegmentationMask2D, SegmentationQuality
 from core.errors import GatewayError
+from services.model_imports import LOCAL_MODEL_IMPORT_LOCK
 from services.model_providers import resolve_detection_provider_spec
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr
@@ -121,10 +122,11 @@ def _ensure_torchvision_nms_fallback() -> None:
         return
 
     try:
-        import torch
-        import torchvision
-        import torchvision.ops as torchvision_ops
-        import torchvision.ops.boxes as torchvision_boxes
+        with LOCAL_MODEL_IMPORT_LOCK:
+            import torch
+            import torchvision
+            import torchvision.ops as torchvision_ops
+            import torchvision.ops.boxes as torchvision_boxes
     except ImportError:
         return
 
@@ -1340,5 +1342,27 @@ class DetectorPipeline:
                 detections_2d=kept,
                 detections_3d=bundle.detections_3d,
                 metadata={**dict(bundle.metadata or {}), "postprocess": nms_stats},
+            )
+        prompt_categories = {
+            _normalize_label(prompt): (prompt, _normalize_label(category))
+            for prompt, category in (image_frame.metadata.get("prompt_categories") or {}).items()
+        }
+        if prompt_categories:
+            def categorize(detection):
+                prompt_category = prompt_categories.get(detection.label)
+                if prompt_category is None:
+                    return detection
+                description, label = prompt_category
+                attributes = dict(detection.attributes)
+                if "aliases" in attributes:
+                    attributes["aliases"] = [label, *(
+                        alias for alias in attributes["aliases"] if alias not in {detection.label, label})]
+                attributes["appearance_description"] = description
+                return detection.model_copy(update={"label": label, "attributes": attributes})
+
+            bundle = DetectionBundle(
+                detections_2d=tuple(categorize(item) for item in bundle.detections_2d),
+                detections_3d=tuple(categorize(item) for item in bundle.detections_3d),
+                metadata=bundle.metadata,
             )
         return bundle, backend.spec

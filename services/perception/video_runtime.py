@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import logging
 import threading
 import time
+from typing import Optional
 
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import PerceptionRuntimeStatus
@@ -24,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 class _Burst:
     reason: str
     count: int
+    source_after_ns: Optional[int] = None
     samples: list = field(default_factory=list)
     frames: set = field(default_factory=set)
 
@@ -70,7 +72,7 @@ class PerceptionVideoRuntime:
         self._write_status()
 
     def acquire(self, reason, *, interval_sec=None, camera_id=None,
-                detector_backend_name=None, open_vocabulary_classes=()):
+                detector_backend_name=None, open_vocabulary_classes=(), prompt_categories=None):
         with self._condition:
             self._condition.wait_for(lambda: not self._releasing or self._closed)
             if self._closed:
@@ -94,7 +96,7 @@ class PerceptionVideoRuntime:
                 self._reasons[reason] = (self._interval_sec if interval_sec is None else interval_sec,
                     camera_id or self._camera_id,
                     detector_backend_name or self._detector_backend_name or None,
-                    tuple(open_vocabulary_classes))
+                    tuple(open_vocabulary_classes), dict(prompt_categories or {}))
                 if new_reason:
                     self._video_consumers[reason] = consumer
                     consumer = None
@@ -143,9 +145,8 @@ class PerceptionVideoRuntime:
                 and (detector_backend_name is None or backend == detector_backend_name)]
             return max(candidates, key=lambda value: value.context.timestamp, default=None)
 
-    def publish_sample(self, context, *, map_name, pose=None, frame_tree=None, image_bytes=None, inputs=None, complete=False,
-                       point_cloud_frames=()):
-        sample = PerceptionSample(context, map_name, pose, frame_tree, image_bytes, inputs, complete, point_cloud_frames)
+    def publish_sample(self, context, *, map_name, pose=None, frame_tree=None, image_bytes=None, inputs=None, complete=False):
+        sample = PerceptionSample(context, map_name, pose, frame_tree, image_bytes, inputs, complete)
         with self._condition:
             key = (context.camera_id, context.detector_backend)
             previous = self._samples.get(key)
@@ -164,24 +165,25 @@ class PerceptionVideoRuntime:
             return sample
         inputs = sample.inputs
         context, pose, tree = self._perception_service.complete_observation_geometry(
-            sample.context, inputs, store_artifact=True, stop_event=self._stop,
-            point_cloud_frames=sample.point_cloud_frames)
+            sample.context, inputs, store_artifact=True, stop_event=self._stop)
         return self.publish_sample(context, map_name=sample.map_name,
             pose=pose if inputs is not None else sample.pose,
             frame_tree=tree if inputs is not None else sample.frame_tree, image_bytes=sample.image_bytes,
             inputs=inputs, complete=True)
 
-    def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
+    def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
         with self._perception_service.point_cloud_consumer():
-            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec)
+            return self._run_burst(ctx, reason=reason, frame_count=frame_count, interval_sec=interval_sec,
+                                   source_after_ns=source_after_ns)
 
-    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
-        burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count)
+    def _run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None, source_after_ns=None):
+        burst = _Burst(reason, self._burst_frame_count if frame_count is None else frame_count, source_after_ns)
         with self._condition:
             settings = self._reasons[reason]
             self._bursts.append(burst)
         self.acquire(reason, interval_sec=self._burst_interval_sec if interval_sec is None else interval_sec,
-            camera_id=settings[1], detector_backend_name=settings[2], open_vocabulary_classes=settings[3])
+            camera_id=settings[1], detector_backend_name=settings[2],
+            open_vocabulary_classes=settings[3], prompt_categories=settings[4])
         try:
             while True:
                 ctx.check()
@@ -210,10 +212,12 @@ class PerceptionVideoRuntime:
                 self._processing = True
             groups = {}
             interval = min(value[0] for value in settings.values())
-            for reason, (_, camera, backend, classes) in settings.items():
-                group = groups.setdefault((camera, backend), {"reasons": set(), "classes": set()})
+            for reason, (_, camera, backend, classes, prompt_categories) in settings.items():
+                group = groups.setdefault((camera, backend),
+                    {"reasons": set(), "classes": set(), "prompt_categories": {}})
                 group["reasons"].add(reason)
                 group["classes"].update(classes)
+                group["prompt_categories"].update(prompt_categories)
             started = clock.monotonic()
             real_started = time.monotonic()
             failed = False
@@ -245,9 +249,11 @@ class PerceptionVideoRuntime:
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
         map_name = "default" if self._geometry_state is None else snapshot.map_name if snapshot is not None else ""
         pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
+        prompt_categories = group["prompt_categories"]
         context = self._perception_service.detect_current_frame_fast(camera_id=camera,
             requested_by="perception_video_runtime", detector_backend_name=backend,
-            open_vocabulary_classes=tuple(sorted(group["classes"])) or None)
+            open_vocabulary_classes=tuple(sorted(group["classes"])) or None,
+            detection_metadata={"prompt_categories": prompt_categories} if prompt_categories else None)
         inputs = self._perception_service.get_fast_observation_input(context)
         if inputs is None:
             return
@@ -261,9 +267,7 @@ class PerceptionVideoRuntime:
         self._seen_frames[key] = frame
         decision = self._selector.decide(now=image.timestamp, current_pose=pose)
         image_bytes, _ = encode_image_frame_bytes(image)
-        # 记忆写线程可能数秒后才补几何，发布时先取出拍照时刻的点云随样本保存。
-        sample = self.publish_sample(context, map_name=map_name, image_bytes=image_bytes, inputs=inputs,
-            point_cloud_frames=self._perception_service.point_cloud_frames_at(image))
+        sample = self.publish_sample(context, map_name=map_name, image_bytes=image_bytes, inputs=inputs)
         if self._event_bus is not None:
             self._event_bus.publish(self._event_bus.build_event("perception.scene_ready",
                 category=RuntimeEventCategory.PERCEPTION, source="perception_video_runtime",
@@ -273,7 +277,9 @@ class PerceptionVideoRuntime:
                     "track_count": len(context.observation.tracks),
                     "stage_status": context.metadata.get("stage_status", {})}))
         with self._condition:
-            bursts = [burst for burst in self._bursts if burst.reason in group["reasons"]]
+            stamp = self._frame_stamp(sample)
+            bursts = [burst for burst in self._bursts if burst.reason in group["reasons"]
+                      and (burst.source_after_ns is None or stamp > burst.source_after_ns)]
         if bursts:
             sample = self.complete_sample(sample)
         if decision.should_process:

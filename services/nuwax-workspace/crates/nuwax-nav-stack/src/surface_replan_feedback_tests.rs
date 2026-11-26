@@ -7,7 +7,7 @@ pub(super) async fn inject_refusal(harness:&Harness,goal:&schema::NavigationGoal
     harness.hub.execution_feedback.send_replace(Some(SurfaceReplanFeedback {
         terminal_phase: nuwax_nav_runtime::TerminalPhase::Travel,
         path_identity:Arc::new(published_surface_identity(goal,path.planner_runtime_generation,path.path_revision)),
-        rejected_context:None,current_context:None,zero_sent_rejection:true,
+        rejected_context:None,current_context:None,zero_sent_rejection:true,locally_blocked:false,
         rejection_reason:Some("适配测试注入的局部命令拒绝".into()),
     }));
     tokio::task::yield_now().await;
@@ -50,7 +50,7 @@ fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::NavigationGoal,Surface
     let actual=Arc::new(ActualExecutionContext {measured_motion:None,source:surface.clone(),odometry:start.clone(),
         applied:Twist2::ZERO});
     let feedback=SurfaceReplanFeedback {terminal_phase:nuwax_nav_runtime::TerminalPhase::Travel,path_identity:Arc::new(published_surface_identity(&goal,31,7)),
-        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_sent_rejection:true,rejection_reason:Some("Current body pose is occupied or outside the local map".into())};
+        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_sent_rejection:true,locally_blocked:false,rejection_reason:Some("Current body pose is occupied or outside the local map".into())};
     (surface,start,goal,config,feedback)
 }
 #[test]

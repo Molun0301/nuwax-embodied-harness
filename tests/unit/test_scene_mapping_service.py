@@ -43,6 +43,56 @@ def remember(setup,x=2,*,timestamp=None):
     setup.memory.write(lambda store:store.put('memory',entry))
     return entry
 
+
+def test_search_regions_match_graph_number_and_adopted_name(setup):
+    setup.service.run_once(apply_labels=False)
+    region, = setup.service.get_map()["regions"]
+    setup.service.update_label(scene_space_id=region["scene_space_id"],
+        map_name=setup.view.name, expected_revision=region["metadata"]["scene_revision"],
+        label="厨房", requested_by="test")
+
+    graph = setup.service.graph
+    node, = graph.query(kinds=["region"])["nodes"]
+    for selector in ("厨房", node["node_id"], node["properties"]["display_code"], 1):
+        match, = graph.resolve_regions(selector)
+        assert match.scene_space_id == node["node_id"]
+    with pytest.raises(GatewayError) as error:
+        graph.resolve_regions("R2")
+    assert error.value.error_code == "scene_space_not_found"
+
+
+def test_explicit_region_naming_and_review_use_committed_partition(setup):
+    setup.service.run_once(apply_labels=False)
+    graph = setup.service.graph.query(kinds=["region"])
+    node, = graph["nodes"]
+    setup.view.revision += 1
+    saved = setup.service.update_label(scene_space_id=node["node_id"], map_name=setup.view.name,
+        expected_revision=node["properties"]["scene_revision"], label="厨房", requested_by="test")
+    assert saved.metadata["map_binding"] == graph["map_binding"]
+    edited = setup.memory.review_scene_space(saved.scene_space_id, map_name=setup.view.name,
+                                              primary_label="餐厅")
+    resolved, = setup.service.graph.resolve_regions("餐厅")
+    assert resolved.scene_space_id == edited.scene_space_id
+    assert resolved.metadata["map_binding"] == graph["map_binding"]
+
+
+def test_model_names_committed_region_while_live_grid_changes(setup):
+    for x in (2, 3):
+        remember(setup, x)
+
+    def change_live_grid():
+        setup.view.revision += 1
+        setup.view.cells[10:50, 30] = 100
+
+    setup.backend.winner = "kitchen"
+    setup.backend.hook = change_live_grid
+    result = setup.service.run_once(apply_labels=True)
+    identity, = result["applied_ids"]
+    space, = setup.service.graph.resolve_regions("茶水间")
+    assert space.scene_space_id == identity
+    assert space.metadata["map_binding"] == result["map_binding"]
+
+
 def test_unknown_never_adopted(setup):
     memory, backend, service = setup.memory, setup.backend, setup.service
     backend.winner = "unknown"
@@ -210,6 +260,106 @@ def test_adopted_label_survives_new_single_view_and_cold_restore(setup, monkeypa
     assert new['primary_label'] == '卧室'
     assert new['metadata']['adopted_label_evidence']['category'] == 'bedroom'
     assert len(new['metadata']['adopted_label_evidence']['observation_samples']) == 2
+
+
+
+
+def test_cold_resegmentation_ignores_retired_matching_room(setup):
+    from contracts.naming import build_scene_space_id
+    from contracts.spatial_memory import SceneSpaceReviewStatus
+
+    setup.backend.winner = "kitchen"
+    for x in (2, 3):
+        remember(setup, x)
+    active_id, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    active, = setup.memory.records("scene_space")
+    retired = active.model_copy(update={
+        "scene_space_id": build_scene_space_id("geometry", timestamp=utc_now(), suffix="000000ab"),
+        "review_status": SceneSpaceReviewStatus.STALE,
+        "primary_label": None,
+    })
+    setup.memory.write(lambda store: store.put("scene_space", retired))
+    setup.view.advance()
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        service.run_once(apply_labels=False)
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert (node["node_id"], node["name"]) == (active_id, active.primary_label)
+    finally:
+        service.close()
+        memory.close()
+
+
+def test_cold_scene_graph_reads_saved_name_with_changed_free_cells(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    saved, = setup.memory.records("scene_space")
+    setup.view.cells[8, 8] = 100
+    setup.view.advance()
+
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert (node["node_id"], node["name"]) == (accepted, saved.primary_label)
+        assert list(memory.records("scene_space")) == [saved]
+    finally:
+        service.close()
+        memory.close()
+
+def test_cold_restore_keeps_room_when_same_grid_is_republished(setup):
+    for x in (2, 3):
+        remember(setup, x)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    setup.view.advance()
+
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        row, = service.get_map()["regions"]
+        assert row["scene_space_id"] == accepted and row["review_status"] == "auto_labeled"
+        node, = service.graph.query(kinds=["region"])["nodes"]
+        assert node["node_id"] == accepted and node["name"] == "办公室"
+    finally:
+        service.close()
+        memory.close()
+
+def test_adopted_room_keeps_name_on_cold_resegmentation(setup, monkeypatch):
+    import services.memory.semantic_map.scene_mapping as mapping_module
+
+    start = utc_now()
+    monkeypatch.setattr(mapping_module.clock, "source_now_ns", lambda: round(start.timestamp() * 1e9))
+    setup.backend.winner = "bedroom"
+    for x in (2, 3):
+        remember(setup, x, timestamp=start)
+    accepted, = setup.service.run_once(apply_labels=True)["applied_ids"]
+    before, = setup.service.get_map()["regions"]
+
+    # 冷加载后自由格边沿略有差别，房间仍继承同一编号，旧照片已超过决策时效。
+    setup.view.cells[5:8, 5:13] = 100
+    setup.view.advance()
+    now = start + timedelta(seconds=setup.service.config.max_evidence_age_sec + 1)
+    monkeypatch.setattr(mapping_module.clock, "source_now_ns", lambda: round(now.timestamp() * 1e9))
+    memory = new_memory(setup.root, setup.view)
+    service = SceneMappingService(memory_service=memory, geometry_state=setup.view,
+        config=setup.service.config, backend=Backend())
+    try:
+        result = service.run_once(apply_labels=False)
+        assert result["skipped"][0]["reason"] == "no_valid_observation_evidence"
+        row, = service.get_map()["regions"]
+        assert row["scene_space_id"] == accepted
+        assert row["primary_label"] == "卧室" and row["review_status"] == "auto_labeled"
+        assert row["metadata"]["adopted_label_evidence"] == before["metadata"]["adopted_label_evidence"]
+        assert [node["name"] for node in service.graph.query(kinds=["region"])["nodes"]] == ["卧室"]
+    finally:
+        service.close()
+        memory.close()
+
 
 @pytest.mark.parametrize('weak_reason', ['low_score', 'adoption_disabled', 'unknown'])
 def test_adopted_label_is_not_revoked_by_nonadopting_decision(setup, weak_reason):

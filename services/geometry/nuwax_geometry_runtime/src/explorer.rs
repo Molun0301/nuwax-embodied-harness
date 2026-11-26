@@ -300,9 +300,8 @@ impl Explorer {
                 .restore_checkpoint(&saved.sources)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
-        let calibration = config
-            .return_policy
-            .enabled()
+        // 只有二维里程预算使用此标定查询去程和回程。
+        let calibration = (!self.uses_surface() && config.return_policy.maximum_distance_m.is_some())
             .then(|| MissionCalibration::capture(self.capabilities.as_ref(),&self.robot_geometry))
             .transpose()
             .map_err(Status::failed_precondition)?;

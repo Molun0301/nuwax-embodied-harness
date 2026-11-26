@@ -99,9 +99,8 @@ class Embeddings:
             return provider
 
     def query(self, text, snapshot):
-        if not self._model_lock.acquire(blocking=False):
-            return {}
-        try:
+        # 后台补算占用模型时等待本次使用结束，避免并发请求丢失向量召回。
+        with self._model_lock:
             names = ["text"]
             if any(key[2] == "image" for key in snapshot.vectors):
                 names.append("image")
@@ -111,8 +110,6 @@ class Embeddings:
                 if provider is not None:
                     vectors[name] = (provider, provider.embed_text(text))
             return vectors
-        finally:
-            self._model_lock.release()
 
     def _run(self):
         while True:

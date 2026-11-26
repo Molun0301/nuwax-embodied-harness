@@ -325,9 +325,8 @@ class DeferredProjectionConfig:
 class PerceptionPostProcessConfig:
     """检测后处理配置：类无关 NMS（杠杆二，见方案文档第 6.2 节）。
 
-    在 detector 之后、tracker 之前，对单帧检测做类无关 NMS：忽略标签，凡 bbox IoU
-    高于阈值的重叠框只保留置信度最高的一个，解决「同一物体被同时框成多个重叠标签」
-    导致的重复识别。纯单帧无状态，下游 tracker / 关联 / 记忆无需改动。
+    在 detector 之后、tracker 之前按交并比筛除重叠的低分框。
+    同标签框的交并比未达阈值时，还筛除至少 95% 面积被较大框覆盖的小框。
     """
 
     enabled: bool = schema_default('perception.postprocess_nms_enabled')
@@ -425,6 +424,8 @@ class SceneMappingConfig:
     base_url: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_BASE_URL')
     model: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_MODEL')
     api_key: str = field(default_factory=lambda: schema_default('semantic_map.NUWAX_SCENE_MAPPING_API_KEY'), repr=False)
+    api_key_file: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_API_KEY_FILE')
+    extra_body: str = schema_default('semantic_map.NUWAX_SCENE_MAPPING_EXTRA_BODY')
     timeout_sec: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_TIMEOUT_SEC')
     interval_sec: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_INTERVAL_SEC')
     min_area_m2: float = schema_default('semantic_map.NUWAX_SCENE_MAPPING_MIN_AREA_M2')
@@ -464,6 +465,9 @@ class ManipulationConfig:
     http_timeout_sec: float = schema_default('manipulation.http_timeout_sec')
     stop_timeout_sec: float = 10.0
     poll_interval_sec: float = schema_default('manipulation.poll_interval_sec')
+    standoff_distance_m: float = schema_default('manipulation.standoff_distance_m')
+    approach_position_tolerance_m: float = schema_default('manipulation.approach_position_tolerance_m')
+    approach_yaw_tolerance_rad: float = schema_default('manipulation.approach_yaw_tolerance_rad')
 
     def __post_init__(self):
         import math
@@ -472,6 +476,11 @@ class ManipulationConfig:
             if not math.isfinite(value) or not 0 < value <= maximum:
                 raise ValueError("操作设备配置必须为有界正数: " + name)
 
+
+
+@dataclass
+class McpConfig:
+    image_max_edge_px: int = schema_default('mcp.image_max_edge_px')
 
 
 @dataclass
@@ -491,6 +500,7 @@ class NuwaxRobotBridgeConfig:
     perception: PerceptionConfig
     scene_mapping: SceneMappingConfig = field(default_factory=SceneMappingConfig)
     manipulation: ManipulationConfig = field(default_factory=ManipulationConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
 
 @dataclass
@@ -943,7 +953,11 @@ def load_config() -> NuwaxRobotBridgeConfig:
             http_timeout_sec=value('manipulation.http_timeout_sec'),
             stop_timeout_sec=10.0,
             poll_interval_sec=value('manipulation.poll_interval_sec'),
+            standoff_distance_m=value('manipulation.standoff_distance_m'),
+            approach_position_tolerance_m=value('manipulation.approach_position_tolerance_m'),
+            approach_yaw_tolerance_rad=value('manipulation.approach_yaw_tolerance_rad'),
         ),
+        mcp=McpConfig(image_max_edge_px=value('mcp.image_max_edge_px')),
     )
 
 

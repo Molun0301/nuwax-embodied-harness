@@ -368,6 +368,8 @@ impl PlanWorker {
 #[cfg(test)]
 #[path = "local_ground_tests.rs"]
 mod ground_tests;
+#[cfg(test)]
+pub(crate) use ground_tests::source as observed_ground_test_source;
 
 #[cfg(test)]
 mod tests {

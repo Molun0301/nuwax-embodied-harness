@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 import logging
@@ -86,6 +87,20 @@ class TaskContext:
     def remaining(self) -> Optional[float]:
         return None if self.deadline is None else max(0.0, self.deadline - clock.monotonic())
 
+    @contextmanager
+    def time_limit(self, seconds: float):
+        """用同一任务的取消标志约束当前执行阶段。"""
+        previous = self.deadline
+        self.deadline = clock.monotonic() + seconds
+        timer = _TaskTimer(self.deadline, self._runner.cancel, args=(self.task_id, "期限"))
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+            self.deadline = previous
+
     def progress(self, value: float, stage: str, message: str, **data: Any) -> None:
         self.check()
         self._last_progress = message or stage
@@ -150,7 +165,7 @@ class TaskRunner:
             if cap.motion:
                 previous = self._cancel_locked(self._motion_task, "新运动命令接管")
             task_id = "task_" + uuid4().hex
-            duration = args.get("timeout_sec", cap.timeout_sec)
+            duration = args.get("timeout_sec", cap.timeout_sec) if cap.timeout_from_args else cap.timeout_sec
             ctx = TaskContext(task_id, threading.Event(),
                               None if duration is None else clock.monotonic() + duration, self)
             status = TaskStatus(task_id, cap.name, caller, TaskState.RUNNING, cap.motion, 0.0,
@@ -205,7 +220,11 @@ class TaskRunner:
             elif error is not None:
                 state, message = TaskState.FAILED, str(error)
                 code = error.error_code if isinstance(error, GatewayError) else "internal_error"
-                if isinstance(error, GatewayError) and cap.name in {"find_target", "explore_and_find_target"}:
+                if cap.name == "execute_manipulation_task":
+                    stage = current.stage if current.stage != "running" else (
+                        "approaching" if cap.motion else "manipulating")
+                    result = {**(error.details if isinstance(error, GatewayError) else {}), "stage": stage}
+                elif isinstance(error, GatewayError) and cap.name in {"find_target", "explore_and_find_target"}:
                     result = dict(error.details)
             else:
                 state, message, code = TaskState.SUCCEEDED, "任务已完成。", None

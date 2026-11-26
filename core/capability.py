@@ -22,6 +22,8 @@ class Capability:
     # 按定义模块登记的分组中文名和 Lucide 图标名，供网页能力面板显示。
     group: str = ""
     group_icon: str = ""
+    # 调用参数 timeout_sec 是否覆盖任务期限。
+    timeout_from_args: bool = True
 
 
 class CapabilityTable:

@@ -27,6 +27,8 @@ pub struct SurfaceReplanFeedback {
     pub current_context: Option<Arc<ActualExecutionContext>>,
     /// 零速请求已被运动端接受，不表示实测停稳。
     pub zero_sent_rejection: bool,
+    /// 全部局部动作均被当前碰撞检查拒绝。
+    pub locally_blocked: bool,
     /// 原局部拒绝的具名原因，只在零速请求被接受后随原路径发布。
     pub rejection_reason: Option<String>,
 }

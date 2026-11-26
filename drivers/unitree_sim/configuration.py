@@ -14,6 +14,9 @@ def configure(values, root, home):
     model = values['unitree_sim.model']
     backend = capabilities(values['unitree_sim.base_url'], model)['backend']
     sensors, limits = backend['sensors'], backend['command_limits']
+    configured_yaw = values['robot.actuator_max_yaw_rps']
+    device_yaw = float(limits['wz_rps'])
+    yaw_limit = device_yaw if configured_yaw == '' else min(float(configured_yaw), device_yaw)
     calibration = sensors['calibration']
     reference = sensors['registration_frame_id']
     # 源已在采样时把点/惯性转换到同一 IMU 参考体；不得再次应用原始安装变换。
@@ -24,7 +27,7 @@ def configure(values, root, home):
                    'motion_guard.backend': 'motion_control',
                    'motion_guard.control_factory': 'drivers.unitree_sim.device:create_motion_control',
                    'robot.actuator_max_linear_mps': math.hypot(limits['vx_mps'], limits['vy_mps']),
-                   'robot.actuator_max_yaw_rps': float(limits['wz_rps']),
+                   'robot.actuator_max_yaw_rps': yaw_limit,
                    'robot.actuator_motion_model': 'omnidirectional',
                    'perception.stream_camera_id': sensors['image']['camera_ids'][0]})
     if not values['geometry.pointlio_options']:

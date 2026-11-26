@@ -12,7 +12,24 @@ import numpy as np
 
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
-from services.memory.semantic_map.room_segmentation import _local, _planar_origin, _world
+from services.memory.semantic_map.room_segmentation import _inside_ring, _local, _planar_origin, _world
+
+
+def target_in_scene_spaces(pose, spaces):
+    """用房间平面轮廓归属物体，桌面和家具不属于机器人可行格掩码。"""
+    if pose is None:
+        return False
+    x, y = pose.position.x, pose.position.y
+    for space in spaces:
+        boundary = space.boundary
+        if boundary is None or pose.frame_id != space.frame_id:
+            continue
+        polygon = [(point.x, point.y) for point in boundary.polygon_points]
+        if _inside_ring(x, y, polygon) and not any(
+            _inside_ring(x, y, ring) for ring in boundary.metadata.get("holes", [])
+        ):
+            return True
+    return False
 
 
 @dataclass

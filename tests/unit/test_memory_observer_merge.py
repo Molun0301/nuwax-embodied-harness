@@ -42,6 +42,24 @@ class Sequence:
         return outcomes[0].instance
 
 
+def test_query_keeps_distinct_temporary_instances_at_the_same_anchor(tmp_path):
+    from contracts.naming import build_anchor_id, build_observation_event_id
+    from contracts.spatial_memory import ObservationEvent
+
+    anchor = build_anchor_id("nightstand")
+    with integration.memory_at(tmp_path, pose=integration.position(0, 0, 0)) as (memory, _):
+        for x, identity in ((-7.7, "old"), (-4.4, "placed"), (-4.4, "placed")):
+            event = ObservationEvent(event_id=build_observation_event_id("apple"), title="观察到 apple",
+                summary="apple", pose=integration.position(x, 2.5, .7), frame_id="map",
+                map_name="house", anchor_id=anchor, visual_labels=["apple"],
+                metadata={"short_term_instance_id": identity})
+            memory.write(lambda store: store.put("observation", event))
+
+        matches = memory.query_semantic_memory("apple").matches
+        positions = [match.observation_event.pose.position.x for match in matches if match.observation_event]
+        assert sorted(positions) == [-7.7, -4.4]
+
+
 def project(robot, *, tree=None, frame='map'):
     box = integration.detection3d('cup', x=3, y=2, z=1.5, size=(.08,.08,.12))
     support = integration.detection2d('cup', x=3, y=2, z=1.5, size=(.08,.08,.12))
@@ -354,3 +372,133 @@ def test_find_target_navigates_to_a_written_door_observation(tmp_path):
             and candidate.metadata["resolution_decision"] == "navigate"
             for candidate in candidates
         )
+
+
+def test_inspection_waits_for_stop_and_confirms_from_each_source_frame(tmp_path, monkeypatch):
+    from contracts.runtime_views import SceneObjectSummary
+    from core.settings import PerceptionConfig
+    from gateways.capabilities import navigation
+    from services.navigation.motion_client import MeasuredMotion
+    from services.perception.runtime_sample import PerceptionSample
+
+    robot = integration.position(0, 0, 0)
+    apple = integration.detection2d("apple", x=1, y=1, size=(.08, .08, .08))
+    samples = []
+    for offset in range(3):
+        context = integration.observed([apple], now=NOW + timedelta(seconds=offset))
+        context.scene_summary.objects = [SceneObjectSummary(label="apple", count=1, max_score=.97)]
+        samples.append(PerceptionSample(context, "house", pose=robot, complete=True))
+    feedback = iter((
+        MeasuredMotion("robot", 99, 0, 0, "base_link", (0., 0., 0.), (0., 0., 0.), None),
+        MeasuredMotion("robot", 100, 0, 0, "base_link", (.1, 0., 0.), (0., 0., 0.), None),
+        MeasuredMotion("robot", 101, 0, 0, "base_link", (0., 0., 0.), (0., 0., 0.), None),
+    ))
+    waits = []
+
+    def burst(ctx, *, reason, frame_count, interval_sec, source_after_ns):
+        assert source_after_ns == 101 and waits == [.05, .05]
+        return tuple(samples[:frame_count])
+
+    monkeypatch.setattr(navigation.clock, "source_now_ns", lambda: 100)
+    video = SimpleNamespace(acquire=lambda *a, **kw: None, release=lambda reason: None,
+                            run_burst=burst, complete_sample=lambda sample: sample)
+    ctx = SimpleNamespace(task_id="inspection", progress=lambda *a: None, check=lambda: None, wait=waits.append)
+    with integration.memory_at(tmp_path, pose=robot) as (memory, geometry):
+        platform = SimpleNamespace(config=SimpleNamespace(perception=PerceptionConfig()),
+            motion=SimpleNamespace(measured_motion=lambda: next(feedback)), geometry_state=geometry,
+            memory=memory, perception=SimpleNamespace(video_runtime=video))
+        result = navigation.inspect_target(platform, ctx, {"query": "apple"})
+        assert result["frame_count"] == 3
+        events = memory.records("observation")
+        assert {event.source_observation_id for event in events} == {
+            sample.context.observation.observation_id for sample in samples}
+        assert sum(bool(event.linked_instance_ids) for event in events) == 1
+        instance, = memory.records("instance")
+        assert instance.support_evidence.confirmation_observation_ids == [
+            sample.context.observation.observation_id for sample in samples]
+
+
+def test_burst_counts_only_images_captured_after_stop(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.test_a2c_perception_runtime import Context, eventually, setup
+
+    with setup(tmp_path) as camera, ThreadPoolExecutor(max_workers=1) as executor:
+        camera.runtime.acquire("inspect")
+        first = camera.source.current.metadata["source_timestamp_ns"]
+        burst = executor.submit(camera.runtime.run_burst, Context(),
+            reason="inspect", frame_count=1, source_after_ns=first + 1_000_000_000)
+        eventually(lambda: bool(camera.runtime._bursts))
+        camera.source.advance()
+        eventually(lambda: camera.runtime.latest().context.observation.metadata["source_sequence"] == 2)
+        assert not burst.done()
+        camera.source.advance()
+        sample, = burst.result(timeout=3)
+        assert sample.context.observation.metadata["source_sequence"] == 3
+
+
+def test_find_target_region_excludes_outside_memory_and_live_detections(tmp_path, monkeypatch):
+    from contracts.naming import build_scene_space_id
+    from contracts.runtime_views import SceneObjectSummary
+    from contracts.spatial_memory import SceneSpace, SceneSpaceBoundary
+    from gateways.capabilities import navigation
+    from services.navigation.motion_client import MeasuredMotion
+    from services.perception.runtime_sample import PerceptionSample
+
+    robot = integration.position(0, 0, 0)
+    kitchen = SceneSpace(scene_space_id=build_scene_space_id("kitchen"),
+        primary_label="厨房", map_name="house", frame_id="map",
+        boundary=SceneSpaceBoundary(frame_id="map", polygon_points=[
+            Vector3(x=1, y=-1), Vector3(x=4, y=-1), Vector3(x=4, y=3), Vector3(x=1, y=3)]))
+    real = integration.detection2d("apple", x=2, y=1, z=1, size=(.08, .08, .08), track="kitchen")
+    outside = integration.detection2d("apple", x=-2, y=1, z=1, size=(.08, .08, .08), track="bedroom")
+    samples = []
+    for offset, image in enumerate(([outside], [outside, real])):
+        context = integration.observed(image, now=NOW + timedelta(seconds=offset))
+        context.scene_summary.objects = [SceneObjectSummary(label="apple", count=len(image), max_score=.97)]
+        samples.append(PerceptionSample(context, "house", pose=robot, complete=True))
+    ctx = SimpleNamespace(task_id="finding", progress=lambda *a, **kw: None, check=lambda: None)
+    visits = []
+
+    def arrive(platform, ctx, goal):
+        visits.append(goal)
+        return {"goal_id": "goal", "arrival": "target"}
+
+    monkeypatch.setattr(navigation, "navigate_to_pose", arrive)
+    monkeypatch.setattr(navigation.clock, "source_now_ns", lambda: 100)
+    stopped = MeasuredMotion("robot", 101, 0, 0, "base_link", (0., 0., 0.), (0., 0., 0.), None)
+    with integration.memory_at(tmp_path, pose=robot) as (memory, geometry):
+        for sample in samples:
+            memory.remember_current_scene(map_name="house", perception_context=sample.context,
+                                          observation_pose=robot)
+        captured = iter(samples)
+        burst_sources = []
+
+        def burst(ctx, *, reason, frame_count, interval_sec, source_after_ns):
+            burst_sources.append(source_after_ns)
+            return (next(captured),)
+
+        video = SimpleNamespace(acquire=lambda *a, **kw: None, release=lambda reason: None,
+            run_burst=burst, complete_sample=lambda sample: sample)
+        region_lookups = []
+
+        def resolve(name):
+            region_lookups.append(name)
+            return (kitchen,)
+
+        platform = SimpleNamespace(memory=memory, geometry_state=geometry,
+            motion=SimpleNamespace(measured_motion=lambda: stopped),
+            perception=SimpleNamespace(video_runtime=video),
+            scene_mapping=SimpleNamespace(graph=SimpleNamespace(resolve_regions=resolve)))
+        result = navigation.find_target(platform, ctx, {"query":"apple", "region":"厨房", "motion_generation":1})
+        assert region_lookups == ["厨房"] and len(visits) == 1
+        assert visits[0]["tolerance_position_m"] == .10
+        assert burst_sources == [None, stopped.source_timestamp_ns]
+        assert result["found_mode"] == "memory_candidate_navigation"
+        assert result["navigation_candidate"].anchor_pose.position.x == pytest.approx(2)
+        assert result["arrival_verification"].verified
+        assert result["perception_refresh"]["detection_evidence"]["matched_detection_count"] == 1
+
+        captured = iter(samples)
+        current = navigation.find_target(platform, ctx, {"query":"apple", "motion_generation":1})
+        assert current["found_mode"] == "current_scene"
+        assert region_lookups == ["厨房"] and len(visits) == 1

@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import copy
 import heapq
+import threading
+from dataclasses import dataclass
 from datetime import timezone
 
 from contracts.base import utc_now
-from contracts.spatial_memory import SceneSpaceReviewStatus
+from contracts.maps import OccupancyGrid
+from contracts.spatial_memory import SceneSpace, SceneSpaceReviewStatus
 from core.errors import GatewayError
 from services.memory.semantic_map.inputs import algorithm_grid, algorithm_pose, map_binding, same_scope
 
@@ -14,10 +17,19 @@ MANAGED_KEY = "scene_mapping_managed"
 PROTECTED = {SceneSpaceReviewStatus.REVIEWED, SceneSpaceReviewStatus.CORRECTED, SceneSpaceReviewStatus.REJECTED}
 
 
+@dataclass(frozen=True)
+class _ScenePartition:
+    grid: OccupancyGrid
+    binding: dict
+    regions: dict[str, SceneSpace]
+
+
 class SemanticMapState:
     def __init__(self, memory, geometry_state):
         self.core = memory
         self.geometry = geometry_state
+        self._partition_lock = threading.Lock()
+        self._partition = None
 
     def capture_scene_mapping_state(self, *, include_decision_inputs=True):
         state = self.geometry.snapshot()
@@ -47,11 +59,11 @@ class SemanticMapState:
         if not same_scope(current, capture["binding"]) or (require_content and current["map_revision"] != capture["binding"]["map_revision"]):
             raise GatewayError("语义任务依据的地图已改变。", error_code="scene_map_changed", http_status=409)
 
-    def _writer(self, capture, operation):
+    def _writer(self, capture, operation, *, require_content=True):
         def write(store):
             if store is None or store.name != capture["library_name"]:
                 raise GatewayError("记忆库已切换，旧语义结果未写入。", error_code="memory_library_changed", http_status=409)
-            self._assert_scene_mapping_capture(capture)
+            self._assert_scene_mapping_capture(capture, require_content=require_content)
             return operation(store)
         return self.core.write(write)
 
@@ -68,6 +80,9 @@ class SemanticMapState:
             retired = []
             for space in spaces:
                 previous = current.get(space.scene_space_id)
+                if not retire_missing and (previous is None or previous.review_status is SceneSpaceReviewStatus.STALE
+                        or not same_scope(previous.metadata.get("map_binding", {}), capture["binding"])):
+                    raise GatewayError("当前地图中没有该受管区域。", error_code="scene_space_not_found", http_status=404)
                 revision = int(previous.metadata.get("scene_revision", 0)) if previous else 0
                 if revision != expected_revisions.get(space.scene_space_id, 0):
                     raise GatewayError("场景空间已被更新。", error_code="scene_revision_conflict", http_status=409)
@@ -83,14 +98,43 @@ class SemanticMapState:
                 store.put("scene_space", space)
             written = self.core.record_scene_space_graphs((*result, *retired), map_name=capture["library_name"])
             return list(written[:len(result)])
-        return self._writer(capture, write)
+        if not retire_missing:
+            return self._writer(capture, write, require_content=False)
+        # 图查询同时看到分区快照和同一批写入的区域记录。
+        with self._partition_lock:
+            written = self._writer(capture, write)
+            self._publish_partition(capture, written)
+            capture["partition"] = self._partition
+            return written
+
+    def _publish_partition(self, capture, spaces):
+        self._partition = _ScenePartition(capture["grid"], capture["binding"],
+                                          {space.scene_space_id: space for space in spaces})
+
+    def restore_scene_partition(self, capture, spaces):
+        """重启后复用已提交且仍与当前栅格一致的分区。"""
+        with self._partition_lock:
+            if self._partition is None:
+                self._publish_partition(capture, spaces)
+            capture["partition"] = self._partition
+
+    def clear_scene_partition(self, map_name):
+        with self._partition_lock:
+            if self._partition is not None and self._partition.binding["map_name"] != map_name:
+                self._partition = None
+
+    def assert_scene_graph_capture(self, capture):
+        self._assert_scene_mapping_capture(capture, require_content=False)
+        with self._partition_lock:
+            if capture["partition"] is not self._partition:
+                raise GatewayError("语义任务依据的分区已改变。", error_code="scene_map_changed", http_status=409)
 
     def current_managed_scene_spaces(self, capture, *, include_stale=False):
         result = []
         for space in capture["spaces"]:
             if not space.metadata.get(MANAGED_KEY) or space.map_name != capture["library_name"]:
                 continue
-            # 同地图同坐标系即有效，不比实时栅格修订；直到下一次分割提交把它标成作废。
+            # 同地图同坐标系即有效，不比实时栅格修订；直到下一次分区提交把它标成作废。
             valid = same_scope(space.metadata.get("map_binding", {}), capture["binding"])
             if not valid or space.review_status is SceneSpaceReviewStatus.STALE:
                 if include_stale:
@@ -102,13 +146,15 @@ class SemanticMapState:
     def commit_scene_mapping_label(self, capture, space, *, label, source, expected_revision, requested_by=None):
         explicit = source == "explicit_tool_update"
         def write(store):
+            if capture["partition"] is not self._partition:
+                raise GatewayError("写名期间区域分区已改变。", error_code="scene_geometry_changed", http_status=409)
             current = store.get("scene_space",space.scene_space_id)
             revision = int(current.metadata.get("scene_revision", 0)) if current else 0
             if revision != expected_revision:
                 raise GatewayError("区域在处理期间已修改，拒绝覆盖。", error_code="scene_revision_conflict", http_status=409)
             if not explicit and current and (current.metadata.get("label_locked") or current.review_status in PROTECTED):
                 raise GatewayError("区域显式名称受保护。", error_code="scene_label_protected", http_status=409)
-            metadata = {**space.metadata, "label_source": source}
+            metadata = {**space.metadata, "map_binding": capture["binding"], "label_source": source}
             updates = {"primary_label": label,
                 "review_status": SceneSpaceReviewStatus.AUTO_LABELED if label else SceneSpaceReviewStatus.CANDIDATE,
                 "metadata": metadata}
@@ -136,20 +182,48 @@ class SemanticMapState:
             result = self._versioned(space.model_copy(update=updates), current, capture["library_name"])
             store.put("scene_space", result)
             return self.core.record_scene_space_graphs((result,), map_name=capture["library_name"])[0]
-        return self._writer(capture, write)
+        with self._partition_lock:
+            return self._writer(capture, write, require_content=False)
 
-    def update_scene_mapping_label(self, *, scene_space_id, map_name, expected_revision, label, requested_by=None):
-        capture = self.capture_scene_mapping_state()
+    def update_scene_mapping_label(self, *, scene_space_id, map_name, expected_revision, label, segmenter, requested_by=None):
+        capture = self.capture_scene_partition(segmenter=segmenter)
         if map_name != capture["library_name"]:
             raise GatewayError("请求地图不是当前地图。", error_code="scene_scope_changed", http_status=409)
-        current = next((space for space in self.current_managed_scene_spaces(capture) if space.scene_space_id == scene_space_id), None)
+        current = next((space for space in capture["spaces"]
+                        if space.scene_space_id == scene_space_id
+                        and same_scope(space.metadata.get("map_binding", {}), capture["binding"])
+                        and space.review_status not in {SceneSpaceReviewStatus.STALE, SceneSpaceReviewStatus.REJECTED}), None)
         if current is None:
             raise GatewayError("当前地图中没有该受管区域。", error_code="scene_space_not_found", http_status=404)
         return self.commit_scene_mapping_label(capture, current, label=label.strip(), source="explicit_tool_update",
                                               expected_revision=expected_revision, requested_by=requested_by)
 
-    def capture_scene_graph_state(self):
-        capture = self.capture_scene_mapping_state()
+    def capture_scene_partition(self, *, segmenter, include_decision_inputs=False):
+        with self._partition_lock:
+            capture = self.capture_scene_mapping_state(include_decision_inputs=include_decision_inputs)
+            if self._partition is not None and not same_scope(self._partition.binding, capture["binding"]):
+                self._partition = None
+            if self._partition is None:
+                persisted = self.current_managed_scene_spaces(capture)
+                if persisted:
+                    # 保存图可能早于最后一次分区。用已载入的实际自由格恢复边界和区域编号。
+                    restored = segmenter.segment(capture["grid"], map_name=capture["library_name"],
+                        map_revision=capture["binding"]["map_revision"], existing_spaces=persisted)
+                    self._publish_partition(capture, restored)
+            partition = self._partition
+        capture["partition"] = partition
+        all_spaces = capture["spaces"]
+        capture["spaces"] = ()
+        capture["space_total"] = len(all_spaces)
+        if partition is not None:
+            # 区域轮廓随分区发布，名称和审核仍读取最新的记忆记录。
+            spaces = tuple(space.model_copy(update={"boundary": partition.regions[space.scene_space_id].boundary})
+                           for space in all_spaces if space.scene_space_id in partition.regions)
+            capture.update(grid=partition.grid, binding=partition.binding, spaces=spaces)
+        return capture
+
+    def capture_scene_graph_state(self, *, segmenter):
+        capture = self.capture_scene_partition(segmenter=segmenter, include_decision_inputs=True)
         snapshot = capture["memory_snapshot"]
         instances = snapshot.model_map("instance")
         entries = capture["entries"]
@@ -174,7 +248,7 @@ class SemanticMapState:
                 if deadline > now:
                     deadlines.append(deadline)
         capture["valid_until"] = min(deadlines) if deadlines else None
-        capture.update(space_total=len(capture["spaces"]), instance_total=len(instances), instance_truncated=len(instances) > len(selected),
+        capture.update(instance_total=len(instances), instance_truncated=len(instances) > len(selected),
                        entries=entries)
         return capture
 

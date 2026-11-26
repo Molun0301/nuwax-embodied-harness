@@ -238,6 +238,7 @@ def derived_values(values, code_root=CODE_ROOT):
             "min_executable_linear_mps": capabilities["MIN_EXECUTABLE_LINEAR_MPS"],
             "min_executable_angular_rps": capabilities["MIN_EXECUTABLE_ANGULAR_RPS"],
             "actuator_max_linear_mps": float(linear),
+            "actuator_max_reverse_mps": float(linear if robot["actuator_max_reverse_mps"] == "" else robot["actuator_max_reverse_mps"]),
             "actuator_max_yaw_rps": float(yaw), "actuator_motion_model": model if profile == "pct-scan-3d" else "",
             "robot_geometry_json": geometry.to_runtime_json(),
             "standing_ground_z_m": geometry.z_min_m + capabilities["STANDING_GROUND_OFFSET_M"]}

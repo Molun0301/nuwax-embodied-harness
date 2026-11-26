@@ -17,7 +17,6 @@ from starlette.requests import Request
 
 from gateways.auth import GatewayAccessManager
 from gateways.agent.router import build_agent_router
-from gateways.agent.service import AgentToolService
 from core.errors import GatewayError
 from gateways.feedback import build_public_error_payload
 from gateways.request_context import (
@@ -241,7 +240,7 @@ def create_gateway_app(
         nonlocal agent_tools
         with agent_tools_lock:
             if agent_tools is None:
-                agent_tools = AgentToolService(runtime, access_manager)
+                agent_tools = runtime.agent_tools
                 app.state.agent_tools = agent_tools
             return agent_tools
 

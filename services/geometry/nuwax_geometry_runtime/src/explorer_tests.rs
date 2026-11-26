@@ -11,6 +11,7 @@ fn make_explorer(
     let d = nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,
         nav_profile: "pct-scan-3d".into(),
         actuator_max_linear_mps: 0.0,
+        actuator_max_reverse_mps: 0.0,
         actuator_max_yaw_rps: 0.0,
         actuator_motion_model: String::new(),
         robot_geometry_json: TEST_GEOMETRY.into(),
@@ -244,6 +245,49 @@ fn feedback(explorer: &mut Explorer, id: String, status: proto::GoalStatus) {
         })
         .unwrap();
 }
+
+#[test]
+fn completion_return_dispatches_home_without_full_motion_calibration() {
+    for surface_mode in [false, true] {
+        let mut explorer = make_explorer("住宅".into(), "map".into(), surface_mode).unwrap();
+        let mut start = request();
+        start.stop_conditions = Some(proto::ExplorationStopConditions {
+            max_goals: Some(0),
+            ..Default::default()
+        });
+        start.return_policy = Some(proto::ExplorationReturnPolicy {
+            return_on_completion: true,
+            ..Default::default()
+        });
+        explorer.start("完成后返航".into(), start).unwrap();
+        let home = pose();
+        let returning = explorer
+            .tick(Some(home.clone()), Some(grid()), Ok(floor(|_, _| false)), Ok(()))
+            .unwrap();
+        let (id, target) = returning.goal.expect("应派发回到实测起点的导航");
+        assert!(returning.status.returning);
+        assert_eq!(target.pose.unwrap().position, home.position);
+        feedback(&mut explorer, id, proto::GoalStatus::Succeeded);
+        assert_eq!(explorer.status("").phase, proto::ExplorationPhase::Succeeded as i32);
+    }
+}
+
+#[test]
+fn only_planar_distance_budget_requires_full_motion_calibration() {
+    let mut start = request();
+    start.return_policy = Some(proto::ExplorationReturnPolicy {
+        maximum_distance_m: Some(20.),
+        ..Default::default()
+    });
+    let mut planar = make_explorer("住宅".into(), "map".into(), false).unwrap();
+    assert_eq!(
+        planar.start("二维预算".into(), start.clone()).unwrap_err().message(),
+        "返航需要导航运动标定"
+    );
+    let mut surface = make_explorer("住宅".into(), "map".into(), true).unwrap();
+    surface.start("三维预算".into(), start).unwrap();
+}
+
 #[test]
 fn max_goals_waits_for_active_child_terminal_before_stopping() {
     let mut explorer = started_with_max_goals(1);
@@ -947,7 +991,7 @@ pub(crate) fn vanishing_fixture() -> (Explorer, Arc<SurfaceSnapshot>) {
 }
 pub(crate) fn vanishing_pose() -> proto::Pose {
     from_mission(
-        &MissionPose { position: [0.75, 1.05, 0.55], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
+        &MissionPose { position: [0.55, 1.05, 0.55], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
         "map",
     )
 }
@@ -966,6 +1010,10 @@ fn surface_child_switches_when_its_frontier_vanishes_and_cancels_only_without_ne
     let (mut explorer, partial) = vanishing_fixture();
     let first = explorer.tick(Some(vanishing_pose()), None, Ok(partial.clone()), Ok(())).unwrap();
     let (first_id, goal) = first.goal.expect("初始前沿应派发子目标");
+    let start = vanishing_pose().position.unwrap();
+    let target = goal.pose.as_ref().unwrap().position.as_ref().unwrap();
+    assert_eq!(goal.position_tolerance_m, Some(GoalOptions::default().position_tolerance_m));
+    assert!((target.x - start.x).hypot(target.y - start.y) > goal.position_tolerance_m.unwrap());
     let cell = goal_cell(&goal);
     // 同一张快照不重复核对；前沿仍在的新快照不换目标；前沿线前移、原前沿格已不是前沿，
     // 但0.75米内仍有前沿格时也不换目标。

@@ -132,6 +132,7 @@ service GeometryRuntime {
   // 分块读取当前会话（建图中为实时，已加载为该地图）的完整稠密扫描点，网页三维显示用。
   // 没有点云 → FAILED_PRECONDITION。
   rpc GetDenseCloudChunk(DenseCloudChunkRequest) returns (DenseCloudChunk);
+  rpc GetDenseCloudRegion(DenseCloudRegionRequest) returns (DenseCloudChunk);
 
   // 读取坐标树最新边（map→odom、odom→base、base→传感器）。任何状态都允许。
   rpc GetFrameTree(Empty) returns (FrameTree);
@@ -487,9 +488,17 @@ message DenseCloudChunkRequest {
   bool allow_delta = 4;        // 允许返回相对已读前缀的增量
 }
 
+// 按地图坐标轴对齐盒读取有效扫描点，包含边界。偏移按盒内点计数。
+message DenseCloudRegionRequest {
+  Vec3 bounds_min = 1;
+  Vec3 bounds_max = 2;
+  string expected_epoch = 3;
+  uint64 offset_points = 4;
+  uint32 max_points = 5;
+}
+
 message DenseCloudChunk {
-  // 点云内容来源标识：会话切换、加载地图、点云整体重建时改变。网页据此判断能否从 offset 续读
-  // （这是本接口唯一的“身份”字段，调用方为网页稠密点云流）。
+  // 会话切换、加载地图、删除历史点或重建点云时改变，据此判断能否从 offset 续读。
   string epoch = 1;
   uint64 source_timestamp_ns = 2;
   string frame_id = 3;
@@ -502,6 +511,9 @@ message DenseCloudChunk {
   string base_epoch = 9;
   uint64 base_offset_points = 10;
   repeated uint64 removed_ranges = 11;
+  // 区域读取返回的地图版本，与 PoseUpdate 对应。
+  uint64 session_id = 12;
+  uint64 correction_seq = 13;
 }
 
 // ============================================================================

@@ -260,6 +260,56 @@ fn display_removals_match_full_scan_for_every_frame() {
     assert!(total_removed > 0, "必须实际覆盖历史展示体素清除");
 }
 #[test]
+fn dense_region_finishes_old_snapshot_after_retraction() {
+    let mut map = immediate_map(41);
+    let points = [
+        Point3::new(-1.0, 0.0, 0.0),
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(0.25, 0.0, 0.0),
+        Point3::new(0.5, 0.0, 0.0),
+        Point3::new(0.75, 0.0, 0.0),
+    ];
+    map.dense.append(&points).unwrap();
+    map.dense_snapshot = map.dense.snapshot(100, 1, "41");
+    let request = proto::DenseCloudRegionRequest {
+        bounds_min: Some(proto::Vec3::default()),
+        bounds_max: Some(proto::Vec3 { x: 1.0, y: 1.0, z: 1.0 }),
+        max_points: 4,
+        ..Default::default()
+    };
+    let (before_count, before) = map.dense.read_region(
+        map.dense_snapshot.as_ref().unwrap(), [[0.0; 3], [1.0; 3]], 0, 4,
+    ).unwrap();
+    let first = map.dense_region(
+        proto::DenseCloudRegionRequest { max_points: 2, ..request.clone() }, "map", 3,
+    ).unwrap();
+    assert_eq!(before_count, 4);
+    assert_eq!(first.xyz_f32_le.len(), 2 * 12);
+
+    // 撤销原本位于第二页的点，并领取最新纪元，确认旧页仍可续读。
+    let removed = voxel_key(points[3].coords.into(), VOXEL_SIZE).unwrap();
+    assert_eq!(map.dense.remove_voxels(&[removed], VOXEL_SIZE).unwrap(), 1);
+    map.dense_snapshot = map.dense.snapshot(200, 2, "41");
+    let latest = map.dense_region(request.clone(), "map", 3).unwrap();
+    assert_ne!(latest.epoch, first.epoch);
+    assert_eq!(latest.total_points, 3);
+
+    let second = map.dense_region(
+        proto::DenseCloudRegionRequest {
+            expected_epoch: first.epoch.clone(),
+            offset_points: (first.xyz_f32_le.len() / 12) as u64,
+            max_points: 2,
+            ..request
+        },
+        "map",
+        3,
+    ).unwrap();
+    assert_eq!(second.epoch, first.epoch);
+    assert_eq!(second.total_points, before_count);
+    assert_eq!([first.xyz_f32_le, second.xyz_f32_le].concat(), before);
+}
+
+#[test]
 fn dense_delta_returns_only_the_unread_surviving_tail() {
     let mut map = immediate_map(41);
     let old: Vec<_> = (0..8)

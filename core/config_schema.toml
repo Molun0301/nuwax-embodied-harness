@@ -735,19 +735,6 @@ panel = "视频与视觉识别"
 category = "分割"
 advanced = true
 
-[perception.deferred_strategy]
-type = "string"
-choices = ["disabled", "triangulation", "delayed_pointcloud", "triangulation_first"]
-default = "disabled"
-description = "控制记忆位置估计的三角化分支。现行读取方把 triangulation 与 triangulation_first 视为启用，其余两种关闭。延迟点云细化在当前调用链中没有读取方。"
-consumers = [
-    "core/settings.py:_build_deferred_projection_config",
-]
-apply = "restart"
-panel = "视频与视觉识别"
-category = "物品定位"
-advanced = true
-
 [perception.ground_tolerance_m]
 type = "float"
 min = 0.0
@@ -791,7 +778,7 @@ switch = "关键帧写入记忆"
 [perception.keyframe_translation_m]
 type = "float"
 min = 0.0
-default = 0.75
+default = 0.3
 description = "关键帧平移阈值（米）"
 title = "关键帧平移阈值"
 unit = "米"
@@ -805,7 +792,7 @@ category = "关键帧记忆"
 [perception.keyframe_yaw_deg]
 type = "float"
 min = 0.0
-default = 20.0
+default = 10.0
 description = "关键帧转向阈值（度）"
 title = "关键帧转向阈值"
 unit = "度"
@@ -1329,45 +1316,6 @@ apply = "restart"
 panel = "视频与视觉识别"
 category = "目标跟踪"
 
-[perception.triangulation_max_residual_m]
-type = "float"
-min = 0.01
-default = 0.5
-description = "三角化最大残差（米）"
-consumers = [
-    "core/settings.py:_build_deferred_projection_config",
-]
-apply = "restart"
-panel = "视频与视觉识别"
-category = "物品定位"
-advanced = true
-
-[perception.triangulation_min_parallax_deg]
-type = "float"
-min = 0.0
-default = 5.0
-description = "三角化最小视差角（度）"
-consumers = [
-    "core/settings.py:_build_deferred_projection_config",
-]
-apply = "restart"
-panel = "视频与视觉识别"
-category = "物品定位"
-advanced = true
-
-[perception.triangulation_min_rays]
-type = "integer"
-min = 2
-default = 2
-description = "多视角三角化估计物品位置所需的最少观察射线数，至少2。"
-title = "三角化最少观察数"
-consumers = [
-    "core/settings.py:_build_deferred_projection_config",
-]
-apply = "restart"
-panel = "视频与视觉识别"
-category = "物品定位"
-
 [perception.yolo_world_aliases]
 type = "array"
 items = "string"
@@ -1606,7 +1554,7 @@ advanced = true
 type = "integer"
 min = 1
 default = 5
-description = "主体簇点数不足时不新建实例、不更新物体位置或尺寸。仅按回退观察规则更新最近观察。完整三维检测尺寸与三角化不按点云簇点数拒绝。"
+description = "主体簇点数不足时只记录观察。完整三维检测沿用自身几何。"
 consumers = [
     "core/settings.py:load_config",
 ]

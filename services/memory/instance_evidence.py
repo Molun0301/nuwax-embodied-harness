@@ -14,14 +14,27 @@ ADMISSION_AUTOMATIC = "automatic"
 ADMISSION_EXPLICIT = "explicit"
 
 
+def insufficient_point_support(attributes, min_support_points):
+    if attributes.get("support_insufficient") is True:
+        return True
+    method = attributes.get("projection_method")
+    if method not in ("map_point_samples", "camera_point_samples", "pointcloud_bbox_projection", "pointcloud_mask_projection"):
+        return False
+    count = attributes.get("support_cluster_point_count")
+    if count is None and isinstance(attributes.get("support_cluster_summary"), dict):
+        count = attributes["support_cluster_summary"].get("point_count")
+    if count is None:
+        count = attributes.get("support_point_count")
+    return type(count) in (int, float) and count < min_support_points
+
+
 def measurement_sigma_m(attributes: Mapping[str, object]) -> Optional[float]:
     """读取测量误差；旧可靠投影使用距离误差下限，回退位置没有测量权重。"""
     if attributes.get("projection_method") == "current_pose_fallback":
         return None
-    for key in ("measurement_sigma_m", "triangulation_residual_m"):
-        value = attributes.get(key)
-        if type(value) in (int,float) and math.isfinite(value) and value > 0:
-            return float(value)
+    value = attributes.get("measurement_sigma_m")
+    if type(value) in (int, float) and math.isfinite(value) and value > 0:
+        return float(value)
     depth = attributes.get("depth_m")
     depth = float(depth) if type(depth) in (int,float) and math.isfinite(depth) and depth > 0 else 0.0
     floor = 0.005 + 0.002*depth*depth

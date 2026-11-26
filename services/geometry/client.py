@@ -1,4 +1,4 @@
-"""Geometry 的协议客户端；每个方法只执行一次远程调用。"""
+"""Geometry 的协议客户端。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ import threading
 from typing import Any, Iterator, Optional, Tuple
 
 import grpc
+import numpy as np
 
 from core.config import value
 
@@ -317,6 +318,32 @@ class GeometryClient:
         return DenseCloudChunk(value.epoch, value.source_timestamp_ns, value.frame_id,
             value.total_points, value.offset_points, value.xyz_f32_le, tuple(value.bounds_min),
             tuple(value.bounds_max), value.base_epoch, value.base_offset_points, tuple(value.removed_ranges))
+
+    def get_dense_cloud_region(self, bounds_min, bounds_max, *,
+                               timeout_sec: Optional[float] = None) -> Tuple[np.ndarray, int, int]:
+        """读取盒内所有地图点，以及该点云的会话号和校正序号。"""
+        request = pb.DenseCloudRegionRequest(
+            bounds_min=pb.Vec3(**dict(zip("xyz", bounds_min))),
+            bounds_max=pb.Vec3(**dict(zip("xyz", bounds_max))),
+            max_points=65_536,
+        )
+        pages = []
+        while True:
+            try:
+                chunk = self._call("GetDenseCloudRegion", request, timeout_sec)
+            except GeometryError as error:
+                if error.message != "DENSE_CLOUD_SOURCE_CHANGED":
+                    raise
+                pages.clear()
+                request.expected_epoch = ""
+                request.offset_points = 0
+                continue
+            pages.append(chunk.xyz_f32_le)
+            request.expected_epoch = chunk.epoch
+            request.offset_points += len(chunk.xyz_f32_le) // 12
+            if request.offset_points >= chunk.total_points:
+                points = np.frombuffer(b"".join(pages), dtype="<f4").reshape(-1, 3)
+                return points, chunk.session_id, chunk.correction_seq
 
     def get_frame_tree(self, *, timeout_sec: Optional[float] = None) -> Tuple[Transform, ...]:
         value = self._call("GetFrameTree", pb.Empty(), timeout_sec)

@@ -1,5 +1,6 @@
 """关键帧场景记忆和场景空间业务操作。"""
 from __future__ import annotations
+from collections import ChainMap
 from services.memory.places import CURRENT_POSE
 from datetime import timedelta
 from contracts.base import utc_now
@@ -16,6 +17,7 @@ from contracts.memory import MemoryRecordKind
 from contracts.geometry import Pose
 import numpy as np
 import uuid
+from services.memory.instance_association_service import AssociationOutcome
 from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT
 from services.memory.semantic_map.observations import refresh_scene_spaces
 
@@ -52,7 +54,7 @@ class ScenesMixin:
             corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, perception_context, image_bytes)
             value = entry.model_copy(update={"pose": corrected, "artifact_ids": photos})
-            value = self._save_scene_record(store, value, source=perception_context, context=perception_context,
+            value = self._save_scene_record(store, value, context=perception_context,
                 projected=prepared_observations, captured=captured, photos=photos)
             identity = ""
             if corrected is not None:
@@ -143,71 +145,19 @@ class ScenesMixin:
             corrected, prepared_observations = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, source, image_bytes)
             value = entry.model_copy(update={'pose': corrected, 'artifact_ids': photos, 'metadata': {**entry.metadata, 'photo_refs': [self.photo_ref(identity, library_name=map_name).model_dump(mode='json') for identity in photos]}})
-            return self._save_scene_record(store, value, source=source, context=context,
+            return self._save_scene_record(store, value, context=context,
                                            projected=prepared_observations, captured=captured, photos=photos)
         return self.write(save)
 
-    def _save_scene_record(self, store, value, *, source, context, projected, captured, photos):
+    def _save_scene_record(self, store, value, *, context, projected, captured, photos):
         from dataclasses import replace
         projected = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in projected)
         value = store.put("memory", value)
         automatic = value.metadata.get("source") in _AUTOMATIC_OBSERVATION_SOURCES
-        outcomes = (self._associate_observations(store, projected,
-            admission=ADMISSION_AUTOMATIC if automatic else ADMISSION_EXPLICIT,
-            occupancy_grid=self.current_grid(), now=value.timestamp)[1] if projected else ())
-        events = []
-        camera = source.camera_id if source is not None else str(value.metadata.get("camera_id") or "")
-        vision = self._collect_scene_vision_tags(context.scene_summary) if context is not None else []
-        for item, outcome in zip(projected, outcomes):
-            instance = outcome.instance
-            linked = [instance.instance_id] if instance is not None and self._is_long_term_static_instance(instance) else []
-            anchor_id = instance.anchor_id if linked else self._resolve_memory_anchor_id(value)
-            visual_labels = self._normalize_tags([item.label, *item.visual_labels])
-            semantic_labels = self._normalize_tags([*value.semantic_labels, *item.semantic_labels,
-                *self._flatten_metadata_strings(item.attributes.get("semantic_labels"))])
-            event = ObservationEvent(event_id=build_observation_event_id("perception", timestamp=value.timestamp),
-                title=f"观察到{item.label}", summary=f"在地图位置 {item.pose.position.x:.2f}, {item.pose.position.y:.2f} 观察到 {item.label}。",
-                camera_id=item.camera_id or camera, pose=item.pose, frame_id=item.pose.frame_id,
-                map_name=value.map_name, scene_space_id=value.scene_space_id,
-                topo_node_id=item.topo_node_id, semantic_region_id=item.semantic_region_id,
-                anchor_id=anchor_id,
-                source_observation_id=item.source_observation_id or value.observation_id, source_memory_id=value.memory_id,
-                linked_instance_ids=linked, artifact_ids=photos,
-                visual_labels=visual_labels, semantic_labels=semantic_labels,
-                vision_tags=self._normalize_tags([*vision, *semantic_labels, *visual_labels]),
-                metadata={**item.attributes, "camera_id": item.camera_id or camera,
-                    "projection_count": len(projected),
-                    "projection_method": str(item.attributes.get("projection_method") or ""),
-                    "projection_confidence": float(item.attributes.get("projection_confidence") or item.score),
-                    "support_point_count": int(item.attributes.get("support_point_count") or 0),
-                    "linked_memory_id": value.memory_id,
-                    "linked_instance_id": instance.instance_id if linked else "",
-                    "short_term_instance_id": instance.instance_id if instance is not None and not linked else "",
-                    "linked_anchor_id": anchor_id,
-                    "dynamic_state": self._instance_dynamic_state(instance).value if instance is not None else "unknown",
-                    "dynamic_state_reason": str((instance.metadata if instance is not None else {}).get("dynamic_state_reason") or ""),
-                    "dynamic_short_term_obstacle_context": bool((instance.metadata if instance is not None else {}).get("dynamic_short_term_obstacle_context")),
-                    "long_term_static_target_eligible": bool(linked),
-                    "scene_visual_labels": self._collect_scene_visual_labels(context.scene_summary) if context is not None else [],
-                    "scene_vision_tags": vision, "map_name": value.map_name})
-            store.put("observation", event)
-            events.append(event)
-            if linked:
-                current = self._writing_record_map("instance")[linked[0]]
-                updated = current.model_copy(update={"last_observation_event_id": event.event_id,
-                    "supporting_observation_event_ids": self._normalize_aliases(
-                        [*current.supporting_observation_event_ids, event.event_id])})
-                store.put_live_instance(updated, persist=self._is_long_term_static_instance(updated))
-        self._record_observation_graph_relations(observation_events=tuple(events), association_outcomes=tuple(outcomes))
         if context is not None:
-            refreshed = refresh_scene_spaces(store, perception_context=context, observation_events=tuple(events), context=captured)
-            self.record_scene_space_graphs(refreshed.scene_spaces, map_name=value.map_name)
-        self._observation_event_write_count += len(events)
-        if self._observation_event_write_count >= 100:
-            self._observation_event_write_count = 0
-            for event in tuple(store.model_map("observation").values()):
-                if (utc_now()-event.timestamp).total_seconds() > 604800:
-                    store.delete("observation", event.event_id)
+            self._write_perception_observations(
+                store, projected, admission=ADMISSION_AUTOMATIC if automatic else ADMISSION_EXPLICIT,
+                context=context, photos=photos, now=value.timestamp, memory=value, captured=captured)
         if value.linked_location_id:
             location = self._writing_record_map("location").get(value.linked_location_id)
             if location is not None:
@@ -218,6 +168,92 @@ class ScenesMixin:
         self._publish_memory_event("memory.entry_created", "语义记忆已写入。",
             payload={"memory_id": value.memory_id, "title": value.title})
         return value
+
+    def _write_perception_observations(self, store, projected, *, admission, context, photos, now,
+                                       memory=None, captured=None):
+        outcomes, changes, removed_ids, aliases = (), {}, (), {}
+        if projected:
+            outcomes, changes, removed_ids, aliases = self._associate_observations(
+                store, projected, admission=admission, occupancy_grid=self.current_grid(), now=now)
+        camera = context.camera_id
+        vision = self._collect_scene_vision_tags(context.scene_summary)
+        scene_labels = self._collect_scene_visual_labels(context.scene_summary)
+        memory_id = memory.memory_id if memory is not None else None
+        memory_anchor = self._resolve_memory_anchor_id(memory) if memory is not None else None
+        memory_labels = memory.semantic_labels if memory is not None else ()
+        scene_space_id = memory.scene_space_id if memory is not None else None
+        events = []
+        for item, outcome in zip(projected, outcomes):
+            instance = outcome.instance
+            linked = [instance.instance_id] if instance is not None and self._is_long_term_static_instance(instance) else []
+            anchor_id = instance.anchor_id if linked else memory_anchor or self._resolve_anchor_id_for_pose(
+                item.pose, semantic_region_id=item.semantic_region_id, topo_node_id=item.topo_node_id)
+            visual_labels = self._normalize_tags([item.label, *item.visual_labels])
+            semantic_labels = self._normalize_tags([*memory_labels, *item.semantic_labels,
+                *self._flatten_metadata_strings(item.attributes.get("semantic_labels"))])
+            event = ObservationEvent(event_id=build_observation_event_id("perception", timestamp=now), timestamp=now,
+                title=f"观察到{item.label}", summary=f"在地图位置 {item.pose.position.x:.2f}, {item.pose.position.y:.2f} 观察到 {item.label}。",
+                camera_id=item.camera_id or camera, pose=item.pose, frame_id=item.pose.frame_id,
+                map_name=store.name, scene_space_id=scene_space_id,
+                topo_node_id=item.topo_node_id, semantic_region_id=item.semantic_region_id,
+                anchor_id=anchor_id, source_observation_id=item.source_observation_id, source_memory_id=memory_id,
+                linked_instance_ids=linked, artifact_ids=photos,
+                visual_labels=visual_labels, semantic_labels=semantic_labels,
+                vision_tags=self._normalize_tags([*vision, *semantic_labels, *visual_labels]),
+                metadata={**item.attributes, "camera_id": item.camera_id or camera,
+                    "projection_count": len(projected),
+                    "projection_method": str(item.attributes.get("projection_method") or ""),
+                    "projection_confidence": float(item.attributes.get("projection_confidence", item.score)),
+                    "support_point_count": int(item.attributes.get("support_point_count") or 0),
+                    "linked_memory_id": memory_id,
+                    "linked_instance_id": instance.instance_id if linked else "",
+                    "short_term_instance_id": instance.instance_id if instance is not None and not linked else "",
+                    "linked_anchor_id": anchor_id,
+                    "dynamic_state": instance.dynamic_state.value if instance is not None else item.attributes.get("dynamic_state", "unknown"),
+                    "dynamic_state_reason": (instance.metadata if instance is not None else item.attributes).get("dynamic_state_reason", ""),
+                    "scene_visual_labels": scene_labels, "scene_vision_tags": vision, "map_name": store.name})
+            event = store.put("observation", event)
+            events.append(event)
+            if instance is not None:
+                current = changes.get(instance.instance_id, instance)
+                changes[instance.instance_id] = current.model_copy(update={
+                    "last_observation_event_id": event.event_id,
+                    "supporting_observation_event_ids": self._normalize_aliases(
+                        [*current.supporting_observation_event_ids, event.event_id]),
+                })
+        if aliases:
+            for event in store.model_map("observation").values():
+                identifiers = list(dict.fromkeys(aliases.get(identity, identity) for identity in event.linked_instance_ids))
+                if identifiers != event.linked_instance_ids:
+                    store.put("observation", event.model_copy(update={"linked_instance_ids": identifiers}))
+        for identifier in removed_ids:
+            store.delete("instance", identifier)
+        # 观察关系和区域聚合也会追加实例字段，一并留到本批次末尾写入。
+        instance_view = ChainMap(changes, store.model_map("instance"))
+        events = tuple(events)
+        self._record_observation_graph_relations(
+            observation_events=events, association_outcomes=outcomes, instance_view=instance_view)
+        if captured is not None:
+            refreshed = refresh_scene_spaces(store, perception_context=context, observation_events=events,
+                                             context=captured, semantic_instances=instance_view.values())
+            for space in refreshed.scene_spaces:
+                self._record_scene_space_graph(space, instance_view=instance_view)
+        for identifier, record in changes.items():
+            metadata = {**record.metadata, "map_name": store.name}
+            metadata.update(self._evaluate_navigation_metadata(metadata,
+                backend_name=str(metadata.get("backend") or metadata.get("backend_type")
+                    or "memory_service.semantic_instance"), map_name=store.name))
+            record = record.model_copy(update={"metadata": metadata})
+            changes[identifier] = store.put_live_instance(record, persist=self._is_long_term_static_instance(record))
+        outcomes = tuple(AssociationOutcome(changes[item.instance.instance_id], item.created, item.matched_score)
+                         if item.instance is not None else item for item in outcomes)
+        self._observation_event_write_count += len(events)
+        if self._observation_event_write_count >= 100:
+            self._observation_event_write_count = 0
+            for event in tuple(store.model_map("observation").values()):
+                if (utc_now()-event.timestamp).total_seconds() > 604800:
+                    store.delete("observation", event.event_id)
+        return events, outcomes
 
     def upsert_scene_space(self, scene_space, *, map_name):
         record = SceneSpace.model_validate(scene_space) if isinstance(scene_space, dict) else scene_space
@@ -267,7 +303,7 @@ class ScenesMixin:
             return len(selected)
         return self.write(delete)
 
-    def _record_observation_graph_relations(self, *, observation_events: Tuple[ObservationEvent, ...], association_outcomes: Tuple[AssociationOutcome, ...]) -> None:
+    def _record_observation_graph_relations(self, *, observation_events: Tuple[ObservationEvent, ...], association_outcomes: Tuple[AssociationOutcome, ...], instance_view) -> None:
         for event_index, event in enumerate(observation_events):
             scene_space_id = event.scene_space_id or str(event.metadata.get('scene_space_id') or '') or None
             source_region_id = event.semantic_region_id or str(event.metadata.get('semantic_region_id') or '') or None
@@ -277,45 +313,46 @@ class ScenesMixin:
                 self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, 'semantic_region', source_region_id, MemoryRecordKind.OBSERVATION_EVENT.value, event.event_id, map_name=event.map_name, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest'})
             outcome = association_outcomes[event_index] if event_index < len(association_outcomes) else None
             for instance_id in event.linked_instance_ids:
-                instance = self._writing_record_map("instance").get(instance_id)
-                instance_map_name = instance.map_name if instance is not None else event.map_name
-                self._record_semantic_graph_relation(SemanticGraphRelationKind.OBSERVED_FROM, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, MemoryRecordKind.OBSERVATION_EVENT.value, event.event_id, map_name=instance_map_name, confidence=instance.confidence if instance is not None else 1.0, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest', 'camera_id': event.camera_id or ''})
+                instance = instance_view[instance_id]
+                instance_map_name = instance.map_name
+                self._record_semantic_graph_relation(SemanticGraphRelationKind.OBSERVED_FROM, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, MemoryRecordKind.OBSERVATION_EVENT.value, event.event_id, map_name=instance_map_name, confidence=instance.confidence, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest', 'camera_id': event.camera_id or ''}, instance_view=instance_view)
                 if outcome is not None and (not outcome.created):
-                    self._record_semantic_graph_relation(SemanticGraphRelationKind.SAME_INSTANCE, MemoryRecordKind.OBSERVATION_EVENT.value, event.event_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, confidence=outcome.matched_score, evidence_observation_event_ids=[event.event_id], metadata={'source': 'instance_association'})
+                    self._record_semantic_graph_relation(SemanticGraphRelationKind.SAME_INSTANCE, MemoryRecordKind.OBSERVATION_EVENT.value, event.event_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, confidence=outcome.matched_score, evidence_observation_event_ids=[event.event_id], metadata={'source': 'instance_association'}, instance_view=instance_view)
                 if scene_space_id:
-                    self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, MemoryRecordKind.SCENE_SPACE.value, scene_space_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest'})
+                    self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, MemoryRecordKind.SCENE_SPACE.value, scene_space_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest'}, instance_view=instance_view)
                 elif source_region_id:
-                    self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, 'semantic_region', source_region_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest'})
+                    self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, 'semantic_region', source_region_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=instance_map_name, evidence_observation_event_ids=[event.event_id], metadata={'source': 'observation_ingest'}, instance_view=instance_view)
 
-    def _record_scene_space_graph(self, scene_space: SceneSpace) -> None:
+    def _record_scene_space_graph(self, scene_space: SceneSpace, *, instance_view=None) -> None:
+        instances = instance_view if instance_view is not None else self._writing_record_map("instance")
         evidence_event_ids = self._normalize_aliases(list(scene_space.linked_observation_event_ids))
         for event_id in evidence_event_ids:
             self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, MemoryRecordKind.SCENE_SPACE.value, scene_space.scene_space_id, MemoryRecordKind.OBSERVATION_EVENT.value, event_id, map_name=scene_space.map_name, evidence_observation_event_ids=[event_id], metadata={'source': 'scene_space_aggregation'})
         for instance_id in scene_space.linked_object_instance_ids:
-            self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, MemoryRecordKind.SCENE_SPACE.value, scene_space.scene_space_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=scene_space.map_name, evidence_observation_event_ids=evidence_event_ids, metadata={'source': 'scene_space_aggregation'})
+            self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, MemoryRecordKind.SCENE_SPACE.value, scene_space.scene_space_id, MemoryRecordKind.OBJECT_INSTANCE.value, instance_id, map_name=scene_space.map_name, evidence_observation_event_ids=evidence_event_ids, metadata={'source': 'scene_space_aggregation'}, instance_view=instance_view)
         for region_id in scene_space.linked_semantic_region_ids:
             self._record_semantic_graph_relation(SemanticGraphRelationKind.CONTAINS, 'semantic_region', region_id, MemoryRecordKind.SCENE_SPACE.value, scene_space.scene_space_id, map_name=scene_space.map_name, evidence_observation_event_ids=evidence_event_ids, metadata={'source': 'scene_space_aggregation'})
-        instance_ids = [item for item in scene_space.linked_object_instance_ids if item in self._writing_record_map("instance")]
+        instance_ids = [item for item in scene_space.linked_object_instance_ids if item in instances]
         for left_index, left_id in enumerate(instance_ids):
-            left = self._writing_record_map("instance")[left_id]
+            left = instances[left_id]
             for right_id in instance_ids[left_index + 1:]:
-                right = self._writing_record_map("instance")[right_id]
+                right = instances[right_id]
                 if self._distance_between_poses(left.pose, right.pose) > 3.0:
                     continue
-                self._record_semantic_graph_relation(SemanticGraphRelationKind.NEARBY, MemoryRecordKind.OBJECT_INSTANCE.value, left_id, MemoryRecordKind.OBJECT_INSTANCE.value, right_id, map_name=scene_space.map_name or left.map_name or right.map_name, evidence_observation_event_ids=evidence_event_ids, metadata={'source': 'scene_space_aggregation', 'distance_m': round(self._distance_between_poses(left.pose, right.pose), 4)})
-        self._record_scene_space_summary_nodes(scene_space, evidence_event_ids=evidence_event_ids)
+                self._record_semantic_graph_relation(SemanticGraphRelationKind.NEARBY, MemoryRecordKind.OBJECT_INSTANCE.value, left_id, MemoryRecordKind.OBJECT_INSTANCE.value, right_id, map_name=scene_space.map_name or left.map_name or right.map_name, evidence_observation_event_ids=evidence_event_ids, metadata={'source': 'scene_space_aggregation', 'distance_m': round(self._distance_between_poses(left.pose, right.pose), 4)}, instance_view=instance_view)
+        self._record_scene_space_summary_nodes(scene_space, evidence_event_ids=evidence_event_ids, instances=instances)
 
-    def _record_scene_space_summary_nodes(self, scene_space: SceneSpace, *, evidence_event_ids: List[str]) -> None:
+    def _record_scene_space_summary_nodes(self, scene_space: SceneSpace, *, evidence_event_ids: List[str], instances) -> None:
         summary_ids: List[str] = []
         region_label = scene_space.primary_label or (scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else scene_space.scene_space_id)
         region_summary = SemanticSummaryNode(summary_id=self._build_semantic_summary_id(SemanticSummaryKind.REGION, region_label, scene_space_id=scene_space.scene_space_id, semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None), summary_kind=SemanticSummaryKind.REGION, title='区域摘要：%s' % region_label, summary=self._build_scene_space_search_text(scene_space), map_name=scene_space.map_name, scene_space_id=scene_space.scene_space_id, semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None, label=region_label, member_node_ids=self._normalize_aliases([scene_space.scene_space_id, *scene_space.linked_object_instance_ids]), relation_ids=list(scene_space.graph_relation_ids), evidence_observation_event_ids=evidence_event_ids, confidence=self._clamp_score(scene_space.boundary.confidence if scene_space.boundary is not None else 0.5), metadata={'source': 'scene_space_aggregation'})
         summary_ids.append(self._upsert_semantic_summary_node(region_summary).summary_id)
         if scene_space.linked_object_instance_ids:
-            labels = self._normalize_aliases([self._writing_record_map("instance")[item].label for item in scene_space.linked_object_instance_ids if item in self._writing_record_map("instance")])
+            labels = self._normalize_aliases([instances[item].label for item in scene_space.linked_object_instance_ids if item in instances])
             object_summary = SemanticSummaryNode(summary_id=self._build_semantic_summary_id(SemanticSummaryKind.OBJECT_CLUSTER, region_label, scene_space_id=scene_space.scene_space_id), summary_kind=SemanticSummaryKind.OBJECT_CLUSTER, title='对象簇摘要：%s' % region_label, summary='%s 内包含对象：%s。' % (region_label, '、'.join(labels) if labels else '未知对象'), map_name=scene_space.map_name, scene_space_id=scene_space.scene_space_id, semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None, label=region_label, member_node_ids=list(scene_space.linked_object_instance_ids), relation_ids=list(scene_space.graph_relation_ids), evidence_observation_event_ids=evidence_event_ids, confidence=0.75, metadata={'source': 'scene_space_aggregation', 'labels': labels})
             summary_ids.append(self._upsert_semantic_summary_node(object_summary).summary_id)
             for label in labels:
-                members = [item.instance_id for item in self._writing_record_map("instance").values() if item.label == label and item.map_name == scene_space.map_name]
+                members = [item.instance_id for item in instances.values() if item.label == label and item.map_name == scene_space.map_name]
                 category_summary = SemanticSummaryNode(summary_id=self._build_semantic_summary_id(SemanticSummaryKind.TARGET_CATEGORY_CLUSTER, label), summary_kind=SemanticSummaryKind.TARGET_CATEGORY_CLUSTER, title='目标类别簇摘要：%s' % label, summary='类别 %s 在当前地图中累计实例 %d 个。' % (label, len(members)), map_name=scene_space.map_name, scene_space_id=scene_space.scene_space_id, semantic_region_id=scene_space.linked_semantic_region_ids[0] if scene_space.linked_semantic_region_ids else None, label=label, member_node_ids=members, relation_ids=list(scene_space.graph_relation_ids), evidence_observation_event_ids=evidence_event_ids, confidence=0.7, metadata={'source': 'scene_space_aggregation'})
                 summary_ids.append(self._upsert_semantic_summary_node(category_summary).summary_id)
         if summary_ids:
@@ -358,7 +395,7 @@ class ScenesMixin:
     def _record_semantic_graph_relation(self, relation_kind, source_node_kind, source_node_id,
                                        target_node_kind, target_node_id, *, map_name, confidence=1.0,
                                        evidence_observation_event_ids=None, evidence_trajectory_event_ids=None,
-                                       metadata=None):
+                                       metadata=None, instance_view=None):
         from contracts.spatial_memory import SemanticGraphRelation
         if not source_node_id or not target_node_id:
             return None
@@ -380,7 +417,9 @@ class ScenesMixin:
             kind = kinds.get(node_kind)
             if kind is None:
                 continue
-            record = self._writing_record_map(kind).get(node_id)
+            staged_instance = kind == "instance" and instance_view is not None
+            records = instance_view if staged_instance else self._writing_record_map(kind)
+            record = records.get(node_id)
             if record is None:
                 continue
             if "graph_relation_ids" in type(record).model_fields:
@@ -390,7 +429,10 @@ class ScenesMixin:
                 updated = record.model_copy(update={"metadata": {**record.metadata,
                     "semantic_graph_relation_ids": self._normalize_aliases(
                         [*record.metadata.get("semantic_graph_relation_ids", []), value.relation_id])}})
-            if kind == "instance":
+            if staged_instance:
+                if updated != record:
+                    instance_view[node_id] = updated
+            elif kind == "instance":
                 store.put_live_instance(updated, persist=self._is_long_term_static_instance(updated))
             else:
                 store.put(kind, updated)

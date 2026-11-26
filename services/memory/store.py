@@ -267,14 +267,12 @@ class MemoryStore:
         self._pending_changed.discard((kind,identity))
 
     def put_live_instance(self, record, *, persist):
-        if persist:
+        if persist or self.has('instance', record.instance_id):
             return self.put('instance',record)
         if SESSION_KEY not in record.metadata and self.get("instance", record.instance_id) is None:
             record = self._record_session(record)
-        self.connection.execute('DELETE FROM semantic_instances WHERE id=?',(record.instance_id,))
         self._pending['instance',record.instance_id] = record.model_copy(deep=True)
         self._pending_persistence[record.instance_id] = False
-        self._delete_vectors('instance',record.instance_id)
         return record
 
     def put_vector(self, kind, identity, name, model, vector):

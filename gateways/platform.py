@@ -207,7 +207,7 @@ def build_platform(config) -> Platform:
         image_embedding_dimension=config.runtime_data.memory_image_embedding_dimension,
         embedding_api_key=config.runtime_data.memory_embedding_api_key, embedding_base_url=config.runtime_data.memory_embedding_base_url,
         embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
-        deferred_projection_config=config.perception.deferred_projection, association_config=config.perception.instance_association)
+        association_config=config.perception.instance_association)
     platform.scene_mapping = SceneMappingService(memory_service=platform.memory,
         geometry_state=platform.geometry_state, config=config.scene_mapping, stream_bus=stream_bus)
     platform.follow = GatewayPersonFollowBridge()

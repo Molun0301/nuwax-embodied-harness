@@ -12,7 +12,7 @@ from contracts.base import utc_now
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
 from contracts.naming import build_anchor_id, build_instance_id
-from contracts.spatial_memory import DeferredProjectionInput, InstanceConfirmationState, InstanceSupportEvidence, InstanceDynamicState, InstanceLifecycleState, InstanceMovability, InstanceObservationWindowSample, SemanticInstance
+from contracts.spatial_memory import InstanceConfirmationState, InstanceSupportEvidence, InstanceDynamicState, InstanceLifecycleState, InstanceMovability, InstanceObservationWindowSample, SemanticInstance
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.instance_consolidation import InstanceConsolidator, InstanceMerge
 from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, measurement_sigma_m, observation_support_points, accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label, cross_label_geometry_compatible, record_support_evidence, cooccurrence_evidence, cooccurrence_sources, observation_source_key, observation_window_sources, remember_coobserved_instances, instance_identity_ids, observation_source_index, historical_coobserved_ids, geometry_overlap_diagnostics, measurement_geometry_fit
@@ -21,6 +21,7 @@ from services.memory.correction_buckets import add_observation
 from services.memory.map_correction import SAMPLE_SOURCE, SESSION_KEY
 from services.memory.spatial_candidate_index import SpatialCandidateIndex, overlaps
 from services.memory.vectorizer import TextEmbedder
+from services.memory.instance_classification import classify_instance_category
 from services.memory.vision_to_map_projection_service import ProjectedObservation
 _UNRESOLVED_GEOMETRY = object()
 
@@ -41,10 +42,6 @@ class InstanceAssociationService:
     _STALE_AFTER_SEC = {InstanceMovability.STATIC: 7 * 24 * 3600.0, InstanceMovability.MOVABLE: 24 * 3600.0, InstanceMovability.TRANSIENT: 15 * 60.0}
     _REMOVED_AFTER_SEC = {InstanceMovability.STATIC: 30 * 24 * 3600.0, InstanceMovability.MOVABLE: 7 * 24 * 3600.0, InstanceMovability.TRANSIENT: 24 * 3600.0}
     _OBSERVATION_WINDOW_LIMIT = 8
-    _DEFERRED_CACHE_LIMIT = 32
-    _STATIC_CLASS_KEYWORDS = ('wall', 'door', 'dock', 'station', 'shelf', 'charger', 'table', 'cabinet')
-    _DYNAMIC_CLASS_KEYWORDS = ('person', 'human', 'pedestrian', 'dog', 'cat', 'visitor', 'worker', 'vehicle', 'car', 'truck', 'bus', 'bicycle', 'motorcycle')
-    _QUASI_STATIC_CLASS_KEYWORDS = ('chair', 'cart', 'box', 'bag', 'cone', 'barrier', 'barricade', 'trash')
     _DYNAMIC_DISPLACEMENT_M = 0.8
     _DYNAMIC_SPEED_MPS = 0.2
     _QUASI_STATIC_DISPLACEMENT_M = 0.25
@@ -55,7 +52,6 @@ class InstanceAssociationService:
     _SIMILARITY_CACHE_LIMIT = 512
     _EMBEDDER_CACHE_IDENTITY_FIELDS = ('model_name', 'dimension', 'model_revision', 'revision', 'version', 'cache_revision')
     _SEMANTIC_ATTRIBUTE_KEYS = ('color', 'colour', 'material', 'shape', 'category', 'object_type', 'brand', 'model', 'pattern', 'text', 'ocr_text', 'description', 'appearance_description', 'display_name_zh')
-    _POSE_EVIDENCE_KEYS = ('projection_method', 'projection_confidence', 'support_point_count', 'projection_degradation_reason', 'pose_quality_level', 'observation_only', 'coverage', 'depth_coverage', 'map_projection_coverage', 'reprojection_error', 'geometry_projection_method', 'geometry_projection_status', 'segmentation_projection_status', 'support_points_2d', 'support_points_3d', 'support_points_map', 'centroid_map', 'bbox_3d_map', 'object_3d_bbox', 'object_extent', 'position_support_radius_m', 'navigable', 'non_navigable_reason', 'has_structured_segmentation', 'segmentation_score', 'predicted_iou', 'stability_score', 'segmentation_quality_score', 'segmentation_support_point_count', 'segmentation_bbox_xyxy', 'centroid_uv', 'mask_center_px', 'segmentation_area_ratio', 'segmentation_occlusion_flags', 'segmentation_truncation_flags')
 
     def __init__(self, *, text_embedder: Optional[TextEmbedder], inspection_pose_planner: Optional[InspectionPosePlanner]=None, association_config=None,
                  load_text_embedder: Optional[Callable[[], Optional[TextEmbedder]]] = None) -> None:
@@ -70,6 +66,10 @@ class InstanceAssociationService:
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
         self._label_similarity_cache: OrderedDict[frozenset[str], float] = OrderedDict()
         self._embedding_cache: OrderedDict[str, object] = OrderedDict()
+
+    @property
+    def association_min_support_points(self):
+        return self._association_config.min_support_points
 
     @classmethod
     def _embedder_cache_identity(cls, text_embedder: Optional[TextEmbedder]) -> Optional[tuple]:
@@ -154,10 +154,6 @@ class InstanceAssociationService:
         if evidence is not None and evidence.position_sigma_m is not None and (evidence.position_sigma_m > 0):
             return evidence.position_sigma_m
         attrs = {**record.attributes, **(getattr(record, 'metadata', None) or {})}
-        if not attrs.get('depth_m') and isinstance(attrs.get('ray_origin_map'), (list, tuple)):
-            origin = attrs['ray_origin_map']
-            if len(origin) == 3 and all((type(v) in (int, float) and math.isfinite(v) for v in origin)):
-                attrs['depth_m'] = math.sqrt(sum(((getattr(record.pose.position, k) - origin[i]) ** 2 for i, k in enumerate('xyz'))))
         return measurement_sigma_m(attrs) or 0.005
 
     def _accumulate_evidence(self, evidence, observation):
@@ -190,41 +186,6 @@ class InstanceAssociationService:
         metadata['label_display_names'] = names
         return instance.model_copy(update={'confirmation_state': state, 'metadata': metadata, 'support_evidence': evidence.model_copy(update={'confirmation_observation_ids': ids})})
 
-    def _fallback_score(self, observation, candidate):
-        if observation.label.strip().lower() != candidate.label.strip().lower() or not self._instance_pose_is_reliable(candidate):
-            return 0.0
-        attrs = observation.attributes
-        origin, direction, angle = (attrs.get(k) for k in ('ray_origin_map', 'ray_dir_map', 'ray_cone_half_angle_rad'))
-        if not isinstance(origin, (list, tuple)) or not isinstance(direction, (list, tuple)) or (not isinstance(angle, (int, float))):
-            return 0.0
-        direction = np.asarray(direction, dtype=float)
-        origin = np.asarray(origin, dtype=float)
-        if direction.shape != (3,) or origin.shape != (3,) or (not np.isfinite(direction).all()) or (not np.isfinite(origin).all()) or (not math.isfinite(angle)) or (not 0 < angle < math.pi / 2):
-            return 0.0
-        norm = np.linalg.norm(direction)
-        if norm <= 0:
-            return 0.0
-        direction = direction / norm
-        delta = np.array([getattr(candidate.pose.position, k) for k in 'xyz']) - origin
-        along = float(delta @ direction)
-        lateral = float(np.linalg.norm(delta - along * direction))
-        return 0.8 if along > 0 and lateral <= along * math.tan(angle) else 0.0
-
-    def _admit_observation_support(self, observation):
-        """少量点云支持只证明最近见过；完整三维检测及多视角三角化沿原准入规则。"""
-        attrs = observation.attributes
-        method = attrs.get('projection_method')
-        count = attrs.get('support_cluster_point_count')
-        if count is None and isinstance(attrs.get('support_cluster_summary'), dict):
-            count = attrs['support_cluster_summary'].get('point_count')
-        point_methods = ('map_point_samples', 'camera_point_samples', 'depth_pose_fallback', 'pointcloud_bbox_projection', 'pointcloud_mask_projection')
-        if count is None and method in point_methods:
-            count = attrs.get('support_point_count')
-        sparse = attrs.get('support_insufficient') is True or (method in point_methods and type(count) in (int, float) and (count < self._association_config.min_support_points))
-        if not sparse:
-            return observation
-        return replace(observation, attributes={**attrs, 'projection_method': 'current_pose_fallback', 'projection_degradation_reason': 'support_cluster_sparse', 'support_insufficient': True})
-
     def _identity_anchors(self, observation, candidates, now, geometry):
         tracked = tuple((candidate for candidate in candidates if self._same_track(observation, candidate, now)))
         if tracked:
@@ -242,14 +203,14 @@ class InstanceAssociationService:
             details = geometry_overlap_diagnostics(left, right, self._association_config)
             if details['reason'] in ('compatible', 'cross_label_size_ratio', 'cross_label_containment'):
                 return details['compatible']
-        return bool(left.camera_id and left.track_id and (left.track_id == right.track_id) and (left.label.strip().lower() == right.label.strip().lower()) and (self._is_fallback_observation(left) or self._is_fallback_observation(right) or self._geometry_fit(left, right) is not None))
+        return bool(left.camera_id and left.track_id and (left.track_id == right.track_id) and (left.label.strip().lower() == right.label.strip().lower()) and self._geometry_fit(left, right) is not None)
 
     @staticmethod
     def _observation_label_votes(observation):
         return dict(observation.attributes.get('frame_label_votes') or update_label_votes(None, observation.label, observation.score))
 
     def _frame_geometry(self, observation):
-        extent = resolve_object_extent(observation) if not self._is_fallback_observation(observation) else None
+        extent = resolve_object_extent(observation)
         if extent is None or self._spatial_geometry(observation) is None:
             return None
         attributes = {'object_extent': extent, 'projection_method': observation.attributes.get('projection_method'), 'measurement_sigma_m': self._record_sigma(observation)}
@@ -262,10 +223,13 @@ class InstanceAssociationService:
         """admission 决定本批新建实例的准入：自动感知先待确认，显式记忆直接确认。"""
         resolved_now = now or utc_now()
         instances = {key: value for key, value in existing_instances.items() if not self.tentative_expired(value, resolved_now)}
-        observations = [self._admit_observation_support(item) for item in projected_observations]
-        outcomes = [None] * len(observations)
+        observations = list(projected_observations)
+        outcomes = [AssociationOutcome(None, False, 0.0)] * len(observations)
         groups = {}
         for index, item in enumerate(observations):
+            if (self._is_fallback_observation(item)
+                    or classify_instance_category(item.label, item.attributes.get('category')) == InstanceDynamicState.DYNAMIC):
+                continue
             groups.setdefault((item.source_observation_id, item.camera_id), []).append(index)
 
         def eligible(candidate):
@@ -284,7 +248,7 @@ class InstanceAssociationService:
             if key not in geometry_cache:
                 geometry_cache[key] = self._spatial_geometry(record)
             return geometry_cache[key]
-        for instance_id, candidate in instances.items() if observations else ():
+        for instance_id, candidate in instances.items() if groups else ():
             if not eligible(candidate):
                 continue
             bounds = self._spatial_bounds(candidate)
@@ -301,7 +265,7 @@ class InstanceAssociationService:
             representatives = []
             duplicate_of = {}
             duplicate_groups = {}
-            ordered = sorted(indices, key=lambda index: (self._is_fallback_observation(observations[index]), -observations[index].score, self._observation_order(observations[index])))
+            ordered = sorted(indices, key=lambda index: (-observations[index].score, self._observation_order(observations[index])))
             for index in ordered:
                 item = observations[index]
                 duplicate = next((prior for prior in representatives if all((self._same_frame_duplicate(item, observations[member]) for member in duplicate_groups[prior]))), None)
@@ -316,9 +280,8 @@ class InstanceAssociationService:
                 frame_geometries = [self._frame_geometry(observations[index]) for index in members]
                 for index in members:
                     item = observations[index]
-                    if not self._is_fallback_observation(item):
-                        label = item.label.strip().lower()
-                        votes[label] = max(votes.get(label, 0.0), item.score)
+                    label = item.label.strip().lower()
+                    votes[label] = max(votes.get(label, 0.0), item.score)
                 for index in members:
                     item = observations[index]
                     observations[index] = replace(item, attributes={**item.attributes, 'frame_label_votes': votes, 'frame_geometries': frame_geometries})
@@ -329,8 +292,6 @@ class InstanceAssociationService:
                 if bounds is not None:
                     candidates.update((value for value in spatial_index.query(bounds) if value not in changed_ids))
                     candidates.update((value for value in changed_ids if value in bounds_by_id and overlaps(bounds, bounds_by_id[value])))
-                if self._is_fallback_observation(item):
-                    candidates = set(instances)
                 eligible_candidates = tuple((instances[key] for key in candidates if eligible(instances[key]) and frame_ids_semantically_equal(item.pose.frame_id, instances[key].pose.frame_id)))
                 anchors = self._identity_anchors(item, eligible_candidates, resolved_now, geometry)
                 for candidate in eligible_candidates:
@@ -359,9 +320,6 @@ class InstanceAssociationService:
                     old_track = (current.metadata.get('last_camera_id'), current.metadata.get('last_track_id'))
                     track_ids.get(old_track, set()).discard(current.instance_id)
                 else:
-                    if self._is_fallback_observation(item):
-                        outcomes[index] = AssociationOutcome(None, False, 0.0)
-                        continue
                     instance = self._create_instance(item, map_name=map_name, occupancy_grid=occupancy_grid, cost_map=cost_map, now=resolved_now)
                 instance = self._confirm_instance(instance, item, admission=admission)
                 source = observation_source_key(item)
@@ -443,22 +401,6 @@ class InstanceAssociationService:
         world_sizes = tuple((sum((abs(rotation[row][col]) * sizes[col] for col in range(3))) for row in range(3)))
         return (center, world_sizes, InstanceAssociationService._record_sigma(record))
 
-    @staticmethod
-    def _position_support_radius(record):
-        metadata = getattr(record, 'metadata', None) or {}
-        attributes = record.attributes
-        stored = metadata.get('position_support_radius_m')
-        if isinstance(stored, (int, float)) and math.isfinite(stored) and (stored >= 0.0):
-            return float(stored)
-        residual = attributes.get('triangulation_residual_m')
-        radius = float(residual) if isinstance(residual, (int, float)) and math.isfinite(residual) and (residual >= 0.0) else 0.0
-        angle = attributes.get('ray_cone_half_angle_rad')
-        origin = attributes.get('ray_origin_map')
-        if isinstance(angle, (int, float)) and math.isfinite(angle) and (0.0 < angle < math.pi / 2) and isinstance(origin, (list, tuple)) and (len(origin) >= 3) and all((isinstance(v, (int, float)) and math.isfinite(v) for v in origin[:3])):
-            depth = math.sqrt(sum(((getattr(record.pose.position, axis) - origin[i]) ** 2 for i, axis in enumerate('xyz'))))
-            radius = max(radius, depth * math.tan(angle))
-        return radius
-
     def _spatial_bounds(self, record):
         metadata = record.attributes if isinstance(record, ProjectedObservation) else record.metadata
         if metadata.get('pending_localization') or metadata.get('observation_only') or metadata.get('projection_method') in (None, '', 'current_pose_fallback'):
@@ -511,8 +453,6 @@ class InstanceAssociationService:
         if not any((candidate_ids & instance_identity_ids(anchor) for anchor in identity_anchors)):
             if any((cooccurrence_evidence(anchor, candidate, self._association_config) is not None for anchor in identity_anchors)):
                 return 0.0
-        if self._is_fallback_observation(observation):
-            return self._fallback_score(observation, candidate)
         same_track = self._same_track(observation, candidate, now)
         geometry_fit = self._geometry_fit(observation, candidate, left=observation_geometry, right=candidate_geometry)
         if not same_track and geometry_fit is None:
@@ -602,8 +542,6 @@ class InstanceAssociationService:
         return False
 
     def _merge_instance(self, current: SemanticInstance, observation: ProjectedObservation, *, map_name: Optional[str], occupancy_grid, cost_map, now: datetime) -> SemanticInstance:
-        if self._is_fallback_observation(observation):
-            return current.model_copy(update={'last_seen_ts': now, 'metadata': {**self._apply_dynamic_navigation_policy(current.metadata, current.dynamic_state), 'last_observation_projection_method': 'current_pose_fallback', 'last_fallback_source_observation_id': observation.source_observation_id}})
         repeated = self._observation_already_seen(current, observation)
         prior_sample = next((sample for sample in current.observation_window if sample.metadata.get('source_observation_id') == observation.source_observation_id and sample.metadata.get('camera_id', '') == (observation.camera_id or '')), None)
         replaces_reliable = prior_sample is not None and self._sample_projection_reliable(prior_sample)
@@ -644,43 +582,27 @@ class InstanceAssociationService:
         artifact_ids = self._merge_strings(current.artifact_ids, observation.source_artifact_ids)
         supporting_event_ids = self._merge_strings(current.supporting_observation_event_ids, ())
         observation_window = self._build_observation_window(current.observation_window, observation, now=now, map_name=map_name or current.map_name, deduplicate_source=repeated)
-        deferred_cache = self._build_deferred_projection_cache(current.deferred_projection_cache, observation, now=now)
-        dynamic_state, dynamic_metadata = self._classify_dynamic_state(label=observation.label, movability=current.movability, observation_window=observation_window, attributes=observation.attributes)
+        movability = self._infer_movability(label, observation.attributes)
+        dynamic_state, dynamic_metadata = self._classify_dynamic_state(
+            label=label, observation_window=observation_window, attributes=observation.attributes)
         if dynamic_state == InstanceDynamicState.UNKNOWN and current.dynamic_state == InstanceDynamicState.STATIC and (self._geometry_fit(observation, current) is not None):
             dynamic_state = current.dynamic_state
-            dynamic_metadata.update(dynamic_state=dynamic_state.value, dynamic_state_reason='retained_static_evidence', dynamic_short_term_obstacle_context=False, long_term_static_target_eligible=True)
-        if not self._is_fallback_observation(observation) and dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
+            dynamic_metadata.update(dynamic_state=dynamic_state.value, dynamic_state_reason='retained_static_evidence')
+        if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
             blended_pose = observation.pose
             evidence = self._accumulate_evidence(evidence if repeated else evidence.model_copy(update={'voxel_keys': []}), observation)
             evidence = evidence.model_copy(update={'position_weight': 1 / sigma ** 2, 'position_sigma_m': sigma})
-        metadata = self._build_instance_metadata(observation, movability=current.movability, current_metadata=current.metadata)
-        metadata['position_observation_count'] = reliable_pose_count + (0 if self._is_fallback_observation(observation) or replaces_reliable else 1)
-        if self._is_fallback_observation(observation) and self._instance_pose_is_reliable(current):
-            pose_metadata = self._clear_dynamic_navigation_policy(current.metadata)
-            for key in self._POSE_EVIDENCE_KEYS:
-                if key in pose_metadata:
-                    metadata[key] = pose_metadata[key]
-                else:
-                    metadata.pop(key, None)
-            metadata['observation_only'] = False
-            metadata.update(self._summarize_segmentation_metadata(metadata))
+        metadata = self._build_instance_metadata(
+            observation, movability=movability, current_metadata=current.metadata,
+            previous_attributes=current.attributes)
+        metadata['position_observation_count'] = reliable_pose_count + (0 if replaces_reliable else 1)
         extent = merge_object_extent(current, observation, pose=blended_pose, support_evidence=evidence)
         if extent is not None:
             metadata['object_extent'] = extent
-        if not self._is_fallback_observation(observation):
-            metadata['position_support_radius_m'] = self._position_support_radius(observation)
         metadata.pop('lifecycle_aged', None)
+        metadata.pop('pending_localization', None)
         metadata.update(dynamic_metadata)
-        metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
-        was_pending = bool((current.metadata or {}).get('pending_localization'))
-        if was_pending and (not self._is_fallback_observation(observation)):
-            metadata.pop('pending_localization', None)
-        elif was_pending:
-            metadata['pending_localization'] = True
-        merged_lifecycle = InstanceLifecycleState.ACTIVE
-        if was_pending and self._is_fallback_observation(observation):
-            merged_lifecycle = InstanceLifecycleState.UNCERTAIN
-        updates = {'label': label, 'display_name': self._label_display(current, observation, label), 'support_evidence': evidence, 'pose': blended_pose, 'map_name': map_name or current.map_name, 'topo_node_id': observation.topo_node_id or current.topo_node_id, 'semantic_region_id': observation.semantic_region_id or current.semantic_region_id, 'confidence': max(float(current.confidence), float(observation.score)), 'observation_count': updated_count, 'last_seen_ts': current.last_seen_ts if repeated else now, 'artifact_ids': artifact_ids, 'semantic_labels': semantic_labels, 'visual_labels': visual_labels, 'vision_tags': self._merge_strings(current.vision_tags, observation.semantic_labels), 'dynamic_state': dynamic_state, 'observation_window': observation_window, 'deferred_projection_cache': deferred_cache, 'lifecycle_state': merged_lifecycle, 'metadata': metadata, 'attributes': self._observer_attributes(observation, previous=current.attributes), 'supporting_observation_event_ids': supporting_event_ids}
+        updates = {'label': label, 'display_name': self._label_display(current, observation, label), 'support_evidence': evidence, 'pose': blended_pose, 'map_name': map_name or current.map_name, 'topo_node_id': observation.topo_node_id or current.topo_node_id, 'semantic_region_id': observation.semantic_region_id or current.semantic_region_id, 'confidence': max(float(current.confidence), float(observation.score)), 'observation_count': updated_count, 'last_seen_ts': current.last_seen_ts if repeated else now, 'artifact_ids': artifact_ids, 'semantic_labels': semantic_labels, 'visual_labels': visual_labels, 'vision_tags': self._merge_strings(current.vision_tags, observation.semantic_labels), 'movability': movability, 'dynamic_state': dynamic_state, 'observation_window': observation_window, 'lifecycle_state': InstanceLifecycleState.ACTIVE, 'metadata': metadata, 'attributes': self._observer_attributes(observation, previous=current.attributes), 'supporting_observation_event_ids': supporting_event_ids}
         isolated_updates = {key: copy.deepcopy(value) for key, value in updates.items()}
         merged = current.model_copy(update=isolated_updates)
         if observation.pose.session_id:
@@ -703,22 +625,13 @@ class InstanceAssociationService:
         instance_id = build_instance_id(id_kind, timestamp=now)
         movability = self._infer_movability(observation.label, observation.attributes)
         observation_window = self._build_observation_window((), observation, now=now, map_name=map_name)
-        deferred_cache = self._build_deferred_projection_cache((), observation, now=now)
-        dynamic_state, dynamic_metadata = self._classify_dynamic_state(label=observation.label, movability=movability, observation_window=observation_window, attributes=observation.attributes)
+        dynamic_state, dynamic_metadata = self._classify_dynamic_state(label=observation.label, observation_window=observation_window, attributes=observation.attributes)
         metadata = self._build_instance_metadata(observation, movability=movability)
         extent = merge_object_extent(None, observation)
         if extent is not None:
             metadata['object_extent'] = extent
-        metadata['position_support_radius_m'] = self._position_support_radius(observation)
-        metadata['position_observation_count'] = 0 if self._is_fallback_observation(observation) else 1
+        metadata['position_observation_count'] = 1
         metadata.update(dynamic_metadata)
-        metadata = self._apply_dynamic_navigation_policy(metadata, dynamic_state)
-        created_lifecycle = InstanceLifecycleState.ACTIVE
-        if self._is_fallback_observation(observation):
-            metadata['pending_localization'] = True
-            metadata['navigable'] = False
-            metadata['non_navigable_reason'] = 'current_pose_fallback_no_geometry'
-            created_lifecycle = InstanceLifecycleState.UNCERTAIN
         evidence = self._accumulate_evidence(None, observation)
         sigma = self._record_sigma(observation)
         evidence = evidence.model_copy(update={'position_weight': 1 / sigma ** 2, 'position_sigma_m': sigma, 'label_votes': self._observation_label_votes(observation)})
@@ -726,7 +639,7 @@ class InstanceAssociationService:
             extent = support_extent(evidence, pose=observation.pose) or extent
             if extent is not None:
                 metadata['object_extent'] = extent
-        instance = SemanticInstance(support_evidence=evidence, confirmation_state=InstanceConfirmationState.TENTATIVE, instance_id=instance_id, anchor_id=anchor_id, label=observation.label.strip().lower(), display_name=str(observation.attributes.get('display_name_zh') or observation.label), pose=observation.pose, map_name=map_name, topo_node_id=observation.topo_node_id, semantic_region_id=observation.semantic_region_id, instance_type=observation.instance_type, movability=movability, dynamic_state=dynamic_state, observation_window=observation_window, deferred_projection_cache=deferred_cache, lifecycle_state=created_lifecycle, confidence=float(observation.score), observation_count=1, first_seen_ts=now, last_seen_ts=now, artifact_ids=list(observation.source_artifact_ids), semantic_labels=list(observation.semantic_labels), visual_labels=list(observation.visual_labels), vision_tags=list(observation.semantic_labels), inspection_poses=[], attributes=self._observer_attributes(observation), metadata=metadata)
+        instance = SemanticInstance(support_evidence=evidence, confirmation_state=InstanceConfirmationState.TENTATIVE, instance_id=instance_id, anchor_id=anchor_id, label=observation.label.strip().lower(), display_name=str(observation.attributes.get('display_name_zh') or observation.label), pose=observation.pose, map_name=map_name, topo_node_id=observation.topo_node_id, semantic_region_id=observation.semantic_region_id, instance_type=observation.instance_type, movability=movability, dynamic_state=dynamic_state, observation_window=observation_window, confidence=float(observation.score), observation_count=1, first_seen_ts=now, last_seen_ts=now, artifact_ids=list(observation.source_artifact_ids), semantic_labels=list(observation.semantic_labels), visual_labels=list(observation.visual_labels), vision_tags=list(observation.semantic_labels), inspection_poses=[], attributes=self._observer_attributes(observation), metadata=metadata)
         instance.inspection_poses = copy.deepcopy(self._inspection_pose_planner.plan_for_target(
             target_pose=instance.pose, observer_body_pose=self._positive_observer_pose(observation),
             occupancy_grid=occupancy_grid, cost_map=cost_map,
@@ -763,8 +676,8 @@ class InstanceAssociationService:
         normalized = normalized[:cls._ID_KIND_MAX_LENGTH].rstrip('_')
         return normalized or 'object'
 
-    def _build_instance_metadata(self, observation: ProjectedObservation, *, movability: InstanceMovability, current_metadata: Optional[Dict[str, object]]=None) -> Dict[str, object]:
-        previous_metadata = self._clear_dynamic_navigation_policy(current_metadata or {})
+    def _build_instance_metadata(self, observation: ProjectedObservation, *, movability: InstanceMovability, current_metadata: Optional[Dict[str, object]]=None, previous_attributes=None) -> Dict[str, object]:
+        previous_metadata = current_metadata or {}
         backend = str(observation.attributes.get('backend') or observation.attributes.get('backend_type') or previous_metadata.get('backend') or previous_metadata.get('backend_type') or 'memory_service.semantic_instance')
         backend_type = str(observation.attributes.get('backend_type') or observation.attributes.get('backend') or previous_metadata.get('backend_type') or previous_metadata.get('backend') or 'memory_service.semantic_instance')
         projection_method = str(observation.attributes.get('projection_method') or previous_metadata.get('projection_method') or '')
@@ -816,19 +729,10 @@ class InstanceAssociationService:
         segmentation_occlusion_flags = raw_metadata_value('segmentation_occlusion_flags') or raw_metadata_value('occlusion_flags')
         segmentation_truncation_flags = raw_metadata_value('segmentation_truncation_flags') or raw_metadata_value('truncation_flags')
         has_structured_segmentation = bool(self._coerce_bool(observation.attributes.get('has_structured_segmentation')) or self._coerce_bool(previous_metadata.get('has_structured_segmentation')) or segmentation_bbox_xyxy or centroid_uv or segmentation_occlusion_flags or segmentation_truncation_flags)
-        previous_navigable = previous_metadata.get('navigable')
-        previous_non_navigable_reason = str(previous_metadata.get('non_navigable_reason') or '')
-        navigable = observation.attributes.get('navigable')
-        non_navigable_reason = str(observation.attributes.get('non_navigable_reason') or '')
-        fallback_recovered = previous_navigable is False and previous_non_navigable_reason == 'current_pose_fallback_no_geometry' and (projection_method != 'current_pose_fallback') and (support_point_count > 0 or projection_method in ('ray_triangulation', 'delayed_pointcloud_projection'))
-        if navigable is None and (not fallback_recovered):
-            navigable = previous_navigable
-        if not non_navigable_reason and (not fallback_recovered):
-            non_navigable_reason = previous_non_navigable_reason
-        if projection_method == 'current_pose_fallback' or projection_degradation_reason == 'current_pose_fallback_no_geometry':
-            navigable = False
-            non_navigable_reason = 'current_pose_fallback_no_geometry'
-        metadata = {**previous_metadata, 'last_track_id': observation.track_id or '', 'last_camera_id': observation.camera_id or '', 'last_source_observation_id': observation.source_observation_id, 'last_observation_label': observation.label.strip().lower(), 'last_observation_projection_method': str(observation.attributes.get('projection_method') or ''), 'last_observation_projection_confidence': observation.attributes.get('projection_confidence'), 'association_policy': movability.value, 'uncertain_after_sec': self._UNCERTAIN_AFTER_SEC[movability], 'stale_after_sec': self._STALE_AFTER_SEC[movability], 'removed_after_sec': self._REMOVED_AFTER_SEC[movability], 'projection_method': projection_method, 'projection_confidence': projection_confidence, 'pose_quality_level': observation.attributes.get('pose_quality_level', observation.pose_quality_level), 'observation_only': self._is_fallback_observation(observation), 'support_point_count': support_point_count, 'coverage': coverage, 'depth_coverage': depth_coverage, 'map_projection_coverage': map_projection_coverage, 'reprojection_error': reprojection_error, 'projection_degradation_reason': projection_degradation_reason, 'geometry_projection_method': geometry_projection_method, 'geometry_projection_status': geometry_projection_status, 'segmentation_projection_status': segmentation_projection_status, 'support_points_2d': support_points_2d, 'support_points_3d': support_points_3d, 'support_points_map': support_points_map, 'centroid_map': centroid_map, 'bbox_3d_map': bbox_3d_map, 'object_3d_bbox': object_3d_bbox, 'segmentation_bbox_xyxy': segmentation_bbox_xyxy, 'centroid_uv': centroid_uv, 'mask_center_px': mask_center_px, 'segmentation_area_ratio': segmentation_area_ratio, 'segmentation_occlusion_flags': self._coerce_flags(segmentation_occlusion_flags), 'segmentation_truncation_flags': self._coerce_flags(segmentation_truncation_flags), 'has_structured_segmentation': has_structured_segmentation, 'segmentation_score': segmentation_score, 'predicted_iou': predicted_iou, 'segmentation_quality_score': segmentation_quality_score, 'stability_score': stability_score, 'segmentation_support_point_count': segmentation_support_point_count, 'navigable': navigable, 'non_navigable_reason': non_navigable_reason, 'backend': backend, 'backend_type': backend_type}
+        navigation_attributes = {**(previous_attributes or {}), **observation.attributes}
+        navigable = navigation_attributes.get('navigable')
+        non_navigable_reason = str(navigation_attributes.get('non_navigable_reason') or '')
+        metadata = {**previous_metadata, 'last_track_id': observation.track_id or '', 'last_camera_id': observation.camera_id or '', 'last_source_observation_id': observation.source_observation_id, 'last_observation_label': observation.label.strip().lower(), 'last_observation_projection_method': str(observation.attributes.get('projection_method') or ''), 'last_observation_projection_confidence': observation.attributes.get('projection_confidence'), 'association_policy': movability.value, 'uncertain_after_sec': self._UNCERTAIN_AFTER_SEC[movability], 'stale_after_sec': self._STALE_AFTER_SEC[movability], 'removed_after_sec': self._REMOVED_AFTER_SEC[movability], 'projection_method': projection_method, 'projection_confidence': projection_confidence, 'pose_quality_level': observation.attributes.get('pose_quality_level', observation.pose_quality_level), 'observation_only': False, 'support_point_count': support_point_count, 'coverage': coverage, 'depth_coverage': depth_coverage, 'map_projection_coverage': map_projection_coverage, 'reprojection_error': reprojection_error, 'projection_degradation_reason': projection_degradation_reason, 'geometry_projection_method': geometry_projection_method, 'geometry_projection_status': geometry_projection_status, 'segmentation_projection_status': segmentation_projection_status, 'support_points_2d': support_points_2d, 'support_points_3d': support_points_3d, 'support_points_map': support_points_map, 'centroid_map': centroid_map, 'bbox_3d_map': bbox_3d_map, 'object_3d_bbox': object_3d_bbox, 'segmentation_bbox_xyxy': segmentation_bbox_xyxy, 'centroid_uv': centroid_uv, 'mask_center_px': mask_center_px, 'segmentation_area_ratio': segmentation_area_ratio, 'segmentation_occlusion_flags': self._coerce_flags(segmentation_occlusion_flags), 'segmentation_truncation_flags': self._coerce_flags(segmentation_truncation_flags), 'has_structured_segmentation': has_structured_segmentation, 'segmentation_score': segmentation_score, 'predicted_iou': predicted_iou, 'segmentation_quality_score': segmentation_quality_score, 'stability_score': stability_score, 'segmentation_support_point_count': segmentation_support_point_count, 'navigable': navigable, 'non_navigable_reason': non_navigable_reason, 'backend': backend, 'backend_type': backend_type}
         if SAMPLE_SOURCE in observation.attributes:
             metadata[SAMPLE_SOURCE] = observation.attributes[SAMPLE_SOURCE]
         metadata.update(self._summarize_segmentation_metadata(metadata))
@@ -846,7 +750,7 @@ class InstanceAssociationService:
         window = [item for item in window if not (deduplicate_source and item.metadata.get('source_observation_id') == observation.source_observation_id and (item.metadata.get('camera_id', '') == (observation.camera_id or '')))]
         projection_method = str(observation.attributes.get('projection_method') or '')
         frame_geometry = observation.attributes.get('frame_geometries', [self._frame_geometry(observation)])
-        window.append(InstanceObservationWindowSample(timestamp=now, pose=observation.pose, observer_pose=self._observer_pose_from_observation(observation), bbox_xyxy=self._observation_bbox_xyxy(observation.attributes), confidence=float(observation.score), track_id=observation.track_id, metadata={'map_name': map_name, 'camera_id': observation.camera_id or '', 'source_observation_id': observation.source_observation_id, 'projection_method': projection_method, 'projection_reliable': not self._is_fallback_observation(observation), 'measurement_sigma_m': measurement_sigma_m(observation.attributes), 'label': observation.label.strip().lower(), 'frame_label_votes': self._observation_label_votes(observation), 'frame_geometry': frame_geometry}))
+        window.append(InstanceObservationWindowSample(timestamp=now, pose=observation.pose, bbox_xyxy=self._observation_bbox_xyxy(observation.attributes), confidence=float(observation.score), track_id=observation.track_id, metadata={'map_name': map_name, 'camera_id': observation.camera_id or '', 'source_observation_id': observation.source_observation_id, 'projection_method': projection_method, 'projection_reliable': True, 'measurement_sigma_m': measurement_sigma_m(observation.attributes), 'label': observation.label.strip().lower(), 'frame_label_votes': self._observation_label_votes(observation), 'frame_geometry': frame_geometry}))
         latest = window[-1]
         reliable = [item for item in window[:-1] if self._sample_projection_reliable(item)]
         selected = reliable[-(self._OBSERVATION_WINDOW_LIMIT - 1):] + [latest]
@@ -856,40 +760,6 @@ class InstanceAssociationService:
             recent = [item for item in window[:-1] if id(item) not in selected_ids]
             selected.extend(recent[-remaining:])
         return sorted(selected, key=lambda item: item.timestamp)
-
-    def _observer_pose_from_observation(self, observation: ProjectedObservation) -> Optional[Pose]:
-        """从观测的射线光心(map frame)构造观测者位姿，供三角化/延迟投影使用。"""
-        origin = observation.attributes.get('ray_origin_map')
-        if not isinstance(origin, (list, tuple)) or len(origin) < 3:
-            return None
-        try:
-            from contracts.geometry import Vector3
-            return observation.pose.model_copy(update={
-                "position": Vector3(x=float(origin[0]), y=float(origin[1]), z=float(origin[2]))})
-        except (TypeError, ValueError):
-            return None
-
-    def _build_deferred_projection_cache(self, current_cache: Iterable[DeferredProjectionInput], observation: ProjectedObservation, *, now: datetime) -> List[DeferredProjectionInput]:
-        """累积延迟投影输入(射线/observer_pose/bbox)，独立于 8 样本观测窗口不被驱逐。
-
-        仅当本次观测带有效射线时追加；上限取较大窗口(32)避免无限增长。
-        """
-        cache = [item for item in current_cache if isinstance(item, DeferredProjectionInput)]
-        cache = [item for item in cache if not (item.source_observation_id == observation.source_observation_id and item.track_id == observation.track_id)]
-        observer_pose = self._observer_pose_from_observation(observation)
-        if observer_pose is None:
-            return cache
-        origin = observation.attributes.get('ray_origin_map')
-        direction = observation.attributes.get('ray_dir_map')
-        ray_origin = [float(v) for v in origin[:3]] if isinstance(origin, (list, tuple)) and len(origin) >= 3 else None
-        ray_dir = [float(v) for v in direction[:3]] if isinstance(direction, (list, tuple)) and len(direction) >= 3 else None
-        cone_half_angle = observation.attributes.get('ray_cone_half_angle_rad')
-        try:
-            cone_half_angle_rad = float(cone_half_angle) if cone_half_angle is not None else None
-        except (TypeError, ValueError):
-            cone_half_angle_rad = None
-        cache.append(DeferredProjectionInput(observer_pose=observer_pose, bbox_xyxy=self._observation_bbox_xyxy(observation.attributes), track_id=observation.track_id, camera_frame_id=str(observation.attributes.get('camera_frame_id') or '') or None, ray_origin_map=ray_origin, ray_dir_map=ray_dir, cone_half_angle_rad=cone_half_angle_rad, source_observation_id=observation.source_observation_id, timestamp=now))
-        return cache[-self._DEFERRED_CACHE_LIMIT:]
 
     def _observation_bbox_xyxy(self, attributes: Dict[str, object]) -> List[float]:
         for key in ('bbox_xyxy', 'segmentation_bbox_xyxy', 'bbox', '2d_bbox'):
@@ -908,17 +778,14 @@ class InstanceAssociationService:
                         return []
         return []
 
-    def _classify_dynamic_state(self, *, label: str, movability: InstanceMovability, observation_window: List[InstanceObservationWindowSample], attributes: Dict[str, object]) -> Tuple[InstanceDynamicState, Dict[str, object]]:
+    def _classify_dynamic_state(self, *, label: str, observation_window: List[InstanceObservationWindowSample], attributes: Dict[str, object]) -> Tuple[InstanceDynamicState, Dict[str, object]]:
         explicit_state = self._explicit_dynamic_state(attributes)
         metrics = self._dynamic_window_metrics(observation_window)
-        lowered = ' '.join((str(item or '').strip().lower() for item in (label, attributes.get('category'), attributes.get('state'), attributes.get('movability')) if str(item or '').strip()))
-        dynamic_prior = movability == InstanceMovability.TRANSIENT or any((item in lowered for item in self._DYNAMIC_CLASS_KEYWORDS))
-        quasi_static_prior = any((item in lowered for item in self._QUASI_STATIC_CLASS_KEYWORDS))
-        static_prior = movability == InstanceMovability.STATIC or any((item in lowered for item in self._STATIC_CLASS_KEYWORDS))
+        class_prior = classify_instance_category(label, attributes.get('category'))
         if explicit_state is not None:
             state = explicit_state
             reason = 'explicit_dynamic_state'
-        elif dynamic_prior:
+        elif class_prior == InstanceDynamicState.DYNAMIC:
             state = InstanceDynamicState.DYNAMIC
             reason = 'dynamic_class_prior'
         elif metrics['observation_count'] >= 2 and (metrics['max_displacement_m'] >= self._DYNAMIC_DISPLACEMENT_M or metrics['estimated_speed_mps'] >= self._DYNAMIC_SPEED_MPS):
@@ -927,10 +794,10 @@ class InstanceAssociationService:
         elif metrics['observation_count'] >= 2 and (metrics['max_displacement_m'] >= self._QUASI_STATIC_DISPLACEMENT_M or metrics['estimated_speed_mps'] >= self._QUASI_STATIC_SPEED_MPS):
             state = InstanceDynamicState.QUASI_STATIC
             reason = 'short_window_quasi_static_motion'
-        elif quasi_static_prior:
+        elif class_prior == InstanceDynamicState.QUASI_STATIC:
             state = InstanceDynamicState.QUASI_STATIC
             reason = 'quasi_static_class_prior'
-        elif static_prior and metrics['max_displacement_m'] <= self._STATIC_CONSISTENCY_M:
+        elif class_prior == InstanceDynamicState.STATIC and metrics['max_displacement_m'] <= self._STATIC_CONSISTENCY_M:
             state = InstanceDynamicState.STATIC
             reason = 'static_class_prior'
         elif metrics['observation_count'] >= 3 and metrics['max_displacement_m'] <= self._STATIC_CONSISTENCY_M:
@@ -939,7 +806,7 @@ class InstanceAssociationService:
         else:
             state = InstanceDynamicState.UNKNOWN
             reason = 'insufficient_motion_evidence'
-        return (state, {'dynamic_state': state.value, 'dynamic_state_reason': reason, 'dynamic_observation_count': metrics['observation_count'], 'dynamic_window_duration_sec': metrics['duration_sec'], 'dynamic_window_displacement_m': metrics['max_displacement_m'], 'dynamic_window_speed_mps': metrics['estimated_speed_mps'], 'dynamic_track_ids': metrics['track_ids'], 'dynamic_short_term_obstacle_context': state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}, 'long_term_static_target_eligible': state == InstanceDynamicState.STATIC, 'observation_window': [item.model_dump(mode='json') for item in observation_window]})
+        return (state, {'dynamic_state': state.value, 'dynamic_state_reason': reason, 'dynamic_observation_count': metrics['observation_count'], 'dynamic_window_duration_sec': metrics['duration_sec'], 'dynamic_window_displacement_m': metrics['max_displacement_m'], 'dynamic_window_speed_mps': metrics['estimated_speed_mps'], 'dynamic_track_ids': metrics['track_ids'], 'observation_window': [item.model_dump(mode='json') for item in observation_window]})
 
     def _explicit_dynamic_state(self, attributes: Dict[str, object]) -> Optional[InstanceDynamicState]:
         value = str(attributes.get('dynamic_state') or attributes.get('motion_state') or attributes.get('object_motion_state') or '').strip().lower()
@@ -975,34 +842,6 @@ class InstanceAssociationService:
         if not all((math.isfinite(v) for v in (sample.pose.position.x, sample.pose.position.y, sample.pose.position.z))):
             return False
         return bool(metadata['projection_reliable'])
-
-    def _clear_dynamic_navigation_policy(self, metadata: Dict[str, object]) -> Dict[str, object]:
-        """撤销旧分类的派生拒绝，当前分类重新决定准入；保留独立导航约束。"""
-        updated = dict(metadata)
-        previous = updated.pop('dynamic_navigation_previous', {})
-        derived_reasons = {'dynamic_entity', 'quasi_static_entity', 'not_long_term_static_target'}
-        if updated.get('non_navigable_reason') in derived_reasons:
-            updated.pop('navigable', None)
-            updated.pop('non_navigable_reason', None)
-            if updated.get('navigation_exclusion_scope') == 'long_term_static_target':
-                updated.pop('navigation_exclusion_scope')
-            if updated.get('local_retry_policy') == 'retry_after_dynamic_obstacle_clears':
-                updated.pop('local_retry_policy')
-            if isinstance(previous, dict) and previous.get('non_navigable_reason') not in derived_reasons:
-                for key in ('navigable', 'non_navigable_reason', 'navigation_exclusion_scope', 'local_retry_policy'):
-                    if key in previous and key not in updated:
-                        updated[key] = previous[key]
-        return updated
-
-    def _apply_dynamic_navigation_policy(self, metadata: Dict[str, object], dynamic_state: InstanceDynamicState) -> Dict[str, object]:
-        updated = self._clear_dynamic_navigation_policy(metadata)
-        if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
-            updated['dynamic_navigation_previous'] = {key: updated[key] for key in ('navigable', 'non_navigable_reason', 'navigation_exclusion_scope', 'local_retry_policy') if key in updated}
-            updated['navigable'] = False
-            updated['non_navigable_reason'] = 'dynamic_entity' if dynamic_state == InstanceDynamicState.DYNAMIC else 'quasi_static_entity'
-            updated['navigation_exclusion_scope'] = 'long_term_static_target'
-            updated['local_retry_policy'] = 'retry_after_dynamic_obstacle_clears'
-        return updated
 
     def _coerce_optional_float(self, raw_value: object, fallback_value: object=None) -> Optional[float]:
         for value in (raw_value, fallback_value):
@@ -1056,9 +895,12 @@ class InstanceAssociationService:
             lifecycle_state = InstanceLifecycleState.STALE
         elif age_sec >= uncertain_after_sec:
             lifecycle_state = InstanceLifecycleState.UNCERTAIN
-        if (instance.metadata or {}).get('pending_localization') is True:
-            if lifecycle_state == InstanceLifecycleState.ACTIVE:
-                lifecycle_state = InstanceLifecycleState.UNCERTAIN
+        if lifecycle_state == InstanceLifecycleState.ACTIVE and (
+            instance.metadata.get('pending_localization') is True
+            or (instance.confirmation_state == InstanceConfirmationState.CONFIRMED
+                and instance.metadata.get('dynamic_window_displacement_m', 0.0) >= self._QUASI_STATIC_DISPLACEMENT_M)
+        ):
+            lifecycle_state = InstanceLifecycleState.UNCERTAIN
         return (lifecycle_state, uncertain_after_sec, stale_after_sec, removed_after_sec)
 
     def _mark_stale(self, instance: SemanticInstance, *, now: datetime) -> SemanticInstance:
@@ -1068,11 +910,10 @@ class InstanceAssociationService:
         return instance.model_copy(update={'lifecycle_state': lifecycle_state, 'metadata': {**dict(instance.metadata), 'association_policy': instance.movability.value, 'uncertain_after_sec': uncertain_after_sec, 'stale_after_sec': stale_after_sec, 'removed_after_sec': removed_after_sec}}, deep=True)
 
     def _infer_movability(self, label: str, attributes: Dict[str, object]) -> InstanceMovability:
-        lowered_label = str(label).strip().lower()
-        combined = ' '.join((str(item).strip().lower() for item in [lowered_label, attributes.get('movability'), attributes.get('state'), attributes.get('category')] if str(item or '').strip()))
-        if any((keyword in combined for keyword in ('wall', 'door', 'dock', 'station', 'shelf', 'charger', 'table'))):
+        class_prior = classify_instance_category(label, attributes.get('category'))
+        if class_prior == InstanceDynamicState.STATIC:
             return InstanceMovability.STATIC
-        if any((keyword in combined for keyword in ('person', 'dog', 'cat', 'visitor', 'worker'))):
+        if class_prior == InstanceDynamicState.DYNAMIC:
             return InstanceMovability.TRANSIENT
         return InstanceMovability.MOVABLE
 

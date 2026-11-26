@@ -42,7 +42,7 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
                  image_embedding_model="disabled", image_embedding_dimension=512,
                  embedding_api_key="", embedding_base_url="https://dashscope.aliyuncs.com/api/v1",
                  embedding_timeout_sec=20.0, text_embedder=None, vision_language_embedder=None,
-                 deferred_projection_config=None, association_config=None):
+                 association_config=None):
         self.geometry_state = geometry_state
         self.maps_root, self.default_root = Path(maps_root), Path(default_root)
         self._observation_service, self._perception_service = observation_service, perception_service
@@ -52,7 +52,6 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
         self._image_embedding_model, self._image_embedding_dimension = image_embedding_model, image_embedding_dimension
         self._embedding_api_key, self._embedding_base_url = embedding_api_key, embedding_base_url
         self._embedding_timeout_sec = embedding_timeout_sec
-        self._deferred_projection_config = deferred_projection_config
         self._condition = threading.Condition()
         self._snapshot = MemorySnapshot.empty()
         self._closed = False
@@ -69,10 +68,7 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
         self._instance_association_service = self._association
         self._semantic_builder = SemanticMapBuilder(inspection_pose_planner=self._planner)
         self._projector = VisionToMapProjectionService(
-            triangulation_enabled=bool(deferred_projection_config is not None and deferred_projection_config.triangulation_enabled),
-            triangulation_min_rays=deferred_projection_config.triangulation_min_rays if deferred_projection_config is not None else 2,
-            triangulation_min_parallax_deg=deferred_projection_config.triangulation_min_parallax_deg if deferred_projection_config is not None else 5.0,
-            triangulation_max_residual_m=deferred_projection_config.triangulation_max_residual_m if deferred_projection_config is not None else .5)
+            min_support_points=self._association.association_min_support_points)
         self._embeddings = Embeddings(self, text_embedder=text_embedder, image_embedder=vision_language_embedder)
         self._writer = LibraryWriter(self.maps_root, self.default_root,
             publish=self._publish_snapshot, changed=self._embeddings.enqueue,

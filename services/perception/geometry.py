@@ -11,6 +11,7 @@ from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D
 from contracts.pointcloud import PointCloudFrame
 from services.localization.frame_tree_ops import resolve_frame_transform
+from services.perception.observation_geometry import ACCUMULATED_CLOUD_MAX_DEPTH_M
 from services.perception.self_body import SelfBodyRegion, is_self_body
 from services.perception.support_points import select_object_support
 
@@ -210,7 +211,11 @@ class DetectionGeometryAugmentor:
         )
         if camera_array is None or camera_array.size == 0:
             return None
-        valid_depth_mask = np.all(np.isfinite(camera_array), axis=1) & (camera_array[:, 2] > self._min_depth_m)
+        valid_depth_mask = (
+            np.all(np.isfinite(camera_array), axis=1)
+            & (camera_array[:, 2] > self._min_depth_m)
+            & (camera_array[:, 2] <= ACCUMULATED_CLOUD_MAX_DEPTH_M)
+        )
         if not np.any(valid_depth_mask):
             return None
         camera_array = camera_array[valid_depth_mask]

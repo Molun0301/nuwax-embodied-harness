@@ -280,6 +280,16 @@ class VisionToMapProjectionService:
             **item.attributes, **({SAMPLE_SOURCE: sample} if effective_pose.source_timestamp_ns is not None else {})})
             for item in projected)
 
+    def detection_map_pose(self, detection, *, perception_context, current_pose, map_frame, frame_tree):
+        """复用实例投影，区域找物只使用实际物体位置。"""
+        if is_self_body(detection.attributes):
+            return None
+        pose, evidence = self._resolve_detection2d_projection(
+            detection=detection, perception_context=perception_context, current_pose=current_pose,
+            track_pose_by_id=self._build_track_pose_index(perception_context),
+            map_frame=map_frame, frame_tree=frame_tree)
+        return None if evidence["projection_method"] == "current_pose_fallback" else pose
+
     def _build_track_pose_index(self, perception_context: PerceptionContext) -> Dict[str, Pose]:
         result: Dict[str, Pose] = {}
         for track in perception_context.observation.tracks:

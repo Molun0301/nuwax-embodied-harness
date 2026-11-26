@@ -1,5 +1,5 @@
 """MCP、HTTP 与控制台共用的唯一调用分发。"""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator
@@ -34,7 +34,9 @@ def invoke(platform, name: str, args: Mapping[str, Any], caller: str) -> dict:
     except (ValidationError, MapNameError) as error:
         raise GatewayError(str(error), error_code="invalid_params", http_status=400) from error
     if cap.before_submit is not None:
-        cap.before_submit(platform, arguments)
+        options = cap.before_submit(platform, arguments)
+        if options is not None:
+            cap = replace(cap, **options)
     if cap.kind == "task":
         return {"task": asdict(platform.tasks.submit(cap, arguments, caller))}
     if cap.motion:

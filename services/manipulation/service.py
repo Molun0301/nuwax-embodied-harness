@@ -18,6 +18,7 @@ class ManipulationService:
         self._closing = False
         self._transport_closing = False
         self._closed = False
+        self.held_object = None
 
     @contextmanager
     def _operation(self):
@@ -79,7 +80,6 @@ class ManipulationService:
         complete = False
         try:
             context.check()
-            context.progress(0.0, "manipulation_submitting", "正在向设备提交操作指令。")
             accepted = self.backend.start(binding, **parameters)
             task_id = accepted["task_id"]
             while True:
@@ -87,7 +87,7 @@ class ManipulationService:
                 result = self.backend.status(binding, task_id)
                 context.check()
                 state = result["state"]
-                context.progress(0.0, "manipulation_" + state, "设备操作状态：" + state,
+                context.progress(0.5, "manipulating", "设备操作状态：" + state,
                     device_task_id=task_id, device_binding=binding.fields(), device_status=result)
                 if state == "succeeded":
                     physical = result.get("result")
@@ -99,7 +99,8 @@ class ManipulationService:
                     return {**binding.fields(), "device_task_id": task_id, "device_status": result}
                 if state in {"failed", "cancelled", "idle"}:
                     raise DeviceError("设备操作未成功：" + str(result.get("error") or state))
-                context.wait(self.config.poll_interval_sec)
+                # 仿真暂停时仍要查询设备终态；行为期限由上下文检查。
+                context.cancelled.wait(self.config.poll_interval_sec)
         finally:
             if task_id is not None and not complete:
                 self.backend.cancel(binding, task_id, timeout=self.config.http_timeout_sec)

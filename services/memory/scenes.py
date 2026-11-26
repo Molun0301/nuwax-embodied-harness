@@ -19,7 +19,13 @@ import uuid
 from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT
 from services.memory.semantic_map.observations import refresh_scene_spaces
 
+_AUTOMATIC_OBSERVATION_SOURCES = {"perception_video_runtime", "inspect_target"}
+
 class ScenesMixin:
+
+    def index_scene_embedding(self, entry):
+        """让放置任务的结果在返回前可参与向量检索。"""
+        self._embeddings._process((entry.map_name, "memory", entry.memory_id))
 
     def observation_event_ids_for_memory(self, memory_id):
         return tuple(event.event_id for event in self.reader().read("observation",
@@ -100,7 +106,7 @@ class ScenesMixin:
         if context is None and observation is None:
             raise GatewayError('当前没有可写入记忆的观察或感知结果', error_code='observation_unavailable', http_status=409)
         pose = self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
-        if (metadata or {}).get("source") == "perception_video_runtime" and pose is not None and pose.mixed_correction:
+        if (metadata or {}).get("source") in _AUTOMATIC_OBSERVATION_SOURCES and pose is not None and pose.mixed_correction:
             return None
         source = context if context is not None else observation
         headline = context.scene_summary.headline if context is not None else observation.observation.summary
@@ -145,8 +151,9 @@ class ScenesMixin:
         from dataclasses import replace
         projected = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in projected)
         value = store.put("memory", value)
+        automatic = value.metadata.get("source") in _AUTOMATIC_OBSERVATION_SOURCES
         outcomes = (self._associate_observations(store, projected,
-            admission=ADMISSION_AUTOMATIC if value.metadata.get("source") == "perception_video_runtime" else ADMISSION_EXPLICIT,
+            admission=ADMISSION_AUTOMATIC if automatic else ADMISSION_EXPLICIT,
             occupancy_grid=self.current_grid(), now=value.timestamp)[1] if projected else ())
         events = []
         camera = source.camera_id if source is not None else str(value.metadata.get("camera_id") or "")

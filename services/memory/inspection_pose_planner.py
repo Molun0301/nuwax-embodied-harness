@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
-from math import atan2, cos, hypot, radians, sin
+from math import atan2, cos, degrees, hypot, radians, sin
 from types import SimpleNamespace
 from typing import Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.maps import CostMap, OccupancyGrid
+from contracts.occupancy_cells import PackedOccupancyCells
 from core.config import runtime_config
 from services.memory.object_extent import object_extent_payload
 
@@ -31,6 +34,85 @@ class InspectionPosePlanner:
         self._candidate_angles_deg = tuple(float(item) for item in candidate_angles_deg)
         self._max_view_distance_m = max(0.1, float(max_view_distance_m))
         self._visibility_step_factor = max(0.1, float(visibility_step_factor))
+
+    def plan_manipulation_pose(self, *, target_pose, current_pose, distance_m, occupancy_grid, cost_map=None,
+                               cloud_chunks=()):
+        """用最近可容纳机身的自由格确定站位方向，最后按操作距离取点。"""
+        if occupancy_grid is None:
+            return None
+        grid = occupancy_grid
+        values = (np.frombuffer(grid.data.raw, dtype=np.int8) if isinstance(grid.data, PackedOccupancyCells)
+                  else np.asarray(grid.data))
+        values = values.reshape(grid.height, grid.width)
+        free = (values >= 0) & (values < self._occupied_threshold)
+        q = grid.origin.orientation
+        yaw = atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        c, s = cos(yaw), sin(yaw)
+        settings = runtime_config()
+        body = self._robot_geometry()
+        nav = settings["navigation"]
+        step = nav["max_step_up_m"]
+        if step == "":
+            step = nav["traversability_max_step_height_m"]
+        floor = current_pose.position.z + settings["derived"]["standing_ground_z_m"]
+        top = current_pose.position.z + body["z_max_m"]
+        self._project_body_obstacles(free, cloud_chunks, grid, c, s, floor + float(step), top)
+
+        row, col = np.nonzero(free)
+        centers = np.column_stack((col + .5, row + .5))
+        dx = target_pose.position.x - grid.origin.position.x
+        dy = target_pose.position.y - grid.origin.position.y
+        local_target = np.array([c * dx + s * dy, -s * dx + c * dy]) / grid.resolution_m
+        offsets = centers - local_target
+        ranges = np.linalg.norm(offsets, axis=1)
+        footprint = np.asarray(body["footprint_xy_m"]) / grid.resolution_m
+        for index in np.argsort(ranges, kind="stable"):
+            radius = ranges[index]
+            if radius == 0:
+                continue
+            heading_x, heading_y = -offsets[index] / radius
+            rotation = np.array([[heading_x, -heading_y], [heading_y, heading_x]])
+            polygon = footprint @ rotation.T + centers[index]
+            if not self._footprint_fits(free, polygon):
+                continue
+            angle = degrees(yaw + atan2(offsets[index, 1], offsets[index, 0]))
+            if cost_map is not None:
+                cell = self._build_candidate_pose(target_pose, radius_m=radius * grid.resolution_m,
+                                                  angle_deg=angle, observer_body_pose=current_pose)
+                if not self._evaluate_pose(cell, occupancy_grid=None, cost_map=cost_map)[0]:
+                    continue
+            return self._build_candidate_pose(target_pose, radius_m=distance_m, angle_deg=angle,
+                                              observer_body_pose=current_pose)
+        return None
+
+    @staticmethod
+    def _project_body_obstacles(free, chunks, grid, c, s, bottom, top):
+        # 二维图可能把柜体下方保留为自由格；加入支撑面以上、机身顶以下的已建图表面。
+        for data in chunks:
+            points = np.frombuffer(data, dtype="<f4").reshape(-1, 3)
+            nearby = points[(bottom < points[:, 2]) & (points[:, 2] < top)]
+            dx = nearby[:, 0] - grid.origin.position.x
+            dy = nearby[:, 1] - grid.origin.position.y
+            cols = np.floor((c * dx + s * dy) / grid.resolution_m).astype(int)
+            rows = np.floor((-s * dx + c * dy) / grid.resolution_m).astype(int)
+            on_map = (cols >= 0) & (cols < grid.width) & (rows >= 0) & (rows < grid.height)
+            free[rows[on_map], cols[on_map]] = False
+
+    @staticmethod
+    def _footprint_fits(free, polygon):
+        x0, y0 = np.floor(polygon.min(axis=0)).astype(int)
+        x1, y1 = np.ceil(polygon.max(axis=0)).astype(int)
+        if x0 < 0 or y0 < 0 or x1 > free.shape[1] or y1 > free.shape[0]:
+            return False
+        rows, cols = np.nonzero(~free[y0:y1, x0:x1])
+        # 外包与栅格方块按分离轴判交。范围切片已检查两个栅格轴。
+        edges = np.roll(polygon, -1, axis=0) - polygon
+        axes = np.column_stack((-edges[:, 1], edges[:, 0]))
+        limits = polygon @ axes.T
+        centers = np.column_stack((x0 + cols + .5, y0 + rows + .5)) @ axes.T
+        half_cell = .5 * np.abs(axes).sum(axis=1)
+        intersects = (centers + half_cell > limits.min(axis=0)) & (centers - half_cell < limits.max(axis=0))
+        return not np.any(intersects.all(axis=1))
 
     def plan_for_target(
         self,
@@ -89,9 +171,12 @@ class InspectionPosePlanner:
             update={'position': Vector3(**extent['center'])})
         object_radius = max((hypot(point['x'] - center.position.x, point['y'] - center.position.y)
                              for point in extent['footprint_xy']), default=0.0) if extent else 0.0
-        body = json.loads(runtime_config()['derived']['robot_geometry_json'])['footprint_xy_m']
-        body_radius = max(hypot(x, y) for x, y in body)
+        body_radius = max(hypot(x, y) for x, y in self._robot_geometry()["footprint_xy_m"])
         return center, object_radius + body_radius
+
+    @staticmethod
+    def _robot_geometry():
+        return json.loads(runtime_config()["derived"]["robot_geometry_json"])
 
     @staticmethod
     def outside_target(pose: Pose, clearance: Optional[Tuple[Pose, float]]) -> bool:

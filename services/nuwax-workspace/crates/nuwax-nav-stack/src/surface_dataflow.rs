@@ -65,21 +65,28 @@ impl SurfaceMapHub {
         let initial = latest.clone();
         drop(latest);
         Box::pin(futures::stream::unfold(
-            (receiver, initial),
-            |(mut receiver, initial)| async move {
+            (self.latest.clone(), receiver, initial),
+            |(latest, mut receiver, initial)| async move {
                 if let Some(update) = initial {
-                    return Some((Ok(GuardedMapFrame::Surface(update)), (receiver, None)));
+                    return Some((Ok(GuardedMapFrame::Surface(update)), (latest, receiver, None)));
                 }
-                match receiver.recv().await {
-                    Ok(update) => Some((Ok(GuardedMapFrame::Surface(update)), (receiver, None))),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => Some((
-                        Err(nuwax_transport::TransportError::Io(format!(
-                            "三维地图事件缺口: {count}条，不能跳过来源失效"
-                        ))),
-                        (receiver, None),
-                    )),
-                }
+                let update = match receiver.recv().await {
+                    Ok(update) => update,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        // 与发布顺序共用最新值锁，当前快照与下一条事件之间不会漏掉更新。
+                        let current = latest.lock().unwrap_or_else(|error| error.into_inner());
+                        receiver = receiver.resubscribe();
+                        let mut update = current.clone().expect("广播滞后前必有已发布的表面状态");
+                        drop(current);
+                        update.change_basis = None;
+                        update.geometry_changes = Arc::new(SurfaceGeometryChanges::Unknown);
+                        tracing::warn!(missed_events = count, revision = update.authority.revision,
+                            "三维地图消费滞后，已重新读取完整表面状态");
+                        update
+                    }
+                };
+                Some((Ok(GuardedMapFrame::Surface(update)), (latest, receiver, None)))
             },
         ))
     }
@@ -802,6 +809,11 @@ async fn run_surface_planner_with_computer(
                     continue;
                 }
                 if successful.should_reuse(surface_replan_rejection(execution_feedback.as_ref(), active_goal), &input) {
+                    if execution_feedback.as_ref().is_some_and(|feedback| feedback.locally_blocked) {
+                        hub.planning.send_replace(Some((active_goal.session_id.clone(), active_goal.goal_key(),
+                            surface_planning_diagnostic(execution_feedback.as_ref(), active_goal,
+                                "相同出发条件下，原全局路线已被局部执行拒绝"), false, true)));
+                    }
                     continue;
                 }
                 let surface = input.actual.as_ref().map_or_else(|| Arc::clone(surface), |actual|
@@ -1723,16 +1735,43 @@ goal: schema::PoseStamped {
                 .is_err(),
             "不同导航组合的地图通道不能互相污染"
         );
-        let mut slow = hub.stream();
-        slow.next().await.unwrap().unwrap();
-        let update = hub.latest.lock().unwrap().as_ref().unwrap().clone();
-        for _ in 0..40 {
-            hub.publish(update.clone());
+    }
+
+    #[tokio::test]
+    async fn map_hub_rejoins_current_complete_state_after_lag() {
+        for cleared in [false, true] {
+            let hub = SurfaceMapHub::new(Arc::from("base_link"));
+            let mut slow = hub.stream();
+            let mut cache = SurfaceGeometryCache::new(config().geometry);
+            let template =
+                prepare_surface_map(map_message(1, "map"), Instant::now(), &config(), &mut cache);
+            let stamp = template.received_at;
+            for revision in 1..=40 {
+                let mut update = template.clone();
+                update.authority.revision = revision;
+                update.source_timestamp_ns = revision;
+                update.change_basis = template.snapshot.as_ref().ok().cloned();
+                update.geometry_changes = Arc::new(SurfaceGeometryChanges::Empty);
+                if cleared && revision == 40 {
+                    update.snapshot = Err("已清图".into());
+                }
+                hub.publish(update);
+            }
+            let GuardedMapFrame::Surface(resumed) = slow.next().await.unwrap().unwrap() else {
+                panic!("重同步必须返回当前表面状态");
+            };
+            assert_eq!(resumed.authority.revision, 40);
+            assert_eq!(resumed.source_timestamp_ns, 40);
+            assert_eq!(resumed.received_at, stamp);
+            assert!(resumed.change_basis.is_none());
+            assert!(matches!(resumed.geometry_changes.as_ref(), SurfaceGeometryChanges::Unknown));
+            assert_eq!(resumed.snapshot.is_err(), cleared);
+            let mut next = template;
+            next.authority.revision = 41;
+            hub.publish(next);
+            assert!(matches!(slow.next().await.unwrap().unwrap(),
+                GuardedMapFrame::Surface(update) if update.authority.revision == 41));
         }
-        assert!(
-            matches!(slow.next().await, Some(Err(_))),
-            "有界队列缺口必须明确失败，不能静默丢失clear"
-        );
     }
 
     struct FeedState {

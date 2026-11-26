@@ -34,8 +34,9 @@ class SceneGraphIndex:
 class SceneGraphService:
     """按需构建一个当前图；几何缓存与标签变化分离，不增加后台线程。"""
 
-    def __init__(self, *, memory_service, max_cells):
+    def __init__(self, *, memory_service, max_cells, segmenter):
         self.memory = memory_service
+        self._segmenter = segmenter
         self.max_cells = max_cells
         self._lock = threading.RLock()
         self._geometry_key = None
@@ -49,6 +50,7 @@ class SceneGraphService:
 
     def _geometry_changed(self, state):
         with self._lock:
+            self.memory.clear_scene_partition(state.map_name)
             if state.map_name != self._library_name:
                 self._geometry = self._index = None
                 self._geometry_key = self._index_key = None
@@ -63,11 +65,12 @@ class SceneGraphService:
 
     def _capture(self):
         with self._lock:
-            capture = self.memory.capture_scene_graph_state()
+            capture = self.memory.capture_scene_graph_state(segmenter=self._segmenter)
             binding = capture["binding"]
             self._library_name = capture["library_name"]
             records = capture["memory_snapshot"].records
-            source_key = (binding_value(binding), *(records[kind] for kind in ("scene_space", "memory", "instance")))
+            source_key = (binding_value(binding), tuple(space.scene_space_id for space in capture["spaces"]),
+                          *(records[kind] for kind in ("scene_space", "memory", "instance")))
             if self._index is not None and source_key == self._index_key and self._within_deadline(self._index.valid_until):
                 self._assert_capture(capture)
                 return capture, self._index
@@ -93,7 +96,7 @@ class SceneGraphService:
         return valid_until is None or utc_now().timestamp() < valid_until
 
     def _assert_capture(self, capture):
-        self.memory._assert_scene_mapping_capture(capture)
+        self.memory.assert_scene_graph_capture(capture)
         if not self._within_deadline(capture.get("valid_until")):
             raise GatewayError("物品状态在图查询期间已过期，请重新读取。", error_code="scene_graph_changed", http_status=409)
 
@@ -238,6 +241,20 @@ class SceneGraphService:
             boundary = row["properties"].pop("boundary")
             row["properties"]["bounds"] = {key: boundary.get(key) for key in ("min_corner", "max_corner", "area_m2")}
         return row
+
+    def resolve_regions(self, selector):
+        """采用场景图的当前名称、人工别名、区域标识和图上编号。"""
+        capture, index = self._capture()
+        name = str(selector).strip().casefold()
+        code = f"r{name}" if name.isdecimal() else name
+        selected = {node.record_id for node in index.nodes.values() if node.kind == "region"
+            and (name in {value.casefold() for value in (node.node_id, node.name, *node.aliases)}
+                 or code == node.properties["display_code"].casefold())}
+        regions = tuple(space for space in capture["spaces"] if space.scene_space_id in selected)
+        self._assert_capture(capture)
+        if not regions:
+            raise GatewayError(f"未找到场景空间：{selector}", error_code="scene_space_not_found", http_status=404)
+        return regions
 
     def query(self, *, query: str = "", node_id: Optional[str] = None, hops: int = 1,
               kinds: Optional[List[str]] = None, limit: int = 100, expected_graph_revision: Optional[str] = None):

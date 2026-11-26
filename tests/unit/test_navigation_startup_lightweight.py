@@ -32,6 +32,9 @@ def test_generic_declaration_does_not_infer_braking(configuration_snapshot):
     assert result['derived']['actuator_max_linear_mps'] == .3
     assert result['derived']['actuator_max_yaw_rps'] == .3
     assert result['navigation']['capabilities_json'] == ''
+    assert result['derived']['actuator_max_reverse_mps'] == .3
+    store.save({'robot.actuator_max_reverse_mps':.2})
+    assert read_config(store.home)['derived']['actuator_max_reverse_mps'] == .2
 
 
 @pytest.mark.parametrize('updates', [

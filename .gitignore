@@ -209,6 +209,7 @@ drivers/.active_robot.lock
 /tests/integration/*
 !/tests/unit/
 /tests/unit/*
+!/tests/unit/embedding_import_race_repro.py
 !/services/geometry/nuwax_geometry_runtime/tests/
 /services/geometry/nuwax_geometry_runtime/tests/*
 !/services/nuwax-workspace/crates/nuwax-numeric/tests/

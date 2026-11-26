@@ -64,7 +64,8 @@ class SceneMappingService:
         self._segmenter = RoomSegmentationService(min_area_m2=config.min_area_m2,
                                                  doorway_width_m=config.doorway_width_m,
                                                  max_cells=config.max_cells)
-        self.graph = SceneGraphService(memory_service=self.memory, max_cells=config.max_cells)
+        self.graph = SceneGraphService(memory_service=self.memory, max_cells=config.max_cells,
+                                       segmenter=self._segmenter)
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._stop = threading.Event()
@@ -83,7 +84,8 @@ class SceneMappingService:
             if self._backend is None:
                 self._backend = create_scene_decision_backend(backend=self.config.backend,
                     base_url=self.config.base_url, model=self.config.model,
-                    api_key=self.config.api_key, timeout_sec=self.config.timeout_sec)
+                    api_key=self.config.api_key, api_key_file=self.config.api_key_file,
+                    extra_body=self.config.extra_body, timeout_sec=self.config.timeout_sec)
             return self._backend
 
     def capture(self):
@@ -95,7 +97,8 @@ class SceneMappingService:
                     "running": self._thread is not None and self._thread.is_alive(),
                     "busy": self._active_jobs > 0, "stop_requested": self._stop.is_set(),
                     "backend": self.config.backend, "model": self.config.model,
-                    "credential_configured": bool(self.config.api_key),
+                    "credential_configured": bool(self.config.api_key_file if self.config.backend == "openai_vision"
+                                                  else self.config.api_key),
                     "auto_apply": self.config.auto_apply, "cycles": self._cycles,
                     "last_finished_at": self._last_finished_at, "last_error": self._last_error,
                     "last_result": self._last_result,
@@ -218,7 +221,9 @@ class SceneMappingService:
             for region in regions)
         if unchanged:
             self.memory._assert_scene_mapping_capture(capture)
-            return capture, [old_by_id[region.scene_space_id] for region in regions]
+            written = [old_by_id[region.scene_space_id] for region in regions]
+            self.memory.restore_scene_partition(capture, written)
+            return capture, written
         revisions = {space.scene_space_id: int(space.metadata.get("scene_revision", 0)) for space in capture["spaces"]}
         written = self.memory.commit_scene_mapping_spaces(capture, regions, expected_revisions=revisions, retire_missing=True)
         return capture, written
@@ -359,9 +364,12 @@ class SceneMappingService:
             self.stream_bus.publish("memory.scene_spaces", source="scene_mapping_service", payload=self.get_map(), status="available")
 
 
+    def capture_partition(self):
+        return self.memory.capture_scene_partition(segmenter=self._segmenter)
+
     def update_label(self, **arguments):
         """网页和智能体显式命名与模型提交共享通知出口。"""
-        result = self.memory.update_scene_mapping_label(**arguments)
+        result = self.memory.update_scene_mapping_label(segmenter=self._segmenter, **arguments)
         self._publish_map()
         return result
 
@@ -419,29 +427,13 @@ class SceneMappingService:
                     request = self._request(space, capture, entries)
                     result = self._get_backend().decide(request)
                     ensure()
-                    # 地图内容变化时重新分割；区域编号还在就提交本次判断。
-                    try:
-                        current_capture = self.memory.capture_scene_mapping_state()
-                    except GatewayError as error:
-                        if error.error_code == "scene_map_library_mismatch":
-                            raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409) from error
-                        raise
-                    if not same_scope(current_capture["binding"], capture["binding"]):
-                        raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409)
-                    if current_capture["binding"]["map_revision"] != capture["binding"]["map_revision"]:
-                        candidates = self._segmenter.segment(current_capture["grid"], map_name=current_capture["library_name"],
-                            map_revision=current_capture["binding"]["map_revision"], existing_spaces=current_capture["spaces"])
-                        matching = next((candidate for candidate in candidates if candidate.scene_space_id == space.scene_space_id), None)
-                        if matching is None:
-                            raise GatewayError("模型返回时区域已被替换。", error_code="scene_geometry_changed", http_status=409)
                     updated = self._decision_space(space, result, entries, request, apply_labels=adopting)
-                    updated.metadata["map_binding"] = current_capture["binding"]
                     updated.metadata["decision_policy_inputs"] = policy_inputs
                     adopted = updated.metadata["last_decision"]["adopted"]
                     with self._lock:
                         ensure()
                         committed = self.memory.commit_scene_mapping_label(
-                            current_capture, updated, label=LABELS[updated.metadata["category"]] if adopted else None,
+                            capture, updated, label=LABELS[updated.metadata["category"]] if adopted else None,
                             source="model" if adopted else "model_candidate",
                             expected_revision=int(space.metadata["scene_revision"]),
                         )
@@ -453,6 +445,8 @@ class SceneMappingService:
                         label_candidates.append({"id": committed.scene_space_id,
                                            "reasons": updated.metadata["last_decision"]["adoption_blockers"]})
                 except GatewayError as exc:
+                    if exc.error_code == "scene_map_changed":
+                        raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409) from exc
                     if exc.error_code in ("scene_mapping_stopped", "scene_scope_changed", "memory_library_changed"):
                         raise
                     failures.append({"id": space.scene_space_id, "code": exc.error_code, "reason": str(exc)})
@@ -565,7 +559,10 @@ def _consistent_visual_votes(result, images, winner):
         return False
     try:
         for view in views:
-            probabilities = {key: float(value["probabilities"]["entailment"]) for key, value in view["nli"].items()}
+            if result.score_kind == "choice_probability":
+                probabilities = view["probabilities"]
+            else:
+                probabilities = {key: float(value["probabilities"]["entailment"]) for key, value in view["nli"].items()}
             if set(probabilities) != set(CATEGORIES) or any(not math.isfinite(v) or not 0 <= v <= 1 for v in probabilities.values()):
                 return False
             if max(probabilities, key=probabilities.get) != winner:

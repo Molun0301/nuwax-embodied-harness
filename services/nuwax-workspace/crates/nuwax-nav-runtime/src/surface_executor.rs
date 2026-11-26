@@ -178,6 +178,10 @@ impl NavPlanner for SurfaceExecutor {
         delegate!(read self.execution_wait_reason())
     }
 
+    fn recovery_surface(&mut self) -> Option<crate::RecoverySurface> {
+        delegate!(self.recovery_surface())
+    }
+
     fn terminal_phase(&self) -> TerminalPhase {
         delegate!(read self.terminal_phase())
     }

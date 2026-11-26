@@ -91,7 +91,7 @@ impl SurfaceNavigationConfig {
             let motion = MotionKinematics {
                 model: MotionModel::Omnidirectional,
                 max_forward_mps: speed,
-                max_reverse_mps: speed,
+                max_reverse_mps: d.actuator_max_reverse_mps,
                 max_lateral_mps: speed,
                 max_angular_rps: d.actuator_max_yaw_rps,
                 min_executable_linear_mps: d.min_executable_linear_mps,
@@ -349,7 +349,7 @@ mod tests {
         nuwax_config::sections::Derived,
     ) {
         (nuwax_config::test_support::section("navigation"),nuwax_config::test_support::section("robot"),
-                    nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,nav_profile:"pct-scan-3d".into(),actuator_max_linear_mps:0.0,
+                    nuwax_config::sections::Derived { min_executable_linear_mps:0.0,min_executable_angular_rps:0.0,nav_profile:"pct-scan-3d".into(),actuator_max_linear_mps:0.0,actuator_max_reverse_mps:0.0,
                         actuator_max_yaw_rps:0.0,actuator_motion_model:String::new(),robot_geometry_json:
                         r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#.into()})
     }
@@ -417,6 +417,17 @@ mod tests {
             let config = SurfaceNavigationConfig::from_config(&n, &r, &d).unwrap();
             assert_eq!(config.follower.controller.speed, speed);
         }
+    }
+
+    #[test]
+    fn declared_reverse_limit_reaches_basic_kinematics() {
+        let (n, r, mut d) = loader_fixture();
+        d.actuator_max_linear_mps = 0.36;
+        d.actuator_max_reverse_mps = 0.2;
+        d.actuator_max_yaw_rps = 0.5;
+        d.actuator_motion_model = "omnidirectional".into();
+        let motion = SurfaceNavigationConfig::from_config(&n, &r, &d).unwrap().follower.kinematics().unwrap();
+        assert_eq!((motion.max_forward_mps, motion.max_reverse_mps, motion.max_lateral_mps), (0.36, 0.2, 0.36));
     }
 
     #[test]

@@ -143,9 +143,12 @@ def build_mcp_router(platform, access_manager=None) -> APIRouter:
                 if name not in {cap.name for cap in platform.capabilities.agent_tools(platform.robot.manifest.robot_name)}:
                     raise GatewayError("未知 MCP 工具。", error_code="unknown_capability", http_status=404)
                 calling = True
-                result = build_mcp_tool_result(await run_in_threadpool(
-                    invoke, platform, name, params.get("arguments", {}),
-                    "mcp:" + (request.headers.get("mcp-session-id") or "client")))
+                def call_tool():
+                    value = invoke(platform, name, params.get("arguments", {}),
+                        "mcp:" + (request.headers.get("mcp-session-id") or "client"))
+                    return build_mcp_tool_result(value, platform=platform, tool_name=name)
+
+                result = await run_in_threadpool(call_tool)
             else:
                 raise GatewayError("不支持的 MCP 方法。", error_code="unsupported_mcp_method", http_status=400)
             return JSONResponse(_jsonrpc_result(request_id, result))

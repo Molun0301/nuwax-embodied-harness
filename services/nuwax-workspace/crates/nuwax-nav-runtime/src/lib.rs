@@ -36,6 +36,9 @@ pub use local_workers::MapInitializer;
 /// Typed actual execution feedback for deduplicating identical rejected work.
 pub mod replan_feedback;
 use replan_feedback::{ActualExecutionContext, SurfaceReplanFeedback};
+mod recovery;
+pub use recovery::RecoverySurface;
+use recovery::{RetreatStep, WalkedPath};
 mod sampling_controller;
 mod sampling_follower;
 mod surface_executor;
@@ -432,6 +435,8 @@ pub enum PlannerStep {
     Failed(String),
     /// 当前路径已失效，先发送零速再等待更新的规划修订。
     ReplanRequired(String),
+    /// 当前位姿没有可执行的局部动作，重规划仍不可出发时可沿实测轨迹脱离。
+    Blocked(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -531,6 +536,8 @@ pub trait NavPlanner: Send + 'static {
     fn uses_route_progress(&self) -> bool { false }
     /// 感知暂停时无法更新路线长度，仍保留该路线的进展期限。
     fn suspended_route_failure(&mut self) -> Option<String> { None }
+    /// 沿实测轨迹脱困时使用的当前碰撞快照与运动能力。
+    fn recovery_surface(&mut self) -> Option<RecoverySurface> { None }
     /// 本次原算法执行周期结束，不是实际几何拒绝；只用于反馈原因分类。
     fn execution_cycle_complete(&self) -> bool { false }
     /// 等待轨迹或当拍命令受阻的原因；速度回执不覆盖该原因。
@@ -672,6 +679,8 @@ pub struct NavScheduler<M, P> {
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     path_wait_started_at: Option<clock::Instant>,
     latest_pose: Option<PoseStamped>,
+    walked_path: WalkedPath,
+    blocked_at: Option<nuwax_nav_types_messages::Point3>,
     lio_measured_motion: Option<MeasuredMotion>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_source_max_age: Option<Duration>,
@@ -714,6 +723,8 @@ where
             current_execution_identity: None,
             path_wait_started_at: None,
             latest_pose: None,
+            walked_path: WalkedPath::default(),
+            blocked_at: None,
             lio_measured_motion: None,
             pose_receipt: None,
             pose_source_max_age: None,
@@ -783,6 +794,8 @@ where
                 self.status.input_wait_reason = Some(format!("地图来源暂不可用: {reason}"));
                 if kind == MapInvalidationKind::Invalidated {
                     self.planner.invalidate_execution_map();
+                    self.walked_path.clear();
+                    self.blocked_at = None;
                 }
                 self.refresh_input_status(Instant::now());
                 let result = if self.lease_active || self.session.is_some() {
@@ -832,7 +845,13 @@ where
                 self.observe_costmap(status_tx, observation, received_at)
             }
             InputKind::UpdateObstacleSource(map, available, registered) => (|| {
-                if let Some(frame) = registered { self.planner.observe_registered_frame(frame); }
+                if let Some(frame) = registered {
+                    if frame.is_none() {
+                        self.walked_path.clear();
+                        self.blocked_at = None;
+                    }
+                    self.planner.observe_registered_frame(frame);
+                }
                 if let Some(map)=map {
                     self.planner.update_execution_map(map.clone())?;
                 }
@@ -858,8 +877,13 @@ where
                 if matches!(self.status.phase,SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling)
                     && self.session.as_ref().is_some_and(|session|
                         session.session_id == goal_id && session.execution_identity.goal_key() == key) {
-                    self.status.no_feasible_path = no_feasible_path;
-                    if failed {
+                    self.status.no_feasible_path = no_feasible_path && !self.walked_path.active();
+                    if self.status.phase == SchedulerPhase::AwaitingPath
+                        && (failed || no_feasible_path) && self.blocked_at.is_some()
+                        && self.lease_active && self.begin_retreat() {
+                        self.publish_status(status_tx);
+                        Ok(())
+                    } else if failed && !self.walked_path.active() {
                         self.status.message=message.clone();self.publish_status(status_tx);
                         let result=self.finish_terminal(status_tx,TerminalOutcome::PlannerFailed,SchedulerPhase::Failed).await;
                         if result.is_ok() {self.status.message=message;self.publish_status(status_tx);}
@@ -896,6 +920,9 @@ where
         self.planner.update_odometry(odometry);
         self.pose_source_max_age = source_max_age;
         self.refresh_input_status(Instant::now());
+        if self.status.planner_inputs_fresh {
+            self.walked_path.record(self.latest_pose.as_ref().unwrap().clone());
+        }
         Ok(())
     }
 
@@ -966,6 +993,8 @@ where
             self.status.last_applied_twist = Some(Twist2::ZERO);
         }
         self.planner.stop();
+        self.walked_path.end();
+        self.blocked_at = None;
         if let Err(error) = self
             .planner
             .configure_execution_goal(&session.goal, session.options)
@@ -1152,6 +1181,14 @@ where
                 step=PlannerStep::ReplanRequired("逼近路线已到近端，原目标仍活动，等待新观测地面与重规划".into());
             }
         }
+        let locally_blocked = matches!(step, PlannerStep::Blocked(_));
+        if locally_blocked {
+            if self.blocked_at.is_some() && self.begin_retreat() {
+                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                return Ok(());
+            }
+            self.blocked_at = self.latest_pose.as_ref().map(|pose| pose.pose.position);
+        }
         let intent = self.wrap_local_intent(step)?;
         // 当拍同步跟踪与当前路线对应，实际上下文只供全局反馈复用。
         self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
@@ -1160,10 +1197,24 @@ where
             rejected_context: None,
             current_context: intent.execution_context.clone(),
             zero_sent_rejection: false,
+            locally_blocked: false,
             rejection_reason: None,
         });
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
+                if twist != Twist2::ZERO {
+                    if let (Some(blocked), Some(pose), Some((ExecutionPath::Surface(path), _))) =
+                        (self.blocked_at, self.latest_pose.as_ref(), self.current_path.as_ref())
+                    {
+                        let advanced = self.planner.recovery_surface().is_some_and(|surface| {
+                            self.walked_path.replan_advanced(path, blocked, pose.pose.position, surface.forward.resolution)
+                        });
+                        if advanced {
+                            self.blocked_at = None;
+                            self.walked_path.end();
+                        }
+                    }
+                }
                 let wait_reason = self.planner.execution_wait_reason();
                 self.apply_controller_twist(status_tx,twist).await?;
                 if twist==Twist2::ZERO{
@@ -1185,21 +1236,7 @@ where
                 Ok(())
             }
             LocalExecutionPayload::ReplanRequired(reason) => {
-                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-                let zero_sent_context=self.planner.refresh_execution_context(Twist2::ZERO);
-                self.planner.stop();
-                self.status.phase = SchedulerPhase::AwaitingPath;
-                self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
-                    terminal_phase: self.planner.terminal_phase(),
-                    path_identity: Arc::clone(&intent.identity),
-                    rejected_context: intent.execution_context,
-                    current_context: zero_sent_context,
-                    zero_sent_rejection: true,
-                    rejection_reason: Some(reason.clone()),
-                });
-                self.status.message = format!("路径失效，零速请求已接受，等待更新路径: {reason}");
-                self.publish_status(status_tx);
-                Ok(())
+                self.request_surface_replan(status_tx, intent.identity, intent.execution_context, reason, locally_blocked).await
             }
             LocalExecutionPayload::Succeeded => {
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
@@ -1218,6 +1255,88 @@ where
                 self.status.message = qualified_cause;
                 self.publish_status(status_tx);
                 Ok(())
+            }
+        }
+    }
+
+    async fn request_surface_replan(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+        identity: Arc<PathExecutionIdentity>,
+        rejected_context: Option<Arc<ActualExecutionContext>>,
+        reason: String,
+        locally_blocked: bool,
+    ) -> Result<(), RuntimeError> {
+        self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+        let current_context = self.planner.refresh_execution_context(Twist2::ZERO);
+        self.planner.stop();
+        self.status.phase = SchedulerPhase::AwaitingPath;
+        self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
+            terminal_phase: self.planner.terminal_phase(),
+            path_identity: identity,
+            rejected_context,
+            current_context,
+            zero_sent_rejection: true,
+            locally_blocked,
+            rejection_reason: Some(reason.clone()),
+        });
+        self.status.message = format!("路径失效，零速请求已接受，等待更新路径: {reason}");
+        self.publish_status(status_tx);
+        Ok(())
+    }
+
+    fn begin_retreat(&mut self) -> bool {
+        if self.walked_path.active() {
+            return true;
+        }
+        let (Some(pose), Some(surface)) = (&self.latest_pose, self.planner.recovery_surface()) else {
+            return false;
+        };
+        if !self.walked_path.begin(pose, &surface) {
+            return false;
+        }
+        self.status.phase = SchedulerPhase::Controlling;
+        self.status.no_feasible_path = false;
+        self.status.surface_replan_feedback = None;
+        self.status.message = "全局重规划仍无法出发，沿实测轨迹倒退".into();
+        tracing::info!(position=?pose.pose.position, "局部无可行动作，开始沿实测轨迹倒退");
+        true
+    }
+
+    async fn retreat_tick(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(reason) = self.planner.suspended_route_failure() {
+            self.status.message = reason;
+            return self.finish_terminal(status_tx, TerminalOutcome::PlannerFailed, SchedulerPhase::Failed).await;
+        }
+        let Some(surface) = self.planner.recovery_surface() else {
+            return self.apply_controller_twist(status_tx, Twist2::ZERO).await;
+        };
+        let Some((ExecutionPath::Surface(path), _)) = self.current_path.as_ref() else {
+            unreachable!("只有三维跟随器提供脱困碰撞快照");
+        };
+        let pose = self.latest_pose.as_ref().unwrap();
+        let applied = self.status.last_applied_twist.unwrap_or(Twist2::ZERO);
+        match self.walked_path.step(pose, &surface, path, applied) {
+            RetreatStep::Move(command) => {
+                self.apply_controller_twist(status_tx, command).await?;
+                self.status.message = "正在沿实测轨迹倒退".into();
+                self.publish_status(status_tx);
+                Ok(())
+            }
+            RetreatStep::DepartureAvailable => {
+                self.walked_path.replan();
+                self.blocked_at = Some(pose.pose.position);
+                tracing::info!(position=?pose.pose.position, "出现可行动作，结束倒退并重规划");
+                let context = self.planner.refresh_execution_context(applied);
+                let identity = Arc::clone(self.current_execution_identity.as_ref().unwrap());
+                self.request_surface_replan(status_tx, identity, context, "脱离局部阻塞，重新从实测位姿规划".into(), false).await
+            }
+            RetreatStep::Exhausted => {
+                self.status.message = "实测轨迹上没有可执行的倒退动作".into();
+                self.finish_terminal(status_tx, TerminalOutcome::PlannerFailed, SchedulerPhase::Failed).await
             }
         }
     }
@@ -1251,7 +1370,7 @@ where
             PlannerStep::Pending(failures) => LocalExecutionPayload::Pending(failures),
             PlannerStep::Succeeded => LocalExecutionPayload::Succeeded,
             PlannerStep::Failed(reason) => LocalExecutionPayload::Failed(reason),
-            PlannerStep::ReplanRequired(reason) => LocalExecutionPayload::ReplanRequired(reason),
+            PlannerStep::ReplanRequired(reason) | PlannerStep::Blocked(reason) => LocalExecutionPayload::ReplanRequired(reason),
         };
         Ok(LocalExecutionCommandIntent {
             identity,
@@ -1291,7 +1410,9 @@ where
             }
             // 控制态与等待路线态都在当拍读取测速，不能用上一拍的停稳结论收尾。
             self.refresh_measured_motion();
-            if self.status.phase == SchedulerPhase::Controlling {
+            if self.walked_path.active() {
+                self.retreat_tick(status_tx).await?;
+            } else if self.status.phase == SchedulerPhase::Controlling {
                 self.control_tick(status_tx).await?;
             } else {
                 match self.planner.step_at_goal() {
@@ -1310,7 +1431,7 @@ where
                         self.status.message = reason;
                         self.finish_terminal(status_tx, TerminalOutcome::PlannerFailed, SchedulerPhase::Failed).await?;
                     }
-                    Some(PlannerStep::ReplanRequired(reason)) => {
+                    Some(PlannerStep::ReplanRequired(reason) | PlannerStep::Blocked(reason)) => {
                         self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                         self.status.message = reason;
                         self.publish_status(status_tx);
@@ -1442,6 +1563,8 @@ where
         }
         self.status.surface_replan_feedback = None;
         self.current_execution_identity = None;
+        self.walked_path.end();
+        self.blocked_at = None;
 
         {
 
@@ -2900,6 +3023,7 @@ mod tests {
         config.set("derived","min_executable_linear_mps",0.0);
         config.set("derived","min_executable_angular_rps",0.0);
         config.set("derived","actuator_max_linear_mps",0.0);
+        config.set("derived","actuator_max_reverse_mps",0.0);
         config.set("derived","actuator_max_yaw_rps",0.0);
         config.set("derived","actuator_motion_model","");
         config.write_install(&root);

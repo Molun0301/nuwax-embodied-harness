@@ -15,5 +15,3 @@ class PerceptionSample:
     image_bytes: Optional[bytes] = None
     inputs: Optional[tuple] = None
     complete: bool = False
-    # 发布时取出的拍照时刻点云帧，后台补几何时与当时缓存合并使用。
-    point_cloud_frames: tuple = ()

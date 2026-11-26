@@ -6,6 +6,7 @@ use nuwax_nav_types_messages::GoalOptions;
 
 pub type BodyPose = ([f64; 3], [f64; 4]);
 pub use nuwax_nav_pct_native::RouteKind;
+pub use nuwax_nav_runtime::surface_follower::position_within_tolerance;
 
 /// 路线用途随结果传递，探索和返航的完整路线接口不会消费逼近结果。
 pub struct SurfaceRoute {

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, is_dataclass
-import json
 from uuid import uuid4
 
 from contracts.runtime_views import DiagnosticItem, DiagnosticLevel, DiagnosticSnapshot, RobotStatusSnapshot
@@ -34,7 +33,7 @@ class RobotStateService:
         self._history: Deque[RobotStatusSnapshot] = deque(maxlen=max(1, history_limit))
         self._diagnostic_history: Deque[DiagnosticSnapshot] = deque(maxlen=max(1, diagnostic_history_limit))
         self._latest_snapshot: Optional[RobotStatusSnapshot] = None
-        self._last_web_state_signature: Optional[str] = None
+        self._last_web_state_signature: Optional[dict] = None
         self._web_state_source_epoch = uuid4().hex
         self._web_state_revision = 0
         self._subscription = None
@@ -188,8 +187,8 @@ class RobotStateService:
             items = items[-max(0, limit) :]
         return tuple(items)
 
-    def _build_web_state_signature(self, snapshot: RobotStatusSnapshot) -> str:
-        payload = {
+    def _build_web_state_signature(self, snapshot: RobotStatusSnapshot) -> dict:
+        return {
             "robot_name": snapshot.robot_name,
             "robot_model": snapshot.robot_model,
             "assembly_status": self._stable_value(snapshot.assembly_status),
@@ -200,7 +199,6 @@ class RobotStateService:
             "adapter_count": snapshot.metadata.get("adapter_count"),
             "source_kind": snapshot.metadata.get("source_kind"),
         }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def _web_robot_state(self, robot_state) -> dict:
         return {
@@ -233,6 +231,7 @@ class RobotStateService:
             "timestamp",
             "updated_at",
             "source_timestamp",
+            "source_timestamp_ns",
             "sequence",
             "seq",
             "cursor",
@@ -261,7 +260,7 @@ class RobotStateService:
         if callable(model_dump):
             return self._stable_value(model_dump(mode="json"))
         if isinstance(value, dict):
-            return {str(key): self._stable_value(value[key]) for key in sorted(value)}
+            return {str(key): self._stable_value(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._stable_value(item) for item in value]
         return value

@@ -74,7 +74,8 @@ SCHEMAS = {'get_navigation_semantic_context': {'type': 'object',
                                           'near_x': {'type': 'number'},
                                           'near_y': {'type': 'number'},
                                           'near_z': {'type': 'number', 'default': 0.0},
-                                          'max_distance_m': {'type': 'number', 'minimum': 0.0}},
+                                          'max_distance_m': {'type': 'number', 'minimum': 0.0},
+                                          'include_removed': {'type': 'boolean', 'default': False}},
                            'required': ['query'],
                            'additionalProperties': False},
  'list_scene_spaces': {'type': 'object',
@@ -198,7 +199,7 @@ DESCRIPTIONS = {'get_navigation_semantic_context': '读取当前地图绑定的�
  'list_memory_libraries': '列出当前可用的命名记忆库及其摘要，供上层选择正确记忆。',
  'tag_location': '把当前位姿与最新观察信息写入命名地点记忆，可供后续命名导航复用。',
  'query_location': '按名称、别名或描述查询已标记地点。',
- 'query_semantic_memory': '按自然语言检索近期场景记忆和语义摘要。',
+ 'query_semantic_memory': '按自然语言检索近期场景记忆、物品实例和观察。默认不返回已被搬走（removed）的物品实例；查历史原位置时传 include_removed=true。',
  'list_scene_spaces': '列出当前记忆库内的场景空间，可按地图名称、审核状态或空间标识筛选。',
  'get_scene_space': '按场景空间标识读取单个场景空间及其证据。',
  'query_scene_spaces': '按自然语言和过滤条件检索场景空间，只返回候选、分数和证据。',
@@ -310,7 +311,7 @@ def query_location(platform, args):
 def query_semantic_memory(platform, args):
     return {"query_result": platform.memory.query_semantic_memory(args["query"].strip(),
         similarity_threshold=args.get("similarity_threshold", .25), limit=args.get("limit", 5),
-        payload_filter=_payload_filter(args))}
+        payload_filter=_payload_filter(args), include_removed=args.get("include_removed", False))}
 
 
 def list_scene_spaces(platform, args):

@@ -31,9 +31,10 @@ from core.errors import GatewayError
 from core.logging_utils import LogRateLimiter
 from core.event_bus import PreparedEventPublication
 from core.stream_bus import PreparedStreamPublication
-from providers import CalibrationProvider, PointCloudProvider
+from providers import CalibrationProvider
 from providers.pointcloud import DemandPointCloudProvider
 from services.artifact_service import ArtifactService
+from services.geometry.client import GeometryError, Transform
 from services.perception.base import (
     DetectionBundle,
     DisabledSegmentationBackend,
@@ -44,7 +45,14 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import GeometryCapture, contract_pose, _stamp
+from services.perception.observation_geometry import (
+    ACCUMULATED_CLOUD_UNAVAILABLE,
+    ObservationGeometry,
+    _capture_reference,
+    _pose_samples,
+    contract_pose,
+    project_accumulated_cloud,
+)
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -55,8 +63,6 @@ from services.perception.trackers import Basic2DTrackerBackend
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
 _INPUT_LOG_LIMITER = LogRateLimiter()
-# 按 Go2 雷达 15.4 帧/秒约保留 3 秒，覆盖检测耗时，检测结束封存时拍照后的点云仍在缓存中。
-_POINT_CLOUD_CACHE_FRAMES = 45
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -126,10 +132,6 @@ class PerceptionService:
         self._active_operations = 0
         self._closing = False
         self._closed = False
-        self._point_cloud_lock = threading.Lock()
-        self._point_cloud_frames = ()
-        self._point_cloud_subscription = (stream_bus.subscribe(self._cache_point_cloud, topics=("pointcloud.frame",))
-                                          if stream_bus is not None else None)
 
     def set_video_frame_source(self, video_frame_source: Optional[VideoFrameSource]) -> None:
         self._video_frame_source = video_frame_source
@@ -184,23 +186,22 @@ class PerceptionService:
 
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
-        with self._operation(), self.point_cloud_consumer():
-            capture = self._begin_geometry_capture(image_frame) if camera_info is not None else None
+        with self._operation():
             return self._run_full_pipeline(
-                image_frame, camera_info, capture=capture, image_artifact=image_artifact,
+                image_frame, camera_info, image_artifact=image_artifact,
                 requested_by=requested_by, detector_backend_name=detector_backend_name,
                 source_name=source_name, detection_metadata=detection_metadata,
                 open_vocabulary_classes=open_vocabulary_classes,
             )
 
-    def _run_full_pipeline(self, image_frame, camera_info, *, capture, **kwargs):
+    def _run_full_pipeline(self, image_frame, camera_info, **kwargs):
         requested_at = perf_counter()
         with self._full_pipeline_lock:
             with self._context_condition:
                 self._ensure_open()
             acquired_at = perf_counter()
             context, scene_publication = self._process_image_locked(
-                image_frame, camera_info, capture=capture,
+                image_frame, camera_info,
                 lock_wait_ms=(acquired_at - requested_at) * 1000.0, **kwargs,
             )
         # 场景事件在完整分析锁内预留顺序；同步订阅不延长模型串行区。
@@ -232,7 +233,6 @@ class PerceptionService:
         image_frame,
         camera_info=None,
         *,
-        capture,
         image_artifact=None,
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
@@ -280,12 +280,11 @@ class PerceptionService:
                 detector_spec.backend_kind,
                 detection_bundle.metadata,
             )
-            if capture is not None:
-                capture = self._seal_geometry_capture(image_frame, capture)
+            reference = self._capture_photo_reference(image_frame) if camera_info is not None else None
             stage_started_at = perf_counter()
             detection_bundle = self._apply_self_body_filter(
                 detection_bundle, image_frame=image_frame, camera_info=camera_info,
-                frame_tree=capture.reference.frame_tree if capture is not None else None,
+                frame_tree=reference.frame_tree if reference is not None else None,
             )
             stage_duration_ms["self_body"] = self._elapsed_ms(stage_started_at)
 
@@ -319,12 +318,16 @@ class PerceptionService:
         )
 
         stage_started_at = perf_counter()
-        cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame, capture) if capture is not None else None
-        detection_bundle = self._augment_detection_geometry(
-            detection_bundle,
+        geometry_detections, geometry_metadata = self._augment_detection_geometry(
+            detection_bundle.detections_2d,
             image_frame=image_frame,
             camera_info=camera_info,
-            cached_geometry_inputs=cached_geometry_inputs,
+            reference=reference,
+            self_region=region_from_detection_metadata(detection_bundle.metadata),
+        )
+        detection_bundle = DetectionBundle(
+            detections_2d=geometry_detections, detections_3d=detection_bundle.detections_3d,
+            metadata={**detection_bundle.metadata, **geometry_metadata},
         )
         stage_duration_ms["geometry"] = self._elapsed_ms(stage_started_at)
         stage_status["geometry"] = str(
@@ -433,7 +436,7 @@ class PerceptionService:
         )
         self._publish_context(
             context, image_frame=image_frame, source=source_name or detector_spec.name,
-            kind="latest_perception", full=True, geometry_inputs=cached_geometry_inputs,
+            kind="latest_perception", full=True, reference=reference,
         )
         scene_publication = None
         if self._event_bus is not None:
@@ -483,7 +486,7 @@ class PerceptionService:
     ) -> PerceptionContext:
         """从平台已接收的端侧推流抽取最新帧并完成完整感知。"""
 
-        with self._operation(), self.point_cloud_consumer():
+        with self._operation():
             return self._perceive_current_scene(
                 camera_id=camera_id, requested_by=requested_by,
                 detector_backend_name=detector_backend_name, store_artifact=store_artifact,
@@ -508,7 +511,6 @@ class PerceptionService:
                 },
             )
         camera_info = self._camera_info_from_video_frame(image_frame)
-        capture = self._begin_geometry_capture(image_frame) if camera_info is not None else None
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
             image_frame,
@@ -523,7 +525,6 @@ class PerceptionService:
         return self._run_full_pipeline(
             image_frame,
             camera_info,
-            capture=capture,
             image_artifact=image_artifact,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
@@ -549,7 +550,7 @@ class PerceptionService:
         三角测量观测跟随 YOLO 节奏。
         """
 
-        with self._operation(), self.point_cloud_consumer():
+        with self._operation():
             return self._detect_current_frame_fast(
                 camera_id=camera_id, requested_by=requested_by,
                 detector_backend_name=detector_backend_name, detection_metadata=detection_metadata,
@@ -574,7 +575,6 @@ class PerceptionService:
                 },
             )
         camera_info = self._camera_info_from_video_frame(image_frame)
-        capture = self._begin_geometry_capture(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
             image_frame,
@@ -583,7 +583,6 @@ class PerceptionService:
         return self._process_image_fast(
             image_frame,
             camera_info,
-            capture=capture,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=source_name,
@@ -606,24 +605,24 @@ class PerceptionService:
 
         from contracts.image import CameraInfo, ImageFrame
 
-        with self._operation(), self.point_cloud_consumer():
+        with self._operation():
             if not isinstance(image_frame, ImageFrame):
                 raise TypeError("PerceptionService.process_image_fast 仅接受标准 ImageFrame。")
             if camera_info is not None and not isinstance(camera_info, CameraInfo):
                 raise TypeError("PerceptionService.process_image_fast 的 camera_info 必须是 CameraInfo。")
             return self._process_image_fast(
-                image_frame, camera_info, capture=self._begin_geometry_capture(image_frame),
+                image_frame, camera_info,
                 requested_by=requested_by, detector_backend_name=detector_backend_name, source_name=source_name,
                 detection_metadata=detection_metadata, open_vocabulary_classes=open_vocabulary_classes,
             )
 
-    def _process_image_fast(self, image_frame, camera_info, *, capture, **kwargs):
+    def _process_image_fast(self, image_frame, camera_info, **kwargs):
         requested_at = perf_counter()
         with self._pipeline_lock:
             with self._context_condition:
                 self._ensure_open()
             context, overlay_publication = self._process_image_fast_locked(
-                image_frame, camera_info, capture=capture,
+                image_frame, camera_info,
                 lock_wait_ms=(perf_counter() - requested_at) * 1000.0, **kwargs,
             )
         if overlay_publication is not None:
@@ -640,7 +639,6 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
-        capture: GeometryCapture,
         lock_wait_ms: Optional[float] = None,
     ) -> Tuple[PerceptionContext, Optional[PreparedStreamPublication]]:
         """process_image_fast 的实际实现，调用方须已持有 _pipeline_lock。"""
@@ -682,7 +680,7 @@ class PerceptionService:
             detector_spec.backend_kind,
             detection_bundle.metadata,
         )
-        capture = self._seal_geometry_capture(image_frame, capture)
+        reference = self._capture_photo_reference(image_frame)
         stage_started_at = perf_counter()
         detection_bundle = self._apply_self_body_filter(
             detection_bundle, image_frame=image_frame, camera_info=camera_info, frame_tree=None,
@@ -794,7 +792,7 @@ class PerceptionService:
             self._fast_frame_cache[context.camera_id] = (
                 source_frame, input_signature if cacheable else None, cache_key, context,
                 image_frame.model_copy(deep=True), camera_info.model_copy(deep=True) if camera_info is not None else None,
-                capture)
+                reference)
             if len(self._fast_frame_cache) > 8:
                 self._fast_frame_cache.pop(next(iter(self._fast_frame_cache)))
         return context, self._prepare_detection_overlay_frame(context)
@@ -820,27 +818,13 @@ class PerceptionService:
         """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
         if inputs is None:
             return context, None, None
-        image_frame, camera_info, capture = inputs
+        image_frame, camera_info, reference = inputs
         if stop_event is not None and stop_event.is_set():
             return context, None, None
-        geometry = self._capture_geometry(image_frame, capture)
-        if camera_info is None:
-            detections = tuple(context.observation.detections_2d)
-            metadata = {"geometry_projection_degradation_reason": "camera_info_missing"}
-        else:
-            detections, metadata = self._geometry_augmentor.augment_detections(
-                tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
-                point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose,
-                self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")))
-        metadata = {**metadata, "geometry_synchronization": "source_time_window_interpolation",
-                    "geometry_input_sources": list(geometry.sources)}
-        if geometry.reason:
-            metadata["geometry_projection_degradation_reason"] = geometry.reason
-            metadata["geometry_projection_degradation_message"] = geometry.message
-            detections = tuple(item.model_copy(update={"attributes": {
-                **item.attributes, "geometry_projection_degradation_reason": geometry.reason,
-                "geometry_projection_degradation_message": geometry.message}})
-                for item in detections)
+        detections, metadata = self._augment_detection_geometry(
+            tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
+            reference=reference, self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")),
+        )
         artifact = context.image_artifact
         if store_artifact and artifact is None:
             artifact = self._artifact_service.save_image_frame(image_frame, metadata={
@@ -851,9 +835,10 @@ class PerceptionService:
         observation = context.observation.model_copy(update={
             "detections_2d": list(detections), "metadata": enriched(context.observation.metadata),
             "artifact_ids": [artifact.artifact_id] if artifact is not None else context.observation.artifact_ids})
-        return context.model_copy(update={"observation": observation, "image_artifact": artifact,
-                                         "metadata": {**enriched(context.metadata), "stage_status": {
-                                             **context.metadata.get("stage_status", {}), "geometry": "completed"}}}), geometry.pose, geometry.frame_tree
+        context = context.model_copy(update={"observation": observation, "image_artifact": artifact,
+            "metadata": {**enriched(context.metadata), "stage_status": {
+                **context.metadata.get("stage_status", {}), "geometry": "completed"}}})
+        return context, reference.pose, reference.frame_tree
 
     @staticmethod
     def _fast_input_signature(image_frame, camera_info):
@@ -1020,7 +1005,7 @@ class PerceptionService:
         return tuple(items)
 
 
-    def _publish_context(self, context, *, image_frame, source, kind, full, geometry_inputs=None):
+    def _publish_context(self, context, *, image_frame, source, kind, full, reference=None):
         with self._context_condition:
             self._ensure_open()
             latest_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
@@ -1037,8 +1022,8 @@ class PerceptionService:
             if full:
                 self._latest_full_by_camera[context.camera_id] = context
                 self._full_inputs[context.camera_id] = (context.observation.observation_id, image_frame,
-                    context.camera_info, geometry_inputs[2] if geometry_inputs else None,
-                    geometry_inputs[1] if geometry_inputs else None)
+                    context.camera_info, reference.pose if reference is not None else None,
+                    reference.frame_tree if reference is not None else None)
 
     def _ensure_open(self):
         if self._closing:
@@ -1082,11 +1067,6 @@ class PerceptionService:
             self._history.clear()
             self._fast_frame_cache.clear()
             self._closed = True
-        if self._point_cloud_subscription is not None:
-            self._stream_bus.unsubscribe(self._point_cloud_subscription)
-            self._point_cloud_subscription = None
-        with self._point_cloud_lock:
-            self._point_cloud_frames = ()
 
     def _attach_segmentation_results(
         self,
@@ -1485,40 +1465,9 @@ class PerceptionService:
         pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
         return pose, self._frame_tree
 
-    def _get_point_cloud_provider_optional(self) -> Optional[PointCloudProvider]:
-        providers = getattr(self._provider_owner, "providers", None)
-        if providers is None or not isinstance(providers, PointCloudProvider):
-            return None
-        if not providers.is_available():
-            return None
-        return providers
-
-    @staticmethod
-    def _has_usable_point_cloud(frame) -> bool:
-        if frame is None:
-            return False
-        points = getattr(frame, "points", None)
-        try:
-            if points is not None and len(points) > 0:
-                return True
-        except TypeError:
-            pass
-        array = getattr(frame, "points_xyz_array", None)
-        shape = getattr(array, "shape", ())
-        try:
-            return (
-                array is not None
-                and len(shape) == 2
-                and shape[0] > 0
-                and shape[1] >= 3
-            )
-        except (TypeError, IndexError):
-            return False
-
     def _geometry_transforms(self):
         """把设备标定接口的相机静态边接回几何坐标树。"""
-        from services.geometry.client import Transform
-        transforms = () if self._geometry_client is None else self._geometry_client.get_frame_tree()
+        transforms = self._geometry_client.get_frame_tree()
         providers = getattr(self._provider_owner, "providers", None)
         topology = providers.get_sensor_topology() if isinstance(providers, CalibrationProvider) else None
         if topology is not None:
@@ -1530,37 +1479,22 @@ class PerceptionService:
             ) for pair in topology.pairs))
         return transforms
 
-    def _cache_point_cloud(self, frame):
-        """按采集时刻保留最新点云，供后台补几何使用。"""
-        with self._point_cloud_lock:
-            frames = sorted((*self._point_cloud_frames, frame), key=lambda item: _stamp(item.payload, item.payload.metadata))
-            self._point_cloud_frames = tuple(frames[-_POINT_CLOUD_CACHE_FRAMES:])
-
-    def _begin_geometry_capture(self, image_frame):
+    def _capture_photo_reference(self, image_frame):
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
-        with self._point_cloud_lock:
-            cloud_frames = self._point_cloud_frames
-        transforms = () if snapshot is None else self._geometry_transforms()
-        capture = GeometryCapture.before_detection(self._stream_bus, image_frame, transforms,
-            None if snapshot is None else snapshot.map_name, cloud_frames)
-        self._frame_tree = capture.reference.frame_tree
-        return capture
-
-    def _seal_geometry_capture(self, image_frame, capture):
-        with self._point_cloud_lock:
-            cloud_frames = self._point_cloud_frames
-        return capture.after_detection(self._stream_bus, image_frame, cloud_frames)
-
-    def _capture_geometry(self, image_frame, capture=None):
-        """投影已封存的几何，或直接配对当前可用的帧。"""
-        if capture is None:
-            capture = self._begin_geometry_capture(image_frame)
-            capture = self._seal_geometry_capture(image_frame, capture)
-        return capture.project(image_frame)
-
-    def _capture_cached_geometry_inputs(self, image_frame, capture=None):
-        geometry = self._capture_geometry(image_frame, capture)
-        return geometry.point_cloud, geometry.frame_tree, geometry.pose
+        self._frame_tree = None
+        if snapshot is None or not snapshot.session_id or self._geometry_client is None:
+            return ObservationGeometry(reason=ACCUMULATED_CLOUD_UNAVAILABLE, message="当前没有地图会话")
+        if self._stream_bus is None:
+            return ObservationGeometry(reason="geometry_stream_unavailable")
+        try:
+            transforms = self._geometry_transforms()
+        except GeometryError as error:
+            return ObservationGeometry(reason=ACCUMULATED_CLOUD_UNAVAILABLE, message=error.message)
+        frames = self._stream_bus.replay(topics=("localization.pose",))
+        poses = _pose_samples(frames, snapshot.map_name, snapshot.info.map_frame_id)
+        reference = _capture_reference(image_frame, transforms, poses)
+        self._frame_tree = reference.frame_tree
+        return reference
 
     def self_body_filter_status(self) -> Dict[str, Any]:
         return self._self_body_filter.status()
@@ -1584,80 +1518,44 @@ class PerceptionService:
         )
 
     def _augment_detection_geometry(
-        self,
-        detection_bundle,
-        *,
-        image_frame,
-        camera_info,
-        cached_geometry_inputs,
+        self, detections, *, image_frame, camera_info, reference, self_region,
     ):
-        if camera_info is None or not detection_bundle.detections_2d:
-            return detection_bundle.__class__(
-                detections_2d=detection_bundle.detections_2d,
-                detections_3d=detection_bundle.detections_3d,
-                metadata={
-                    **dict(detection_bundle.metadata),
-                    "geometry_stage_status": "completed",
-                    "geometry_degraded_reason": "camera_info_missing" if detection_bundle.detections_2d else "no_detections",
-                },
-            )
+        if camera_info is None or not detections:
+            reason = "camera_info_missing" if detections else "no_detections"
+            return detections, {"geometry_stage_status": "completed", "geometry_degraded_reason": reason,
+                                "geometry_projection_degradation_reason": reason}
 
-        if cached_geometry_inputs is None:
-            cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame)
-        point_cloud_frame, frame_tree, current_pose = cached_geometry_inputs
-
-        detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
-            detection_bundle.detections_2d,
-            image_frame=image_frame,
-            camera_info=camera_info,
-            point_cloud=point_cloud_frame,
-            frame_tree=frame_tree,
-            current_pose=current_pose,
-            self_region=region_from_detection_metadata(detection_bundle.metadata),
+        geometry = reference
+        if reference.frame_tree is not None and not self._geometry_augmentor._camera_geometry_error(image_frame, camera_info):
+            geometry = project_accumulated_cloud(reference, image_frame, camera_info, self._geometry_client)
+        cloud = geometry.point_cloud
+        detections, metadata = self._geometry_augmentor.augment_detections(
+            detections, image_frame=image_frame, camera_info=camera_info,
+            point_cloud=cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose, self_region=self_region,
         )
-        if not self._has_usable_point_cloud(point_cloud_frame):
-            geometry_metadata = {
-                **dict(geometry_metadata),
-                "geometry_projection_status": "pointcloud_unavailable",
-                "geometry_degraded_reason": geometry_metadata.get("geometry_projection_degradation_reason") or "pointcloud_unavailable",
-            }
-        if current_pose is None and geometry_metadata.get("geometry_projection_degradation_reason") == "point_cloud_unavailable":
-            geometry_metadata.update(geometry_projection_degradation_reason="capture_pose_unavailable",
-                                     geometry_projection_degradation_message="图像时刻的位姿不可用")
-        geometry_metadata["geometry_synchronization"] = "source_time_window_interpolation"
-        if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
-            return detection_bundle.__class__(
-                detections_2d=detection_bundle.detections_2d,
-                detections_3d=detection_bundle.detections_3d,
-                metadata={
-                    **dict(detection_bundle.metadata),
-                    "geometry_stage_status": "completed",
-                },
-            )
-        support_count = int(geometry_metadata.get("geometry_support_point_total") or 0)
-        degraded_reason = str(geometry_metadata.get("geometry_projection_degradation_reason") or geometry_metadata.get("geometry_degraded_reason") or "")
-        if support_count <= 0 and self._has_usable_point_cloud(point_cloud_frame):
-            degraded_reason = degraded_reason or "pointcloud_projection_failed"
-        return detection_bundle.__class__(
-            detections_2d=detections_2d,
-            detections_3d=detection_bundle.detections_3d,
-            metadata={
-                **dict(detection_bundle.metadata),
-                **geometry_metadata,
-                "geometry_stage_status": "completed",
-                "geometry_degraded_reason": degraded_reason,
-            },
+        reason = metadata.get("geometry_projection_degradation_reason", "")
+        if reason == "point_cloud_unavailable" and geometry.reason:
+            reason = geometry.reason
+            degradation = {"geometry_projection_degradation_reason": reason,
+                           "geometry_projection_degradation_message": geometry.message}
+            metadata.update(degradation)
+            if reason == ACCUMULATED_CLOUD_UNAVAILABLE:
+                degradation = {**degradation, "support_insufficient": True}
+            detections = tuple(item.model_copy(update={"attributes": {**item.attributes, **degradation}})
+                               for item in detections)
+        if cloud is None or not cloud.point_count:
+            metadata["geometry_projection_status"] = "pointcloud_unavailable"
+        elif not metadata.get("geometry_support_point_total"):
+            reason = reason or "pointcloud_projection_failed"
+        metadata.update(
+            geometry_stage_status="completed", geometry_degraded_reason=reason,
+            geometry_synchronization="source_time_window_interpolation",
+            geometry_input_sources=[] if cloud is None else [{
+                "source_id": cloud.metadata["source_topic"], "frame_id": cloud.frame_id,
+                "selected_point_count": cloud.point_count,
+            }],
         )
-
-    def _get_latest_point_cloud_optional(self):
-        provider = self._get_point_cloud_provider_optional()
-        if provider is None:
-            return None
-        try:
-            return provider.get_latest_point_cloud()
-        except Exception:
-            LOGGER.exception("读取点云提供器失败。")
-            raise
+        return detections, metadata
 
     def _latest_stream_payload(self, topic: str):
         if self._stream_bus is None:

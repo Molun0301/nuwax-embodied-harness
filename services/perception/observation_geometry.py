@@ -1,21 +1,20 @@
-"""用各帧的来源时间配准拍照前后的几何输入。"""
+"""将照片来源位姿与同一版本的累积地图点云配对。"""
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Optional
 
+import cv2
 import numpy as np
 
 from contracts.geometry import FrameTree, Pose, Transform, Vector3, Quaternion
 from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.pointcloud import PointCloudFrame
+from services.geometry.client import GeometryError
 from services.localization.frame_tree_ops import resolve_frame_transform
 
 _POSE_PAIR_WINDOW_NS = 200_000_000
-# Go2 雷达约 15.4 帧/秒，单帧只扫一个扇区，约 10 帧铺满相机视野。
-_POINT_CLOUD_MERGE_WINDOW_NS = 350_000_000
 _LATEST_POSE_WINDOW_NS = 100_000_000
-# 按 1 米/秒和 1 弧度/秒估算，取 10 毫秒桶中心时几米内的误差为毫米至厘米级。
-_POINT_TIME_BUCKET_NS = 10_000_000
+ACCUMULATED_CLOUD_MAX_DEPTH_M = 8.0
+ACCUMULATED_CLOUD_UNAVAILABLE = "accumulated_cloud_unavailable"
 
 
 @dataclass(frozen=True)
@@ -24,12 +23,7 @@ class ObservationGeometry:
     frame_tree: object = None
     point_cloud: object = None
     reason: str = "capture_pose_unavailable"
-    sources: tuple = ()
     message: str = ""
-
-    @property
-    def point_batch_count(self) -> int:
-        return sum(source["point_batch_count"] for source in self.sources)
 
 
 def _stamp(payload, metadata):
@@ -105,9 +99,10 @@ def _pose_at_source_time(samples, stamp):
     return None
 
 
-def _pose_samples(frames, map_name):
+def _pose_samples(frames, map_name, map_frame_id):
     return tuple(sorted(((_stamp(f.payload, f.metadata), contract_pose(f.payload)) for f in frames
-                         if f.topic == "localization.pose" and (map_name is None or f.metadata.get("map_name") == map_name)),
+                         if f.topic == "localization.pose" and f.metadata.get("map_name") == map_name
+                         and frame_ids_semantically_equal(f.payload.frame_id, map_frame_id)),
                         key=lambda item: item[0]))
 
 
@@ -127,163 +122,41 @@ def _capture_reference(image_frame, transforms, pose_samples):
         (body for body in dynamic_bodies if frame_ids_semantically_equal(base, body)), None)
     if body is None:
         return ObservationGeometry(pose=pose, reason="capture_reference_frame_unavailable")
-    if body != base:
-        # 相机和雷达的静态外参可能挂在同一机身的不同名称下。
-        static.append(Transform(parent_frame_id=base, child_frame_id=body,
-                                timestamp=camera_edge.timestamp, authority="calibration_static"))
     tree = _pose_tree(pose, base, static)
     return ObservationGeometry(pose, tree, reason="")
 
 
-def _matching_clouds(image_frame, frames, map_frame_id, map_name):
-    stamp = _stamp(image_frame, image_frame.metadata)
-    clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
-    for frame in frames:
-        cloud = frame.payload
-        if frame.topic != "pointcloud.frame" or not isinstance(cloud, PointCloudFrame):
-            continue
-        metadata = cloud.metadata
-        if map_name is not None and frame.metadata.get("map_name") != map_name:
-            continue
-        map_cloud = cloud.frame_id == map_frame_id and not metadata.get("canonical_lidar_frame")
-        if clock and metadata.get("clock_id") != clock and not map_cloud:
-            continue
-        cloud_stamp = _stamp(cloud, metadata)
-        if map_cloud:
-            # 地图系点已完成坐标注册；复用本地图最近的既有点云，不重复搬动它。
-            if cloud_stamp > stamp:
-                continue
-        elif abs(cloud_stamp-stamp) > _POINT_CLOUD_MERGE_WINDOW_NS:
-            continue
-        yield cloud_stamp, cloud, map_cloud
-
-
-@dataclass(frozen=True)
-class GeometryCapture:
-    """同一图像的原始测量快照，投影线程只消费封存的输入。"""
-
-    reference: ObservationGeometry
-    pose_samples: tuple
-    clouds: tuple
-    map_name: Optional[str]
-
-    @classmethod
-    def before_detection(cls, stream_bus, image_frame, transforms, map_name, point_cloud_frames):
-        if stream_bus is None:
-            return cls(ObservationGeometry(reason="geometry_stream_unavailable"), (), (), map_name)
-        poses = _pose_samples(stream_bus.replay(topics=("localization.pose",)), map_name)
-        reference = _capture_reference(image_frame, transforms, poses)
-        if reference.frame_tree is None:
-            return cls(reference, poses, (), map_name)
-        stamp = _stamp(image_frame, image_frame.metadata)
-        clouds = tuple(row for row in _matching_clouds(image_frame, point_cloud_frames, reference.pose.frame_id, map_name)
-                       if row[0] <= stamp)
-        return cls(reference, poses, clouds, map_name)
-
-    def after_detection(self, stream_bus, image_frame, point_cloud_frames):
-        if self.reference.frame_tree is None:
-            return self
-        stamp = _stamp(image_frame, image_frame.metadata)
-        clouds = tuple(row for row in _matching_clouds(image_frame, point_cloud_frames,
-                                                        self.reference.pose.frame_id, self.map_name)
-                       if row[0] > stamp)
-        poses = dict(self.pose_samples)
-        for time, pose in _pose_samples(stream_bus.replay(topics=("localization.pose",)), self.map_name):
-            if time > stamp:
-                poses[time] = pose
-        return replace(self, pose_samples=tuple(sorted(poses.items())), clouds=self.clouds + clouds)
-
-    def project(self, image_frame):
-        return _project_geometry(image_frame, self.reference, self.pose_samples, self.clouds)
-
-
-def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None, point_cloud_frames=None):
-    """用同一份可用帧重建几何，供独立配对调用使用。"""
-    if stream_bus is None:
-        return ObservationGeometry(reason="geometry_stream_unavailable")
-    frames = stream_bus.replay(topics=("localization.pose", "pointcloud.frame"))
-    poses = _pose_samples(frames, map_name)
-    reference = _capture_reference(image_frame, transforms, poses)
-    if reference.frame_tree is None:
-        return reference
-    clouds = _matching_clouds(image_frame, frames if point_cloud_frames is None else point_cloud_frames,
-                              reference.pose.frame_id, map_name)
-    return _project_geometry(image_frame, reference, poses, clouds)
-
-
-def _project_geometry(image_frame, reference, pose_samples, clouds):
-    if reference.frame_tree is None:
-        return reference
-    pose, tree = reference.pose, reference.frame_tree
-    base = tree.transforms[0].child_frame_id
-    static = tree.transforms[1:]
-    stamp = _stamp(image_frame, image_frame.metadata)
-    clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
-    scans = []
-    for cloud_stamp, cloud, map_cloud in clouds:
-        sample = cloud.metadata.get("canonical_lidar_frame")
-        points = cloud.points_xyz_array
-        if points is None:
-            points = np.asarray([[p.x, p.y, p.z] for p in cloud.points], dtype=np.float64)
-        if not len(points):
-            continue
-        rank = (abs(cloud_stamp-stamp), -cloud_stamp)
-        scans.append((rank, cloud, points, cloud_stamp, sample, map_cloud))
-    if not scans:
-        return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable")
-
-    # 仍由最接近图像时刻的帧决定使用地图系点云还是雷达扫描。
-    nearest = min(scans, key=lambda scan: scan[0])
-    use_map_cloud = nearest[-1]
-    selected = (nearest,) if use_map_cloud else (scan for scan in scans if not scan[-1])
-    registered, sources = [], []
-    mixed = pose.mixed_correction
-    message = ""
-    for _, source_cloud, points, cloud_stamp, sample, map_cloud in selected:
-        batch_count = 0
-        if not map_cloud:
-            if sample is not None and sample.time_offset_ns_le is not None:
-                offsets = np.frombuffer(sample.time_offset_ns_le, dtype="<u8").astype(np.int64)
-            elif source_cloud.metadata.get("offset_ns_array") is not None:
-                # 显示/感知原始数组保留逐点时间，不为几何配对创建标准字节载荷。
-                offsets = np.asarray(source_cloud.metadata["offset_ns_array"], dtype=np.int64)
-            else:
-                offsets = np.zeros(len(points), dtype=np.int64)
-            scan_stamp = int(sample.timestamp_ns) if sample is not None else cloud_stamp
-            point_buckets = offsets // _POINT_TIME_BUCKET_NS
-            mapped = np.empty((len(points), 3), dtype=np.float64)
-            scan_mixed = False
-            for bucket in np.unique(point_buckets):
-                center_offset = int(bucket) * _POINT_TIME_BUCKET_NS + _POINT_TIME_BUCKET_NS // 2
-                batch_pose = _pose_at_source_time(pose_samples, scan_stamp + center_offset)
-                if batch_pose is None:
-                    message = "点云批次时刻的位姿不可用"
-                    mapped = None
-                    break
-                transform = resolve_frame_transform(_pose_tree(batch_pose, base, static),
-                    source_frame_id=source_cloud.frame_id, target_frame_id=pose.frame_id)
-                if transform is None:
-                    mapped = None
-                    break
-                batch = point_buckets == bucket
-                mapped[batch] = np.asarray(points)[batch] @ transform.matrix[:3, :3].T+transform.matrix[:3, 3]
-                scan_mixed |= batch_pose.mixed_correction or (
-                    batch_pose.session_id, batch_pose.correction_seq) != (pose.session_id, pose.correction_seq)
-                batch_count += 1
-            if mapped is None:
-                continue
-            points = mapped
-            mixed |= scan_mixed
-        registered.append(points)
-        sources.append({"source_id": source_cloud.metadata.get("source_id") or getattr(sample, "sensor_id", None),
-                        "frame_id": source_cloud.frame_id, "source_timestamp_ns": cloud_stamp,
-                        "selected_point_count": len(points), "canonical_lidar": sample is not None,
-                        "point_batch_count": batch_count, "image_delta_ns": cloud_stamp-stamp})
-    if not registered:
-        return ObservationGeometry(pose, tree, reason="capture_pointcloud_unavailable", message=message)
-    if not use_map_cloud:
-        pose = pose.model_copy(update={"mixed_correction": mixed})
-    points = registered[0] if len(registered) == 1 else np.concatenate(registered)
-    cloud = PointCloudFrame(frame_id=pose.frame_id, timestamp=image_frame.timestamp, point_count=len(points),
-                            points_xyz_array=points, metadata={"source_timestamp_ns": stamp, "clock_id": clock})
-    return ObservationGeometry(pose, tree, cloud, "", tuple(sources))
+def project_accumulated_cloud(reference, image_frame, camera_info, geometry_client):
+    """用照片的相机坐标系确定地图取点区域，并核对这批点的校正版本。"""
+    pose = reference.pose
+    camera_to_map = resolve_frame_transform(
+        reference.frame_tree, source_frame_id=camera_info.frame_id, target_frame_id=pose.frame_id,
+    ).matrix
+    width, height = image_frame.width_px, image_frame.height_px
+    corners = np.array([(0, 0), (width, 0), (0, height), (width, height)], dtype=np.float64)
+    center = np.array([camera_info.cx, camera_info.cy])
+    focal = np.array([camera_info.fx, camera_info.fy])
+    model = (camera_info.distortion_model or "").strip().lower()
+    coefficients = camera_info.distortion_coefficients
+    rays = (corners - center) / focal
+    if model in {"fisheye", "equidistant", "kannala_brandt", "kb"}:
+        distortion = np.asarray(coefficients or [0.0] * 4, dtype=np.float64)
+        rays = cv2.fisheye.undistortPoints(rays[:, None, :], np.eye(3), distortion).reshape(-1, 2)
+    elif any(coefficients):
+        rays = cv2.undistortPoints(rays[:, None, :], np.eye(3), np.asarray(coefficients)).reshape(-1, 2)
+    far_corners = np.column_stack((rays, np.ones(len(rays)))) * ACCUMULATED_CLOUD_MAX_DEPTH_M
+    vertices = np.vstack((np.zeros(3), far_corners))
+    map_vertices = vertices @ camera_to_map[:3, :3].T + camera_to_map[:3, 3]
+    try:
+        points, session_id, correction_seq = geometry_client.get_dense_cloud_region(
+            map_vertices.min(axis=0), map_vertices.max(axis=0),
+        )
+    except GeometryError as error:
+        return replace(reference, reason=ACCUMULATED_CLOUD_UNAVAILABLE, message=error.message)
+    if pose.mixed_correction or (pose.session_id, pose.correction_seq) != (session_id, correction_seq):
+        return replace(reference, reason=ACCUMULATED_CLOUD_UNAVAILABLE, message="照片位姿与完整点云版本不一致")
+    cloud = PointCloudFrame(
+        frame_id=pose.frame_id, timestamp=image_frame.timestamp, point_count=len(points),
+        points_xyz_array=points, metadata={"source_topic": "geometry.dense_cloud_region"},
+    )
+    return replace(reference, point_cloud=cloud)

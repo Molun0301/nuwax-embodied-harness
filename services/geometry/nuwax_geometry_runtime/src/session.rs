@@ -421,6 +421,15 @@ impl SessionHandle {
             .await
             .map_err(Status::failed_precondition)
     }
+    pub async fn dense_region(
+        &self,
+        request: DenseCloudRegionRequest,
+    ) -> Result<DenseCloudChunk, Status> {
+        self.mapper()?
+            .dense_region(request)
+            .await
+            .map_err(Status::failed_precondition)
+    }
     pub fn frame_tree(&self) -> FrameTree {
         let info = self.state.borrow().info.clone().unwrap();
         let pose = self.pose.borrow().clone();

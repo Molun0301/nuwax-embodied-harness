@@ -789,12 +789,47 @@ impl CloudMap {
             base_epoch: String::new(),
             base_offset_points: 0,
             removed_ranges,
+            ..Default::default()
         };
         if let Some(base) = base {
             result.base_epoch = base.epoch.clone();
             result.base_offset_points = request.offset_points;
         }
         Ok(result)
+    }
+
+    pub fn dense_region(
+        &mut self,
+        request: proto::DenseCloudRegionRequest,
+        frame_id: &str,
+        correction_seq: u64,
+    ) -> Result<proto::DenseCloudChunk, String> {
+        let latest = self.dense_snapshot.clone().ok_or(if request.expected_epoch.is_empty() {
+            "当前地图没有点云"
+        } else {
+            "DENSE_CLOUD_SOURCE_CHANGED"
+        })?;
+        let snapshot = self.dense.pin_read(latest, &request.expected_epoch, request.offset_points)?;
+        let bounds = [request.bounds_min, request.bounds_max].map(|coord| {
+            let coord = coord.unwrap_or_default();
+            [coord.x, coord.y, coord.z]
+        });
+        let (total_points, xyz_f32_le) = self.dense.read_region(
+            &snapshot, bounds, request.offset_points, request.max_points,
+        )?;
+        Ok(proto::DenseCloudChunk {
+            epoch: snapshot.epoch.clone(),
+            source_timestamp_ns: snapshot.source_timestamp_ns,
+            frame_id: frame_id.into(),
+            total_points,
+            offset_points: request.offset_points,
+            xyz_f32_le,
+            bounds_min: snapshot.bounds_min.to_vec(),
+            bounds_max: snapshot.bounds_max.to_vec(),
+            session_id: self.session_id,
+            correction_seq,
+            ..Default::default()
+        })
     }
 }
 #[derive(Clone, Debug)]

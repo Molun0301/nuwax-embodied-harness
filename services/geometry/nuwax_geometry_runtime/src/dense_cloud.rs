@@ -613,6 +613,78 @@ impl DenseCloud {
         self.readers.pin_read(latest, epoch, offset)
     }
 
+    /// 以可见归档点的顺序读取盒内点，偏移和总数均只计入盒内点。
+    pub fn read_region(
+        &self,
+        snapshot: &DenseSnapshot,
+        [min, max]: [[f64; 3]; 2],
+        offset: u64,
+        count: u32,
+    ) -> Result<(u64, Vec<u8>), String> {
+        if count == 0 {
+            return Err("完整点云分块位置或大小非法".into());
+        }
+        if !(0..3).all(|axis| {
+            min[axis] <= max[axis]
+                && min[axis] <= f64::from(snapshot.bounds_max[axis])
+                && f64::from(snapshot.bounds_min[axis]) <= max[axis]
+        }) {
+            return Ok((0, Vec::new()));
+        }
+        // 目录按原坐标索引。外扩一个单精度间隔，涵盖写入归档时舍入跨块的边界点。
+        let low = index_block(min.map(|v| f64::from((v as f32).next_down())));
+        let high = index_block(max.map(|v| f64::from((v as f32).next_up())));
+        let mut candidates: Vec<_> = match self.block_directory.pages_in_region(low, high) {
+            Some(pages) => pages.into_iter().collect(),
+            None => (0..snapshot.pages.len()).collect(),
+        };
+        candidates.sort_unstable();
+        let end = offset.saturating_add(u64::from(count.min(CHUNK_POINTS)));
+        let mut total = 0;
+        let mut output = Vec::new();
+        let mut bytes = vec![0; PAGE_POINTS * 12];
+        for index in candidates {
+            let Some(page) = snapshot.pages.get(index) else {
+                continue;
+            };
+            if page.count == 0 || (0..3).any(|axis| {
+                f64::from(page.high[axis]) < min[axis] || f64::from(page.low[axis]) > max[axis]
+            }) {
+                continue;
+            }
+            let inside = (0..3).all(|axis| {
+                min[axis] <= f64::from(page.low[axis]) && f64::from(page.high[axis]) <= max[axis]
+            });
+            if inside && (total + page.count <= offset || total >= end) {
+                total += page.count;
+                continue;
+            }
+            let bytes = &mut bytes[..page.length * 12];
+            snapshot.file
+                .read_exact_at(bytes, (index * PAGE_POINTS * 12) as u64)
+                .map_err(|error| error.to_string())?;
+            for (local, bytes) in bytes.chunks_exact(12).enumerate() {
+                if page.visible[local / 64] & (1 << (local % 64)) == 0 {
+                    continue;
+                }
+                if !inside {
+                    let point = decode_point(bytes).map(f64::from);
+                    if !(0..3).all(|axis| min[axis] <= point[axis] && point[axis] <= max[axis]) {
+                        continue;
+                    }
+                }
+                if (offset..end).contains(&total) {
+                    output.extend_from_slice(bytes);
+                }
+                total += 1;
+            }
+        }
+        if offset > total {
+            return Err("完整点云分块位置或大小非法".into());
+        }
+        Ok((total, output))
+    }
+
     pub fn pin_update(
         &mut self,
         latest: DenseSnapshot,

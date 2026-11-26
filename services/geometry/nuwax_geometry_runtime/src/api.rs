@@ -223,6 +223,14 @@ impl GeometryRuntime for GeometryApi {
             self.session.dense_chunk(request.into_inner()).await?,
         ))
     }
+    async fn get_dense_cloud_region(
+        &self,
+        request: Request<DenseCloudRegionRequest>,
+    ) -> Result<Response<DenseCloudChunk>, Status> {
+        Ok(Response::new(
+            self.session.dense_region(request.into_inner()).await?,
+        ))
+    }
     async fn get_frame_tree(&self, _: Request<Empty>) -> Result<Response<FrameTree>, Status> {
         Ok(Response::new(self.session.frame_tree()))
     }

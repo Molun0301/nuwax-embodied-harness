@@ -122,14 +122,6 @@ class DetectionGeometryAugmentor:
             ground_meta["ground_removed_point_count"]=int(keep.size-np.count_nonzero(keep))
             projected_pixels,camera_points,map_points=projected_pixels[keep],camera_points[keep],map_points[keep]
         metadata.update(ground_meta)
-        # 先按像素块、再按相机深度排序，每个 4×4 像素块只交付最近的点。
-        columns = (image_frame.width_px + 3) // 4
-        pixel_blocks = projected_pixels.astype(np.int64) // 4
-        block_ids = pixel_blocks[:, 1] * columns + pixel_blocks[:, 0]
-        by_depth = np.lexsort((camera_points[:, 2], block_ids))
-        nearest = np.sort(by_depth[np.diff(block_ids[by_depth], prepend=-1) != 0])
-        projected_pixels, camera_points = projected_pixels[nearest], camera_points[nearest]
-        map_points = map_points[nearest] if map_points is not None else None
         augmented = []
         augmented_count = 0
         support_point_total = 0

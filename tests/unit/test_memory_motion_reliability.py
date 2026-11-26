@@ -4,7 +4,7 @@ from datetime import timedelta
 import pytest
 from contracts.base import utc_now
 from contracts.geometry import Pose, Vector3, Quaternion
-from contracts.spatial_memory import InstanceDynamicState
+from contracts.spatial_memory import InstanceDynamicState, InstanceLifecycleState
 from services.memory.instance_association_service import InstanceAssociationService
 from services.memory.vision_to_map_projection_service import ProjectedObservation
 
@@ -80,7 +80,7 @@ def test_static_geometric_history_survives_many_fast_frames_bounded():
     assert obj.metadata.get('non_navigable_reason') not in {'dynamic_entity', 'quasi_static_entity'}
 
 
-def test_real_motion_stays_excluded_through_fast_frames_then_reliable_rest_recovers():
+def test_real_motion_marks_uncertain_through_fast_frames_then_reliable_rest_recovers():
     seq = Sequence()
     seq.add(observation(8.0))
     obj = seq.add(observation(8.3))
@@ -89,13 +89,12 @@ def test_real_motion_stays_excluded_through_fast_frames_then_reliable_rest_recov
         obj = seq.add(observation(i, fallback=True))
         assert obj.dynamic_state == InstanceDynamicState.DYNAMIC
         assert obj.metadata['dynamic_window_speed_mps'] == pytest.approx(.3)
-        assert obj.metadata['navigable'] is False
+        assert obj.lifecycle_state == InstanceLifecycleState.UNCERTAIN
     for _ in range(10):obj = seq.add(observation(8.3))
     assert obj.dynamic_state == InstanceDynamicState.STATIC
     assert obj.metadata.get('non_navigable_reason') not in {'dynamic_entity', 'quasi_static_entity'}
     assert obj.metadata.get('navigable') is not False
-    assert 'navigation_exclusion_scope' not in obj.metadata
-    assert 'local_retry_policy' not in obj.metadata
+    assert obj.lifecycle_state == InstanceLifecycleState.ACTIVE
 
 
 @pytest.mark.parametrize('reason', ['geometry_missing', 'operator_blocked'])
@@ -110,17 +109,6 @@ def test_dynamic_recovery_preserves_other_navigation_rejection(reason):
     assert obj.metadata['non_navigable_reason'] == reason
 
 
-def test_legacy_dynamic_reason_is_not_restored_by_fallback_pose_preservation():
-    seq = Sequence()
-    for _ in range(3):obj = seq.add(observation())
-    obj.metadata.update(navigable=False, non_navigable_reason='dynamic_entity', navigation_exclusion_scope='long_term_static_target', local_retry_policy='retry_after_dynamic_obstacle_clears')
-    obj = seq.add(observation(0, fallback=True,ray_origin_map=[0,-1.029,.627],ray_dir_map=[1,0,0],ray_cone_half_angle_rad=.02))
-    assert obj.dynamic_state == InstanceDynamicState.STATIC
-    assert obj.metadata.get('non_navigable_reason') != 'dynamic_entity'
-    assert obj.metadata.get('navigable') is not False
-    assert 'local_retry_policy' not in obj.metadata
-
-
 def test_dynamic_window_keeps_repeated_observations_and_excludes_other_frames():
     service = InstanceAssociationService(text_embedder=None)
     now = utc_now()
@@ -132,21 +120,3 @@ def test_dynamic_window_keeps_repeated_observations_and_excludes_other_frames():
     metrics = service._dynamic_window_metrics(third)
     assert metrics['observation_count'] == 1
     assert metrics['max_displacement_m'] == 0
-
-
-@pytest.mark.parametrize('nested', [False, True])
-def test_current_static_classification_clears_earlier_eligibility_rejection(nested):
-    seq = Sequence()
-    obj = seq.add(observation(label='potted plant'))
-    assert obj.dynamic_state == InstanceDynamicState.UNKNOWN
-    obj.metadata.update(navigable=False, non_navigable_reason='not_long_term_static_target')
-    if nested:
-        obj.metadata.update(navigable=False, non_navigable_reason='dynamic_entity',
-            dynamic_navigation_previous={'navigable': False, 'non_navigable_reason': 'not_long_term_static_target'})
-    for _ in range(3):
-        obj = seq.add(observation(label='potted plant'))
-    assert obj.dynamic_state == InstanceDynamicState.STATIC
-    assert obj.metadata['long_term_static_target_eligible'] is True
-    assert obj.metadata.get('navigable') is not False
-    assert obj.metadata.get('non_navigable_reason') not in {
-        'dynamic_entity', 'quasi_static_entity', 'not_long_term_static_target'}

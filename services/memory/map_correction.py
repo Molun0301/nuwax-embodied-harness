@@ -112,16 +112,13 @@ class MapCorrection:
             elif isinstance(value, (tuple, list)) and value:
                 corrected[name] = (motion.point(value).tolist() if np.isscalar(value[0])
                                    else [_like(point, motion.point(point)) for point in value])
-        for name in ("centroid_map", "ray_origin_map", "ray_dir_map"):
-            if attributes.get(name) is not None:
-                value = attributes[name]
-                moved = motion.direction(value) if name == "ray_dir_map" else motion.point(value)
-                corrected[name] = _like(value, moved)
-        for name in ("centroid_map", "map"):
-            prefix = name + "_"
-            if prefix + "x" in attributes and prefix + "y" in attributes:
-                moved = motion.point([attributes.get(prefix + axis, 0.0) for axis in _AXES])
-                corrected.update({prefix + axis: value for axis, value in zip(_AXES, moved.tolist())})
+        if attributes.get("centroid_map") is not None:
+            value = attributes["centroid_map"]
+            corrected["centroid_map"] = _like(value, motion.point(value))
+        prefix = "centroid_map_"
+        if prefix + "x" in attributes and prefix + "y" in attributes:
+            moved = motion.point([attributes.get(prefix + axis, 0.0) for axis in _AXES])
+            corrected.update({prefix + axis: value for axis, value in zip(_AXES, moved.tolist())})
         if "min_map_x" in attributes and "max_map_x" in attributes:
             lower, upper = motion.bounds(*([attributes[prefix + axis] for axis in _AXES]
                                            for prefix in ("min_map_", "max_map_")))
@@ -139,13 +136,6 @@ class MapCorrection:
                 if "extent_m" in value:
                     updates["extent_m"] = {axis: upper[axis] - lower[axis] for axis in _AXES}
                 corrected[name] = {**value, **updates}
-        value = attributes.get("map_pose")
-        if isinstance(value, dict) and "x" in value and self.is_map(value.get("frame_id") or pose.frame_id):
-            position = motion.point([value["x"], value["y"], value.get("z", 0.0)])
-            orientation = motion.orientation(Quaternion(**{axis: value.get("q" + axis, default)
-                for axis, default in zip("xyzw", (0.0, 0.0, 0.0, 1.0))}))
-            corrected["map_pose"] = {**value, **_point(position),
-                **{"q" + axis: getattr(orientation, axis) for axis in "xyzw"}}
         value = attributes.get("object_extent")
         if value and value.get("orientation") and self.is_map(value["frame_id"]):
             corrected["object_extent"] = motion.extent(value)
@@ -190,19 +180,7 @@ class MapCorrection:
             metadata = dict(sample.metadata)
             if metadata.get("frame_geometry"):
                 metadata["frame_geometry"] = [self.frame_geometry(item) for item in metadata["frame_geometry"]]
-            window.append(sample.model_copy(update={"pose": self.pose(sample.pose),
-                "observer_pose": self.pose(sample.observer_pose), "metadata": metadata}))
-        cache = []
-        for item in record.deferred_projection_cache:
-            observer = self.pose(item.observer_pose)
-            updates = {"observer_pose": observer}
-            if observer is not item.observer_pose:
-                motion = self.at_pose(item.observer_pose)
-                for field, action in (("ray_origin_map", motion.point), ("ray_dir_map", motion.direction)):
-                    value = getattr(item, field)
-                    if value is not None:
-                        updates[field] = action(value).tolist()
-            cache.append(item.model_copy(update=updates))
+            window.append(sample.model_copy(update={"pose": self.pose(sample.pose), "metadata": metadata}))
         metadata = self.attributes(record.metadata, old)
         if "observation_window" in metadata:
             metadata["observation_window"] = [sample.model_dump(mode="json") for sample in window]
@@ -214,7 +192,7 @@ class MapCorrection:
         return record.model_copy(update={"pose": pose, "support_evidence": evidence, "correction_buckets": buckets,
             "attributes": self.attributes(record.attributes, old), "metadata": metadata,
             "inspection_poses": [self.pose(item, derived=derived) for item in record.inspection_poses],
-            "observation_window": window, "deferred_projection_cache": cache}), derived
+            "observation_window": window}), derived
 
     def frame_geometry(self, value):
         if value is None:

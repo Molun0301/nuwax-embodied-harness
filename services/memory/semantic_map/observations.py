@@ -51,13 +51,13 @@ def understand_space(scene_space, *, model_output, observation_samples, scene_su
         "semantic_updated_at": utc_now(), "attributes": attributes, "metadata": metadata}, deep=False)
 
 
-def refresh_scene_spaces(store, *, perception_context, observation_events, context):
+def refresh_scene_spaces(store, *, perception_context, observation_events, context, semantic_instances=None):
     """由记忆写线程调用，只更新context中已有的业务区域。"""
     summary = getattr(perception_context, "scene_summary", None)
     if summary is None or not observation_events or not context.scene_spaces:
         return context
     events = store.model_map("observation").values()
-    instances = store.model_map("instance").values()
+    instances = store.model_map("instance").values() if semantic_instances is None else semantic_instances
     current = store.model_map("scene_space")
     new_event_ids = {event.event_id for event in observation_events}
     metadata = provider_metadata(perception_context)

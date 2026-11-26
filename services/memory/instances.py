@@ -11,7 +11,7 @@ from contracts.spatial_memory import InstanceConfirmationState, InstanceDynamicS
 from services.memory.object_extent import object_extent_payload
 from services.memory.instance_association_service import AssociationOutcome
 from services.memory.instance_evidence import ADMISSION_AUTOMATIC
-from services.memory.vision_to_map_projection_service import InstanceCacheRayHistoryProvider
+from services.memory.instance_classification import classify_instance_category
 from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
 
 class InstancesMixin:
@@ -123,31 +123,8 @@ class InstancesMixin:
 
 
     def _is_long_term_static_instance(self, instance: SemanticInstance) -> bool:
-        if not self._instance_is_confirmed(instance):
-            return False
-        dynamic_state = self._instance_dynamic_state(instance)
-        metadata = dict(instance.metadata or {})
-        if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
-            return False
-        if bool(metadata.get("dynamic_short_term_obstacle_context")):
-            return False
-        if metadata.get("long_term_static_target_eligible") is False:
-            return False
-        if dynamic_state == InstanceDynamicState.STATIC:
-            return True
-        # 补充路径：无 class prior 的物品首次观测为 UNKNOWN，需要多次观测才能收敛到 STATIC
-        # 当观测次数 >= 2 且投影质量非 fallback 时也允许持久化
-        observation_count = len(instance.observation_window) if instance.observation_window else 0
-        if observation_count >= 2:
-            pose_quality = str(metadata.get("pose_quality_level") or "").strip()
-            projection_confidence = self._coerce_optional_float(
-                metadata.get("projection_confidence")
-            )
-            if pose_quality != "fallback" and (
-                projection_confidence is None or projection_confidence >= 0.5
-            ):
-                return True
-        return False
+        return (self._instance_is_confirmed(instance)
+                and classify_instance_category(instance.label, instance.attributes.get("category")) != InstanceDynamicState.DYNAMIC)
 
 
     def _instance_dynamic_state(self, instance: SemanticInstance) -> InstanceDynamicState:
@@ -228,12 +205,9 @@ class InstancesMixin:
         if pose is None or (admission == ADMISSION_AUTOMATIC and pose.mixed_correction):
             return (), (), []
         context = self._semantic_builder.build(self.current_grid(), map_name=map_name)
-        ray_history = (InstanceCacheRayHistoryProvider(self._record_map("instance").values())
-                       if self._deferred_projection_config is not None
-                       and self._deferred_projection_config.triangulation_enabled else None)
         # 投影在进入写线程之前完成，查询不等待投影或关联。
         projected = self._projector.project(perception_context, current_pose=pose, map_context=context,
-                                             frame_tree=frame_tree, ray_history=ray_history)
+                                             frame_tree=frame_tree)
         def ingest(store):
             if store is None or store.name != map_name:
                 if admission == ADMISSION_AUTOMATIC:
@@ -243,8 +217,12 @@ class InstancesMixin:
             _, prepared = self._prepare_map_sample(store, pose, projected)
             photos = self._copy_photos(store, perception_context, image_bytes) if projected else ()
             values = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in prepared)
-            return self._associate_observations(store, values, admission=admission,
-                                                occupancy_grid=self.current_grid(), now=now)
+            if not values:
+                return (), (), []
+            _, outcomes = self._write_perception_observations(
+                store, values, admission=admission, context=perception_context,
+                photos=photos, now=now or utc_now())
+            return values, outcomes, [item.instance.instance_id for item in outcomes if item.instance is not None]
         return self.write(ingest)
 
     def _associate_observations(self, store, projected, *, admission, occupancy_grid=None, now=None):
@@ -254,23 +232,9 @@ class InstancesMixin:
                 map_name=store.name, occupancy_grid=occupancy_grid, now=now or utc_now(), admission=admission)
             updated, merges = self._association.consolidate(updated,
                 candidate_ids={outcome.instance.instance_id for outcome in outcomes if outcome.instance is not None})
-        for identifier, record in updated.items():
-            metadata = {**record.metadata, "map_name": store.name}
-            metadata.update(self._evaluate_navigation_metadata(metadata,
-                backend_name=str(metadata.get("backend") or metadata.get("backend_type")
-                    or "memory_service.semantic_instance"), map_name=store.name))
-            updated[identifier] = record.model_copy(update={"metadata": metadata}, deep=False)
         aliases = {old: merge.survivor_id for merge in merges for old in merge.merged_ids}
         outcomes = tuple(AssociationOutcome(updated[aliases.get(item.instance.instance_id, item.instance.instance_id)]
             if item.instance is not None else None, item.created, item.matched_score) for item in outcomes)
-        if aliases:
-            for event in store.model_map("observation").values():
-                identifiers = list(dict.fromkeys(aliases.get(identity, identity) for identity in event.linked_instance_ids))
-                if identifiers != event.linked_instance_ids:
-                    store.put("observation", event.model_copy(update={"linked_instance_ids": identifiers}))
-        for identifier in before.keys() - updated.keys():
-            store.delete("instance", identifier)
-        for identifier, record in updated.items():
-            if before.get(identifier) != record:
-                store.put_live_instance(record, persist=self._is_long_term_static_instance(record))
-        return projected, outcomes, [item.instance.instance_id for item in outcomes if item.instance is not None]
+        changes = {identifier: record for identifier, record in updated.items()
+                   if before.get(identifier) != record}
+        return outcomes, changes, before.keys() - updated.keys(), aliases

@@ -13,7 +13,7 @@ from contracts.runtime_views import PerceptionContext, NavigationSemanticContext
 from core.errors import GatewayError
 from contracts.geometry import Vector3
 from contracts.runtime_views import TopologyNodeSummary
-from contracts.spatial_memory import SemanticRegion, InstanceDynamicState
+from contracts.spatial_memory import SemanticRegion
 
 from contracts.memory import GoalSpec, GoalConstraint, GoalSpatialRelation, GoalCandidateScoreBreakdown, NavigationCandidateResolution
 from contracts.spatial_memory import SpatialAnchor, SpatialAnchorKind, NavigationTrajectoryEvent, NavigationTrajectoryEventKind, SemanticGraphRelation, SemanticGraphRelationKind
@@ -85,13 +85,6 @@ class NavigationMixin:
             add_reason('projection_confidence_low')
         if projection_method and support_point_count is not None and (support_point_count <= 0):
             add_reason('projection_geometry_missing')
-        dynamic_state = str(metadata.get('dynamic_state') or '').strip()
-        if dynamic_state in {InstanceDynamicState.DYNAMIC.value, InstanceDynamicState.QUASI_STATIC.value}:
-            add_reason('dynamic_entity' if dynamic_state == InstanceDynamicState.DYNAMIC.value else 'quasi_static_entity')
-        if bool(metadata.get('dynamic_short_term_obstacle_context')):
-            add_reason('dynamic_obstacle_context')
-        if metadata.get('long_term_static_target_eligible') is False:
-            add_reason('not_long_term_static_target')
         if self._coerce_optional_bool(metadata.get('navigable')) is False:
             add_reason(str(metadata.get('non_navigable_reason') or 'not_navigable'))
         segmentation_reason_codes = self._navigation_quality_reason_codes_from_segmentation(segmentation_summary)
@@ -141,7 +134,6 @@ class NavigationMixin:
             displacement = self._coerce_optional_float(metadata.get('dynamic_window_displacement_m'))
             diagnostics = {'level': level, 'reason_codes': list(reason_codes),
                 'dynamic_window_displacement_m': displacement,
-                'dynamic_short_term_obstacle_context': metadata.get('dynamic_short_term_obstacle_context'),
                 'message': ('这个物体的观测位置有变化，可能被移动过。' if displacement is not None and displacement > 0
                             else '已记录物体状态、投影与分割质量，到达后复核目标。')}
             reason_codes = []
@@ -178,7 +170,7 @@ class NavigationMixin:
         recommended_action = {'direct_navigation': 'navigate', 'needs_review': 'verify_then_navigate', 'continue_exploration': 'explore_more', 'not_navigable': 'reject'}[level]
         confidence = self._navigation_quality_confidence(level, candidate_score, projection_confidence, segmentation_summary)
         primary_reason_code = reason_codes[0] if reason_codes else ''
-        return {'schema_version': self._NAVIGATION_QUALITY_SCHEMA_VERSION, 'level': level, 'confidence': confidence, 'recommended_action': recommended_action, 'primary_reason_code': primary_reason_code, 'reason_codes': reason_codes, 'explanation': self._navigation_quality_explanation(level, primary_reason_code), 'inputs': {'candidate_score': candidate_score, 'projection_confidence': projection_confidence, 'projection_method': projection_method or None, 'support_point_count': support_point_count, 'segmentation_quality': str(segmentation_summary.get('segmentation_quality') or '') or None, 'segmentation_review_required': bool(segmentation_summary.get('segmentation_review_required')), 'segmentation_risk_factors': list(segmentation_summary.get('segmentation_risk_factors') or []), 'planner_query_scope': str(planner_metadata.get('query_scope') or '').strip() or None, 'planner_ambiguity_count': ambiguity_count, 'planner_negative_constraint_count': negative_constraint_count, 'candidate_ranking_hints_present': candidate_ranking_hints_present, 'map_name': map_name, 'expected_map_name': expected_map_name, 'dynamic_state': str(metadata.get('dynamic_state') or '') or None, 'dynamic_state_reason': str(metadata.get('dynamic_state_reason') or '') or None, 'long_term_static_target_eligible': metadata.get('long_term_static_target_eligible')}, 'thresholds': self._navigation_quality_thresholds(), **({'diagnostics': diagnostics} if object_target else {})}
+        return {'schema_version': self._NAVIGATION_QUALITY_SCHEMA_VERSION, 'level': level, 'confidence': confidence, 'recommended_action': recommended_action, 'primary_reason_code': primary_reason_code, 'reason_codes': reason_codes, 'explanation': self._navigation_quality_explanation(level, primary_reason_code), 'inputs': {'candidate_score': candidate_score, 'projection_confidence': projection_confidence, 'projection_method': projection_method or None, 'support_point_count': support_point_count, 'segmentation_quality': str(segmentation_summary.get('segmentation_quality') or '') or None, 'segmentation_review_required': bool(segmentation_summary.get('segmentation_review_required')), 'segmentation_risk_factors': list(segmentation_summary.get('segmentation_risk_factors') or []), 'planner_query_scope': str(planner_metadata.get('query_scope') or '').strip() or None, 'planner_ambiguity_count': ambiguity_count, 'planner_negative_constraint_count': negative_constraint_count, 'candidate_ranking_hints_present': candidate_ranking_hints_present, 'map_name': map_name, 'expected_map_name': expected_map_name, 'dynamic_state': str(metadata.get('dynamic_state') or '') or None, 'dynamic_state_reason': str(metadata.get('dynamic_state_reason') or '') or None}, 'thresholds': self._navigation_quality_thresholds(), **({'diagnostics': diagnostics} if object_target else {})}
 
     def _navigation_quality_reason_codes_from_segmentation(self, segmentation_summary: Dict[str, object]) -> List[str]:
         mapping = {'segmentation_support_points_missing': 'segmentation_support_missing', 'segmentation_score_below_threshold': 'segmentation_quality_low', 'predicted_iou_below_threshold': 'segmentation_quality_low', 'stability_score_below_threshold': 'segmentation_quality_low', 'coverage_below_threshold': 'segmentation_coverage_low', 'depth_coverage_below_threshold': 'segmentation_depth_coverage_low', 'map_projection_coverage_below_threshold': 'segmentation_map_coverage_low', 'reprojection_error_above_threshold': 'segmentation_reprojection_error_high', 'segmentation_projection_degraded': 'projection_degraded', 'segmentation_occluded': 'segmentation_occluded', 'segmentation_truncated': 'segmentation_truncated'}
@@ -682,7 +674,7 @@ class NavigationMixin:
         for instance in self._record_map('instance').values():
             if instance.lifecycle_state.value == 'removed' or not self._is_long_term_static_instance(instance):
                 continue
-            anchors.append(SpatialAnchor(anchor_id=instance.anchor_id, anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE, name=instance.display_name or instance.label, pose=instance.pose, map_name=instance.map_name, topo_node_id=instance.topo_node_id, semantic_region_id=instance.semantic_region_id, semantic_labels=self._normalize_tags([instance.label, *instance.semantic_labels, *instance.visual_labels, *instance.vision_tags]), inspection_poses=list(instance.inspection_poses), metadata=dict({'instance_id': instance.instance_id, 'instance_type': instance.instance_type, 'movability': instance.movability.value, 'dynamic_state': self._instance_dynamic_state(instance).value, 'dynamic_state_reason': str(instance.metadata.get('dynamic_state_reason') or ''), 'long_term_static_target_eligible': True, 'lifecycle_state': instance.lifecycle_state.value, 'observation_count': instance.observation_count, 'last_seen_ts': instance.last_seen_ts.isoformat()})))
+            anchors.append(SpatialAnchor(anchor_id=instance.anchor_id, anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE, name=instance.display_name or instance.label, pose=instance.pose, map_name=instance.map_name, topo_node_id=instance.topo_node_id, semantic_region_id=instance.semantic_region_id, semantic_labels=self._normalize_tags([instance.label, *instance.semantic_labels, *instance.visual_labels, *instance.vision_tags]), inspection_poses=list(instance.inspection_poses), metadata=dict({'instance_id': instance.instance_id, 'instance_type': instance.instance_type, 'movability': instance.movability.value, 'dynamic_state': self._instance_dynamic_state(instance).value, 'dynamic_state_reason': str(instance.metadata.get('dynamic_state_reason') or ''), 'lifecycle_state': instance.lifecycle_state.value, 'observation_count': instance.observation_count, 'last_seen_ts': instance.last_seen_ts.isoformat()})))
         return anchors
 
     def _record_navigation_candidate_graph(self, candidate: NavigationCandidate, reachability_decision: str) -> NavigationCandidate:
@@ -1005,7 +997,7 @@ class NavigationMixin:
                 if anchor.anchor_id == anchor_id:
                     poses.extend(anchor.inspection_poses)
             for instance in self._record_map('instance').values():
-                if self._instance_is_confirmed(instance) and instance.anchor_id == anchor_id:
+                if self._is_long_term_static_instance(instance) and instance.anchor_id == anchor_id:
                     poses.extend(instance.inspection_poses)
         for pose in poses:
             if self._planner.outside_target(pose, clearance):

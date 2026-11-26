@@ -96,38 +96,34 @@ def test_map_frame_and_assigned_asset_isolation_but_runtime_session_restart_allo
     assert other_frame.instance_id not in (first.instance_id,replaced.instance_id)
 
 
-def test_geometryless_fallback_requires_scoped_track_and_never_moves_saved_geometry():
+def test_geometryless_fallback_does_not_update_existing_instance():
     seq = Sequence()
     first = seq.add(observation(track='t'))[0]
-    weak = seq.add(observation(x=20,track='t',fallback=True,source='weak',ray_origin_map=[0,3,.5],ray_dir_map=[1,0,0],ray_cone_half_angle_rad=.03),seconds=1)[0]
-    assert weak.instance_id == first.instance_id
-    assert weak.pose == first.pose
-    assert weak.metadata['object_extent'] == first.metadata['object_extent']
-    unrelated = seq.add(observation(x=20,fallback=True,source='unknown'),seconds=2)[0]
-    assert unrelated is None
-    assert len(seq.instances)==1
+    weak = seq.add(observation(x=20, track='t', fallback=True, source='weak'), seconds=1)[0]
+    assert weak is None
+    assert seq.instances[first.instance_id] == first
 
 
-def test_centroid_only_projection_uses_measured_ray_support_not_fixed_meter_radius():
+def test_centroid_only_projection_uses_measured_uncertainty_to_distinguish_neighbors():
     seq = Sequence()
-    first = seq.add(observation(size=None,ray_origin_map=[0,3,.5],ray_cone_half_angle_rad=.025))[0]
-    again = seq.add(observation(x=2.02,size=None,source='again',
-        ray_origin_map=[0,3,.5],ray_cone_half_angle_rad=.025),seconds=3600)[0]
+    first = seq.add(observation(size=None, depth_m=2, ray_cone_half_angle_rad=.025))[0]
+    again = seq.add(observation(x=2.02, size=None, source='again',
+        depth_m=2.02, ray_cone_half_angle_rad=.025), seconds=3600)[0]
     assert again.instance_id == first.instance_id
-    neighbor = seq.add(observation(x=2.2,size=None,source='neighbor',
-        ray_origin_map=[0,3,.5],ray_cone_half_angle_rad=.025),seconds=3601)[0]
+    neighbor = seq.add(observation(x=2.2, size=None, source='neighbor',
+        depth_m=2.2, ray_cone_half_angle_rad=.025), seconds=3601)[0]
     assert neighbor.instance_id != first.instance_id
     assert 'object_extent' not in again.metadata
 
 
-def test_legacy_centroid_reacquired_using_new_size_and_triangulation_residual():
+def test_centroid_reacquired_using_new_size_and_measured_uncertainty():
     seq = Sequence()
     first = seq.add(observation(size=None))[0]
     repeat = seq.add(observation(x=2.02,source='size_now'),seconds=3600)[0]
     assert repeat.instance_id == first.instance_id
     points = Sequence()
-    first = points.add(observation(size=None,triangulation_residual_m=.04))[0]
-    repeat = points.add(observation(x=2.02,size=None,triangulation_residual_m=.04,source='next'),seconds=3600)[0]
+    first = points.add(observation(size=None,measurement_sigma_m=.04))[0]
+    repeat = points.add(observation(x=2.02,size=None,measurement_sigma_m=.04,source='next'),seconds=3600)[0]
     assert repeat.instance_id == first.instance_id
 
 

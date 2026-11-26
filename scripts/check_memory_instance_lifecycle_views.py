@@ -17,11 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.spatial_memory import (
-    DeferredProjectionInput,
     InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
-    InstanceObservationWindowSample,
     SemanticInstance,
 )
 from services.memory.instance_association_service import InstanceAssociationService
@@ -146,7 +144,7 @@ class LifecycleProjectionChecks(unittest.TestCase):
             expected = _original_mark_stale(policy, instance, now=NOW)
             actual = policy._mark_stale(instance, now=NOW)
             self.assertEqual(actual.model_dump(), expected.model_dump())
-            for field in ("pose", "metadata", "attributes", "observation_window", "deferred_projection_cache"):
+            for field in ("pose", "metadata", "attributes", "observation_window"):
                 self.assertEqual(getattr(actual, field) is getattr(instance, field),
                                  getattr(expected, field) is getattr(instance, field))
             self.assertEqual(actual.metadata["nested"] is instance.metadata["nested"],

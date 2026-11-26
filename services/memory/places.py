@@ -80,7 +80,7 @@ class PlacesMixin:
             if entry is not None:
                 prepared = entry.model_copy(update={"pose": corrected, "artifact_ids": photos,
                     "metadata": {**entry.metadata, "photo_refs": photo_refs}})
-                memory = self._save_scene_record(store, prepared, source=source, context=perception,
+                memory = self._save_scene_record(store, prepared, context=perception,
                     projected=prepared_observations, captured=captured, photos=photos)
                 value = value.model_copy(update={"memory_id": memory.memory_id})
                 store.put("location", value)

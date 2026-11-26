@@ -291,37 +291,6 @@ class PerceptionStreamRuntimeConfig:
 
 
 @dataclass
-class DeferredProjectionConfig:
-    """延迟投影(射线三角化 / 延迟点云重投影)配置。
-
-    strategy 单轴枚举(消除 MODE×METHOD 笛卡尔积的无意义组合)：
-    - disabled：仅现有实时点云链(默认，向后兼容，=现状)
-    - triangulation：多视角射线三角化(L2 主推，不等点云，置信≤0.7)
-    - delayed_pointcloud：延迟点云重投影(稠密激光雷达/地面物品，等累积点云，置信0.85)
-    - triangulation_first：三角化即时 + 点云累积后 cross-validation(求更高精度)
-    """
-
-    strategy: str = "disabled"
-    triangulation_min_rays: int = schema_default('perception.triangulation_min_rays')
-    triangulation_min_parallax_deg: float = schema_default('perception.triangulation_min_parallax_deg')
-    triangulation_max_residual_m: float = schema_default('perception.triangulation_max_residual_m')
-    delayed_pc_min_points: int = 5
-    delayed_pc_max_retry: int = 3
-    delayed_pc_max_range_m: float = 8.0
-    delayed_pc_refine_interval_sec: float = 6.0
-    delayed_pc_max_concurrency: int = 2
-    xval_threshold_m: float = 0.3
-
-    @property
-    def triangulation_enabled(self) -> bool:
-        return self.strategy in ("triangulation", "triangulation_first")
-
-    @property
-    def delayed_pointcloud_enabled(self) -> bool:
-        return self.strategy in ("delayed_pointcloud", "triangulation_first")
-
-
-@dataclass
 class PerceptionPostProcessConfig:
     """检测后处理配置：类无关 NMS（杠杆二，见方案文档第 6.2 节）。
 
@@ -380,7 +349,6 @@ class PerceptionConfig:
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
     segmentation: PerceptionSegmentationConfig = field(default_factory=PerceptionSegmentationConfig)
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
-    deferred_projection: DeferredProjectionConfig = field(default_factory=DeferredProjectionConfig)
     postprocess: PerceptionPostProcessConfig = field(default_factory=lambda: PerceptionPostProcessConfig())
     self_filter: PerceptionSelfFilterConfig = field(default_factory=PerceptionSelfFilterConfig)
     instance_association: MemoryInstanceAssociationConfig = field(default_factory=MemoryInstanceAssociationConfig)
@@ -555,33 +523,6 @@ class RelayServerConfig:
     upstream_token: str = schema_default('relay.upstream_token')
 
 
-def _build_deferred_projection_config() -> DeferredProjectionConfig:
-    """构建延迟投影配置，校验 strategy 单轴枚举。"""
-
-    raw_strategy = value('perception.deferred_strategy').strip().lower()
-    allowed = {"disabled", "triangulation", "delayed_pointcloud", "triangulation_first"}
-    if raw_strategy in allowed:
-        strategy = raw_strategy
-    else:
-        if raw_strategy:
-            logging.getLogger("nuwax_robot_bridge.settings").warning(
-                "未知 perception.deferred_strategy=%s，回退 disabled。", raw_strategy
-            )
-        strategy = "disabled"
-    return DeferredProjectionConfig(
-        strategy=strategy,
-        triangulation_min_rays=max(2, value('perception.triangulation_min_rays')),
-        triangulation_min_parallax_deg=max(0.0, value('perception.triangulation_min_parallax_deg')),
-        triangulation_max_residual_m=max(0.01, value('perception.triangulation_max_residual_m')),
-        delayed_pc_min_points=max(1, 5),
-        delayed_pc_max_retry=max(0, 3),
-        delayed_pc_max_range_m=max(0.5, 8.0),
-        delayed_pc_refine_interval_sec=max(1.0, 6.0),
-        delayed_pc_max_concurrency=max(1, 2),
-        xval_threshold_m=max(0.01, 0.3),
-    )
-
-
 def load_config() -> NuwaxRobotBridgeConfig:
     """统一加载配置。"""
 
@@ -693,7 +634,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             burst_frame_count=max(1, value('perception.burst_frame_count')),
             burst_interval_sec=max(0.05, value('perception.burst_interval_sec')),
         ),
-        deferred_projection=_build_deferred_projection_config(),
         postprocess=PerceptionPostProcessConfig(
             enabled=value('perception.postprocess_nms_enabled'),
             iou_threshold=max(

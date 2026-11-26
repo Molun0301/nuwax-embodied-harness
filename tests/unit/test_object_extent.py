@@ -105,7 +105,7 @@ def test_missing_detector_axis_stays_unknown():
 def test_size_survives_position_only_and_fallback_and_follows_smoothed_pose():
     first = projected_detection()
     current = instance(first, merge_object_extent(None,first))
-    for later in [observation({'projection_method':'track_pose'}), observation({'projection_method':'current_pose_fallback'})]:
+    for later in [observation({'projection_method':'map_point_samples'}), observation({'projection_method':'current_pose_fallback'})]:
         assert merge_object_extent(current,later) == current.metadata['object_extent']
     current.pose = Pose(frame_id='map',position=Vector3(x=20,y=30,z=-4))
     assert object_extent_payload(current)['center'] == {'x':20,'y':30,'z':-4}

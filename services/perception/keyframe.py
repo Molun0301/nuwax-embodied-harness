@@ -7,6 +7,9 @@ from typing import Dict, Optional
 
 from contracts.geometry import Pose
 
+_STATIONARY_FOLLOWUP_INTERVAL_SEC = 2.0
+_STATIONARY_FOLLOWUP_LIMIT = 2
+
 
 @dataclass(frozen=True)
 class KeyframeDecision:
@@ -18,7 +21,7 @@ class KeyframeDecision:
 
 
 class PerceptionKeyframeSelector:
-    """关键帧选择器：启动记录一帧，之后位姿平移或旋转超阈值再记录一帧。
+    """启动、位姿到达移动阈值或原地补帧时选择关键帧。
 
     规则：
     1. 首帧（尚无任何关键帧）直接触发，reason=bootstrap；
@@ -27,6 +30,7 @@ class PerceptionKeyframeSelector:
        朝向变化 >= yaw_threshold_deg 触发 pose_rotation；
     4. 还没有基准位姿（首帧触发时 SLAM 尚未给出坐标），一旦拿到首个有效位姿
        立即触发 pose_baseline_acquired 并登记为基准，之后转入规则 3。
+    5. 未达到移动阈值时每隔 2 秒补一帧，最多补两帧，移动后重新计数。
 
     与启动时机无关：无论谁先就绪，只要 SLAM 后续给出坐标，就按坐标变化更新；
     位姿始终不可用时只在首帧出一帧，不再有其它兜底触发。
@@ -44,6 +48,7 @@ class PerceptionKeyframeSelector:
         self._yaw_threshold_rad = math.radians(max(0.0, float(yaw_threshold_deg)))
         self._last_keyframe_at = None
         self._last_keyframe_pose = None
+        self._stationary_followups = 0
 
     def update_thresholds(self, *, min_interval_sec, translation_threshold_m, yaw_threshold_deg) -> None:
         """由感知运行锁保护，保留上一关键帧及位姿基准。"""
@@ -85,6 +90,8 @@ class PerceptionKeyframeSelector:
             return KeyframeDecision(True, "pose_translation", metadata)
         if yaw_delta_rad >= self._yaw_threshold_rad:
             return KeyframeDecision(True, "pose_rotation", metadata)
+        if elapsed_sec >= _STATIONARY_FOLLOWUP_INTERVAL_SEC and self._stationary_followups < _STATIONARY_FOLLOWUP_LIMIT:
+            return KeyframeDecision(True, "stationary_followup", metadata)
         return KeyframeDecision(False, "no_significant_change", metadata)
 
     def mark_processed(
@@ -99,9 +106,14 @@ class PerceptionKeyframeSelector:
         而导致后续移动判定永远进不去。
         """
 
+        decision = self.decide(now=timestamp, current_pose=current_pose)
         self._last_keyframe_at = timestamp
-        if current_pose is not None:
+        if decision.reason == "stationary_followup":
+            # 保留移动基准，让累计平移或转向仍能触发移动关键帧。
+            self._stationary_followups += 1
+        elif current_pose is not None:
             self._last_keyframe_pose = current_pose
+            self._stationary_followups = 0
 
     def _distance(self, left: Pose, right: Pose) -> float:
         dx = float(left.position.x) - float(right.position.x)

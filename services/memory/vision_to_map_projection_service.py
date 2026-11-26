@@ -2,113 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
 from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.runtime_views import PerceptionContext
+from contracts.spatial_memory import InstanceDynamicState
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
+from services.memory.instance_classification import classify_instance_category
+from services.memory.instance_evidence import insufficient_point_support
 from services.memory.map_correction import SAMPLE_SOURCE
 from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
-from services.perception.ray_triangulation import triangulate_rays, triangulation_confidence
 from services.perception.self_body import is_self_body
-
-
-@dataclass(frozen=True)
-class RaySample:
-    """单条 map frame 观测射线(光心 + 单位方向)。"""
-
-    origin: Tuple[float, float, float]
-    direction: Tuple[float, float, float]
-    half_angle_rad: float = 0.0  # bbox 角张成的视锥半角，供延迟点云锥内取点
-
-
-class RayHistoryProvider(Protocol):
-    """历史观测射线查询接口(依赖注入，避免投影层持有可变状态)。
-
-    主键 track_id，回退键 instance_id(track 断裂时同一实例的射线不丢)。
-    """
-
-    def get_rays(
-        self,
-        *,
-        track_id: Optional[str],
-        instance_id: Optional[str],
-    ) -> List[RaySample]:
-        ...
-
-
-class InstanceCacheRayHistoryProvider:
-    """从已有实例的 deferred_projection_cache 读取历史射线。
-
-    投影层无状态：本 provider 由 service 层在每次投影前用当前实例快照构造，
-    按 track_id(主键)/ instance_id(回退键)双索引返回历史射线。
-    """
-
-    def __init__(self, instances: Iterable[object]) -> None:
-        self._rays_by_track: Dict[str, List[RaySample]] = {}
-        self._rays_by_instance: Dict[str, List[RaySample]] = {}
-        track_owner: Dict[str, str] = {}
-        ambiguous_tracks: set[str] = set()
-        for instance in instances:
-            instance_id = str(getattr(instance, "instance_id", "") or "")
-            cache = getattr(instance, "deferred_projection_cache", None) or []
-            collected: List[RaySample] = []
-            samples_by_track: Dict[str, List[RaySample]] = {}
-            for entry in cache:
-                origin = getattr(entry, "ray_origin_map", None)
-                direction = getattr(entry, "ray_dir_map", None)
-                if not origin or not direction or len(origin) < 3 or len(direction) < 3:
-                    continue
-                try:
-                    sample = RaySample(
-                        origin=(float(origin[0]), float(origin[1]), float(origin[2])),
-                        direction=(float(direction[0]), float(direction[1]), float(direction[2])),
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if not all(math.isfinite(value) for value in (*sample.origin, *sample.direction)):
-                    continue
-                if sum(value * value for value in sample.direction) <= 0.0:
-                    continue
-                collected.append(sample)
-                window_track = self._extract_track_id(entry)
-                if window_track:
-                    samples_by_track.setdefault(window_track, []).append(sample)
-            if not collected:
-                continue
-            if instance_id:
-                self._rays_by_instance[instance_id] = collected
-            for track_id, samples in samples_by_track.items():
-                if track_id in track_owner and track_owner[track_id] != instance_id:
-                    ambiguous_tracks.add(track_id)
-                    continue
-                track_owner[track_id] = instance_id
-                self._rays_by_track.setdefault(track_id, []).extend(samples)
-        # 跟踪号可被相机或重启后的跟踪器复用，归属不唯一时禁止混合射线三角化。
-        for track_id in ambiguous_tracks:
-            self._rays_by_track.pop(track_id, None)
-
-    @staticmethod
-    def _extract_track_id(entry: object) -> Optional[str]:
-        track_id = getattr(entry, "track_id", None)
-        if track_id:
-            return str(track_id)
-        return None
-
-    def get_rays(
-        self,
-        *,
-        track_id: Optional[str],
-        instance_id: Optional[str],
-    ) -> List[RaySample]:
-        if track_id and track_id in self._rays_by_track:
-            return list(self._rays_by_track[track_id])
-        if instance_id and instance_id in self._rays_by_instance:
-            return list(self._rays_by_instance[instance_id])
-        return []
 
 
 @dataclass(frozen=True)
@@ -140,19 +47,11 @@ class VisionToMapProjectionService:
     _MAP_POINT_KEYS = ("map_points", "support_points_map", "point_samples_map", "map_point", "point_sample_map")
     _CAMERA_POINT_KEYS = ("camera_points", "support_points_3d", "point_samples_camera", "camera_point", "point_sample_camera")
 
-    def __init__(
-        self,
-        *,
-        triangulation_enabled: bool = False,
-        triangulation_min_rays: int = 2,
-        triangulation_min_parallax_deg: float = 5.0,
-        triangulation_max_residual_m: float = 0.5,
-    ) -> None:
-        # 三角化默认关闭(disabled 策略=现状，向后兼容)；由 strategy 配置开启。
-        self._triangulation_enabled = bool(triangulation_enabled)
-        self._triangulation_min_rays = max(2, int(triangulation_min_rays))
-        self._triangulation_min_parallax_deg = float(triangulation_min_parallax_deg)
-        self._triangulation_max_residual_m = float(triangulation_max_residual_m)
+    def __init__(self, *, min_support_points=None):
+        if min_support_points is None:
+            from core.settings import MemoryInstanceAssociationConfig
+            min_support_points = MemoryInstanceAssociationConfig().min_support_points
+        self._min_support_points = min_support_points
 
     def project(
         self,
@@ -161,7 +60,6 @@ class VisionToMapProjectionService:
         current_pose: Optional[Pose],
         map_context: SemanticMapBuildResult,
         frame_tree=None,
-        ray_history: Optional[RayHistoryProvider] = None,
     ) -> Tuple[ProjectedObservation, ...]:
         effective_pose = current_pose
         if effective_pose is None:
@@ -176,72 +74,28 @@ class VisionToMapProjectionService:
                 "source_timestamp_ns": effective_pose.source_timestamp_ns,
                 "session_id": effective_pose.session_id, "correction_seq": effective_pose.correction_seq})
         projected: List[ProjectedObservation] = []
-        track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
             if is_self_body(detection.attributes):
                 continue
-            if frame_ids_semantically_equal(detection.pose.frame_id, map_context.frame_id):
-                projected_pose = self._resolve_pose_to_map(
-                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id, frame_tree=frame_tree,
-                )
-                extent_orientation = projected_pose.orientation
+            if classify_instance_category(detection.label, detection.attributes.get("category")) == InstanceDynamicState.DYNAMIC:
+                projected_pose, attributes = self._observation_fallback(
+                    observer_body_pose or effective_pose, detection.attributes, dynamic=True)
             else:
-                transformed_pose = transform_pose_to_frame(
-                    frame_tree, detection.pose, target_frame_id=map_context.frame_id,
-                )
-                projected_pose = transformed_pose or self._relative_pose_to_map(
-                    detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id,
-                )
-                extent_orientation = transformed_pose.orientation if transformed_pose is not None else None
-            if (extent_orientation is None and infer_frame_role(detection.pose.frame_id) == "base"
-                    and frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id)):
-                # Existing relative-position fallback is valid for body-frame data.
-                # Compose the box's orientation too, without changing nav pose semantics.
-                a, b = effective_pose.orientation, detection.pose.orientation
-                extent_orientation = Quaternion(
-                    x=a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-                    y=a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-                    z=a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-                    w=a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
-                )
-            if projected_pose is None:
-                continue
-            # Only explicit detector identity can bridge simultaneous 2D/3D
-            # observations. The context camera need not own a fused 3D detection.
+                projected_pose, attributes = self._project_3d_detection(
+                    detection, current_pose=effective_pose, map_frame=map_context.frame_id,
+                    frame_tree=frame_tree, source_observation_id=perception_context.observation.observation_id)
+            # 只有检测器明确提供的身份才能关联同帧的二维与三维检测。
             camera_id = detection.attributes.get("camera_id")
             track_id = detection.attributes.get("track_id")
-            projected.append(
-                self._build_projected_observation(
-                    label=detection.label,
-                    score=detection.score,
-                    pose=projected_pose,
-                    camera_id=(camera_id.strip() or None) if isinstance(camera_id, str) else None,
-                    track_id=(track_id.strip() or None) if isinstance(track_id, str) else None,
-                    instance_type=str(detection.attributes.get("instance_type") or "object"),
-                    source_observation_id=perception_context.observation.observation_id,
-                    source_artifact_ids=tuple(perception_context.observation.artifact_ids),
-                    map_context=map_context,
-                    observer_body_pose=observer_body_pose,
-                    attributes={
-                        **dict(detection.attributes),
-                        "projection_method": str(detection.attributes.get("projection_method") or "detection3d_pose"),
-                        "projection_confidence": float(detection.attributes.get("projection_confidence") or detection.score),
-                        "support_point_count": int(detection.attributes.get("support_point_count") or 1),
-                        "size_x_m": detection.size_x_m,
-                        "size_y_m": detection.size_y_m,
-                        "size_z_m": detection.size_z_m,
-                        "extent_projection_status": "projected" if extent_orientation is not None else "frame_transform_unverified",
-                        "object_extent": {
-                            "frame_id": map_context.frame_id,
-                            "center_offset_m": {"x": 0.0, "y": 0.0, "z": 0.0},
-                            "size_m": {"x": detection.size_x_m, "y": detection.size_y_m, "z": detection.size_z_m},
-                            "orientation": extent_orientation.model_dump() if extent_orientation is not None else None,
-                            "source": "detection3d",
-                            "source_observation_id": perception_context.observation.observation_id,
-                        },
-                    },
-                )
-            )
+            projected.append(self._build_projected_observation(
+                label=detection.label, score=detection.score, pose=projected_pose,
+                camera_id=(camera_id.strip() or None) if isinstance(camera_id, str) else None,
+                track_id=(track_id.strip() or None) if isinstance(track_id, str) else None,
+                instance_type=str(detection.attributes.get("instance_type") or "object"),
+                source_observation_id=perception_context.observation.observation_id,
+                source_artifact_ids=tuple(perception_context.observation.artifact_ids),
+                map_context=map_context, observer_body_pose=observer_body_pose, attributes=attributes,
+            ))
 
         for detection in perception_context.observation.detections_2d:
             # 机器人自身不是环境物体，不产生地图投影、实例或观察事件。
@@ -250,14 +104,10 @@ class VisionToMapProjectionService:
             projected_pose, projection_attributes = self._resolve_detection2d_projection(
                 detection=detection,
                 perception_context=perception_context,
-                current_pose=effective_pose,
-                track_pose_by_id=track_pose_by_id,
+                current_pose=observer_body_pose or effective_pose,
                 map_frame=map_context.frame_id,
                 frame_tree=frame_tree,
-                ray_history=ray_history,
             )
-            if projected_pose is None:
-                continue
             projected.append(
                 self._build_projected_observation(
                     label=detection.label,
@@ -286,16 +136,8 @@ class VisionToMapProjectionService:
             return None
         pose, evidence = self._resolve_detection2d_projection(
             detection=detection, perception_context=perception_context, current_pose=current_pose,
-            track_pose_by_id=self._build_track_pose_index(perception_context),
             map_frame=map_frame, frame_tree=frame_tree)
         return None if evidence["projection_method"] == "current_pose_fallback" else pose
-
-    def _build_track_pose_index(self, perception_context: PerceptionContext) -> Dict[str, Pose]:
-        result: Dict[str, Pose] = {}
-        for track in perception_context.observation.tracks:
-            if track.track_id and track.pose is not None:
-                result[track.track_id] = track.pose
-        return result
 
     def _resolve_detection2d_projection(
         self,
@@ -303,185 +145,49 @@ class VisionToMapProjectionService:
         detection,
         perception_context: PerceptionContext,
         current_pose: Pose,
-        track_pose_by_id: Dict[str, Pose],
         map_frame: str,
         frame_tree,
-        ray_history: Optional[RayHistoryProvider] = None,
-    ) -> Tuple[Optional[Pose], Dict[str, object]]:
+    ) -> Tuple[Pose, Dict[str, object]]:
         base_attributes = self._detection_attributes_with_segmentation(detection)
-        # 计算本次检测射线(光心+bbox中心方向，map frame)，写入 attributes 供下游缓存/三角化。
-        current_ray = self._compute_detection_ray(
-            detection=detection,
-            perception_context=perception_context,
-            map_frame=map_frame,
-            frame_tree=frame_tree,
-        )
-        if current_ray is not None:
-            base_attributes["ray_origin_map"] = list(current_ray.origin)
-            base_attributes["ray_dir_map"] = list(current_ray.direction)
-            base_attributes["ray_cone_half_angle_rad"] = float(current_ray.half_angle_rad)
+        if classify_instance_category(detection.label, base_attributes.get("category")) == InstanceDynamicState.DYNAMIC:
+            return self._observation_fallback(current_pose, base_attributes, dynamic=True)
         if base_attributes.get("support_insufficient") is True:
-            reason=("support_cluster_sparse" if (base_attributes.get("support_cluster_point_count") or 0)>0
-                    else "current_pose_fallback_no_geometry")
-            return current_pose,self._merge_projection_attributes(base_attributes,
-                projection_method="current_pose_fallback",projection_confidence=0.0,
-                support_point_count=0,map_projection_coverage=0.0,
-                projection_degradation_reason=reason,navigable=False,
-                non_navigable_reason=reason)
-        explicit_pose = self._pose_from_attributes(base_attributes, map_frame=map_frame)
-        if explicit_pose is not None:
-            projected_pose = self._resolve_pose_to_map(
-                explicit_pose,
-                current_pose=current_pose,
-                map_frame=map_frame,
-                frame_tree=frame_tree,
-            )
-            if projected_pose is not None:
-                return projected_pose, self._merge_projection_attributes(
-                    base_attributes,
-                    projection_method="explicit_map_pose",
-                    projection_confidence=0.99,
-                    support_point_count=1,
-                    map_projection_coverage=1.0,
-                    projection_degradation_reason="",
-                )
-
-        point_pose, point_attributes = self._pose_from_point_samples(
-            attributes=base_attributes,
-            current_pose=current_pose,
-            map_frame=map_frame,
-            frame_tree=frame_tree,
-            camera_frame_id=(
-                perception_context.camera_info.frame_id
-                if perception_context.camera_info is not None
-                else detection.camera_id or perception_context.camera_id
-            ),
-        )
-        if point_pose is not None:
-            return point_pose, self._merge_projection_attributes(base_attributes, **point_attributes)
-
-        if detection.track_id and detection.track_id in track_pose_by_id:
-            projected_pose = self._resolve_pose_to_map(
-                track_pose_by_id[detection.track_id],
-                current_pose=current_pose,
-                map_frame=map_frame,
-                frame_tree=frame_tree,
-            )
-            if projected_pose is not None:
-                return projected_pose, self._merge_projection_attributes(
-                    base_attributes,
-                    projection_method="track_pose",
-                    projection_confidence=0.88,
-                    support_point_count=1,
-                    map_projection_coverage=1.0,
-                    projection_degradation_reason="track_pose_fallback",
-                )
-
-        depth_pose, depth_attributes = self._pose_from_depth_projection(
-            detection=detection,
-            perception_context=perception_context,
-            current_pose=current_pose,
-            map_frame=map_frame,
-            frame_tree=frame_tree,
-        )
-        if depth_pose is not None:
-            return depth_pose, self._merge_projection_attributes(base_attributes, **depth_attributes)
-
-        # 路径T：多视角射线三角化(depth 之后、fallback 之前)。不依赖点云，绕开 L2 稀疏。
-        if self._triangulation_enabled and ray_history is not None and current_ray is not None:
-            tri_pose, tri_attributes = self._pose_from_ray_triangulation(
-                detection=detection,
-                current_ray=current_ray,
-                current_pose=current_pose,
-                map_frame=map_frame,
-                ray_history=ray_history,
-            )
-            if tri_pose is not None:
-                return tri_pose, self._merge_projection_attributes(base_attributes, **tri_attributes)
-
-        return (
-            Pose(
-                frame_id=map_frame,
-                position=Vector3(
-                    x=float(current_pose.position.x),
-                    y=float(current_pose.position.y),
-                    z=float(current_pose.position.z),
-                ),
-                orientation=current_pose.orientation,
-            ),
-            self._merge_projection_attributes(
-                base_attributes,
-                projection_method="current_pose_fallback",
-                projection_confidence=0.2,
-                support_point_count=0,
-                coverage=0.0,
-                depth_coverage=0.0,
-                map_projection_coverage=0.0,
-                projection_degradation_reason="current_pose_fallback_no_geometry",
-                navigable=False,
-                non_navigable_reason="current_pose_fallback_no_geometry",
-                observation_only=True,
-            ),
-        )
-
-    def _compute_detection_ray(
-        self,
-        *,
-        detection,
-        perception_context: PerceptionContext,
-        map_frame: str,
-        frame_tree,
-    ) -> Optional[RaySample]:
-        """计算本次检测的 map frame 射线(相机光心 + bbox 中心反投影方向)。
-
-        光心 = 相机系原点变换到 map；方向 = bbox 中心像素反投影的单位向量(相机系)
-        变换到 map 后减光心并归一化。复用与点云投影相同的 frame_tree 路径。
-        """
-
+            return self._observation_fallback(
+                current_pose, base_attributes, sparse=(base_attributes.get("support_cluster_point_count") or 0) > 0)
         camera_info = perception_context.camera_info
-        if camera_info is None:
-            return None
-        camera_frame_id = camera_info.frame_id or detection.camera_id or perception_context.camera_id
-        if not camera_frame_id:
-            return None
-        pixel_u, pixel_v, _pixel_source = self._resolve_projection_pixel(
-            detection=detection,
-            image_width_px=perception_context.observation.metadata.get("width_px") or camera_info.width_px,
-            image_height_px=perception_context.observation.metadata.get("height_px") or camera_info.height_px,
+        point_pose, point_attributes = self._pose_from_point_samples(
+            attributes=base_attributes, current_pose=current_pose, map_frame=map_frame,
+            frame_tree=frame_tree, camera_frame_id=(
+                camera_info.frame_id if camera_info is not None else detection.camera_id or perception_context.camera_id
+            ),
         )
-        # 单位深度反投影方向 + 相机光心(0,0,0)，一并变换到 map。
-        direction_camera = self._backproject_pixel_with_depth(
-            pixel_u=pixel_u,
-            pixel_v=pixel_v,
-            depth_m=1.0,
-            camera_info=camera_info,
-        )
-        origin_camera = Vector3(x=0.0, y=0.0, z=0.0)
-        transformed = transform_points_to_frame(
-            frame_tree,
-            [origin_camera, direction_camera],
-            source_frame_id=camera_frame_id,
-            target_frame_id=map_frame,
-        )
-        if transformed is None or len(transformed) < 2:
-            return None
-        origin = np.asarray([float(transformed[0].x), float(transformed[0].y), float(transformed[0].z)], dtype=np.float64)
-        far = np.asarray([float(transformed[1].x), float(transformed[1].y), float(transformed[1].z)], dtype=np.float64)
-        direction = far - origin
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-9:
-            return None
-        direction = direction / norm
-        # 视锥半角：bbox 角点相对中心方向的最大夹角(相机系内计算，夹角对刚体变换不变)。
-        half_angle_rad = self._bbox_cone_half_angle_rad(
-            detection=detection,
-            center_dir_camera=direction_camera,
-            camera_info=camera_info,
-        )
-        return RaySample(
-            origin=(float(origin[0]), float(origin[1]), float(origin[2])),
-            direction=(float(direction[0]), float(direction[1]), float(direction[2])),
-            half_angle_rad=float(half_angle_rad),
+        if point_pose is None:
+            return self._observation_fallback(current_pose, base_attributes)
+        attributes = self._merge_projection_attributes(base_attributes, **point_attributes)
+        if insufficient_point_support(attributes, self._min_support_points):
+            return self._observation_fallback(current_pose, base_attributes, sparse=True)
+        if camera_info is not None and attributes.get("depth_m") is not None:
+            pixel_u, pixel_v = self._resolve_projection_pixel(
+                detection=detection, attributes=base_attributes,
+                image_width_px=perception_context.observation.metadata.get("width_px") or camera_info.width_px,
+                image_height_px=perception_context.observation.metadata.get("height_px") or camera_info.height_px,
+            )
+            center = self._camera_direction(pixel_u=pixel_u, pixel_v=pixel_v, camera_info=camera_info)
+            # 只在有点云位置时用检测框角度估计测量误差。
+            attributes["ray_cone_half_angle_rad"] = self._bbox_cone_half_angle_rad(
+                detection=detection, center_dir_camera=center, camera_info=camera_info)
+        return point_pose, attributes
+
+    def _observation_fallback(self, pose, attributes, *, dynamic=False, sparse=False):
+        reason = "support_cluster_sparse" if sparse else "current_pose_fallback_no_geometry"
+        if dynamic:
+            attributes = {**attributes, "dynamic_state": InstanceDynamicState.DYNAMIC.value,
+                          "dynamic_state_reason": "dynamic_class_prior"}
+        return pose, self._merge_projection_attributes(
+            attributes, projection_method="current_pose_fallback", projection_confidence=0.0,
+            support_point_count=0, coverage=0.0, depth_coverage=0.0, map_projection_coverage=0.0,
+            projection_degradation_reason=reason, navigable=False,
+            non_navigable_reason=reason, observation_only=True,
         )
 
     def _bbox_cone_half_angle_rad(self, *, detection, center_dir_camera: Vector3, camera_info) -> float:
@@ -511,10 +217,9 @@ class VisionToMapProjectionService:
         center = center / center_norm
         max_angle = 0.0
         for corner_u, corner_v in ((left, top), (right, top), (left, bottom), (right, bottom)):
-            corner_vec = self._backproject_pixel_with_depth(
+            corner_vec = self._camera_direction(
                 pixel_u=corner_u,
                 pixel_v=corner_v,
-                depth_m=1.0,
                 camera_info=camera_info,
             )
             corner = np.asarray([float(corner_vec.x), float(corner_vec.y), float(corner_vec.z)], dtype=np.float64)
@@ -524,95 +229,48 @@ class VisionToMapProjectionService:
             corner = corner / corner_norm
             dot = float(np.clip(np.dot(center, corner), -1.0, 1.0))
             max_angle = max(max_angle, float(np.arccos(dot)))
-        # 加 10% 余量并钳制到合理范围，避免锥过窄漏点或过宽纳入背景。
+        # 保留原有角度余量与上下限，用于估计点云测量误差。
         half_angle = max_angle * 1.1
         return float(min(max(half_angle, math.radians(1.0)), math.radians(30.0)))
 
-    def _pose_from_ray_triangulation(
-        self,
-        *,
-        detection,
-        current_ray: RaySample,
-        current_pose: Pose,
-        map_frame: str,
-        ray_history: RayHistoryProvider,
-    ) -> Tuple[Optional[Pose], Dict[str, object]]:
-        """用历史射线 + 本次射线做多视角三角化(异常安全，失败降级 fallback)。"""
-
-        try:
-            history = ray_history.get_rays(
-                track_id=detection.track_id,
-                instance_id=str(detection.attributes.get("instance_id") or "") or None,
-            )
-        except Exception:
-            history = []
-        samples: List[RaySample] = list(history) + [current_ray]
-        if len(samples) < self._triangulation_min_rays:
-            return None, {}
-        origins = [s.origin for s in samples]
-        directions = [s.direction for s in samples]
-        try:
-            result = triangulate_rays(
-                origins,
-                directions,
-                min_rays=self._triangulation_min_rays,
-                min_parallax_deg=self._triangulation_min_parallax_deg,
-                max_residual_m=self._triangulation_max_residual_m,
-            )
-        except Exception:
-            return None, {}
-        if result is None:
-            return None, {}
-        confidence = triangulation_confidence(
-            ray_count=result.ray_count,
-            residual_m=result.residual_m,
-            max_residual_m=self._triangulation_max_residual_m,
-        )
-        pose = Pose(
-            frame_id=map_frame,
-            position=Vector3(x=result.point[0], y=result.point[1], z=result.point[2]),
-            orientation=current_pose.orientation,
-        )
-        return pose, {
-            "projection_method": "ray_triangulation",
-            "projection_confidence": float(confidence),
-            "support_point_count": int(result.ray_count),
-            "coverage": 1.0,
-            "depth_coverage": 0.0,
-            "map_projection_coverage": 1.0,
-            "reprojection_error": round(float(result.residual_m), 6),
-            "projection_degradation_reason": "",
-            "triangulation_ray_count": int(result.ray_count),
-            "triangulation_parallax_deg": round(float(result.parallax_deg), 4),
-            "triangulation_residual_m": round(float(result.residual_m), 6),
-            "centroid_map": {
-                "x": round(float(result.point[0]), 6),
-                "y": round(float(result.point[1]), 6),
-                "z": round(float(result.point[2]), 6),
-            },
-            "navigable": True,
-        }
-
-    def _resolve_pose_to_map(
-        self,
-        pose: Pose,
-        *,
-        current_pose: Pose,
-        map_frame: str,
-        frame_tree,
-    ) -> Optional[Pose]:
+    def _project_3d_detection(self, detection, *, current_pose, map_frame, frame_tree, source_observation_id):
+        pose = detection.pose
         if frame_ids_semantically_equal(pose.frame_id, map_frame):
-            if pose.frame_id == map_frame:
-                return pose
-            return pose.model_copy(update={"frame_id": map_frame}, deep=True)
-        transformed = transform_pose_to_frame(
-            frame_tree,
-            pose,
-            target_frame_id=map_frame,
-        )
-        if transformed is not None:
-            return transformed
-        return self._relative_pose_to_map(pose, current_pose=current_pose, map_frame=map_frame)
+            projected_pose = pose if pose.frame_id == map_frame else pose.model_copy(update={"frame_id": map_frame})
+            extent_orientation = projected_pose.orientation
+        else:
+            transformed_pose = transform_pose_to_frame(frame_tree, pose, target_frame_id=map_frame)
+            projected_pose = transformed_pose or self._relative_pose_to_map(
+                pose, current_pose=current_pose, map_frame=map_frame)
+            extent_orientation = transformed_pose.orientation if transformed_pose is not None else None
+        if (extent_orientation is None and infer_frame_role(pose.frame_id) == "base"
+                and frame_ids_semantically_equal(current_pose.frame_id, map_frame)):
+            # 机身坐标系的物体范围随当前位姿旋转。
+            a, b = current_pose.orientation, pose.orientation
+            extent_orientation = Quaternion(
+                x=a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                y=a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                z=a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                w=a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+            )
+        return projected_pose, {
+            **dict(detection.attributes),
+            "projection_method": str(detection.attributes.get("projection_method") or "detection3d_pose"),
+            "projection_confidence": float(detection.attributes.get("projection_confidence") or detection.score),
+            "support_point_count": int(detection.attributes.get("support_point_count") or 1),
+            "size_x_m": detection.size_x_m,
+            "size_y_m": detection.size_y_m,
+            "size_z_m": detection.size_z_m,
+            "extent_projection_status": "projected" if extent_orientation is not None else "frame_transform_unverified",
+            "object_extent": {
+                "frame_id": map_frame,
+                "center_offset_m": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "size_m": {"x": detection.size_x_m, "y": detection.size_y_m, "z": detection.size_z_m},
+                "orientation": extent_orientation.model_dump() if extent_orientation is not None else None,
+                "source": "detection3d",
+                "source_observation_id": source_observation_id,
+            },
+        }
 
     def _pose_from_point_samples(
         self,
@@ -657,131 +315,30 @@ class VisionToMapProjectionService:
             source_frame_id=camera_points[1],
             target_frame_id=map_frame,
         )
-        map_projection_coverage = 1.0
         if transformed_points is None:
-            transformed_points = self._relative_points_to_map(
-                camera_points[0],
-                current_pose=current_pose,
-                map_frame=map_frame,
-            )
-            map_projection_coverage = 0.0
-        return self._pose_from_resolved_points(
-            transformed_points,
-            current_pose=current_pose,
-            map_frame=map_frame,
-            projection_method="camera_point_samples",
-            projection_confidence=0.93,
-            map_projection_coverage=map_projection_coverage,
-            projection_degradation_reason="" if map_projection_coverage else "camera_points_relative_pose_fallback",
-        )
-
-    def _pose_from_depth_projection(
-        self,
-        *,
-        detection,
-        perception_context: PerceptionContext,
-        current_pose: Pose,
-        map_frame: str,
-        frame_tree,
-    ) -> Tuple[Optional[Pose], Dict[str, object]]:
-        depth_m = self._float_or_none(detection.attributes.get("depth_m"))
-        if depth_m is None:
             return None, {}
-        pixel_u, pixel_v, pixel_source = self._resolve_projection_pixel(
-            detection=detection,
-            image_width_px=perception_context.observation.metadata.get("width_px") or (
-                perception_context.camera_info.width_px if perception_context.camera_info is not None else None
-            ),
-            image_height_px=perception_context.observation.metadata.get("height_px") or (
-                perception_context.camera_info.height_px if perception_context.camera_info is not None else None
-            ),
+        return self._pose_from_resolved_points(
+            transformed_points, current_pose=current_pose, map_frame=map_frame,
+            projection_method="camera_point_samples", projection_confidence=0.93,
         )
-        lateral_offset_m = self._float_or_none(detection.attributes.get("lateral_offset_m"))
-        if perception_context.camera_info is not None:
-            camera_point = self._backproject_pixel_with_depth(
-                pixel_u=pixel_u,
-                pixel_v=pixel_v,
-                depth_m=depth_m,
-                camera_info=perception_context.camera_info,
-            )
-            transformed_points = transform_points_to_frame(
-                frame_tree,
-                [camera_point],
-                source_frame_id=perception_context.camera_info.frame_id,
-                target_frame_id=map_frame,
-            )
-            if transformed_points is not None:
-                point_pose, point_attributes = self._pose_from_resolved_points(
-                    transformed_points,
-                    current_pose=current_pose,
-                    map_frame=map_frame,
-                    projection_method="depth_camera_projection",
-                    projection_confidence=0.9,
-                )
-                if point_pose is not None:
-                    point_attributes.update(
-                        {
-                            "depth_m": float(depth_m),
-                            "sample_pixel_u_px": round(float(pixel_u), 4),
-                            "sample_pixel_v_px": round(float(pixel_v), 4),
-                            "sample_pixel_source": pixel_source,
-                            "camera_frame_id": perception_context.camera_info.frame_id,
-                            "coverage": 1.0,
-                            "depth_coverage": 1.0,
-                            "map_projection_coverage": 1.0,
-                            "reprojection_error": 0.0,
-                            "projection_degradation_reason": "",
-                        }
-                    )
-                    return point_pose, point_attributes
-            if lateral_offset_m is None:
-                lateral_offset_m = self._lateral_offset_from_pixel(
-                    pixel_u=pixel_u,
-                    depth_m=depth_m,
-                    camera_info=perception_context.camera_info,
-                )
-        fallback_pose = Pose(
-            frame_id=map_frame,
-            position=Vector3(
-                x=float(current_pose.position.x) + float(depth_m),
-                y=float(current_pose.position.y) + float(lateral_offset_m or 0.0),
-                z=float(current_pose.position.z),
-            ),
-            orientation=current_pose.orientation,
-        )
-        return fallback_pose, {
-            "projection_method": "depth_pose_fallback",
-            "projection_confidence": 0.58,
-            "support_point_count": 1,
-            "coverage": 0.5,
-            "depth_coverage": 1.0,
-            "map_projection_coverage": 0.0,
-            "reprojection_error": 0.0,
-            "projection_degradation_reason": "depth_pose_relative_fallback",
-            "depth_m": float(depth_m),
-            "sample_pixel_u_px": round(float(pixel_u), 4),
-            "sample_pixel_v_px": round(float(pixel_v), 4),
-            "sample_pixel_source": pixel_source,
-            "lateral_offset_m": round(float(lateral_offset_m or 0.0), 6),
-        }
 
     def _resolve_projection_pixel(
         self,
         *,
         detection,
+        attributes: Dict[str, object],
         image_width_px: Optional[object],
         image_height_px: Optional[object],
-    ) -> Tuple[float, float, str]:
-        attributes = self._detection_attributes_with_segmentation(detection)
+    ) -> Tuple[float, float]:
         for key in self._PIXEL_CENTER_KEYS:
             candidate = self._extract_pixel_pair(attributes.get(key))
             if candidate is not None:
-                return candidate[0], candidate[1], key
+                return candidate[0], candidate[1]
 
         polygon_points = attributes.get(self._PIXEL_POLYGON_KEYS[0]) or attributes.get(self._PIXEL_POLYGON_KEYS[1])
         polygon_center = self._polygon_centroid_px(polygon_points)
         if polygon_center is not None:
-            return polygon_center[0], polygon_center[1], "mask_polygon_px"
+            return polygon_center[0], polygon_center[1]
 
         width_px = self._float_or_none(image_width_px) or (
             float(detection.bbox.x_px + detection.bbox.width_px) if detection.bbox is not None else 0.0
@@ -793,15 +350,10 @@ class VisionToMapProjectionService:
         center_v = float(detection.bbox.y_px) + (float(detection.bbox.height_px) * 0.5)
         center_u = max(0.0, min(center_u, max(0.0, width_px - 1.0)))
         center_v = max(0.0, min(center_v, max(0.0, height_px - 1.0)))
-        return center_u, center_v, "bbox_center"
+        return center_u, center_v
 
-    def _backproject_pixel_with_depth(self, *, pixel_u: float, pixel_v: float, depth_m: float, camera_info) -> Vector3:
-        """像素 + 深度 → 相机光学系 3D 点，按 camera_info.distortion_model 反畸变。
-
-        归一化坐标 (x_n, y_n) 先按畸变模型反畸变，再乘深度得相机系坐标
-        （光学系：+X 右、+Y 下、+Z 前）。畸变系数全 0 时严格退化为针孔。
-        不预设鱼眼——模型由 Phase0 实机棋盘格残差裁定并写入 camera_info。
-        """
+    def _camera_direction(self, *, pixel_u: float, pixel_v: float, camera_info) -> Vector3:
+        """把像素变成反畸变后的相机方向，光轴分量取 1。"""
         fx = max(1e-6, float(camera_info.fx))
         fy = max(1e-6, float(camera_info.fy))
         # 畸变像素 → 归一化坐标（含畸变）
@@ -809,9 +361,9 @@ class VisionToMapProjectionService:
         y_d = (float(pixel_v) - float(camera_info.cy)) / fy
         x_n, y_n = self._undistort_normalized(x_d, y_d, camera_info)
         return Vector3(
-            x=float(x_n * float(depth_m)),
-            y=float(y_n * float(depth_m)),
-            z=float(depth_m),
+            x=float(x_n),
+            y=float(y_n),
+            z=1.0,
         )
 
     @staticmethod
@@ -861,12 +413,6 @@ class VisionToMapProjectionService:
             x = (x_d - dx) / radial
             y = (y_d - dy) / radial
         return x, y
-
-    def _lateral_offset_from_pixel(self, *, pixel_u: float, depth_m: float, camera_info) -> float:
-        x_d = (float(pixel_u) - float(camera_info.cx)) / max(1e-6, float(camera_info.fx))
-        y_d = 0.0
-        x_n, _ = self._undistort_normalized(x_d, y_d, camera_info)
-        return float(x_n * float(depth_m))
 
     def _extract_points(
         self,
@@ -1031,25 +577,6 @@ class VisionToMapProjectionService:
             ),
         )
 
-    def _relative_points_to_map(
-        self,
-        points: Iterable[Vector3],
-        *,
-        current_pose: Pose,
-        map_frame: str,
-    ) -> Tuple[Vector3, ...]:
-        mapped: List[Vector3] = []
-        for point in points:
-            rotated = self._rotate_vector_by_quaternion(point, current_pose.orientation)
-            mapped.append(
-                Vector3(
-                    x=float(current_pose.position.x) + float(rotated.x),
-                    y=float(current_pose.position.y) + float(rotated.y),
-                    z=float(current_pose.position.z) + float(rotated.z),
-                )
-            )
-        return tuple(mapped)
-
     def _rotate_vector_by_quaternion(self, vector: Vector3, rotation: Quaternion) -> Vector3:
         x = float(rotation.x)
         y = float(rotation.y)
@@ -1105,49 +632,13 @@ class VisionToMapProjectionService:
         array = np.asarray(points, dtype=np.float64)
         return float(array[:, 0].mean()), float(array[:, 1].mean())
 
-    def _pose_from_attributes(self, attributes: Dict[str, object], *, map_frame: str) -> Optional[Pose]:
-        if not isinstance(attributes, dict):
-            return None
-        if isinstance(attributes.get("map_pose"), dict):
-            pose_payload = attributes["map_pose"]
-            try:
-                return Pose(
-                    frame_id=str(pose_payload.get("frame_id") or map_frame),
-                    position=Vector3(
-                        x=float(pose_payload.get("x")),
-                        y=float(pose_payload.get("y")),
-                        z=float(pose_payload.get("z", 0.0)),
-                    ),
-                    orientation=Quaternion(
-                        x=float(pose_payload.get("qx", 0.0)),
-                        y=float(pose_payload.get("qy", 0.0)),
-                        z=float(pose_payload.get("qz", 0.0)),
-                        w=float(pose_payload.get("qw", 1.0)),
-                    ),
-                )
-            except (TypeError, ValueError):
-                return None
-        try:
-            map_x = self._float_or_none(attributes.get("map_x"))
-            map_y = self._float_or_none(attributes.get("map_y"))
-            if map_x is None or map_y is None:
-                return None
-            map_z = self._float_or_none(attributes.get("map_z")) or 0.0
-            return Pose(
-                frame_id=map_frame,
-                position=Vector3(x=map_x, y=map_y, z=map_z),
-                orientation=Quaternion(w=1.0),
-            )
-        except (TypeError, ValueError):
-            return None
-
     @staticmethod
     def _infer_pose_quality_level(projection_method: str) -> str:
         """根据 projection_method 推导投影坐标质量等级。"""
         m = str(projection_method or "").lower()
-        if any(k in m for k in ("map_points", "support_points", "detection3d_pose", "map_point_samples", "explicit_map_pose")):
+        if any(k in m for k in ("map_points", "support_points", "detection3d_pose", "map_point_samples")):
             return "high"
-        if any(k in m for k in ("track_pose", "depth", "camera_point_samples")):
+        if m == "camera_point_samples":
             return "medium"
         if any(k in m for k in ("robot_pose", "fallback", "current_pose")):
             return "fallback"
